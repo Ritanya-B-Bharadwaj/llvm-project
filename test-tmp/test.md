@@ -1,31 +1,95 @@
 ### test.cpp
 
-#### Line 3
-Source code: `    return a + b;`
+#### Line 5
+Source code: `    if (n <= 1)`
 
 Mapped IR code:
 ```llvm
-  %5 = load i32, ptr %3, align 4, !dbg !19
-  %6 = load i32, ptr %4, align 4, !dbg !20
-  %7 = add nsw i32 %5, %6, !dbg !21
-  ret i32 %7, !dbg !22
+  %4 = load i32, ptr %3, align 4, !dbg !808
+  %5 = icmp sle i32 %4, 1, !dbg !810
+  br i1 %5, label %6, label %8, !dbg !811
+```
+
+#### Line 6
+Source code: `        return n;`
+
+Mapped IR code:
+```llvm
+  %7 = load i32, ptr %3, align 4, !dbg !812
+  store i32 %7, ptr %2, align 4, !dbg !813
+  br label %16, !dbg !813
 ```
 
 #### Line 7
-Source code: `    int x = add(2, 3);`
+Source code: `    return fibonacci(n - 1) + fibonacci(n - 2);`
 
 Mapped IR code:
 ```llvm
-  %3 = call noundef i32 @_Z3addii(i32 noundef 2, i32 noundef 3), !dbg !17
-  store i32 %3, ptr %2, align 4, !dbg !16
+  %9 = load i32, ptr %3, align 4, !dbg !814
+  %10 = sub nsw i32 %9, 1, !dbg !815
+  %11 = call noundef i32 @_Z9fibonaccii(i32 noundef %10), !dbg !816
+  %12 = load i32, ptr %3, align 4, !dbg !817
+  %13 = sub nsw i32 %12, 2, !dbg !818
+  %14 = call noundef i32 @_Z9fibonaccii(i32 noundef %13), !dbg !819
+  %15 = add nsw i32 %11, %14, !dbg !820
+  store i32 %15, ptr %2, align 4, !dbg !821
+  br label %16, !dbg !821
 ```
 
 #### Line 8
-Source code: `    return x;`
+Source code: `}`
 
 Mapped IR code:
 ```llvm
-  %4 = load i32, ptr %2, align 4, !dbg !18
-  ret i32 %4, !dbg !19
+  %17 = load i32, ptr %2, align 4, !dbg !822
+  ret i32 %17, !dbg !822
+```
+
+#### Line 12
+Source code: `    std::cout << "Enter a number: ";`
+
+Mapped IR code:
+```llvm
+  %4 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc(ptr noundef nonnull align 8 dereferenceable(8) @_ZSt4cout, ptr noundef @.str), !dbg !808
+```
+
+#### Line 13
+Source code: `    std::cin >> n;`
+
+Mapped IR code:
+```llvm
+  %5 = call noundef nonnull align 8 dereferenceable(16) ptr @_ZNSirsERi(ptr noundef nonnull align 8 dereferenceable(16) @_ZSt3cin, ptr noundef nonnull align 4 dereferenceable(4) %2), !dbg !809
+```
+
+#### Line 14
+Source code: `    int result = fibonacci(n);`
+
+Mapped IR code:
+```llvm
+  %6 = load i32, ptr %2, align 4, !dbg !812
+  %7 = call noundef i32 @_Z9fibonaccii(i32 noundef %6), !dbg !813
+  store i32 %7, ptr %3, align 4, !dbg !811
+```
+
+#### Line 15
+Source code: `    std::cout << "Fibonacci(" << n << ") = " << result << "\n";`
+
+Mapped IR code:
+```llvm
+  %8 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc(ptr noundef nonnull align 8 dereferenceable(8) @_ZSt4cout, ptr noundef @.str.1), !dbg !814
+  %9 = load i32, ptr %2, align 4, !dbg !815
+  %10 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZNSolsEi(ptr noundef nonnull align 8 dereferenceable(8) %8, i32 noundef %9), !dbg !816
+  %11 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc(ptr noundef nonnull align 8 dereferenceable(8) %10, ptr noundef @.str.2), !dbg !817
+  %12 = load i32, ptr %3, align 4, !dbg !818
+  %13 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZNSolsEi(ptr noundef nonnull align 8 dereferenceable(8) %11, i32 noundef %12), !dbg !819
+  %14 = call noundef nonnull align 8 dereferenceable(8) ptr @_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc(ptr noundef nonnull align 8 dereferenceable(8) %13, ptr noundef @.str.3), !dbg !820
+```
+
+#### Line 16
+Source code: `    return 0;`
+
+Mapped IR code:
+```llvm
+  ret i32 0, !dbg !821
 ```
 
