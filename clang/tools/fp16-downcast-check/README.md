@@ -13,8 +13,7 @@ For every `FloatingLiteral` in the translation unit it:
 1. Converts the value to IEEE half-precision (`binary16`) using round-to-nearest-ties-to-even.
 2. Computes the **relative error**
 
-   \[ \\text{err} = \\frac{| \\text{orig} - \\text{downcast} |}{|\\text{orig}|} \]
-
+      `err = |orig - downcast| / |orig|`
 3. Emits diagnostics according to the result:
 
 | case | condition                              | diagnostic |
