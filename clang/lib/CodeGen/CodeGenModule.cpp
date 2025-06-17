@@ -9,6 +9,13 @@
 // This coordinates the per-module state used while generating code.
 //
 //===----------------------------------------------------------------------===//
+#include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/ADT/StringRef.h"
 
 #include "CodeGenModule.h"
 #include "ABIInfo.h"
@@ -414,11 +421,6 @@ CodeGenModule::CodeGenModule(ASTContext &C,
       CodeGenOpts.CoverageNotesFile.size() ||
       CodeGenOpts.CoverageDataFile.size())
     DebugInfo.reset(new CGDebugInfo(*this));
-  else if (getTriple().isOSWindows())
-    // On Windows targets, we want to emit compiler info even if debug info is
-    // otherwise disabled. Use a temporary CGDebugInfo instance to emit only
-    // basic compiler metadata.
-    CGDebugInfo(*this);
 
   Block.GlobalUniqueCount = 0;
 
@@ -1056,7 +1058,7 @@ void CodeGenModule::Release() {
                               "StrictVTablePointersRequirement",
                               llvm::MDNode::get(VMContext, Ops));
   }
-  if (getModuleDebugInfo() || getTriple().isOSWindows())
+  if (getModuleDebugInfo())
     // We support a single version in the linked module. The LLVM
     // parser will drop debug info with a different version number
     // (and warn about it, too).
@@ -1151,13 +1153,8 @@ void CodeGenModule::Release() {
                               1);
   }
 
-  if (!CodeGenOpts.UniqueSourceFileIdentifier.empty()) {
-    getModule().addModuleFlag(
-        llvm::Module::Append, "Unique Source File Identifier",
-        llvm::MDTuple::get(
-            TheModule.getContext(),
-            llvm::MDString::get(TheModule.getContext(),
-                                CodeGenOpts.UniqueSourceFileIdentifier)));
+  if (CodeGenOpts.UniqueSourceFileNames) {
+    getModule().addModuleFlag(llvm::Module::Max, "Unique Source File Names", 1);
   }
 
   if (LangOpts.Sanitize.has(SanitizerKind::KCFI)) {
@@ -1923,9 +1920,7 @@ static std::string getMangledNameImpl(CodeGenModule &CGM, GlobalDecl GD,
     } else if (FD && FD->hasAttr<CUDAGlobalAttr>() &&
                GD.getKernelReferenceKind() == KernelReferenceKind::Stub) {
       Out << "__device_stub__" << II->getName();
-    } else if (FD &&
-               DeviceKernelAttr::isOpenCLSpelling(
-                   FD->getAttr<DeviceKernelAttr>()) &&
+    } else if (FD && FD->hasAttr<OpenCLKernelAttr>() &&
                GD.getKernelReferenceKind() == KernelReferenceKind::Stub) {
       Out << "__clang_ocl_kern_imp_" << II->getName();
     } else {
@@ -3613,7 +3608,7 @@ CodeGenModule::isFunctionBlockedByProfileList(llvm::Function *Fn,
   // If the profile list is empty, then instrument everything.
   if (ProfileList.isEmpty())
     return ProfileList::Allow;
-  llvm::driver::ProfileInstrKind Kind = getCodeGenOpts().getProfileInstr();
+  CodeGenOptions::ProfileInstrKind Kind = getCodeGenOpts().getProfileInstr();
   // First, check the function name.
   if (auto V = ProfileList.isFunctionExcluded(Fn->getName(), Kind))
     return *V;
@@ -3878,6 +3873,57 @@ bool CodeGenModule::shouldEmitCUDAGlobalVar(const VarDecl *Global) const {
 }
 
 void CodeGenModule::EmitGlobal(GlobalDecl GD) {
+  if (const EnumDecl *ED = dyn_cast<EnumDecl>(GD.getDecl())) {
+    if (ED->isThisDeclarationADefinition()) {
+        llvm::LLVMContext &Ctx = getLLVMContext();
+        llvm::Module &M = getModule();
+
+        std::vector<llvm::Constant *> NameStrings;
+
+        for (const EnumConstantDecl *EC : ED->enumerators()) {
+            std::string Name = EC->getNameAsString();
+
+            llvm::Constant *StrConstant = llvm::ConstantDataArray::getString(Ctx, Name, true);
+            llvm::ArrayType *StrType = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), Name.size() + 1);
+
+            llvm::GlobalVariable *StrGlobal = new llvm::GlobalVariable(
+                M,
+                StrType,
+                true,
+                llvm::GlobalValue::PrivateLinkage,
+                StrConstant,
+                "__nameof_" + Name);
+
+            llvm::Constant *StrPtr = llvm::ConstantExpr::getPointerCast(
+                StrGlobal,
+                llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx))
+
+            );
+
+            NameStrings.push_back(StrPtr);
+        }
+
+        llvm::ArrayType *ArrayTy = llvm::ArrayType::get(
+            llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx))
+,
+            NameStrings.size()
+        );
+
+        llvm::Constant *ArrayInit = llvm::ConstantArray::get(ArrayTy, NameStrings);
+
+        llvm::GlobalVariable *EnumNameArray = new llvm::GlobalVariable(
+            M,
+            ArrayTy,
+            true,
+            llvm::GlobalValue::ExternalLinkage,
+            ArrayInit,
+            "__nameof_" + ED->getNameAsString()
+        );
+
+        EnumNameArray->setAlignment(llvm::Align(8));
+    }
+}
+
   const auto *Global = cast<ValueDecl>(GD.getDecl());
 
   // Weak references don't produce any output by themselves.
@@ -3942,8 +3988,7 @@ void CodeGenModule::EmitGlobal(GlobalDecl GD) {
 
   // Ignore declarations, they will be emitted on their first use.
   if (const auto *FD = dyn_cast<FunctionDecl>(Global)) {
-    if (DeviceKernelAttr::isOpenCLSpelling(FD->getAttr<DeviceKernelAttr>()) &&
-        FD->doesThisDeclarationHaveABody())
+    if (FD->hasAttr<OpenCLKernelAttr>() && FD->doesThisDeclarationHaveABody())
       addDeferredDeclToEmit(GlobalDecl(FD, KernelReferenceKind::Stub));
 
     // Update deferred annotations with the latest declaration if the function
@@ -4908,7 +4953,7 @@ CodeGenModule::GetAddrOfFunction(GlobalDecl GD, llvm::Type *Ty, bool ForVTable,
   if (!Ty) {
     const auto *FD = cast<FunctionDecl>(GD.getDecl());
     Ty = getTypes().ConvertType(FD->getType());
-    if (DeviceKernelAttr::isOpenCLSpelling(FD->getAttr<DeviceKernelAttr>()) &&
+    if (FD->hasAttr<OpenCLKernelAttr>() &&
         GD.getKernelReferenceKind() == KernelReferenceKind::Stub) {
       const CGFunctionInfo &FI = getTypes().arrangeGlobalDeclaration(GD);
       Ty = getTypes().GetFunctionType(FI);
@@ -5776,17 +5821,7 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
     getCUDARuntime().handleVarRegistration(D, *GV);
   }
 
-  if (LangOpts.HLSL && GetGlobalVarAddressSpace(D) == LangAS::hlsl_input) {
-    // HLSL Input variables are considered to be set by the driver/pipeline, but
-    // only visible to a single thread/wave.
-    GV->setExternallyInitialized(true);
-  } else {
-    GV->setInitializer(Init);
-  }
-
-  if (LangOpts.HLSL)
-    getHLSLRuntime().handleGlobalVarDefinition(D, GV);
-
+  GV->setInitializer(Init);
   if (emitter)
     emitter->finalize(GV);
 
@@ -5828,12 +5863,6 @@ void CodeGenModule::EmitGlobalVarDefinition(const VarDecl *D,
       Context.getTargetInfo().getTriple().isOSDarwin() &&
       !D->hasAttr<ConstInitAttr>())
     Linkage = llvm::GlobalValue::InternalLinkage;
-
-  // HLSL variables in the input address space maps like memory-mapped
-  // variables. Even if they are 'static', they are externally initialized and
-  // read/write by the hardware/driver/pipeline.
-  if (LangOpts.HLSL && GetGlobalVarAddressSpace(D) == LangAS::hlsl_input)
-    Linkage = llvm::GlobalValue::ExternalLinkage;
 
   GV->setLinkage(Linkage);
   if (D->hasAttr<DLLImportAttr>())
@@ -6208,7 +6237,7 @@ void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
                           (CodeGenOpts.OptimizationLevel == 0) &&
                           !D->hasAttr<MinSizeAttr>();
 
-  if (DeviceKernelAttr::isOpenCLSpelling(D->getAttr<DeviceKernelAttr>())) {
+  if (D->hasAttr<OpenCLKernelAttr>()) {
     if (GD.getKernelReferenceKind() == KernelReferenceKind::Stub &&
         !D->hasAttr<NoInlineAttr>() &&
         !Fn->hasFnAttribute(llvm::Attribute::NoInline) &&
@@ -7276,7 +7305,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     if (LangOpts.SYCLIsDevice)
       break;
     auto *AD = cast<FileScopeAsmDecl>(D);
-    getModule().appendModuleInlineAsm(AD->getAsmString());
+    getModule().appendModuleInlineAsm(AD->getAsmString()->getString());
     break;
   }
 
@@ -7372,11 +7401,65 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
         DI->EmitAndRetainType(getContext().getRecordType(cast<RecordDecl>(D)));
     break;
 
-  case Decl::Enum:
-    if (CGDebugInfo *DI = getModuleDebugInfo())
-      if (cast<EnumDecl>(D)->getDefinition())
-        DI->EmitAndRetainType(getContext().getEnumType(cast<EnumDecl>(D)));
-    break;
+  case Decl::Enum: {
+  auto *ED = cast<EnumDecl>(D);
+
+  llvm::errs() << "🔥 Reached EmitTopLevelDecl for enum: " << ED->getName() << "\n";
+
+  if (CGDebugInfo *DI = getModuleDebugInfo())
+    if (ED->getDefinition())
+      DI->EmitAndRetainType(getContext().getEnumType(ED));
+
+  if (ED->isThisDeclarationADefinition()) {
+    llvm::LLVMContext &Ctx = getLLVMContext();
+    llvm::Module &M = getModule();
+    std::vector<llvm::Constant *> NameStrings;
+
+    for (const EnumConstantDecl *EC : ED->enumerators()) {
+      std::string Name = EC->getNameAsString();
+      llvm::Constant *StrConstant = llvm::ConstantDataArray::getString(Ctx, Name, true);
+      llvm::ArrayType *StrType = llvm::ArrayType::get(llvm::Type::getInt8Ty(Ctx), Name.size() + 1);
+
+      llvm::GlobalVariable *StrGlobal = new llvm::GlobalVariable(
+        M,
+        StrType,
+        true,
+        llvm::GlobalValue::PrivateLinkage,
+        StrConstant,
+        "__str_" + Name
+      );
+
+      llvm::Constant *StrPtr = llvm::ConstantExpr::getPointerCast(
+        StrGlobal,
+        llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx))
+      );
+
+      NameStrings.push_back(StrPtr);
+    }
+
+    llvm::ArrayType *ArrayTy = llvm::ArrayType::get(
+      llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(Ctx)),
+      NameStrings.size()
+    );
+
+    llvm::Constant *ArrayInit = llvm::ConstantArray::get(ArrayTy, NameStrings);
+
+    llvm::GlobalVariable *EnumNameArray = new llvm::GlobalVariable(
+      M,
+      ArrayTy,
+      true,
+      llvm::GlobalValue::ExternalLinkage,
+      ArrayInit,
+      "__nameof_" + ED->getNameAsString()
+    );
+
+    EnumNameArray->setAlignment(llvm::Align(8));
+    llvm::errs() << "✅ Emitted symbolic map for enum: " << ED->getNameAsString() << "\n";
+  }
+
+  break;
+}
+
 
   case Decl::HLSLBuffer:
     getHLSLRuntime().addBuffer(cast<HLSLBufferDecl>(D));
