@@ -56,7 +56,7 @@ These commands generate the following output files in the `llvm/tools/ir-mapper/
 
 The following `test.cpp` file generates the following output files:
 `test.cpp`
-```
+```cpp
 int add(int a, int b) {
     return a + b;
 }
@@ -67,6 +67,7 @@ int main() {
 }
 ```
 
+`out.ll`
 ```llvm
 ; ./examples/test.cpp:2 -     return a + b;
   %5 = load i32, ptr %3, align 4, !dbg !20
@@ -85,7 +86,7 @@ int main() {
 ```
 
 `out.md`
-````
+````md
 ### ./examples/test.cpp
 
 #### Line 2
@@ -118,7 +119,7 @@ Mapped IR code:
 ````
 
 `out_explained.md`
-````
+````md
 ### Line 1: `return a + b;`
 
 **LLVM IR Block:**
