@@ -51,4 +51,3 @@ int main(int argc, const char **argv) {
 
     return Tool.run(newFrontendActionFactory<FloatConversionFrontendAction>().get());
 }
-
