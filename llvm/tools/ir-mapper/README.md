@@ -48,9 +48,9 @@ python mapping_explainer.py ./examples/out.md ./examples/out_explained.md
 
 ```
 These commands generate the following output files in the `llvm/tools/ir-mapper/examples` directory:
-`out.ll` - The annotated LLVM IR code file
-`out.md` - The markdown file with the mapped source code and IR code lines.
-`out_explained.md` - The markdown file that explains the IR code lines from `out.md`.
+- `out.ll` - The annotated LLVM IR code file
+- `out.md` - The markdown file with the mapped source code and IR code lines.
+- `out_explained.md` - The markdown file that explains the IR code lines from `out.md`.
 
 ### Sample Input and Outputs
 
