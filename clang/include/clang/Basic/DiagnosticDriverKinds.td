@@ -870,3 +870,11 @@ def warn_drv_openacc_without_cir
               "-fclangir to enable runtime effect">,
       InGroup<SourceUsesOpenACC>;
 }
+
+def err_drv_malformed_sanitizer_whitelist : Error<
+  "malformed sanitizer whitelist: '%0'"> {
+  let CategoryName = "Sanitizer Diagnostics";
+  let Component = "Driver";
+}
+
+

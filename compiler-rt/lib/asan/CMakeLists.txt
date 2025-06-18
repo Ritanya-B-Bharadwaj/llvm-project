@@ -391,3 +391,6 @@ add_subdirectory(scripts)
 if(COMPILER_RT_INCLUDE_TESTS)
   add_subdirectory(tests)
 endif()
+
+include_directories(${COMPILER_RT_SOURCE_DIR}/lib/sanitizer_common)
+
