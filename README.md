@@ -15,7 +15,7 @@ The **OpenMP-to-IR Construct Annotator** is a custom LLVM pass and CLI tool that
   * Compiles `.cpp` to `.ll`
   * Runs the annotator pass
   * Outputs annotated IR
-* Optional GenAI module to explain annotated OpenMP IR using LLMs (e.g., LLaMA3)
+  * GenAI module to explain annotated OpenMP IR using LLM (LLaMA3)
 
 ---
 
@@ -141,7 +141,9 @@ indicates that this call has been annotated by the OpenMPAnnotatorPass with the 
 
 ---
 
-## GenAI IR Explainer (Optional)
+## GenAI Annotated IR Explainer (Additonal Feature)
+
+This module uses **LLaMA 3 (8B)** hosted via the **Groq API** to generate human-readable explanations of annotated OpenMP LLVM IR constructs.
 
 ### Script
 
@@ -233,7 +235,7 @@ Command:
 ./bin/omp-annotate <input.cpp> -o <output.ll>
 ```
 
-Optional GenAI JSON explanation also generated alongside IR output.
+GenAI JSON explanation also generated alongside IR output.
 
 ---
 
