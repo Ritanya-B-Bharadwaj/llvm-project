@@ -36,7 +36,7 @@ git clone https://github.com/Ritanya-B-Bharadwaj/llvm-project.git
 cd llvm-project
 mkdir build && cd build
 cmake -DLLVM_ENABLE_PROJECTS="clang;openmp" -G Ninja ../llvm
-ninja clang opt
+ninja clang
 ```
 
 ### Add the Pass
@@ -237,10 +237,9 @@ Optional GenAI JSON explanation also generated alongside IR output.
 
 ---
 
-## Authors
-
-Aneesh Sai Grandhi
-Bolla Sai Naga Yaswanth
+## Authors  
+Aneesh Sai Grandhi<br>
+Bolla Sai Naga Yaswanth<br>
 Manasvini Padmasali
 
 Based on: [Ritanya-B-Bharadwaj/llvm-project](https://github.com/Ritanya-B-Bharadwaj/llvm-project)
