@@ -4,7 +4,7 @@ import json
 import openai
 
 # 👉 Replace this with your real Groq API key
-openai.api_key = "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"
+openai.api_key = "gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 openai.api_base = "https://api.groq.com/openai/v1"
 MODEL_NAME = "llama3-8b-8192"
 
@@ -35,7 +35,7 @@ def extract_directives(source_file):
 
 def extract_ir_snippets(ir_file):
     with open(ir_file, 'r') as f:
-        lines = f.readlines()
+        lines = f.readlines()g
 
     snippets = []
     block = []
