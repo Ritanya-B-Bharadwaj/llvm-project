@@ -763,6 +763,14 @@ SanitizerArgs::SanitizerArgs(const ToolChain &TC,
       options::OPT_fno_sanitize_ignorelist,
       clang::diag::err_drv_malformed_sanitizer_ignorelist, DiagnoseErrors);
 
+  //For whitelist
+  
+  parseSpecialCaseListArg(
+      D, Args, UserWhitelistFiles, options::OPT_fsanitize_whitelist_EQ,
+      options::OPT_fno_sanitize_whitelist,
+      clang::diag::err_drv_malformed_sanitizer_whitelist, DiagnoseErrors);
+
+
   // Verify that -fsanitize-coverage-stack-depth-callback-min is >= 0.
   if (Arg *A = Args.getLastArg(
           options::OPT_fsanitize_coverage_stack_depth_callback_min_EQ)) {
@@ -1553,6 +1561,11 @@ void SanitizerArgs::addArgs(const ToolChain &TC, const llvm::opt::ArgList &Args,
   if (Sanitizers.has(SanitizerKind::MemtagStack) &&
       !hasTargetFeatureMTE(CmdArgs))
     TC.getDriver().Diag(diag::err_stack_tagging_requires_hardware_feature);
+
+  for (const auto &Path : UserWhitelistFiles) {
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back(Args.MakeArgString("-asan-whitelist=" + Path));
+  }
 }
 
 SanitizerMask parseArgValues(const Driver &D, const llvm::opt::Arg *A,

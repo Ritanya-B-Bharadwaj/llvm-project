@@ -1,4 +1,4 @@
-//===- AddressSanitizer.cpp - memory error detector -----------------------===//
+﻿//===- AddressSanitizer.cpp - memory error detector -----------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -70,6 +70,22 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include "llvm/Passes/PassBuilder.h" // For PreservedAnalyses
+#include "llvm/Passes/PassPlugin.h"  // If used for plugin registration
+
+#include "llvm/Support/SpecialCaseList.h"
+#include "llvm/Support/VirtualFileSystem.h"
+
+#include "llvm/Support/MemoryBuffer.h" // <--- **ADD THIS LINE**
+#include "llvm/Support/ErrorOr.h"       // <--- **ADD THIS LINE**
+
+#include "llvm/Support/Error.h"
+
+#include "llvm/IR/DiagnosticInfo.h"
+
+#include "llvm/Transforms/Instrumentation/AddressSanitizer.h"
+
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerCommon.h"
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
@@ -192,6 +208,12 @@ constexpr size_t kIsWriteShift = 5;
 constexpr size_t kIsWriteMask = 0x1;
 
 // Command-line flags.
+
+static cl::opt<std::string> AsanWhitelistFile(
+    "asan-whitelist",
+    cl::desc("Path to a file with whitelist entries for AddressSanitizer."),
+    cl::value_desc("filename"), cl::Hidden);
+
 
 static cl::opt<bool> ClEnableKasan(
     "asan-kernel", cl::desc("Enable KernelAddressSanitizer instrumentation"),
@@ -760,7 +782,9 @@ public:
 
 /// AddressSanitizer: instrument the code in module to find memory bugs.
 struct AddressSanitizer {
+  std::unique_ptr<llvm::SpecialCaseList> Whitelist;
   AddressSanitizer(Module &M, const StackSafetyGlobalInfo *SSGI,
+                   std::shared_ptr<llvm::SpecialCaseList> Whitelist,
                    int InstrumentationWithCallsThreshold,
                    uint32_t MaxInlinePoisoningSize, bool CompileKernel = false,
                    bool Recover = false, bool UseAfterScope = false,
@@ -792,6 +816,38 @@ struct AddressSanitizer {
     Mapping = getShadowMapping(TargetTriple, LongSize, this->CompileKernel);
 
     assert(this->UseAfterReturn != AsanDetectStackUseAfterReturnMode::Invalid);
+
+
+    // --- START: Corrected Whitelist Loading in ModuleAddressSanitizer
+    // constructor ---
+    if (!AsanWhitelistFile.empty()) { // Use AsanWhitelistFile
+      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
+          llvm::MemoryBuffer::getFile(
+              AsanWhitelistFile.getValue()); // Use AsanWhitelistFile
+
+      if (std::error_code EC = FileBufOrErr.getError()) {
+        llvm::report_fatal_error(
+            llvm::Twine("Failed to read AddressSanitizer whitelist file '") +
+                AsanWhitelistFile.getValue() + "': " + EC.message(),
+            /*GenCrashDiag=*/false);
+      }
+
+      std::string ErrorStr;
+      // Pass the MemoryBuffer to create
+      Whitelist =
+          llvm::SpecialCaseList::create(FileBufOrErr.get().get(), ErrorStr);
+
+      if (!ErrorStr.empty()) {
+        llvm::report_fatal_error(
+            llvm::Twine("Failed to parse AddressSanitizer whitelist file '") +
+                AsanWhitelistFile.getValue() + "': " + ErrorStr,
+            /*GenCrashDiag=*/false);
+      }
+    }
+    // --- END: Corrected Whitelist Loading in ModuleAddressSanitizer
+    // constructor ---
+
+
   }
 
   TypeSize getAllocaSizeInBytes(const AllocaInst &AI) const {
@@ -912,7 +968,9 @@ private:
 
 class ModuleAddressSanitizer {
 public:
+  std::shared_ptr<llvm::SpecialCaseList> Whitelist;
   ModuleAddressSanitizer(Module &M, bool InsertVersionCheck,
+                         std::shared_ptr<llvm::SpecialCaseList> Whitelist,
                          bool CompileKernel = false, bool Recover = false,
                          bool UseGlobalsGC = true, bool UseOdrIndicator = true,
                          AsanDtorKind DestructorKind = AsanDtorKind::Global,
@@ -951,6 +1009,9 @@ public:
     TargetTriple = M.getTargetTriple();
     Mapping = getShadowMapping(TargetTriple, LongSize, this->CompileKernel);
 
+    // --- END: Whitelist Loading Logic in ModuleAddressSanitizer constructor
+    // ---
+
     if (ClOverrideDestructorKind != AsanDtorKind::Invalid)
       this->DestructorKind = ClOverrideDestructorKind;
     assert(this->DestructorKind != AsanDtorKind::Invalid);
@@ -959,6 +1020,8 @@ public:
   bool instrumentModule();
 
 private:
+  //std::unique_ptr<llvm::SpecialCaseList> Whitelist;
+
   void initializeCallbacks();
 
   void instrumentGlobals(IRBuilder<> &IRB, bool *CtorComdat);
@@ -1301,50 +1364,73 @@ AddressSanitizerPass::AddressSanitizerPass(
       UseOdrIndicator(UseOdrIndicator), DestructorKind(DestructorKind),
       ConstructorKind(ConstructorKind) {}
 
+
 PreservedAnalyses AddressSanitizerPass::run(Module &M,
                                             ModuleAnalysisManager &MAM) {
-  // Return early if nosanitize_address module flag is present for the module.
-  // This implies that asan pass has already run before.
   if (checkIfAlreadyInstrumented(M, "nosanitize_address"))
     return PreservedAnalyses::all();
 
+  // --- START: Whitelist Loading Logic ---
+  std::shared_ptr<llvm::SpecialCaseList> Whitelist;
+  if (!AsanWhitelistFile.empty()) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
+        llvm::MemoryBuffer::getFile(AsanWhitelistFile.getValue());
+
+    if (std::error_code EC = FileBufOrErr.getError()) {
+      M.getContext().emitError("Failed to read whitelist: " + EC.message());
+      return PreservedAnalyses::all();
+    }
+
+    std::string ErrorStr;
+    Whitelist =
+        llvm::SpecialCaseList::create(FileBufOrErr.get().get(), ErrorStr);
+
+    if (!ErrorStr.empty()) {
+      M.getContext().emitError("Failed to parse whitelist: " + ErrorStr);
+      return PreservedAnalyses::all();
+    }
+  }
+  // --- END: Whitelist Loading Logic ---
+
   ModuleAddressSanitizer ModuleSanitizer(
-      M, Options.InsertVersionCheck, Options.CompileKernel, Options.Recover,
-      UseGlobalGC, UseOdrIndicator, DestructorKind, ConstructorKind);
+      M, Options.InsertVersionCheck, Whitelist, Options.CompileKernel,
+      Options.Recover, UseGlobalGC, UseOdrIndicator, DestructorKind,
+      ConstructorKind);
+
   bool Modified = false;
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   const StackSafetyGlobalInfo *const SSGI =
       ClUseStackSafety ? &MAM.getResult<StackSafetyGlobalAnalysis>(M) : nullptr;
+
   for (Function &F : M) {
-    if (F.empty())
+    if (F.empty() ||
+        F.getLinkage() == GlobalValue::AvailableExternallyLinkage ||
+        (!ClDebugFunc.empty() && ClDebugFunc == F.getName()) ||
+        F.getName().starts_with("__asan_") || F.isPresplitCoroutine())
       continue;
-    if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage)
-      continue;
-    if (!ClDebugFunc.empty() && ClDebugFunc == F.getName())
-      continue;
-    if (F.getName().starts_with("__asan_"))
-      continue;
-    if (F.isPresplitCoroutine())
-      continue;
+
     AddressSanitizer FunctionSanitizer(
-        M, SSGI, Options.InstrumentationWithCallsThreshold,
+        M, SSGI, Whitelist, Options.InstrumentationWithCallsThreshold,
         Options.MaxInlinePoisoningSize, Options.CompileKernel, Options.Recover,
         Options.UseAfterScope, Options.UseAfterReturn);
+
     const TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
     Modified |= FunctionSanitizer.instrumentFunction(F, &TLI);
   }
+
   Modified |= ModuleSanitizer.instrumentModule();
+
   if (!Modified)
     return PreservedAnalyses::all();
 
   PreservedAnalyses PA = PreservedAnalyses::none();
-  // GlobalsAA is considered stateless and does not get invalidated unless
-  // explicitly invalidated; PreservedAnalyses::none() is not enough. Sanitizers
-  // make changes that require GlobalsAA to be invalidated.
   PA.abandon<GlobalsAA>();
   return PA;
 }
 
+
+// Keep ONLY ONE definition of this function in your entire AddressSanitizer.cpp
+// file. Ensure this is the only copy.
 static size_t TypeStoreSizeToSizeIndex(uint32_t TypeSize) {
   size_t Res = llvm::countr_zero(TypeSize / 8);
   assert(Res < kNumberOfAccessSizes);
@@ -2079,6 +2165,10 @@ ModuleAddressSanitizer::getExcludedAliasedGlobal(const GlobalAlias &GA) const {
 bool ModuleAddressSanitizer::shouldInstrumentGlobal(GlobalVariable *G) const {
   Type *Ty = G->getValueType();
   LLVM_DEBUG(dbgs() << "GLOBAL: " << *G << "\n");
+
+  if (Whitelist && Whitelist->inSection("global", G->getName(), ""))
+    return false;
+
 
   if (G->hasSanitizerMetadata() && G->getSanitizerMetadata().NoAddress)
     return false;
@@ -3003,6 +3093,14 @@ bool AddressSanitizer::suppressInstrumentationSiteForDebug(int &Instrumented) {
 
 bool AddressSanitizer::instrumentFunction(Function &F,
                                           const TargetLibraryInfo *TLI) {
+
+  dbgs() << "Checking function: " << F.getName() << "\n";
+  if (Whitelist && !Whitelist->inSection("fun", F.getName(), "")) {
+    dbgs() << "Skipping non-whitelisted function: " << F.getName() << "\n";
+    return false;
+  }
+
+
   bool FunctionModified = false;
 
   // Do not apply any instrumentation for naked functions.

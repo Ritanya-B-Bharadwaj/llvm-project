@@ -30,6 +30,7 @@
 #include "sanitizer_common/sanitizer_interface_internal.h"
 #include "sanitizer_common/sanitizer_libc.h"
 #include "sanitizer_common/sanitizer_symbolizer.h"
+#include "sanitizer_common/sanitizer_special_case_list.h"
 #include "ubsan/ubsan_init.h"
 #include "ubsan/ubsan_platform.h"
 
@@ -73,6 +74,8 @@ static void CheckUnwind() {
 // -------------------------- Globals --------------------- {{{1
 static StaticSpinMutex asan_inited_mutex;
 static atomic_uint8_t asan_inited = {0};
+
+static std::unique_ptr<__sanitizer::SpecialCaseList> Whitelist;
 
 static void SetAsanInited() {
   atomic_store(&asan_inited, 1, memory_order_release);
@@ -400,6 +403,19 @@ static bool AsanInitInternal() {
   // Initialize flags. This must be done early, because most of the
   // initialization steps look at flags().
   InitializeFlags();
+
+  const char *options = GetEnv("ASAN_OPTIONS");
+  if (options) {
+    const char *key = "whitelist=";
+    const char *pos = strstr(options, key);
+    if (pos) {
+      pos += strlen(key);
+      const char *end = strchr(pos, ':');  // Support multiple options
+      std::string path = end ? std::string(pos, end - pos) : std::string(pos);
+      Whitelist = __sanitizer::SpecialCaseList::createOrDie({path});
+    }
+  }
+
 
   WaitForDebugger(flags()->sleep_before_init, "before init");
 

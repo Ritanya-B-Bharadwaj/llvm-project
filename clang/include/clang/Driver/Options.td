@@ -2337,8 +2337,19 @@ def fsanitize_EQ : CommaJoined<["-"], "fsanitize=">, Group<f_clang_Group>,
 def fno_sanitize_EQ : CommaJoined<["-"], "fno-sanitize=">, Group<f_clang_Group>,
                       Visibility<[ClangOption, CLOption]>;
 
+def fsanitize_whitelist_EQ : Joined<["-"], "fsanitize-whitelist=">,
+  Group<f_clang_Group>,
+  Visibility<[CC1Option]>,
+  HelpText<"Whitelist file for sanitizers to restrict instrumentation">;
+
+def fno_sanitize_whitelist : Flag<["-"], "fno-sanitize-whitelist">,
+  Group<f_clang_Group>,
+  Visibility<[CC1Option]>,
+  HelpText<"Disable the whitelist for sanitizers">;
+
 def fsanitize_ignorelist_EQ : Joined<["-"], "fsanitize-ignorelist=">,
   Group<f_clang_Group>, HelpText<"Path to ignorelist file for sanitizers">;
+
 def : Joined<["-"], "fsanitize-blacklist=">,
   Group<f_clang_Group>, Flags<[HelpHidden]>, Alias<fsanitize_ignorelist_EQ>,
   HelpText<"Alias for -fsanitize-ignorelist=">;
