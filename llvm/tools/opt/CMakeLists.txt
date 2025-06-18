@@ -42,6 +42,7 @@ add_llvm_library(LLVMOptDriver
 add_llvm_tool(opt
   PARTIAL_SOURCES_INTENDED
   opt.cpp
+  ../../lib/Transforms/OpenMPAnnotator/OpenMPAnnotatorPass.cpp
   DEPENDS
   intrinsics_gen
   SUPPORT_PLUGINS

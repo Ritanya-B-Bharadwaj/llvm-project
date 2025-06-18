@@ -5,8 +5,8 @@ add_llvm_component_library(LLVMPasses
   PassBuilderBindings.cpp
   PassBuilderPipelines.cpp
   PassPlugin.cpp
+  ../Transforms/OpenMPAnnotator/OpenMPAnnotatorPass.cpp
   StandardInstrumentations.cpp
-
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Passes

@@ -81,19 +81,12 @@ unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
     return llvm::CallingConv::AArch64_VectorCall;
   case CC_AArch64SVEPCS:
     return llvm::CallingConv::AArch64_SVE_VectorCall;
+  case CC_AMDGPUKernelCall:
+    return llvm::CallingConv::AMDGPU_KERNEL;
   case CC_SpirFunction:
     return llvm::CallingConv::SPIR_FUNC;
-  case CC_DeviceKernel: {
-    if (CGM.getLangOpts().OpenCL)
-      return CGM.getTargetCodeGenInfo().getOpenCLKernelCallingConv();
-    if (CGM.getTriple().isSPIROrSPIRV())
-      return llvm::CallingConv::SPIR_KERNEL;
-    if (CGM.getTriple().isAMDGPU())
-      return llvm::CallingConv::AMDGPU_KERNEL;
-    if (CGM.getTriple().isNVPTX())
-      return llvm::CallingConv::PTX_Kernel;
-    llvm_unreachable("Unknown kernel calling convention");
-  }
+  case CC_OpenCLKernel:
+    return CGM.getTargetCodeGenInfo().getOpenCLKernelCallingConv();
   case CC_PreserveMost:
     return llvm::CallingConv::PreserveMost;
   case CC_PreserveAll:
@@ -291,8 +284,8 @@ static CallingConv getCallingConventionForDecl(const ObjCMethodDecl *D,
   if (D->hasAttr<AArch64SVEPcsAttr>())
     return CC_AArch64SVEPCS;
 
-  if (D->hasAttr<DeviceKernelAttr>())
-    return CC_DeviceKernel;
+  if (D->hasAttr<AMDGPUKernelCallAttr>())
+    return CC_AMDGPUKernelCall;
 
   if (D->hasAttr<IntelOclBiccAttr>())
     return CC_IntelOclBicc;
@@ -540,7 +533,7 @@ CodeGenTypes::arrangeFunctionDeclaration(const GlobalDecl GD) {
   assert(isa<FunctionType>(FTy));
   setCUDAKernelCallingConvention(FTy, CGM, FD);
 
-  if (DeviceKernelAttr::isOpenCLSpelling(FD->getAttr<DeviceKernelAttr>()) &&
+  if (FD->hasAttr<OpenCLKernelAttr>() &&
       GD.getKernelReferenceKind() == KernelReferenceKind::Stub) {
     const FunctionType *FT = FTy->getAs<FunctionType>();
     CGM.getTargetCodeGenInfo().setOCLKernelStubCallingConvention(FT);
@@ -768,7 +761,7 @@ CodeGenTypes::arrangeSYCLKernelCallerDeclaration(QualType resultType,
 
   return arrangeLLVMFunctionInfo(GetReturnType(resultType), FnInfoOpts::None,
                                  argTypes,
-                                 FunctionType::ExtInfo(CC_DeviceKernel),
+                                 FunctionType::ExtInfo(CC_OpenCLKernel),
                                  /*paramInfos=*/{}, RequiredArgs::All);
 }
 
@@ -2371,8 +2364,9 @@ static bool canApplyNoFPClass(const ABIArgInfo &AI, QualType ParamType,
 
   if (llvm::StructType *ST = dyn_cast<llvm::StructType>(IRTy)) {
     return !IsReturn && AI.getCanBeFlattened() &&
-           llvm::all_of(ST->elements(),
-                        llvm::AttributeFuncs::isNoFPClassCompatibleType);
+           llvm::all_of(ST->elements(), [](llvm::Type *Ty) {
+             return llvm::AttributeFuncs::isNoFPClassCompatibleType(Ty);
+           });
   }
 
   return false;
@@ -2542,8 +2536,7 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
                                  NumElemsParam);
     }
 
-    if (DeviceKernelAttr::isOpenCLSpelling(
-            TargetDecl->getAttr<DeviceKernelAttr>()) &&
+    if (TargetDecl->hasAttr<OpenCLKernelAttr>() &&
         CallingConv != CallingConv::CC_C &&
         CallingConv != CallingConv::CC_SpirFunction) {
       // Check CallingConv to avoid adding uniform-work-group-size attribute to
@@ -2926,9 +2919,7 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
     // > For arguments to a __kernel function declared to be a pointer to a
     // > data type, the OpenCL compiler can assume that the pointee is always
     // > appropriately aligned as required by the data type.
-    if (TargetDecl &&
-        DeviceKernelAttr::isOpenCLSpelling(
-            TargetDecl->getAttr<DeviceKernelAttr>()) &&
+    if (TargetDecl && TargetDecl->hasAttr<OpenCLKernelAttr>() &&
         ParamType->isPointerType()) {
       QualType PTy = ParamType->getPointeeType();
       if (!PTy->isIncompleteType() && PTy->isConstantSizeType()) {
@@ -3938,9 +3929,9 @@ llvm::Value *CodeGenFunction::EmitCMSEClearRecord(llvm::Value *Src,
   return R;
 }
 
-void CodeGenFunction::EmitFunctionEpilog(
-    const CGFunctionInfo &FI, bool EmitRetDbgLoc, SourceLocation EndLoc,
-    uint64_t RetKeyInstructionsSourceAtom) {
+void CodeGenFunction::EmitFunctionEpilog(const CGFunctionInfo &FI,
+                                         bool EmitRetDbgLoc,
+                                         SourceLocation EndLoc) {
   if (FI.isNoReturn()) {
     // Noreturn functions don't return.
     EmitUnreachable(EndLoc);
@@ -3955,11 +3946,7 @@ void CodeGenFunction::EmitFunctionEpilog(
 
   // Functions with no result always return void.
   if (!ReturnValue.isValid()) {
-    auto *I = Builder.CreateRetVoid();
-    if (RetKeyInstructionsSourceAtom)
-      addInstToSpecificSourceAtom(I, nullptr, RetKeyInstructionsSourceAtom);
-    else
-      addInstToNewSourceAtom(I, nullptr);
+    Builder.CreateRetVoid();
     return;
   }
 
@@ -4139,12 +4126,6 @@ void CodeGenFunction::EmitFunctionEpilog(
 
   if (RetDbgLoc)
     Ret->setDebugLoc(std::move(RetDbgLoc));
-
-  llvm::Value *Backup = RV ? Ret->getOperand(0) : nullptr;
-  if (RetKeyInstructionsSourceAtom)
-    addInstToSpecificSourceAtom(Ret, Backup, RetKeyInstructionsSourceAtom);
-  else
-    addInstToNewSourceAtom(Ret, Backup);
 }
 
 void CodeGenFunction::EmitReturnValueCheck(llvm::Value *RV) {
@@ -4183,7 +4164,7 @@ void CodeGenFunction::EmitReturnValueCheck(llvm::Value *RV) {
     Handler = SanitizerHandler::NullabilityReturn;
   }
 
-  SanitizerDebugLocation SanScope(this, {CheckKind}, Handler);
+  SanitizerScope SanScope(this);
 
   // Make sure the "return" source location is valid. If we're checking a
   // nullability annotation, make sure the preconditions for the check are met.
@@ -4568,7 +4549,7 @@ void CodeGenFunction::EmitNonNullArgCheck(RValue RV, QualType ArgType,
     Handler = SanitizerHandler::NullabilityArg;
   }
 
-  SanitizerDebugLocation SanScope(this, {CheckKind}, Handler);
+  SanitizerScope SanScope(this);
   llvm::Value *Cond = EmitNonNullRValueCheck(RV, ArgType);
   llvm::Constant *StaticData[] = {
       EmitCheckSourceLocation(ArgLoc),

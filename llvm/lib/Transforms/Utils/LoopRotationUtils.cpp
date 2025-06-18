@@ -634,7 +634,8 @@ bool LoopRotate::rotateLoop(Loop *L, bool SimplifiedLatch) {
           // memory access in coroutines.
           !Inst->getFunction()->isPresplitCoroutine()) {
 
-        if (!NextDbgInsts.empty()) {
+        if (LoopEntryBranch->getParent()->IsNewDbgInfoFormat &&
+            !NextDbgInsts.empty()) {
           auto DbgValueRange =
               LoopEntryBranch->cloneDebugInfoFrom(Inst, NextDbgInsts.begin());
           RemapDbgRecordRange(M, DbgValueRange, ValueMap,
@@ -663,7 +664,8 @@ bool LoopRotate::rotateLoop(Loop *L, bool SimplifiedLatch) {
 
       ++NumInstrsDuplicated;
 
-      if (!NextDbgInsts.empty()) {
+      if (LoopEntryBranch->getParent()->IsNewDbgInfoFormat &&
+          !NextDbgInsts.empty()) {
         auto Range = C->cloneDebugInfoFrom(Inst, NextDbgInsts.begin());
         RemapDbgRecordRange(M, Range, ValueMap,
                             RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);

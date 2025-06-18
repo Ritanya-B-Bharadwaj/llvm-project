@@ -530,10 +530,8 @@ void RuntimePointerChecking::groupChecks(
     // equivalence class, the iteration order is deterministic.
     for (auto M : DepCands.members(Access)) {
       auto PointerI = PositionMap.find(M.getPointer());
-      // If we can't find the pointer in PositionMap that means we can't
-      // generate a memcheck for it.
-      if (PointerI == PositionMap.end())
-        continue;
+      assert(PointerI != PositionMap.end() &&
+             "pointer in equivalence class not found in PositionMap");
       for (unsigned Pointer : PointerI->second) {
         bool Merged = false;
         // Mark this pointer as seen.
@@ -695,13 +693,10 @@ public:
   /// non-intersection.
   ///
   /// Returns true if we need no check or if we do and we can generate them
-  /// (i.e. the pointers have computable bounds). A return value of false means
-  /// we couldn't analyze and generate runtime checks for all pointers in the
-  /// loop, but if \p AllowPartial is set then we will have checks for those
-  /// pointers we could analyze.
+  /// (i.e. the pointers have computable bounds).
   bool canCheckPtrAtRT(RuntimePointerChecking &RtCheck, Loop *TheLoop,
                        const DenseMap<Value *, const SCEV *> &Strides,
-                       Value *&UncomputablePtr, bool AllowPartial);
+                       Value *&UncomputablePtr);
 
   /// Goes over all memory accesses, checks whether a RT check is needed
   /// and builds sets of dependent accesses.
@@ -1179,8 +1174,8 @@ bool AccessAnalysis::createCheckForAccess(
 
 bool AccessAnalysis::canCheckPtrAtRT(
     RuntimePointerChecking &RtCheck, Loop *TheLoop,
-    const DenseMap<Value *, const SCEV *> &StridesMap, Value *&UncomputablePtr,
-    bool AllowPartial) {
+    const DenseMap<Value *, const SCEV *> &StridesMap,
+    Value *&UncomputablePtr) {
   // Find pointers with computable bounds. We are going to use this information
   // to place a runtime bound check.
   bool CanDoRT = true;
@@ -1273,8 +1268,7 @@ bool AccessAnalysis::canCheckPtrAtRT(
                                   /*Assume=*/true)) {
           CanDoAliasSetRT = false;
           UncomputablePtr = Access.getPointer();
-          if (!AllowPartial)
-            break;
+          break;
         }
       }
     }
@@ -1314,7 +1308,7 @@ bool AccessAnalysis::canCheckPtrAtRT(
     }
   }
 
-  if (MayNeedRTCheck && (CanDoRT || AllowPartial))
+  if (MayNeedRTCheck && CanDoRT)
     RtCheck.generateChecks(DepCands, IsDepCheckNeeded);
 
   LLVM_DEBUG(dbgs() << "LAA: We need to do " << RtCheck.getNumberOfChecks()
@@ -1328,7 +1322,7 @@ bool AccessAnalysis::canCheckPtrAtRT(
   bool CanDoRTIfNeeded = !RtCheck.Need || CanDoRT;
   assert(CanDoRTIfNeeded == (CanDoRT || !MayNeedRTCheck) &&
          "CanDoRTIfNeeded depends on RtCheck.Need");
-  if (!CanDoRTIfNeeded && !AllowPartial)
+  if (!CanDoRTIfNeeded)
     RtCheck.reset();
   return CanDoRTIfNeeded;
 }
@@ -1622,7 +1616,7 @@ bool llvm::isConsecutiveAccess(Value *A, Value *B, const DataLayout &DL,
   std::optional<int64_t> Diff =
       getPointersDiff(ElemTyA, PtrA, ElemTyB, PtrB, DL, SE,
                       /*StrictCheck=*/true, CheckType);
-  return Diff == 1;
+  return Diff && *Diff == 1;
 }
 
 void MemoryDepChecker::addAccess(StoreInst *SI) {
@@ -2598,9 +2592,9 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   // Find pointers with computable bounds. We are going to use this information
   // to place a runtime bound check.
   Value *UncomputablePtr = nullptr;
-  HasCompletePtrRtChecking = Accesses.canCheckPtrAtRT(
-      *PtrRtChecking, TheLoop, SymbolicStrides, UncomputablePtr, AllowPartial);
-  if (!HasCompletePtrRtChecking) {
+  bool CanDoRTIfNeeded = Accesses.canCheckPtrAtRT(
+      *PtrRtChecking, TheLoop, SymbolicStrides, UncomputablePtr);
+  if (!CanDoRTIfNeeded) {
     const auto *I = dyn_cast_or_null<Instruction>(UncomputablePtr);
     recordAnalysis("CantIdentifyArrayBounds", I)
         << "cannot identify array bounds";
@@ -2628,12 +2622,11 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
       PtrRtChecking->Need = true;
 
       UncomputablePtr = nullptr;
-      HasCompletePtrRtChecking =
-          Accesses.canCheckPtrAtRT(*PtrRtChecking, TheLoop, SymbolicStrides,
-                                   UncomputablePtr, AllowPartial);
+      CanDoRTIfNeeded = Accesses.canCheckPtrAtRT(
+          *PtrRtChecking, TheLoop, SymbolicStrides, UncomputablePtr);
 
       // Check that we found the bounds for the pointer.
-      if (!HasCompletePtrRtChecking) {
+      if (!CanDoRTIfNeeded) {
         auto *I = dyn_cast_or_null<Instruction>(UncomputablePtr);
         recordAnalysis("CantCheckMemDepsAtRunTime", I)
             << "cannot check memory dependencies at runtime";
@@ -2908,10 +2901,9 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
 LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                                const TargetTransformInfo *TTI,
                                const TargetLibraryInfo *TLI, AAResults *AA,
-                               DominatorTree *DT, LoopInfo *LI,
-                               bool AllowPartial)
+                               DominatorTree *DT, LoopInfo *LI)
     : PSE(std::make_unique<PredicatedScalarEvolution>(*SE, *L)),
-      PtrRtChecking(nullptr), TheLoop(L), AllowPartial(AllowPartial) {
+      PtrRtChecking(nullptr), TheLoop(L) {
   unsigned MaxTargetVectorWidthInBits = std::numeric_limits<unsigned>::max();
   if (TTI && !TTI->enableScalableVectorization())
     // Scale the vector width by 2 as rough estimate to also consider
@@ -2960,8 +2952,6 @@ void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {
 
   // List the pair of accesses need run-time checks to prove independence.
   PtrRtChecking->print(OS, Depth);
-  if (PtrRtChecking->Need && !HasCompletePtrRtChecking)
-    OS.indent(Depth) << "Generated run-time checks are incomplete\n";
   OS << "\n";
 
   OS.indent(Depth)
@@ -2981,15 +2971,12 @@ void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {
   PSE->print(OS, Depth);
 }
 
-const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L,
-                                                     bool AllowPartial) {
+const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L) {
   const auto &[It, Inserted] = LoopAccessInfoMap.try_emplace(&L);
 
-  // We need to create the LoopAccessInfo if either we don't already have one,
-  // or if it was created with a different value of AllowPartial.
-  if (Inserted || It->second->hasAllowPartial() != AllowPartial)
-    It->second = std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT,
-                                                  &LI, AllowPartial);
+  if (Inserted)
+    It->second =
+        std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT, &LI);
 
   return *It->second;
 }

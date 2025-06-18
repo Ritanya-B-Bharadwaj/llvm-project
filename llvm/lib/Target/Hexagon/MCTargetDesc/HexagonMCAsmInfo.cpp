@@ -38,7 +38,6 @@ HexagonMCAsmInfo::HexagonMCAsmInfo(const Triple &TT) {
   LCOMMDirectiveAlignmentType = LCOMM::ByteAlignment;
   InlineAsmStart = "# InlineAsm Start";
   InlineAsmEnd = "# InlineAsm End";
-  UsesSetToEquateSymbol = true;
   ZeroDirective = "\t.space\t";
   AscizDirective = "\t.string\t";
 

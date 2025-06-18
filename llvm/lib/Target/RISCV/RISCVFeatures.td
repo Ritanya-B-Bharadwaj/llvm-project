@@ -75,8 +75,7 @@ def FeatureStdExtI
       RISCVExtensionBitmask<0, 8>;
 
 def FeatureStdExtE
-    : RISCVExtension<2, 0, "Embedded Instruction Set with 16 GPRs">,
-      RISCVExtensionBitmask<0, 4>;
+    : RISCVExtension<2, 0, "Embedded Instruction Set with 16 GPRs">;
 
 def FeatureStdExtZic64b
     : RISCVExtension<1, 0, "Cache Block Size Is 64 Bytes">;
@@ -511,8 +510,7 @@ def HasStdExtZbs : Predicate<"Subtarget->hasStdExtZbs()">,
 
 def FeatureStdExtB
     : RISCVExtension<1, 0, "the collection of the Zba, Zbb, Zbs extensions",
-                     [FeatureStdExtZba, FeatureStdExtZbb, FeatureStdExtZbs]>,
-      RISCVExtensionBitmask<0, 1>;
+                     [FeatureStdExtZba, FeatureStdExtZbb, FeatureStdExtZbs]>;
 
 def FeatureStdExtZbkb
     : RISCVExtension<1, 0, "Bitmanip instructions for Cryptography">,
@@ -889,8 +887,8 @@ def HasVInstructionsFullMultiply : Predicate<"Subtarget->hasVInstructionsFullMul
 
 // Hypervisor Extensions
 
-def FeatureStdExtH : RISCVExtension<1, 0, "Hypervisor">,
-                     RISCVExtensionBitmask<0, 7>;
+def FeatureStdExtH : RISCVExtension<1, 0, "Hypervisor">;
+
 def HasStdExtH : Predicate<"Subtarget->hasStdExtH()">,
                  AssemblerPredicate<(all_of FeatureStdExtH),
                                     "'H' (Hypervisor)">;
@@ -1741,9 +1739,6 @@ def TuneSiFive7 : SubtargetFeature<"sifive7", "RISCVProcFamily", "SiFive7",
 
 def TuneVentanaVeyron : SubtargetFeature<"ventana-veyron", "RISCVProcFamily", "VentanaVeyron",
                                          "Ventana Veyron-Series processors">;
-
-def TuneAndes45 : SubtargetFeature<"andes45", "RISCVProcFamily", "Andes45",
-                                   "Andes 45-Series processors">;
 
 def TuneVXRMPipelineFlush : SubtargetFeature<"vxrm-pipeline-flush", "HasVXRMPipelineFlush",
                                              "true", "VXRM writes causes pipeline flush">;

@@ -21,10 +21,9 @@
 
 namespace llvm {
 
-class AArch64MCExpr : public MCSpecifierExpr {
+class AArch64MCExpr : public MCTargetExpr {
 public:
-  using Specifier = uint16_t;
-  enum {
+  enum Specifier : uint16_t {
     // clang-format off
     None          = 0,
     // Symbol locations specifying (roughly speaking) what calculation should be
@@ -140,13 +139,34 @@ public:
     // clang-format on
   };
 
+private:
+  const MCExpr *Expr;
+  const Specifier specifier;
+
 protected:
   explicit AArch64MCExpr(const MCExpr *Expr, Specifier S)
-      : MCSpecifierExpr(Expr, S) {}
+      : Expr(Expr), specifier(S) {}
 
 public:
+  /// @name Construction
+  /// @{
+
   static const AArch64MCExpr *create(const MCExpr *Expr, Specifier,
                                      MCContext &Ctx);
+
+  /// @}
+  /// @name Accessors
+  /// @{
+
+  /// Get the kind of this expression.
+  Specifier getSpecifier() const { return specifier; }
+
+  /// Get the expression this modifier applies to.
+  const MCExpr *getSubExpr() const { return Expr; }
+
+  /// @}
+  /// @name VariantKind information extractors.
+  /// @{
 
   static Specifier getSymbolLoc(Specifier S) {
     return static_cast<Specifier>(S & VK_SymLocBits);
@@ -157,6 +177,24 @@ public:
   }
 
   static bool isNotChecked(Specifier S) { return S & VK_NC; }
+
+  /// @}
+
+  /// Return the string representation of the ELF relocation specifier
+  /// (e.g. ":got:", ":lo12:").
+  StringRef getSpecifierName() const;
+
+  void printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const override;
+
+  void visitUsedExpr(MCStreamer &Streamer) const override;
+
+  MCFragment *findAssociatedFragment() const override;
+
+  bool evaluateAsRelocatableImpl(MCValue &Res,
+                                 const MCAssembler *Asm) const override;
+  static bool classof(const MCExpr *E) {
+    return E->getKind() == MCExpr::Target;
+  }
 };
 
 class AArch64AuthMCExpr final : public AArch64MCExpr {
@@ -177,7 +215,11 @@ public:
   uint16_t getDiscriminator() const { return Discriminator; }
   bool hasAddressDiversity() const { return getSpecifier() == VK_AUTHADDR; }
 
-  void print(raw_ostream &OS, const MCAsmInfo *MAI) const;
+  void printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const override;
+
+  void visitUsedExpr(MCStreamer &Streamer) const override;
+
+  MCFragment *findAssociatedFragment() const override;
 
   static bool classof(const MCExpr *E) {
     return isa<AArch64MCExpr>(E) && classof(cast<AArch64MCExpr>(E));

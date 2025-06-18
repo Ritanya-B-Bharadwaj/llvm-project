@@ -3335,7 +3335,8 @@ class TypePromotionTransaction {
 
       // Record where we would have to re-insert the instruction in the sequence
       // of DbgRecords, if we ended up reinserting.
-      BeforeDbgRecord = Inst->getDbgReinsertionPosition();
+      if (BB->IsNewDbgInfoFormat)
+        BeforeDbgRecord = Inst->getDbgReinsertionPosition();
 
       if (HasPrevInstruction) {
         Point.PrevInst = std::prev(Inst->getIterator());
@@ -5944,17 +5945,8 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
   // The current BB may be optimized multiple times, we can't guarantee the
   // reuse of Addr happens later, call findInsertPos to find an appropriate
   // insert position.
-  auto InsertPos = findInsertPos(Addr, MemoryInst, SunkAddr);
-
-  // TODO: Adjust insert point considering (Base|Scaled)Reg if possible.
-  if (!SunkAddr) {
-    auto &DT = getDT(*MemoryInst->getFunction());
-    if ((AddrMode.BaseReg && !DT.dominates(AddrMode.BaseReg, &*InsertPos)) ||
-        (AddrMode.ScaledReg && !DT.dominates(AddrMode.ScaledReg, &*InsertPos)))
-      return Modified;
-  }
-
-  IRBuilder<> Builder(MemoryInst->getParent(), InsertPos);
+  IRBuilder<> Builder(MemoryInst->getParent(),
+                      findInsertPos(Addr, MemoryInst, SunkAddr));
 
   if (SunkAddr) {
     LLVM_DEBUG(dbgs() << "CGP: Reusing nonlocal addrmode: " << AddrMode

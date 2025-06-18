@@ -61,15 +61,6 @@ LogicalResult PackedStochRoundFp8Op::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// mxfp float ops
-//===----------------------------------------------------------------------===//
-LogicalResult PackedScaledTruncOp::verify() {
-  if (getExisting() && getExisting().getType() != getResult().getType())
-    return emitOpError("existing values must have same type as result");
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
 // FatRawBufferCastOp
 //===----------------------------------------------------------------------===//
 

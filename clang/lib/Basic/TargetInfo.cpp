@@ -49,8 +49,6 @@ static const LangASMap FakeAddrSpaceMap = {
     13, // hlsl_groupshared
     14, // hlsl_constant
     15, // hlsl_private
-    16, // hlsl_device
-    17, // hlsl_input
     20, // wasm_funcref
 };
 
@@ -555,7 +553,8 @@ void TargetInfo::adjust(DiagnosticsEngine &Diags, LangOptions &Opts) {
 bool TargetInfo::initFeatureMap(
     llvm::StringMap<bool> &Features, DiagnosticsEngine &Diags, StringRef CPU,
     const std::vector<std::string> &FeatureVec) const {
-  for (StringRef Name : FeatureVec) {
+  for (const auto &F : FeatureVec) {
+    StringRef Name = F;
     if (Name.empty())
       continue;
     // Apply the feature via the target.

@@ -100,7 +100,6 @@ bool Qualifiers::isTargetAddressSpaceSupersetOf(LangAS A, LangAS B,
          // address spaces to default to work around this problem.
          (A == LangAS::Default && B == LangAS::hlsl_private) ||
          (A == LangAS::Default && B == LangAS::hlsl_device) ||
-         (A == LangAS::Default && B == LangAS::hlsl_input) ||
          // Conversions from target specific address spaces may be legal
          // depending on the target information.
          Ctx.getTargetInfo().isAddressSpaceSupersetOf(A, B);
@@ -3572,12 +3571,6 @@ QualType QualType::getNonLValueExprType(const ASTContext &Context) const {
   return *this;
 }
 
-bool FunctionType::getCFIUncheckedCalleeAttr() const {
-  if (const auto *FPT = getAs<FunctionProtoType>())
-    return FPT->hasCFIUncheckedCallee();
-  return false;
-}
-
 StringRef FunctionType::getNameForCallConv(CallingConv CC) {
   switch (CC) {
   case CC_C:
@@ -3606,12 +3599,14 @@ StringRef FunctionType::getNameForCallConv(CallingConv CC) {
     return "aarch64_vector_pcs";
   case CC_AArch64SVEPCS:
     return "aarch64_sve_pcs";
+  case CC_AMDGPUKernelCall:
+    return "amdgpu_kernel";
   case CC_IntelOclBicc:
     return "intel_ocl_bicc";
   case CC_SpirFunction:
     return "spir_function";
-  case CC_DeviceKernel:
-    return "device_kernel";
+  case CC_OpenCLKernel:
+    return "opencl_kernel";
   case CC_Swift:
     return "swiftcall";
   case CC_SwiftAsync:
@@ -3667,7 +3662,6 @@ FunctionProtoType::FunctionProtoType(QualType result, ArrayRef<QualType> params,
   FunctionTypeBits.HasExtParameterInfos = !!epi.ExtParameterInfos;
   FunctionTypeBits.Variadic = epi.Variadic;
   FunctionTypeBits.HasTrailingReturn = epi.HasTrailingReturn;
-  FunctionTypeBits.CFIUncheckedCallee = epi.CFIUncheckedCallee;
 
   if (epi.requiresFunctionProtoTypeExtraBitfields()) {
     FunctionTypeBits.HasExtraBitfields = true;
@@ -3935,7 +3929,6 @@ void FunctionProtoType::Profile(llvm::FoldingSetNodeID &ID, QualType Result,
 
   ID.AddInteger((EffectCount << 3) | (HasConds << 2) |
                 (epi.AArch64SMEAttributes << 1) | epi.HasTrailingReturn);
-  ID.AddInteger(epi.CFIUncheckedCallee);
 
   for (unsigned Idx = 0; Idx != EffectCount; ++Idx) {
     ID.AddInteger(epi.FunctionEffects.Effects[Idx].toOpaqueInt32());
@@ -4013,17 +4006,18 @@ StringRef CountAttributedType::getAttributeName(bool WithMacroPrefix) const {
 }
 
 TypedefType::TypedefType(TypeClass tc, const TypedefNameDecl *D,
-                         QualType UnderlyingType, bool HasTypeDifferentFromDecl)
-    : Type(tc, UnderlyingType.getCanonicalType(),
-           toSemanticDependence(UnderlyingType->getDependence())),
+                         QualType Underlying, QualType can)
+    : Type(tc, can, toSemanticDependence(can->getDependence())),
       Decl(const_cast<TypedefNameDecl *>(D)) {
-  TypedefBits.hasTypeDifferentFromDecl = HasTypeDifferentFromDecl;
+  assert(!isa<TypedefType>(can) && "Invalid canonical type");
+  TypedefBits.hasTypeDifferentFromDecl = !Underlying.isNull();
   if (!typeMatchesDecl())
-    *getTrailingObjects() = UnderlyingType;
+    *getTrailingObjects<QualType>() = Underlying;
 }
 
 QualType TypedefType::desugar() const {
-  return typeMatchesDecl() ? Decl->getUnderlyingType() : *getTrailingObjects();
+  return typeMatchesDecl() ? Decl->getUnderlyingType()
+                           : *getTrailingObjects<QualType>();
 }
 
 UsingType::UsingType(const UsingShadowDecl *Found, QualType Underlying,
@@ -4032,14 +4026,14 @@ UsingType::UsingType(const UsingShadowDecl *Found, QualType Underlying,
       Found(const_cast<UsingShadowDecl *>(Found)) {
   UsingBits.hasTypeDifferentFromDecl = !Underlying.isNull();
   if (!typeMatchesDecl())
-    *getTrailingObjects() = Underlying;
+    *getTrailingObjects<QualType>() = Underlying;
 }
 
 QualType UsingType::getUnderlyingType() const {
   return typeMatchesDecl()
              ? QualType(
                    cast<TypeDecl>(Found->getTargetDecl())->getTypeForDecl(), 0)
-             : *getTrailingObjects();
+             : *getTrailingObjects<QualType>();
 }
 
 QualType MacroQualifiedType::desugar() const { return getUnderlyingType(); }
@@ -4145,7 +4139,7 @@ PackIndexingType::PackIndexingType(QualType Canonical, QualType Pattern,
       Pattern(Pattern), IndexExpr(IndexExpr), Size(Expansions.size()),
       FullySubstituted(FullySubstituted) {
 
-  llvm::uninitialized_copy(Expansions, getTrailingObjects());
+  llvm::uninitialized_copy(Expansions, getTrailingObjects<QualType>());
 }
 
 UnsignedOrNone PackIndexingType::getSelectedIndex() const {
@@ -4325,7 +4319,7 @@ bool AttributedType::isCallingConv() const {
   case attr::VectorCall:
   case attr::AArch64VectorPcs:
   case attr::AArch64SVEPcs:
-  case attr::DeviceKernel:
+  case attr::AMDGPUKernelCall:
   case attr::Pascal:
   case attr::MSABI:
   case attr::SysVABI:
@@ -4368,7 +4362,7 @@ SubstTemplateTypeParmType::SubstTemplateTypeParmType(QualType Replacement,
   SubstTemplateTypeParmTypeBits.HasNonCanonicalUnderlyingType =
       Replacement != getCanonicalTypeInternal();
   if (SubstTemplateTypeParmTypeBits.HasNonCanonicalUnderlyingType)
-    *getTrailingObjects() = Replacement;
+    *getTrailingObjects<QualType>() = Replacement;
 
   SubstTemplateTypeParmTypeBits.Index = Index;
   SubstTemplateTypeParmTypeBits.Final = Final;

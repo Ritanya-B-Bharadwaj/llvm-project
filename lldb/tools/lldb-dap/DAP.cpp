@@ -70,7 +70,6 @@
 
 using namespace lldb_dap;
 using namespace lldb_dap::protocol;
-using namespace lldb_private;
 
 namespace {
 #ifdef _WIN32
@@ -821,7 +820,7 @@ void DAP::SendTerminatedEvent() {
   });
 }
 
-llvm::Error DAP::Disconnect() { return Disconnect(!is_attach); }
+llvm::Error DAP::Disconnect() { return Disconnect(is_attach); }
 
 llvm::Error DAP::Disconnect(bool terminateDebuggee) {
   lldb::SBError error;
@@ -894,14 +893,14 @@ llvm::Error DAP::Loop() {
 
         while (!disconnecting) {
           llvm::Expected<Message> next =
-              transport.Read<protocol::Message>(std::chrono::seconds(1));
-          if (next.errorIsA<TransportEOFError>()) {
+              transport.Read(std::chrono::seconds(1));
+          if (next.errorIsA<EndOfFileError>()) {
             consumeError(next.takeError());
             break;
           }
 
           // If the read timed out, continue to check if we should disconnect.
-          if (next.errorIsA<TransportTimeoutError>()) {
+          if (next.errorIsA<TimeoutError>()) {
             consumeError(next.takeError());
             continue;
           }
@@ -1241,10 +1240,7 @@ void DAP::EventThread() {
             // automatically restarted.
             if (!lldb::SBProcess::GetRestartedFromEvent(event)) {
               SendStdOutStdErr(*this, process);
-              if (llvm::Error err = SendThreadStoppedEvent(*this))
-                DAP_LOG_ERROR(log, std::move(err),
-                              "({1}) reporting thread stopped: {0}",
-                              transport.GetClientName());
+              SendThreadStoppedEvent(*this);
             }
             break;
           case lldb::eStateRunning:

@@ -693,17 +693,6 @@ CGCallee ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(
   llvm::Constant *CheckTypeDesc;
   bool ShouldEmitCFICheck = CGF.SanOpts.has(SanitizerKind::CFIMFCall) &&
                             CGM.HasHiddenLTOVisibility(RD);
-
-  if (ShouldEmitCFICheck) {
-    if (const auto *BinOp = dyn_cast<BinaryOperator>(E)) {
-      if (BinOp->isPtrMemOp() &&
-          BinOp->getRHS()
-              ->getType()
-              ->hasPointeeToToCFIUncheckedCalleeFunctionType())
-        ShouldEmitCFICheck = false;
-    }
-  }
-
   bool ShouldEmitVFEInfo = CGM.getCodeGenOpts().VirtualFunctionElimination &&
                            CGM.HasHiddenLTOVisibility(RD);
   bool ShouldEmitWPDInfo =
@@ -713,9 +702,9 @@ CGCallee ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(
   llvm::Value *VirtualFn = nullptr;
 
   {
-    auto CheckOrdinal = SanitizerKind::SO_CFIMFCall;
-    auto CheckHandler = SanitizerHandler::CFICheckFail;
-    SanitizerDebugLocation SanScope(&CGF, {CheckOrdinal}, CheckHandler);
+    CodeGenFunction::SanitizerScope SanScope(&CGF);
+    ApplyDebugLocation ApplyTrapDI(
+        CGF, CGF.SanitizerAnnotateDebugInfo(SanitizerKind::SO_CFIMFCall));
 
     llvm::Value *TypeId = nullptr;
     llvm::Value *CheckResult = nullptr;
@@ -785,15 +774,16 @@ CGCallee ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(
       };
 
       if (CGM.getCodeGenOpts().SanitizeTrap.has(SanitizerKind::CFIMFCall)) {
-        CGF.EmitTrapCheck(CheckResult, CheckHandler);
+        CGF.EmitTrapCheck(CheckResult, SanitizerHandler::CFICheckFail);
       } else {
         llvm::Value *AllVtables = llvm::MetadataAsValue::get(
             CGM.getLLVMContext(),
             llvm::MDString::get(CGM.getLLVMContext(), "all-vtables"));
         llvm::Value *ValidVtable = Builder.CreateCall(
             CGM.getIntrinsic(llvm::Intrinsic::type_test), {VTable, AllVtables});
-        CGF.EmitCheck(std::make_pair(CheckResult, CheckOrdinal), CheckHandler,
-                      StaticData, {VTable, ValidVtable});
+        CGF.EmitCheck(std::make_pair(CheckResult, SanitizerKind::SO_CFIMFCall),
+                      SanitizerHandler::CFICheckFail, StaticData,
+                      {VTable, ValidVtable});
       }
 
       FnVirtual = Builder.GetInsertBlock();
@@ -812,9 +802,9 @@ CGCallee ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(
   if (ShouldEmitCFICheck) {
     CXXRecordDecl *RD = MPT->getMostRecentCXXRecordDecl();
     if (RD->hasDefinition()) {
-      auto CheckOrdinal = SanitizerKind::SO_CFIMFCall;
-      auto CheckHandler = SanitizerHandler::CFICheckFail;
-      SanitizerDebugLocation SanScope(&CGF, {CheckOrdinal}, CheckHandler);
+      CodeGenFunction::SanitizerScope SanScope(&CGF);
+      ApplyDebugLocation ApplyTrapDI(
+          CGF, CGF.SanitizerAnnotateDebugInfo(SanitizerKind::SO_CFIMFCall));
 
       llvm::Constant *StaticData[] = {
           llvm::ConstantInt::get(CGF.Int8Ty, CodeGenFunction::CFITCK_NVMFCall),
@@ -837,7 +827,8 @@ CGCallee ItaniumCXXABI::EmitLoadOfMemberFunctionPointer(
         Bit = Builder.CreateOr(Bit, TypeTest);
       }
 
-      CGF.EmitCheck(std::make_pair(Bit, CheckOrdinal), CheckHandler, StaticData,
+      CGF.EmitCheck(std::make_pair(Bit, SanitizerKind::SO_CFIMFCall),
+                    SanitizerHandler::CFICheckFail, StaticData,
                     {NonVirtualFn, llvm::UndefValue::get(CGF.IntPtrTy)});
 
       FnNonVirtual = Builder.GetInsertBlock();

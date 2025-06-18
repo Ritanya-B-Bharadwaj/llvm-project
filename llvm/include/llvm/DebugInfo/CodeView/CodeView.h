@@ -13,7 +13,6 @@
 #ifndef LLVM_DEBUGINFO_CODEVIEW_CODEVIEW_H
 #define LLVM_DEBUGINFO_CODEVIEW_CODEVIEW_H
 
-#include "llvm/Support/Compiler.h"
 #include <cinttypes>
 #include <type_traits>
 
@@ -528,10 +527,9 @@ enum class EncodedFramePtrReg : uint8_t {
   BasePtr = 3,
 };
 
-LLVM_ABI RegisterId decodeFramePtrReg(EncodedFramePtrReg EncodedReg,
-                                      CPUType CPU);
+RegisterId decodeFramePtrReg(EncodedFramePtrReg EncodedReg, CPUType CPU);
 
-LLVM_ABI EncodedFramePtrReg encodeFramePtrReg(RegisterId Reg, CPUType CPU);
+EncodedFramePtrReg encodeFramePtrReg(RegisterId Reg, CPUType CPU);
 
 /// These values correspond to the THUNK_ORDINAL enumeration.
 enum class ThunkOrdinal : uint8_t {

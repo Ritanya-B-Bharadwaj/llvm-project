@@ -47,7 +47,6 @@ static const unsigned ARM64AddrSpaceMap[] = {
     0, // hlsl_constant
     0, // hlsl_private
     0, // hlsl_device
-    0, // hlsl_input
     // Wasm address space values for this target are dummy values,
     // as it is only enabled for Wasm targets.
     20, // wasm_funcref
@@ -66,7 +65,6 @@ class LLVM_LIBRARY_VISIBILITY AArch64TargetInfo : public TargetInfo {
 
   unsigned FPU = FPUMode;
   bool HasCRC = false;
-  bool HasCSSC = false;
   bool HasAES = false;
   bool HasSHA2 = false;
   bool HasSHA3 = false;

@@ -1472,7 +1472,6 @@ void CodeGenFunction::EmitOMPReductionClauseFinal(
   llvm::SmallVector<const Expr *, 8> LHSExprs;
   llvm::SmallVector<const Expr *, 8> RHSExprs;
   llvm::SmallVector<const Expr *, 8> ReductionOps;
-  llvm::SmallVector<bool, 8> IsPrivateVarReduction;
   bool HasAtLeastOneReduction = false;
   bool IsReductionWithTaskMod = false;
   for (const auto *C : D.getClausesOfKind<OMPReductionClause>()) {
@@ -1483,8 +1482,6 @@ void CodeGenFunction::EmitOMPReductionClauseFinal(
     Privates.append(C->privates().begin(), C->privates().end());
     LHSExprs.append(C->lhs_exprs().begin(), C->lhs_exprs().end());
     RHSExprs.append(C->rhs_exprs().begin(), C->rhs_exprs().end());
-    IsPrivateVarReduction.append(C->private_var_reduction_flags().begin(),
-                                 C->private_var_reduction_flags().end());
     ReductionOps.append(C->reduction_ops().begin(), C->reduction_ops().end());
     IsReductionWithTaskMod =
         IsReductionWithTaskMod || C->getModifier() == OMPC_REDUCTION_task;
@@ -1506,7 +1503,7 @@ void CodeGenFunction::EmitOMPReductionClauseFinal(
     // parallel directive (it always has implicit barrier).
     CGM.getOpenMPRuntime().emitReduction(
         *this, D.getEndLoc(), Privates, LHSExprs, RHSExprs, ReductionOps,
-        {WithNowait, SimpleReduction, IsPrivateVarReduction, ReductionKind});
+        {WithNowait, SimpleReduction, ReductionKind});
   }
 }
 
@@ -1850,6 +1847,14 @@ void CodeGenFunction::EmitOMPParallelDirective(const OMPParallelDirective &S) {
         OMPBuilder.createParallel(Builder, AllocaIP, BodyGenCB, PrivCB, FiniCB,
                                   IfCond, NumThreads, ProcBind, S.hasCancel()));
     Builder.restoreIP(AfterIP);
+llvm::BasicBlock *BB = AfterIP.getBlock();
+
+if (!BB->empty()) {
+    llvm::Instruction *LastInst = &BB->back(); // Safe: BB is non-empty
+    llvm::LLVMContext &Ctx = CGM.getLLVMContext();
+    llvm::MDNode *MD = llvm::MDNode::get(Ctx, llvm::MDString::get(Ctx, "omp_parallel"));
+    LastInst->setMetadata("omp.annot", MD);
+}
     return;
   }
 
@@ -3947,8 +3952,7 @@ static void emitScanBasedDirective(
       PrivScope.Privatize();
       CGF.CGM.getOpenMPRuntime().emitReduction(
           CGF, S.getEndLoc(), Privates, LHSs, RHSs, ReductionOps,
-          {/*WithNowait=*/true, /*SimpleReduction=*/true,
-           /*IsPrivateVarReduction*/ {}, OMPD_unknown});
+          {/*WithNowait=*/true, /*SimpleReduction=*/true, OMPD_unknown});
     }
     llvm::Value *NextIVal =
         CGF.Builder.CreateNUWSub(IVal, llvm::ConstantInt::get(CGF.SizeTy, 1));
@@ -5753,8 +5757,7 @@ void CodeGenFunction::EmitOMPScanDirective(const OMPScanDirective &S) {
       }
       CGM.getOpenMPRuntime().emitReduction(
           *this, ParentDir.getEndLoc(), Privates, LHSs, RHSs, ReductionOps,
-          {/*WithNowait=*/true, /*SimpleReduction=*/true,
-           /*IsPrivateVarReduction*/ {}, OMPD_simd});
+          {/*WithNowait=*/true, /*SimpleReduction=*/true, OMPD_simd});
       for (unsigned I = 0, E = CopyArrayElems.size(); I < E; ++I) {
         const Expr *PrivateExpr = Privates[I];
         LValue DestLVal;

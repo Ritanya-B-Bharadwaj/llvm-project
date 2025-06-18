@@ -6591,6 +6591,10 @@ bool Compiler<Emitter>::visitDeclRef(const ValueDecl *D, const Expr *E) {
     return T->isReferenceType();
   };
 
+  // DecompositionDecls are just proxies for us.
+  if (isa<DecompositionDecl>(VD))
+    return revisit(VD);
+
   if ((VD->hasGlobalStorage() || VD->isStaticDataMember()) &&
       typeShouldBeVisited(VD->getType())) {
     if (const Expr *Init = VD->getAnyInitializer();

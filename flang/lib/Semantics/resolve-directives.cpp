@@ -2073,7 +2073,6 @@ bool OmpAttributeVisitor::Pre(const parser::OpenMPDispatchConstruct &x) {
 }
 
 bool OmpAttributeVisitor::Pre(const parser::OpenMPExecutableAllocate &x) {
-  IssueNonConformanceWarning(llvm::omp::Directive::OMPD_allocate, x.source);
   PushContext(x.source, llvm::omp::Directive::OMPD_allocate);
   const auto &list{std::get<std::optional<parser::OmpObjectList>>(x.t)};
   if (list) {
@@ -2217,20 +2216,6 @@ static bool IsPrivatizable(const Symbol *sym) {
               misc->kind() != MiscDetails::Kind::ConstructName));
 }
 
-static bool IsSymbolStaticStorageDuration(const Symbol &symbol) {
-  LLVM_DEBUG(llvm::dbgs() << "IsSymbolStaticStorageDuration(" << symbol.name()
-                          << "):\n");
-  auto ultSym = symbol.GetUltimate();
-  // Module-scope variable
-  return (ultSym.owner().kind() == Scope::Kind::Module) ||
-      // Data statement variable
-      (ultSym.flags().test(Symbol::Flag::InDataStmt)) ||
-      // Save attribute variable
-      (ultSym.attrs().test(Attr::SAVE)) ||
-      // Referenced in a common block
-      (ultSym.flags().test(Symbol::Flag::InCommonBlock));
-}
-
 void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
   if (!IsPrivatizable(symbol)) {
     return;
@@ -2324,7 +2309,6 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
     bool targetDir = llvm::omp::allTargetSet.test(dirContext.directive);
     bool parallelDir = llvm::omp::allParallelSet.test(dirContext.directive);
     bool teamsDir = llvm::omp::allTeamsSet.test(dirContext.directive);
-    bool isStaticStorageDuration = IsSymbolStaticStorageDuration(*symbol);
 
     if (dsa.any()) {
       if (parallelDir || taskGenDir || teamsDir) {
@@ -2382,9 +2366,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
       dsa = prevDSA;
     } else if (taskGenDir) {
       // TODO 5) dummy arg in orphaned taskgen construct -> firstprivate
-      if (prevDSA.test(Symbol::Flag::OmpShared) ||
-          (isStaticStorageDuration &&
-              (prevDSA & dataSharingAttributeFlags).none())) {
+      if (prevDSA.test(Symbol::Flag::OmpShared)) {
         // 6) shared in enclosing context -> shared
         dsa = {Symbol::Flag::OmpShared};
         makeSymbol(dsa);
@@ -2903,6 +2885,20 @@ void ResolveOmpTopLevelParts(
   });
 }
 
+static bool IsSymbolInCommonBlock(const Symbol &symbol) {
+  // TODO Improve the performance of this predicate function.
+  //      Going through all symbols sequentially, in all common blocks, can be
+  //      slow when there are many symbols. A possible optimization is to add
+  //      an OmpInCommonBlock flag to Symbol, to make it possible to quickly
+  //      test if a given symbol is in a common block.
+  for (const auto &cb : symbol.owner().commonBlocks()) {
+    if (IsCommonBlockContaining(cb.second.get(), symbol)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool IsSymbolThreadprivate(const Symbol &symbol) {
   if (const auto *details{symbol.detailsIf<HostAssocDetails>()}) {
     return details->symbol().test(Symbol::Flag::OmpThreadprivate);
@@ -2931,7 +2927,7 @@ static bool IsSymbolPrivate(const Symbol &symbol) {
     case Scope::Kind::BlockConstruct:
       return !symbol.attrs().test(Attr::SAVE) &&
           !symbol.attrs().test(Attr::PARAMETER) && !IsAssumedShape(symbol) &&
-          !symbol.flags().test(Symbol::Flag::InCommonBlock);
+          !IsSymbolInCommonBlock(symbol);
     default:
       return false;
     }
@@ -3023,14 +3019,10 @@ void OmpAttributeVisitor::CheckSourceLabel(const parser::Label &label) {
 void OmpAttributeVisitor::CheckLabelContext(const parser::CharBlock source,
     const parser::CharBlock target, std::optional<DirContext> sourceContext,
     std::optional<DirContext> targetContext) {
-  auto dirContextsSame = [](DirContext &lhs, DirContext &rhs) -> bool {
-    // Sometimes nested constructs share a scope but are different contexts
-    return (lhs.scope == rhs.scope) && (lhs.directive == rhs.directive);
-  };
   unsigned version{context_.langOptions().OpenMPVersion};
   if (targetContext &&
       (!sourceContext ||
-          (!dirContextsSame(*targetContext, *sourceContext) &&
+          (sourceContext->scope != targetContext->scope &&
               !DoesScopeContain(
                   &targetContext->scope, sourceContext->scope)))) {
     context_
@@ -3042,7 +3034,7 @@ void OmpAttributeVisitor::CheckLabelContext(const parser::CharBlock source,
   }
   if (sourceContext &&
       (!targetContext ||
-          (!dirContextsSame(*sourceContext, *targetContext) &&
+          (sourceContext->scope != targetContext->scope &&
               !DoesScopeContain(
                   &sourceContext->scope, targetContext->scope)))) {
     context_
@@ -3163,9 +3155,6 @@ void OmpAttributeVisitor::IssueNonConformanceWarning(
     break;
   case llvm::omp::OMPD_parallel_master_taskloop_simd:
     setAlternativeStr("PARALLEL_MASKED TASKLOOP SIMD");
-    break;
-  case llvm::omp::OMPD_allocate:
-    setAlternativeStr("ALLOCATORS");
     break;
   case llvm::omp::OMPD_target_loop:
   default:;

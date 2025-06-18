@@ -61,14 +61,6 @@ static cl::opt<bool> UseDivergentRegisterIndexing(
     cl::desc("Use indirect register addressing for divergent indexes"),
     cl::init(false));
 
-// TODO: This option should be removed once we switch to always using PTRADD in
-// the SelectionDAG.
-static cl::opt<bool> UseSelectionDAGPTRADD(
-    "amdgpu-use-sdag-ptradd", cl::Hidden,
-    cl::desc("Generate ISD::PTRADD nodes for 64-bit pointer arithmetic in the "
-             "SelectionDAG ISel"),
-    cl::init(false));
-
 static bool denormalModeIsFlushAllF32(const MachineFunction &MF) {
   const SIMachineFunctionInfo *Info = MF.getInfo<SIMachineFunctionInfo>();
   return Info->getMode().FP32Denormals == DenormalMode::getPreserveSign();
@@ -759,10 +751,10 @@ SITargetLowering::SITargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::BUILD_VECTOR, {MVT::v2i16, MVT::v2f16, MVT::v2bf16},
                        Subtarget->hasVOP3PInsts() ? Legal : Custom);
 
-    setOperationAction(ISD::FNEG, {MVT::v2f16, MVT::v2bf16}, Legal);
+    setOperationAction(ISD::FNEG, MVT::v2f16, Legal);
     // This isn't really legal, but this avoids the legalizer unrolling it (and
     // allows matching fneg (fabs x) patterns)
-    setOperationAction(ISD::FABS, {MVT::v2f16, MVT::v2bf16}, Legal);
+    setOperationAction(ISD::FABS, MVT::v2f16, Legal);
 
     // Can do this in one BFI plus a constant materialize.
     setOperationAction(ISD::FCOPYSIGN,
@@ -934,11 +926,8 @@ SITargetLowering::SITargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::BUILD_VECTOR, MVT::v2bf16, Legal);
   }
 
-  if (Subtarget->hasCvtPkF16F32Inst()) {
-    setOperationAction(ISD::FP_ROUND,
-                       {MVT::v2f16, MVT::v4f16, MVT::v8f16, MVT::v16f16},
-                       Custom);
-  }
+  if (Subtarget->hasCvtPkF16F32Inst())
+    setOperationAction(ISD::FP_ROUND, MVT::v2f16, Custom);
 
   setTargetDAGCombine({ISD::ADD,
                        ISD::UADDO_CARRY,
@@ -3585,6 +3574,21 @@ void SITargetLowering::passSpecialInputs(
   }
 }
 
+static bool canGuaranteeTCO(CallingConv::ID CC) {
+  return CC == CallingConv::Fast;
+}
+
+/// Return true if we might ever do TCO for calls with this calling convention.
+static bool mayTailCallThisCC(CallingConv::ID CC) {
+  switch (CC) {
+  case CallingConv::C:
+  case CallingConv::AMDGPU_Gfx:
+    return true;
+  default:
+    return canGuaranteeTCO(CC);
+  }
+}
+
 bool SITargetLowering::isEligibleForTailCallOptimization(
     SDValue Callee, CallingConv::ID CalleeCC, bool IsVarArg,
     const SmallVectorImpl<ISD::OutputArg> &Outs,
@@ -3593,7 +3597,7 @@ bool SITargetLowering::isEligibleForTailCallOptimization(
   if (AMDGPU::isChainCC(CalleeCC))
     return true;
 
-  if (!AMDGPU::mayTailCallThisCC(CalleeCC))
+  if (!mayTailCallThisCC(CalleeCC))
     return false;
 
   // For a divergent call target, we need to do a waterfall loop over the
@@ -3615,7 +3619,7 @@ bool SITargetLowering::isEligibleForTailCallOptimization(
   bool CCMatch = CallerCC == CalleeCC;
 
   if (DAG.getTarget().Options.GuaranteedTailCallOpt) {
-    if (AMDGPU::canGuaranteeTCO(CalleeCC) && CCMatch)
+    if (canGuaranteeTCO(CalleeCC) && CCMatch)
       return true;
     return false;
   }
@@ -6907,35 +6911,14 @@ SDValue SITargetLowering::getFPExtOrFPRound(SelectionDAG &DAG, SDValue Op,
                            DAG.getTargetConstant(0, DL, MVT::i32));
 }
 
-SDValue SITargetLowering::splitFP_ROUNDVectorOp(SDValue Op,
-                                                SelectionDAG &DAG) const {
-  EVT DstVT = Op.getValueType();
-  unsigned NumElts = DstVT.getVectorNumElements();
-  assert(NumElts > 2 && isPowerOf2_32(NumElts));
-
-  auto [Lo, Hi] = DAG.SplitVectorOperand(Op.getNode(), 0);
-
-  SDLoc DL(Op);
-  unsigned Opc = Op.getOpcode();
-  SDValue Flags = Op.getOperand(1);
-  EVT HalfDstVT =
-      EVT::getVectorVT(*DAG.getContext(), DstVT.getScalarType(), NumElts / 2);
-  SDValue OpLo = DAG.getNode(Opc, DL, HalfDstVT, Lo, Flags);
-  SDValue OpHi = DAG.getNode(Opc, DL, HalfDstVT, Hi, Flags);
-
-  return DAG.getNode(ISD::CONCAT_VECTORS, DL, DstVT, OpLo, OpHi);
-}
-
 SDValue SITargetLowering::lowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const {
   SDValue Src = Op.getOperand(0);
   EVT SrcVT = Src.getValueType();
   EVT DstVT = Op.getValueType();
 
-  if (DstVT.isVector() && DstVT.getScalarType() == MVT::f16) {
+  if (DstVT == MVT::v2f16) {
     assert(Subtarget->hasCvtPkF16F32Inst() && "support v_cvt_pk_f16_f32");
-    if (SrcVT.getScalarType() != MVT::f32)
-      return SDValue();
-    return SrcVT == MVT::v2f32 ? Op : splitFP_ROUNDVectorOp(Op, DAG);
+    return SrcVT == MVT::v2f32 ? Op : SDValue();
   }
 
   if (SrcVT.getScalarType() != MVT::f64)
@@ -10463,11 +10446,6 @@ SDValue SITargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     return Op;
   }
   }
-}
-
-bool SITargetLowering::shouldPreservePtrArith(const Function &F,
-                                              EVT PtrVT) const {
-  return UseSelectionDAGPTRADD && PtrVT == MVT::i64;
 }
 
 // The raw.(t)buffer and struct.(t)buffer intrinsics have two offset args:
@@ -17563,11 +17541,9 @@ void SITargetLowering::emitExpandAtomicAddrSpacePredicate(
   // where we only insert a check for private and still use the flat instruction
   // for global and shared.
 
-  bool FullFlatEmulation =
-      RMW && RMW->getOperation() == AtomicRMWInst::FAdd &&
-      ((Subtarget->hasAtomicFaddInsts() && RMW->getType()->isFloatTy()) ||
-       (Subtarget->hasFlatBufferGlobalAtomicFaddF64Inst() &&
-        RMW->getType()->isDoubleTy()));
+  bool FullFlatEmulation = RMW && RMW->getOperation() == AtomicRMWInst::FAdd &&
+                           Subtarget->hasAtomicFaddInsts() &&
+                           RMW->getType()->isFloatTy();
 
   // If the return value isn't used, do not introduce a false use in the phi.
   bool ReturnValueIsUsed = !AI->use_empty();

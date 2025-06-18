@@ -80,6 +80,16 @@ public:
     SRCK_InRegs    // Small structs in registers (-freg-struct-return).
   };
 
+  enum ProfileInstrKind {
+    ProfileNone,       // Profile instrumentation is turned off.
+    ProfileClangInstr, // Clang instrumentation to generate execution counts
+                       // to use with PGO.
+    ProfileIRInstr,    // IR level PGO instrumentation in LLVM.
+    ProfileCSIRInstr, // IR level PGO context sensitive instrumentation in LLVM.
+    ProfileIRSampleColdCov, // IR level sample pgo based cold function coverage
+                            // instrumentation in LLVM.
+  };
+
   enum EmbedBitcodeKind {
     Embed_Off,      // No embedded bitcode.
     Embed_All,      // Embed both bitcode and commandline in the output.
@@ -328,10 +338,6 @@ public:
   /// -fsymbol-partition (see https://lld.llvm.org/Partitions.html).
   std::string SymbolPartition;
 
-  /// If non-empty, allow the compiler to assume that the given source file
-  /// identifier is unique at link time.
-  std::string UniqueSourceFileIdentifier;
-
   enum RemarkKind {
     RK_Missing,            // Remark argument not present on the command line.
     RK_Enabled,            // Remark enabled via '-Rgroup'.
@@ -512,41 +518,35 @@ public:
 
   /// Check if Clang profile instrumenation is on.
   bool hasProfileClangInstr() const {
-    return getProfileInstr() ==
-           llvm::driver::ProfileInstrKind::ProfileClangInstr;
+    return getProfileInstr() == ProfileClangInstr;
   }
 
   /// Check if IR level profile instrumentation is on.
   bool hasProfileIRInstr() const {
-    return getProfileInstr() == llvm::driver::ProfileInstrKind::ProfileIRInstr;
+    return getProfileInstr() == ProfileIRInstr;
   }
 
   /// Check if CS IR level profile instrumentation is on.
   bool hasProfileCSIRInstr() const {
-    return getProfileInstr() ==
-           llvm::driver::ProfileInstrKind::ProfileCSIRInstr;
+    return getProfileInstr() == ProfileCSIRInstr;
   }
 
   /// Check if any form of instrumentation is on.
-  bool hasProfileInstr() const {
-    return getProfileInstr() != llvm::driver::ProfileInstrKind::ProfileNone;
-  }
+  bool hasProfileInstr() const { return getProfileInstr() != ProfileNone; }
 
   /// Check if Clang profile use is on.
   bool hasProfileClangUse() const {
-    return getProfileUse() == llvm::driver::ProfileInstrKind::ProfileClangInstr;
+    return getProfileUse() == ProfileClangInstr;
   }
 
   /// Check if IR level profile use is on.
   bool hasProfileIRUse() const {
-    return getProfileUse() == llvm::driver::ProfileInstrKind::ProfileIRInstr ||
-           getProfileUse() == llvm::driver::ProfileInstrKind::ProfileCSIRInstr;
+    return getProfileUse() == ProfileIRInstr ||
+           getProfileUse() == ProfileCSIRInstr;
   }
 
   /// Check if CSIR profile use is on.
-  bool hasProfileCSIRUse() const {
-    return getProfileUse() == llvm::driver::ProfileInstrKind::ProfileCSIRInstr;
-  }
+  bool hasProfileCSIRUse() const { return getProfileUse() == ProfileCSIRInstr; }
 
   /// Check if type and variable info should be emitted.
   bool hasReducedDebugInfo() const {

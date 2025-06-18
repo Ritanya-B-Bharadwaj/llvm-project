@@ -30,7 +30,7 @@ class ScalarEvolution;
 class User;
 class Value;
 
-class HexagonTTIImpl final : public BasicTTIImplBase<HexagonTTIImpl> {
+class HexagonTTIImpl : public BasicTTIImplBase<HexagonTTIImpl> {
   using BaseT = BasicTTIImplBase<HexagonTTIImpl>;
   using TTI = TargetTransformInfo;
 

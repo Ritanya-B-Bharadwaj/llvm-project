@@ -270,7 +270,7 @@ private:
 };
 
 void ClangDocCommentVisitor::parseComment(const comments::Comment *C) {
-  CurrentCI.Kind = stringToCommentKind(C->getCommentKindName());
+  CurrentCI.Kind = C->getCommentKindName();
   ConstCommentVisitor<ClangDocCommentVisitor>::visit(C);
   for (comments::Comment *Child :
        llvm::make_range(C->child_begin(), C->child_end())) {
@@ -388,8 +388,7 @@ std::string serialize(std::unique_ptr<Info> &I) {
     return serialize(*static_cast<EnumInfo *>(I.get()));
   case InfoType::IT_function:
     return serialize(*static_cast<FunctionInfo *>(I.get()));
-  case InfoType::IT_typedef:
-  case InfoType::IT_default:
+  default:
     return "";
   }
 }
@@ -526,13 +525,9 @@ static std::unique_ptr<Info> makeAndInsertIntoParent(ChildType Child) {
     InsertChild(ParentRec->Children, std::forward<ChildType>(Child));
     return ParentRec;
   }
-  case InfoType::IT_default:
-  case InfoType::IT_enum:
-  case InfoType::IT_function:
-  case InfoType::IT_typedef:
-    break;
+  default:
+    llvm_unreachable("Invalid reference type for parent namespace");
   }
-  llvm_unreachable("Invalid reference type for parent namespace");
 }
 
 // There are two uses for this function.
@@ -747,7 +742,6 @@ static void populateFunctionInfo(FunctionInfo &I, const FunctionDecl *D,
   I.ReturnType = getTypeInfoForType(D->getReturnType(), LO);
   I.Prototype = getFunctionPrototype(D);
   parseParameters(I, D);
-  I.IsStatic = D->isStatic();
 
   populateTemplateParameters(I.Template, D);
 

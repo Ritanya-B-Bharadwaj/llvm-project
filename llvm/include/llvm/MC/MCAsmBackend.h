@@ -12,7 +12,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCFixup.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Endian.h"
 #include <cstdint>
 
@@ -40,7 +39,7 @@ class StringRef;
 class raw_ostream;
 
 /// Generic interface to target specific assembler backends.
-class LLVM_ABI MCAsmBackend {
+class MCAsmBackend {
 protected: // Can only create subclasses.
   MCAsmBackend(llvm::endianness Endian) : Endian(Endian) {}
 

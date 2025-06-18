@@ -1483,14 +1483,7 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
   if (!Weights && CGM.getCodeGenOpts().OptimizationLevel)
     BoolCondVal = emitCondLikelihoodViaExpectIntrinsic(
         BoolCondVal, Stmt::getLikelihood(S.getBody()));
-  auto *I = Builder.CreateCondBr(BoolCondVal, ForBody, ExitBlock, Weights);
-  // Key Instructions: Emit the condition and branch as separate atoms to
-  // match existing loop stepping behaviour. FIXME: We could have the branch as
-  // the backup location for the condition, which would probably be a better
-  // experience.
-  if (auto *CondI = dyn_cast<llvm::Instruction>(BoolCondVal))
-    addInstToNewSourceAtom(CondI, nullptr);
-  addInstToNewSourceAtom(I, nullptr);
+  Builder.CreateCondBr(BoolCondVal, ForBody, ExitBlock, Weights);
 
   if (ExitBlock != LoopExit.getBlock()) {
     EmitBlock(ExitBlock);
@@ -1515,9 +1508,6 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
     EmitStmt(S.getLoopVarStmt());
     EmitStmt(S.getBody());
   }
-  // The last block in the loop's body (which unconditionally branches to the
-  // `inc` block if there is one).
-  auto *FinalBodyBB = Builder.GetInsertBlock();
 
   EmitStopPoint(&S);
   // If there is an increment, emit it next.
@@ -1542,12 +1532,6 @@ CodeGenFunction::EmitCXXForRangeStmt(const CXXForRangeStmt &S,
 
   if (CGM.shouldEmitConvergenceTokens())
     ConvergenceTokenStack.pop_back();
-
-  if (FinalBodyBB) {
-    // We want the for closing brace to be step-able on to match existing
-    // behaviour.
-    addInstToNewSourceAtom(FinalBodyBB->getTerminator(), nullptr);
-  }
 }
 
 void CodeGenFunction::EmitReturnOfRValue(RValue RV, QualType Ty) {
@@ -1605,7 +1589,6 @@ static bool isSwiftAsyncCallee(const CallExpr *CE) {
 /// if the function returns void, or may be missing one if the function returns
 /// non-void.  Fun stuff :).
 void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
-  ApplyAtomGroup Grp(getDebugInfo());
   if (requiresReturnValueCheck()) {
     llvm::Constant *SLoc = EmitCheckSourceLocation(S.getBeginLoc());
     auto *SLocPtr =
@@ -1681,19 +1664,16 @@ void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
     // If this function returns a reference, take the address of the expression
     // rather than the value.
     RValue Result = EmitReferenceBindingToExpr(RV);
-    auto *I = Builder.CreateStore(Result.getScalarVal(), ReturnValue);
-    addInstToCurrentSourceAtom(I, I->getValueOperand());
+    Builder.CreateStore(Result.getScalarVal(), ReturnValue);
   } else {
     switch (getEvaluationKind(RV->getType())) {
     case TEK_Scalar: {
       llvm::Value *Ret = EmitScalarExpr(RV);
-      if (CurFnInfo->getReturnInfo().getKind() == ABIArgInfo::Indirect) {
+      if (CurFnInfo->getReturnInfo().getKind() == ABIArgInfo::Indirect)
         EmitStoreOfScalar(Ret, MakeAddrLValue(ReturnValue, RV->getType()),
                           /*isInit*/ true);
-      } else {
-        auto *I = Builder.CreateStore(Ret, ReturnValue);
-        addInstToCurrentSourceAtom(I, I->getValueOperand());
-      }
+      else
+        Builder.CreateStore(Ret, ReturnValue);
       break;
     }
     case TEK_Complex:

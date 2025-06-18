@@ -47,7 +47,11 @@ namespace llvm {
     Module &M;
     LLVMContext &VMContext;
 
-    DICompileUnit *CUNode; ///< The one compile unit created by this DIBuiler.
+    DICompileUnit *CUNode;   ///< The one compile unit created by this DIBuiler.
+    Function *DeclareFn;     ///< llvm.dbg.declare
+    Function *ValueFn;       ///< llvm.dbg.value
+    Function *LabelFn;       ///< llvm.dbg.label
+    Function *AssignFn;      ///< llvm.dbg.assign
 
     SmallVector<TrackingMDNodeRef, 4> AllEnumTypes;
     /// Track the RetainTypes, since they can be updated later on.

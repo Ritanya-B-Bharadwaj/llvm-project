@@ -234,10 +234,6 @@ struct VPlanTransforms {
   /// removed in the future.
   static DenseMap<VPBasicBlock *, VPValue *>
   introduceMasksAndLinearize(VPlan &Plan, bool FoldTail);
-
-  /// Add branch weight metadata, if the \p Plan's middle block is terminated by
-  /// a BranchOnCond recipe.
-  static void addBranchWeightToMiddleTerminator(VPlan &Plan, ElementCount VF);
 };
 
 } // namespace llvm

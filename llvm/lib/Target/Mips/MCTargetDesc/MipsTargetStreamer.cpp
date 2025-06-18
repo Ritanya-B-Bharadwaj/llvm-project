@@ -12,7 +12,6 @@
 
 #include "MipsTargetStreamer.h"
 #include "MCTargetDesc/MipsABIInfo.h"
-#include "MCTargetDesc/MipsMCAsmInfo.h"
 #include "MipsBaseInfo.h"
 #include "MipsELFStreamer.h"
 #include "MipsInstPrinter.h"
@@ -399,42 +398,42 @@ MipsTargetAsmStreamer::MipsTargetAsmStreamer(MCStreamer &S,
 void MipsTargetAsmStreamer::emitDTPRel32Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.dtprelword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
 void MipsTargetAsmStreamer::emitDTPRel64Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.dtpreldword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
 void MipsTargetAsmStreamer::emitTPRel32Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.tprelword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
 void MipsTargetAsmStreamer::emitTPRel64Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.tpreldword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
 void MipsTargetAsmStreamer::emitGPRel32Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.gpword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
 void MipsTargetAsmStreamer::emitGPRel64Value(const MCExpr *Value) {
   auto *MAI = getStreamer().getContext().getAsmInfo();
   OS << "\t.gpdword\t";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   OS << '\n';
 }
 
@@ -1267,7 +1266,7 @@ void MipsTargetELFStreamer::emitDirectiveCpLoad(unsigned RegNo) {
   TmpInst.setOpcode(Mips::LUi);
   TmpInst.addOperand(MCOperand::createReg(GPReg));
   const MCExpr *HiSym = MipsMCExpr::create(
-      Mips::S_HI, MCSymbolRefExpr::create(GP_Disp, MCA.getContext()),
+      MipsMCExpr::MEK_HI, MCSymbolRefExpr::create(GP_Disp, MCA.getContext()),
       MCA.getContext());
   TmpInst.addOperand(MCOperand::createExpr(HiSym));
   getStreamer().emitInstruction(TmpInst, STI);
@@ -1278,7 +1277,7 @@ void MipsTargetELFStreamer::emitDirectiveCpLoad(unsigned RegNo) {
   TmpInst.addOperand(MCOperand::createReg(GPReg));
   TmpInst.addOperand(MCOperand::createReg(GPReg));
   const MCExpr *LoSym = MipsMCExpr::create(
-      Mips::S_LO, MCSymbolRefExpr::create(GP_Disp, MCA.getContext()),
+      MipsMCExpr::MEK_LO, MCSymbolRefExpr::create(GP_Disp, MCA.getContext()),
       MCA.getContext());
   TmpInst.addOperand(MCOperand::createExpr(LoSym));
   getStreamer().emitInstruction(TmpInst, STI);
@@ -1343,10 +1342,10 @@ void MipsTargetELFStreamer::emitDirectiveCpsetup(unsigned RegNo,
   }
 
   const MipsMCExpr *HiExpr = MipsMCExpr::createGpOff(
-      Mips::S_HI, MCSymbolRefExpr::create(&Sym, MCA.getContext()),
+      MipsMCExpr::MEK_HI, MCSymbolRefExpr::create(&Sym, MCA.getContext()),
       MCA.getContext());
   const MipsMCExpr *LoExpr = MipsMCExpr::createGpOff(
-      Mips::S_LO, MCSymbolRefExpr::create(&Sym, MCA.getContext()),
+      MipsMCExpr::MEK_LO, MCSymbolRefExpr::create(&Sym, MCA.getContext()),
       MCA.getContext());
 
   // lui $gp, %hi(%neg(%gp_rel(funcSym)))

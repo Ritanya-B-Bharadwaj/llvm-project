@@ -17,7 +17,6 @@
 #include "llvm/MC/MCFixup.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/Support/Alignment.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/SMLoc.h"
 #include <cstdint>
 #include <utility>
@@ -79,7 +78,7 @@ protected:
   /// MCRelaxableFragment: x86-specific
   bool AllowAutoPadding : 1;
 
-  LLVM_ABI MCFragment(FragmentType Kind, bool HasInstructions);
+  MCFragment(FragmentType Kind, bool HasInstructions);
 
 public:
   MCFragment() = delete;
@@ -90,7 +89,7 @@ public:
   ///
   /// This must be used instead of delete as MCFragment is non-virtual.
   /// This method will dispatch to the appropriate subclass.
-  LLVM_ABI void destroy();
+  void destroy();
 
   MCFragment *getNext() const { return Next; }
 
@@ -99,7 +98,7 @@ public:
   MCSection *getParent() const { return Parent; }
   void setParent(MCSection *Value) { Parent = Value; }
 
-  LLVM_ABI const MCSymbol *getAtom() const;
+  const MCSymbol *getAtom() const;
 
   unsigned getLayoutOrder() const { return LayoutOrder; }
   void setLayoutOrder(unsigned Value) { LayoutOrder = Value; }
@@ -108,7 +107,7 @@ public:
   /// this is false, but specific fragment types may set it to true.
   bool hasInstructions() const { return HasInstructions; }
 
-  LLVM_ABI void dump() const;
+  void dump() const;
 };
 
 /// Interface implemented by fragments that contain encoded instructions and/or

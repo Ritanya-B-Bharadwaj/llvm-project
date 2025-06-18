@@ -1536,7 +1536,7 @@ public:
   static bool canInstrumentCallsite(const CallBase &CB) {
     return !CB.isInlineAsm() &&
            (CB.isIndirectCall() ||
-            (CB.getIntrinsicID() == Intrinsic::not_intrinsic));
+            (CB.getCalledFunction() && !CB.getCalledFunction()->isIntrinsic()));
   }
   LLVM_ABI Value *getCallee() const;
   LLVM_ABI void setCallee(Value *Callee);

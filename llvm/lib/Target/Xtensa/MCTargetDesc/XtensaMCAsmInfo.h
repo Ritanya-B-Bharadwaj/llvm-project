@@ -23,9 +23,6 @@ class Triple;
 class XtensaMCAsmInfo : public MCAsmInfoELF {
 public:
   explicit XtensaMCAsmInfo(const Triple &TT);
-
-  void printSpecifierExpr(raw_ostream &OS,
-                          const MCSpecifierExpr &Expr) const override;
 };
 
 } // namespace llvm

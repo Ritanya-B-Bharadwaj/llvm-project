@@ -32,8 +32,6 @@ public:
                                     unsigned Encoding,
                                     MCStreamer &Streamer) const override;
 
-  void printSpecifierExpr(raw_ostream &OS,
-                          const MCSpecifierExpr &Expr) const override;
 };
 
 } // end namespace llvm

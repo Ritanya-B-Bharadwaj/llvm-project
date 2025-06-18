@@ -99,7 +99,7 @@ void CodeGenSubRegIndex::updateComponents(CodeGenRegBank &RegBank) {
   if (!Parts.empty()) {
     if (Parts.size() < 2)
       PrintFatalError(TheDef->getLoc(),
-                      "CoveringSubRegIndices must have two or more entries");
+                      "CoveredBySubRegs must have two or more entries");
     SmallVector<CodeGenSubRegIndex *, 8> IdxParts;
     for (const Record *Part : Parts)
       IdxParts.push_back(RegBank.getSubRegIdx(Part));
@@ -466,7 +466,7 @@ void CodeGenRegister::computeSecondarySubRegs(CodeGenRegBank &RegBank) {
 
   std::queue<std::pair<CodeGenSubRegIndex *, CodeGenRegister *>> SubRegQueue;
   for (auto [SRI, SubReg] : SubRegs)
-    SubRegQueue.emplace(SRI, SubReg);
+    SubRegQueue.push({SRI, SubReg});
 
   // Look at the leading super-registers of each sub-register. Those are the
   // candidates for new sub-registers, assuming they are fully contained in
@@ -703,7 +703,7 @@ struct TupleExpander : SetTheory::Expander {
           RV.setValue(BitInit::get(RK, true));
 
         // Copy fields from the RegisterTuples def.
-        if (Field == "SubRegIndices") {
+        if (Field == "SubRegIndices" || Field == "CompositeIndices") {
           NewReg->addValue(*Def->getValue(Field));
           continue;
         }
@@ -933,7 +933,9 @@ bool CodeGenRegisterClass::Key::operator<(
 static bool testSubClass(const CodeGenRegisterClass *A,
                          const CodeGenRegisterClass *B) {
   return A->RSI.isSubClassOf(B->RSI) &&
-         llvm::includes(A->getMembers(), B->getMembers(), deref<std::less<>>());
+         std::includes(A->getMembers().begin(), A->getMembers().end(),
+                       B->getMembers().begin(), B->getMembers().end(),
+                       deref<std::less<>>());
 }
 
 /// Sorting predicate for register classes.  This provides a topological
@@ -1331,7 +1333,7 @@ CodeGenSubRegIndex *CodeGenRegBank::getSubRegIdx(const Record *Def) {
 
 const CodeGenSubRegIndex *
 CodeGenRegBank::findSubRegIdx(const Record *Def) const {
-  return Def2SubRegIdx.at(Def);
+  return Def2SubRegIdx.lookup(Def);
 }
 
 CodeGenRegister *CodeGenRegBank::getReg(const Record *Def) {
@@ -1459,7 +1461,7 @@ void CodeGenRegBank::computeComposites() {
   for (const CodeGenRegister &R : Registers) {
     const CodeGenRegister::SubRegMap &SM = R.getSubRegs();
     for (auto [SRI, SubReg] : SM)
-      SubRegAction[SRI].try_emplace(&R, SubReg);
+      SubRegAction[SRI].insert({&R, SubReg});
   }
 
   // Calculate the composition of two subregisters as compositions of their
@@ -1469,10 +1471,10 @@ void CodeGenRegBank::computeComposites() {
     RegMap C;
     const RegMap &Img1 = SubRegAction.at(Sub1);
     const RegMap &Img2 = SubRegAction.at(Sub2);
-    for (auto [R, SubReg] : Img1) {
+    for (auto [SRI, SubReg] : Img1) {
       auto F = Img2.find(SubReg);
       if (F != Img2.end())
-        C.try_emplace(R, F->second);
+        C.insert({SRI, F->second});
     }
     return C;
   };
@@ -1530,7 +1532,7 @@ void CodeGenRegBank::computeComposites() {
         if (CodeGenSubRegIndex *Prev =
                 Idx1->addComposite(Idx2, Idx3, getHwModes())) {
           // If the composition was not user-defined, always emit a warning.
-          if (!UserDefined.contains({Idx1, Idx2}) ||
+          if (!UserDefined.count({Idx1, Idx2}) ||
               agree(compose(Idx1, Idx2), SubRegAction.at(Idx3)))
             PrintWarning(Twine("SubRegIndex ") + Idx1->getQualifiedName() +
                          " and " + Idx2->getQualifiedName() +
@@ -1847,21 +1849,26 @@ static void computeUberWeights(MutableArrayRef<UberRegSet> UberSets,
   // Skip the first unallocatable set.
   for (UberRegSet &S : UberSets.drop_front()) {
     // Initialize all unit weights in this set, and remember the max units/reg.
-    unsigned MaxWeight = 0;
-    for (const CodeGenRegister *R : S.Regs) {
-      unsigned Weight = 0;
-      for (unsigned U : R->getRegUnits()) {
-        if (!RegBank.getRegUnit(U).Artificial) {
-          unsigned UWeight = RegBank.getRegUnit(U).Weight;
-          if (!UWeight) {
-            UWeight = 1;
-            RegBank.increaseRegUnitWeight(U, UWeight);
-          }
-          Weight += UWeight;
-        }
+    const CodeGenRegister *Reg = nullptr;
+    unsigned MaxWeight = 0, Weight = 0;
+    for (RegUnitIterator UnitI(S.Regs); UnitI.isValid(); ++UnitI) {
+      if (Reg != UnitI.getReg()) {
+        if (Weight > MaxWeight)
+          MaxWeight = Weight;
+        Reg = UnitI.getReg();
+        Weight = 0;
       }
-      MaxWeight = std::max(MaxWeight, Weight);
+      if (!RegBank.getRegUnit(*UnitI).Artificial) {
+        unsigned UWeight = RegBank.getRegUnit(*UnitI).Weight;
+        if (!UWeight) {
+          UWeight = 1;
+          RegBank.increaseRegUnitWeight(*UnitI, UWeight);
+        }
+        Weight += UWeight;
+      }
     }
+    if (Weight > MaxWeight)
+      MaxWeight = Weight;
     if (S.Weight != MaxWeight) {
       LLVM_DEBUG({
         dbgs() << "UberSet " << &S - UberSets.begin() << " Weight "
@@ -1988,7 +1995,8 @@ findRegUnitSet(const std::vector<RegUnitSet> &UniqueSets,
 // Return true if the RUSubSet is a subset of RUSuperSet.
 static bool isRegUnitSubSet(const std::vector<unsigned> &RUSubSet,
                             const std::vector<unsigned> &RUSuperSet) {
-  return llvm::includes(RUSuperSet, RUSubSet);
+  return std::includes(RUSuperSet.begin(), RUSuperSet.end(), RUSubSet.begin(),
+                       RUSubSet.end());
 }
 
 /// Iteratively prune unit sets. Prune subsets that are close to the superset,
@@ -2400,7 +2408,7 @@ void CodeGenRegBank::inferMatchingSuperRegClass(
     if (RC->getSubClassWithSubReg(SubIdx) != RC)
       continue;
 
-    if (ImpliedSubRegIndices.contains(SubIdx))
+    if (ImpliedSubRegIndices.count(SubIdx))
       continue;
 
     // Build list of (Sub, Super) pairs for this SubIdx, sorted by Sub. Note
@@ -2615,55 +2623,6 @@ CodeGenRegBank::getMinimalPhysRegClass(const Record *RegRecord,
   return BestRC;
 }
 
-const CodeGenRegisterClass *
-CodeGenRegBank::getSuperRegForSubReg(const ValueTypeByHwMode &ValueTy,
-                                     const CodeGenSubRegIndex *SubIdx,
-                                     bool MustBeAllocatable) const {
-  std::vector<const CodeGenRegisterClass *> Candidates;
-  auto &RegClasses = getRegClasses();
-
-  // Try to find a register class which supports ValueTy, and also contains
-  // SubIdx.
-  for (const CodeGenRegisterClass &RC : RegClasses) {
-    // Is there a subclass of this class which contains this subregister index?
-    const CodeGenRegisterClass *SubClassWithSubReg =
-        RC.getSubClassWithSubReg(SubIdx);
-    if (!SubClassWithSubReg)
-      continue;
-
-    // We have a class. Check if it supports this value type.
-    if (!llvm::is_contained(SubClassWithSubReg->VTs, ValueTy))
-      continue;
-
-    // If necessary, check that it is allocatable.
-    if (MustBeAllocatable && !SubClassWithSubReg->Allocatable)
-      continue;
-
-    // We have a register class which supports both the value type and
-    // subregister index. Remember it.
-    Candidates.push_back(SubClassWithSubReg);
-  }
-
-  // If we didn't find anything, we're done.
-  if (Candidates.empty())
-    return nullptr;
-
-  // Find and return the largest of our candidate classes.
-  llvm::stable_sort(Candidates, [&](const CodeGenRegisterClass *A,
-                                    const CodeGenRegisterClass *B) {
-    if (A->getMembers().size() > B->getMembers().size())
-      return true;
-
-    if (A->getMembers().size() < B->getMembers().size())
-      return false;
-
-    // Order by name as a tie-breaker.
-    return StringRef(A->getName()) < B->getName();
-  });
-
-  return Candidates[0];
-}
-
 BitVector
 CodeGenRegBank::computeCoveredRegisters(ArrayRef<const Record *> Regs) {
   SetVector<const CodeGenRegister *> Set;
@@ -2680,13 +2639,13 @@ CodeGenRegBank::computeCoveredRegisters(ArrayRef<const Record *> Regs) {
   // Second, find all super-registers that are completely covered by the set.
   for (unsigned i = 0; i != Set.size(); ++i) {
     for (const CodeGenRegister *Super : Set[i]->getSuperRegs()) {
-      if (!Super->CoveredBySubRegs || Set.contains(Super))
+      if (!Super->CoveredBySubRegs || Set.count(Super))
         continue;
       // This new super-register is covered by its sub-registers.
       bool AllSubsInSet = true;
       const CodeGenRegister::SubRegMap &SRM = Super->getSubRegs();
       for (auto [_, SR] : SRM)
-        if (!Set.contains(SR)) {
+        if (!Set.count(SR)) {
           AllSubsInSet = false;
           break;
         }

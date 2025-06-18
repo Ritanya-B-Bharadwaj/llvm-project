@@ -508,6 +508,7 @@ ExpandVariadics::replaceAllUsesWithNewDeclaration(Module &M,
   Function *NF = Function::Create(FTy, F.getLinkage(), F.getAddressSpace());
 
   NF->setName(F.getName() + ".varargs");
+  NF->IsNewDbgInfoFormat = F.IsNewDbgInfoFormat;
 
   F.getParent()->getFunctionList().insert(F.getIterator(), NF);
 
@@ -549,6 +550,7 @@ ExpandVariadics::deriveFixedArityReplacement(Module &M, IRBuilder<> &Builder,
   NF->setComdat(F.getComdat());
   F.getParent()->getFunctionList().insert(F.getIterator(), NF);
   NF->setName(F.getName() + ".valist");
+  NF->IsNewDbgInfoFormat = F.IsNewDbgInfoFormat;
 
   AttrBuilder ParamAttrs(Ctx);
 

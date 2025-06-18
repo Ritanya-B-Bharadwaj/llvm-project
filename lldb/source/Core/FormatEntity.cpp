@@ -124,7 +124,6 @@ constexpr Definition g_function_child_entries[] = {
     Definition("initial-function", EntryType::FunctionInitial),
     Definition("changed", EntryType::FunctionChanged),
     Definition("is-optimized", EntryType::FunctionIsOptimized),
-    Definition("is-inlined", EntryType::FunctionIsInlined),
     Definition("prefix", EntryType::FunctionPrefix),
     Definition("scope", EntryType::FunctionScope),
     Definition("basename", EntryType::FunctionBasename),
@@ -403,7 +402,6 @@ const char *FormatEntity::Entry::TypeToCString(Type t) {
     ENUM_TO_CSTR(FunctionInitial);
     ENUM_TO_CSTR(FunctionChanged);
     ENUM_TO_CSTR(FunctionIsOptimized);
-    ENUM_TO_CSTR(FunctionIsInlined);
     ENUM_TO_CSTR(LineEntryFile);
     ENUM_TO_CSTR(LineEntryLineNumber);
     ENUM_TO_CSTR(LineEntryColumn);
@@ -1281,13 +1279,13 @@ static bool FormatFunctionNameForLanguage(Stream &s,
   if (!language_plugin)
     return false;
 
-  FormatEntity::Entry format = language_plugin->GetFunctionNameFormat();
+  const auto *format = language_plugin->GetFunctionNameFormat();
   if (!format)
     return false;
 
   StreamString name_stream;
   const bool success =
-      FormatEntity::Format(format, name_stream, sc, exe_ctx, /*addr=*/nullptr,
+      FormatEntity::Format(*format, name_stream, sc, exe_ctx, /*addr=*/nullptr,
                            /*valobj=*/nullptr, /*function_changed=*/false,
                            /*initial_function=*/false);
   if (success)
@@ -1928,10 +1926,6 @@ bool FormatEntity::Format(const Entry &entry, Stream &s,
       is_optimized = true;
     }
     return is_optimized;
-  }
-
-  case Entry::Type::FunctionIsInlined: {
-    return sc && sc->block && sc->block->GetInlinedFunctionInfo();
   }
 
   case Entry::Type::FunctionInitial:

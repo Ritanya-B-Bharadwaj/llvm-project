@@ -92,7 +92,7 @@ protected:
   lldb::ValueObjectSP
   CreateValueObjectFromAddress(llvm::StringRef name, uint64_t address,
                                const ExecutionContext &exe_ctx,
-                               CompilerType type, bool do_deref = true);
+                               CompilerType type);
 
   lldb::ValueObjectSP CreateValueObjectFromData(llvm::StringRef name,
                                                 const DataExtractor &data,

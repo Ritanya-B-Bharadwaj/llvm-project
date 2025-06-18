@@ -32,13 +32,13 @@
 
 using namespace llvm;
 
-static Xtensa::Specifier
+static XtensaMCExpr::Specifier
 getModifierSpecifier(XtensaCP::XtensaCPModifier Modifier) {
   switch (Modifier) {
   case XtensaCP::no_modifier:
-    return Xtensa::S_None;
+    return XtensaMCExpr::VK_None;
   case XtensaCP::TPOFF:
-    return Xtensa::S_TPOFF;
+    return XtensaMCExpr::VK_TPOFF;
   }
   report_fatal_error("Invalid XtensaCPModifier!");
 }
@@ -92,7 +92,7 @@ void XtensaAsmPrinter::emitMachineConstantPoolValue(
   MCSymbol *LblSym = GetCPISymbol(ACPV->getLabelId());
   auto *TS =
       static_cast<XtensaTargetStreamer *>(OutStreamer->getTargetStreamer());
-  auto Spec = getModifierSpecifier(ACPV->getModifier());
+  XtensaMCExpr::Specifier VK = getModifierSpecifier(ACPV->getModifier());
 
   if (ACPV->getModifier() != XtensaCP::no_modifier) {
     std::string SymName(MCSym->getName());
@@ -101,7 +101,7 @@ void XtensaAsmPrinter::emitMachineConstantPoolValue(
     MCSym = OutContext.getOrCreateSymbol(SymName);
   }
 
-  const MCExpr *Expr = MCSymbolRefExpr::create(MCSym, Spec, OutContext);
+  const MCExpr *Expr = MCSymbolRefExpr::create(MCSym, VK, OutContext);
   TS->emitLiteral(LblSym, Expr, false);
 }
 
@@ -227,6 +227,8 @@ XtensaAsmPrinter::LowerSymbolOperand(const MachineOperand &MO,
                                      MachineOperand::MachineOperandType MOTy,
                                      unsigned Offset) const {
   const MCSymbol *Symbol;
+  XtensaMCExpr::Specifier Kind = XtensaMCExpr::VK_None;
+
   switch (MOTy) {
   case MachineOperand::MO_GlobalAddress:
     Symbol = getSymbol(MO.getGlobal());
@@ -255,6 +257,8 @@ XtensaAsmPrinter::LowerSymbolOperand(const MachineOperand &MO,
   }
 
   const MCExpr *ME = MCSymbolRefExpr::create(Symbol, OutContext);
+  ME = XtensaMCExpr::create(ME, Kind, OutContext);
+
   if (Offset) {
     // Assume offset is never negative.
     assert(Offset > 0);

@@ -140,13 +140,6 @@ public:
     }
   }
 
-  void HandleTagDeclDefinition(TagDecl *D) override {
-    PrettyStackTraceDecl CrashInfo(D, SourceLocation(),
-                                   Context->getSourceManager(),
-                                   "CIR generation of declaration");
-    Gen->HandleTagDeclDefinition(D);
-  }
-
   void CompleteTentativeDefinition(VarDecl *D) override {
     Gen->CompleteTentativeDefinition(D);
   }

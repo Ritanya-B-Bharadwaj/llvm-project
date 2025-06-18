@@ -45,22 +45,20 @@ private:
 
     bool Pre(const parser::OpenMPConstruct &omp) {
       // Skip constructs that may not have privatizations.
-      if (isOpenMPPrivatizingConstruct(omp))
-        constructs.push_back(&omp);
+      if (!std::holds_alternative<parser::OpenMPCriticalConstruct>(omp.u))
+        currentConstruct = &omp;
       return true;
     }
 
     void Post(const parser::OpenMPConstruct &omp) {
-      if (isOpenMPPrivatizingConstruct(omp))
-        constructs.pop_back();
+      currentConstruct = nullptr;
     }
 
     void Post(const parser::Name &name) {
-      auto *current = !constructs.empty() ? constructs.back() : nullptr;
-      symDefMap.try_emplace(name.symbol, current);
+      symDefMap.try_emplace(name.symbol, currentConstruct);
     }
 
-    llvm::SmallVector<const parser::OpenMPConstruct *> constructs;
+    const parser::OpenMPConstruct *currentConstruct = nullptr;
     llvm::DenseMap<semantics::Symbol *, const parser::OpenMPConstruct *>
         symDefMap;
 
@@ -114,9 +112,6 @@ private:
   void copyLastPrivateSymbol(const semantics::Symbol *sym,
                              mlir::OpBuilder::InsertPoint *lastPrivIP);
   void insertDeallocs();
-
-  static bool isOpenMPPrivatizingConstruct(const parser::OpenMPConstruct &omp);
-  bool isOpenMPPrivatizingEvaluation(const pft::Evaluation &eval) const;
 
 public:
   DataSharingProcessor(lower::AbstractConverter &converter,

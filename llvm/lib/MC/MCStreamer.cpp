@@ -72,7 +72,7 @@ void MCTargetStreamer::emitValue(const MCExpr *Value) {
   SmallString<128> Str;
   raw_svector_ostream OS(Str);
 
-  Streamer.getContext().getAsmInfo()->printExpr(OS, *Value);
+  Value->print(OS, Streamer.getContext().getAsmInfo());
   Streamer.emitRawText(OS.str());
 }
 
@@ -1185,10 +1185,6 @@ void MCStreamer::visitUsedExpr(const MCExpr &Expr) {
 
   case MCExpr::Unary:
     visitUsedExpr(*cast<MCUnaryExpr>(Expr).getSubExpr());
-    break;
-
-  case MCExpr::Specifier:
-    visitUsedExpr(*cast<MCSpecifierExpr>(Expr).getSubExpr());
     break;
   }
 }

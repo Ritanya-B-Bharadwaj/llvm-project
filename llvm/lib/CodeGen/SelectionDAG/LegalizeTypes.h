@@ -651,7 +651,6 @@ private:
   SDValue SoftenFloatOp_STORE(SDNode *N, unsigned OpNo);
   SDValue SoftenFloatOp_ATOMIC_STORE(SDNode *N, unsigned OpNo);
   SDValue SoftenFloatOp_FCOPYSIGN(SDNode *N);
-  SDValue SoftenFloatOp_FAKE_USE(SDNode *N);
 
   //===--------------------------------------------------------------------===//
   // Float Expansion Support: LegalizeFloatTypes.cpp

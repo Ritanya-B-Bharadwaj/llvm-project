@@ -140,12 +140,6 @@ def SharedVar : SubsetSubject<Var,
                               [{S->hasGlobalStorage() && !S->getTLSKind()}],
                               "global variables">;
 
-def HLSLInputBuiltin
-    : SubsetSubject<Var, [{S->hasGlobalStorage() &&
-                           S->getStorageClass() == StorageClass::SC_Static &&
-                           S->getType().isConstQualified()}],
-                    "static const globals">;
-
 def GlobalVar : SubsetSubject<Var,
                              [{S->hasGlobalStorage()}], "global variables">;
 
@@ -196,10 +190,8 @@ def FunctionPointer : SubsetSubject<DeclBase,
                                     "functions pointers">;
 
 def OpenCLKernelFunction
-    : SubsetSubject<Function, [{S->getASTContext().getLangOpts().OpenCL &&
-                               DeviceKernelAttr::isOpenCLSpelling(
-			                 S->getAttr<DeviceKernelAttr>()}],
-                               "kernel functions">;
+    : SubsetSubject<Function, [{S->hasAttr<OpenCLKernelAttr>()}],
+                    "kernel functions">;
 
 // HasFunctionProto is a more strict version of FunctionLike, so it should
 // never be specified in a Subjects list along with FunctionLike (due to the
@@ -1111,8 +1103,6 @@ static llvm::StringRef canonicalizePlatformName(llvm::StringRef Platform) {
     return llvm::StringSwitch<llvm::StringRef>(Platform)
              .Case("iOS", "ios")
              .Case("macOS", "macos")
-             .Case("macOSX", "macos")
-             .Case("macosx", "macos")
              .Case("tvOS", "tvos")
              .Case("watchOS", "watchos")
              .Case("iOSApplicationExtension", "ios_app_extension")
@@ -1177,26 +1167,6 @@ static llvm::Triple::EnvironmentType getEnvironmentType(llvm::StringRef Environm
              .Case("library", llvm::Triple::Library)
              .Default(llvm::Triple::UnknownEnvironment);
 }
-
-static llvm::Triple::OSType getOSType(llvm::StringRef Platform) {
-    using OSType = llvm::Triple::OSType;
-    return llvm::StringSwitch<OSType>(Platform)
-             .Case("ios", OSType::IOS)
-             .Case("macos", OSType::MacOSX)
-             .Case("maccatalyst", OSType::IOS)
-             .Case("tvos", OSType::TvOS)
-             .Case("watchos", OSType::WatchOS)
-             .Case("bridgeos", OSType::BridgeOS)
-             .Case("ios_app_extension", OSType::IOS)
-             .Case("maccatalyst_app_extension", OSType::IOS)
-             .Case("macos_app_extension", OSType::MacOSX)
-             .Case("tvos_app_extension", OSType::TvOS)
-             .Case("watchos_app_extension", OSType::WatchOS)
-             .Case("xros", OSType::XROS)
-             .Case("xros_app_extension", OSType::XROS)
-             .Default(OSType::UnknownOS);
-}
-
 }];
   let HasCustomParsing = 1;
   let InheritEvenIfAlreadyPresent = 1;
@@ -1539,6 +1509,12 @@ def CUDAGridConstant : InheritableAttr {
   let Documentation = [CUDAGridConstantAttrDocs];
 }
 
+def NVPTXKernel : InheritableAttr, TargetSpecificAttr<TargetNVPTX> {
+  let Spellings = [Clang<"nvptx_kernel">];
+  let Subjects = SubjectList<[Function]>;
+  let Documentation = [Undocumented];
+}
+
 def HIPManaged : InheritableAttr {
   let Spellings = [GNU<"managed">, Declspec<"__managed__">];
   let Subjects = SubjectList<[Var]>;
@@ -1573,52 +1549,11 @@ def CUDAShared : InheritableAttr {
 }
 def : MutualExclusions<[CUDAConstant, CUDAShared, HIPManaged]>;
 
-def DeviceKernel : DeclOrTypeAttr {
-  let Spellings = [Clang<"device_kernel">, Clang<"sycl_kernel">,
-                   Clang<"nvptx_kernel">, Clang<"amdgpu_kernel">,
-                   CustomKeyword<"__kernel">, CustomKeyword<"kernel">];
-  let Documentation = [DeviceKernelDocs];
-  let AdditionalMembers =
-  [{
-    static inline bool isAMDGPUSpelling(const AttributeCommonInfo& A) {
-      return A.getAttributeSpellingListIndex() == GNU_amdgpu_kernel ||
-             A.getAttributeSpellingListIndex() == CXX11_clang_amdgpu_kernel ||
-             A.getAttributeSpellingListIndex() == C23_clang_amdgpu_kernel;
-    }
-    static inline bool isAMDGPUSpelling(const AttributeCommonInfo* A) {
-      if(!A) return false;
-      return isAMDGPUSpelling(*A);
-    }
-    static inline bool isNVPTXSpelling(const AttributeCommonInfo& A) {
-      return A.getAttributeSpellingListIndex() == GNU_nvptx_kernel ||
-             A.getAttributeSpellingListIndex() == CXX11_clang_nvptx_kernel ||
-             A.getAttributeSpellingListIndex() == C23_clang_nvptx_kernel;
-    }
-    static inline bool isNVPTXSpelling(const AttributeCommonInfo* A) {
-      if(!A) return false;
-      return isNVPTXSpelling(*A);
-    }
-    static inline bool isSYCLSpelling(const AttributeCommonInfo& A) {
-      return A.getAttributeSpellingListIndex() == GNU_sycl_kernel ||
-             A.getAttributeSpellingListIndex() == CXX11_clang_sycl_kernel ||
-             A.getAttributeSpellingListIndex() == C23_clang_sycl_kernel;
-    }
-    static inline bool isSYCLSpelling(const AttributeCommonInfo* A) {
-      if(!A) return false;
-      return isSYCLSpelling(*A);
-    }
-    static inline bool isOpenCLSpelling(const AttributeCommonInfo& A) {
-    // Tablegen trips underscores from spellings to build the spelling
-    // list, but here we have the same spelling with unscores and without,
-    // so handle that case manually.
-      return A.getAttributeSpellingListIndex() == Keyword_kernel ||
-      (A.getAttrName() && A.getAttrName()->getName() == "kernel");
-    }
-    static inline bool isOpenCLSpelling(const AttributeCommonInfo* A) {
-      if (!A) return false;
-      return isOpenCLSpelling(*A);
-    }
-}];
+def SYCLKernel : InheritableAttr {
+  let Spellings = [Clang<"sycl_kernel">];
+  let Subjects = SubjectList<[FunctionTmpl]>;
+  let LangOpts = [SYCLDevice];
+  let Documentation = [SYCLKernelDocs];
 }
 
 def SYCLKernelEntryPoint : InheritableAttr {
@@ -1682,6 +1617,15 @@ def Blocking : TypeAttr {
 def Allocating : TypeAttr {
   let Spellings = [Clang<"allocating">];
   let Documentation = [AllocatingDocs];
+}
+
+// Similar to CUDA, OpenCL attributes do not receive a [[]] spelling because
+// the specification does not expose them with one currently.
+def OpenCLKernel : InheritableAttr {
+  let Spellings = [CustomKeyword<"__kernel">, CustomKeyword<"kernel">];
+  let Subjects = SubjectList<[Function], ErrorDiag>;
+  let Documentation = [Undocumented];
+  let SimpleHandler = 1;
 }
 
 def OpenCLUnrollHint : StmtAttr {
@@ -2418,6 +2362,11 @@ def AMDGPUMaxNumWorkGroups : InheritableAttr {
   let Args = [ExprArgument<"MaxNumWorkGroupsX">, ExprArgument<"MaxNumWorkGroupsY", 1>, ExprArgument<"MaxNumWorkGroupsZ", 1>];
   let Documentation = [AMDGPUMaxNumWorkGroupsDocs];
   let Subjects = SubjectList<[Function], ErrorDiag, "kernel functions">;
+}
+
+def AMDGPUKernelCall : DeclOrTypeAttr {
+  let Spellings = [Clang<"amdgpu_kernel">];
+  let Documentation = [Undocumented];
 }
 
 def BPFPreserveAccessIndex : InheritableAttr,
@@ -3160,11 +3109,6 @@ def SwiftVersionedRemoval : Attr {
 def NoDeref : TypeAttr {
   let Spellings = [Clang<"noderef">];
   let Documentation = [NoDerefDocs];
-}
-
-def CFIUncheckedCallee : TypeAttr {
-  let Spellings = [Clang<"cfi_unchecked_callee">];
-  let Documentation = [CFIUncheckedCalleeDocs];
 }
 
 def ReqdWorkGroupSize : InheritableAttr {
@@ -4630,7 +4574,6 @@ def OMPDeclareVariant : InheritableAttr {
     OMPTraitInfoArgument<"TraitInfos">,
     VariadicExprArgument<"AdjustArgsNothing">,
     VariadicExprArgument<"AdjustArgsNeedDevicePtr">,
-    VariadicExprArgument<"AdjustArgsNeedDeviceAddr">,
     VariadicOMPInteropInfoArgument<"AppendArgs">,
   ];
   let AdditionalMembers = [{
@@ -4902,13 +4845,6 @@ def HLSLResourceBinding: InheritableAttr {
   }];
 }
 
-def HLSLSV_Position : HLSLAnnotationAttr {
-  let Spellings = [HLSLAnnotation<"sv_position">];
-  let Subjects = SubjectList<[ParmVar, Field]>;
-  let LangOpts = [HLSL];
-  let Documentation = [HLSLSV_PositionDocs];
-}
-
 def HLSLPackOffset: HLSLAnnotationAttr {
   let Spellings = [HLSLAnnotation<"packoffset">];
   let LangOpts = [HLSL];
@@ -5013,14 +4949,6 @@ def HLSLWaveSize: InheritableAttr {
       int getSpelledArgsCount() const { return SpelledArgsCount; }
   }];
   let Documentation = [WaveSizeDocs];
-}
-
-def HLSLVkExtBuiltinInput : InheritableAttr {
-  let Spellings = [CXX11<"vk", "ext_builtin_input">];
-  let Args = [UnsignedArgument<"BuiltIn">];
-  let Subjects = SubjectList<[HLSLInputBuiltin], ErrorDiag>;
-  let LangOpts = [HLSL];
-  let Documentation = [HLSLVkExtBuiltinInputDocs];
 }
 
 def RandomizeLayout : InheritableAttr {

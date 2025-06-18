@@ -2622,9 +2622,8 @@ void CoverageMappingModuleGen::emit() {
   CGM.addUsedGlobal(CovData);
   // Create the deferred function records array
   if (!FunctionNames.empty()) {
-    auto AddrSpace = FunctionNames.front()->getType()->getPointerAddressSpace();
-    auto NamesArrTy = llvm::ArrayType::get(
-        llvm::PointerType::get(Ctx, AddrSpace), FunctionNames.size());
+    auto NamesArrTy = llvm::ArrayType::get(llvm::PointerType::getUnqual(Ctx),
+                                           FunctionNames.size());
     auto NamesArrVal = llvm::ConstantArray::get(NamesArrTy, FunctionNames);
     // This variable will *NOT* be emitted to the object file. It is used
     // to pass the list of names referenced to codegen.

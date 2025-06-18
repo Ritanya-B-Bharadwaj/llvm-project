@@ -695,12 +695,10 @@ void MCAsmStreamer::emitAssignment(MCSymbol *Symbol, const MCExpr *Value) {
     if (E->inlineAssignedExpr())
       EmitSet = false;
   if (EmitSet) {
-    bool UseSet = MAI->usesSetToEquateSymbol();
-    if (UseSet)
-      OS << ".set ";
+    OS << ".set ";
     Symbol->print(OS, MAI);
-    OS << (UseSet ? ", " : " = ");
-    MAI->printExpr(OS, *Value);
+    OS << ", ";
+    Value->print(OS, MAI);
 
     EmitEOL();
   }
@@ -713,7 +711,7 @@ void MCAsmStreamer::emitConditionalAssignment(MCSymbol *Symbol,
   OS << ".lto_set_conditional ";
   Symbol->print(OS, MAI);
   OS << ", ";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   EmitEOL();
 }
 
@@ -1065,7 +1063,7 @@ void MCAsmStreamer::emitELFSize(MCSymbol *Symbol, const MCExpr *Value) {
   OS << "\t.size\t";
   Symbol->print(OS, MAI);
   OS << ", ";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   EmitEOL();
 }
 
@@ -1399,7 +1397,7 @@ void MCAsmStreamer::emitValueImpl(const MCExpr *Value, unsigned Size,
   if (MCTargetStreamer *TS = getTargetStreamer()) {
     TS->emitValue(Value);
   } else {
-    MAI->printExpr(OS, *Value);
+    Value->print(OS, MAI);
     EmitEOL();
   }
 }
@@ -1411,7 +1409,7 @@ void MCAsmStreamer::emitULEB128Value(const MCExpr *Value) {
     return;
   }
   OS << "\t.uleb128 ";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   EmitEOL();
 }
 
@@ -1422,7 +1420,7 @@ void MCAsmStreamer::emitSLEB128Value(const MCExpr *Value) {
     return;
   }
   OS << "\t.sleb128 ";
-  MAI->printExpr(OS, *Value);
+  Value->print(OS, MAI);
   EmitEOL();
 }
 
@@ -1437,7 +1435,7 @@ void MCAsmStreamer::emitFill(const MCExpr &NumBytes, uint64_t FillValue,
     if (!MAI->isAIX() || FillValue == 0) {
       // FIXME: Emit location directives
       OS << ZeroDirective;
-      MAI->printExpr(OS, NumBytes);
+      NumBytes.print(OS, MAI);
       if (FillValue != 0)
         OS << ',' << (int)FillValue;
       EmitEOL();
@@ -1460,7 +1458,7 @@ void MCAsmStreamer::emitFill(const MCExpr &NumValues, int64_t Size,
                              int64_t Expr, SMLoc Loc) {
   // FIXME: Emit location directives
   OS << "\t.fill\t";
-  MAI->printExpr(OS, NumValues);
+  NumValues.print(OS, MAI);
   OS << ", " << Size << ", 0x";
   OS.write_hex(truncateToSize(Expr, 4));
   EmitEOL();
@@ -1558,7 +1556,7 @@ void MCAsmStreamer::emitValueToOffset(const MCExpr *Offset,
                                       SMLoc Loc) {
   // FIXME: Verify that Offset is associated with the current section.
   OS << ".org ";
-  MAI->printExpr(OS, *Offset);
+  Offset->print(OS, MAI);
   OS << ", " << (unsigned)Value;
   EmitEOL();
 }
@@ -2417,7 +2415,7 @@ void MCAsmStreamer::AddEncodingComment(const MCInst &Inst,
     MCFixup &F = Fixups[i];
     OS << "  fixup " << char('A' + i) << " - "
        << "offset: " << F.getOffset() << ", value: ";
-    MAI->printExpr(OS, *F.getValue());
+    F.getValue()->print(OS, MAI);
     auto Kind = F.getKind();
     if (mc::isRelocation(Kind))
       OS << ", relocation type: " << Kind;
@@ -2496,11 +2494,11 @@ MCAsmStreamer::emitRelocDirective(const MCExpr &Offset, StringRef Name,
                                   const MCExpr *Expr, SMLoc,
                                   const MCSubtargetInfo &STI) {
   OS << "\t.reloc ";
-  MAI->printExpr(OS, Offset);
+  Offset.print(OS, MAI);
   OS << ", " << Name;
   if (Expr) {
     OS << ", ";
-    MAI->printExpr(OS, *Expr);
+    Expr->print(OS, MAI);
   }
   EmitEOL();
   return std::nullopt;

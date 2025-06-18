@@ -19,10 +19,12 @@ LLVM_LIBC_FUNCTION(int, wcscmp, (const wchar_t *left, const wchar_t *right)) {
   LIBC_CRASH_ON_NULLPTR(left);
   LIBC_CRASH_ON_NULLPTR(right);
 
-  for (; *left && (*left == *right); ++left, ++right)
+  auto comp = [](wchar_t l, wchar_t r) -> int { return l - r; };
+
+  for (; *left && !comp(*left, *right); ++left, ++right)
     ;
 
-  return *left - *right;
+  return comp(*left, *right);
 }
 
 } // namespace LIBC_NAMESPACE_DECL

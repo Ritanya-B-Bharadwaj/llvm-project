@@ -8,7 +8,6 @@
 
 #include "AVRMCExpr.h"
 
-#include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCStreamer.h"
@@ -45,7 +44,7 @@ void AVRMCExpr::printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const {
   OS << getName() << '(';
   if (isNegated())
     OS << '-' << '(';
-  MAI->printExpr(OS, *getSubExpr());
+  getSubExpr()->print(OS, MAI);
   if (isNegated())
     OS << ')';
   OS << ')';
@@ -70,7 +69,8 @@ bool AVRMCExpr::evaluateAsConstant(int64_t &Result) const {
 bool AVRMCExpr::evaluateAsRelocatableImpl(MCValue &Result,
                                           const MCAssembler *Asm) const {
   MCValue Value;
-  bool isRelocatable = getSubExpr()->evaluateAsRelocatable(Value, Asm);
+  bool isRelocatable = SubExpr->evaluateAsRelocatable(Value, Asm);
+
   if (!isRelocatable)
     return false;
 
@@ -185,6 +185,10 @@ AVR::Fixups AVRMCExpr::getFixupKind() const {
   }
 
   return Kind;
+}
+
+void AVRMCExpr::visitUsedExpr(MCStreamer &Streamer) const {
+  Streamer.visitUsedExpr(*getSubExpr());
 }
 
 const char *AVRMCExpr::getName() const {

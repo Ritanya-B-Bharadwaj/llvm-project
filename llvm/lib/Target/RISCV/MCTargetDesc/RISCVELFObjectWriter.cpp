@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/RISCVFixupKinds.h"
-#include "MCTargetDesc/RISCVMCAsmInfo.h"
+#include "MCTargetDesc/RISCVMCExpr.h"
 #include "MCTargetDesc/RISCVMCTargetDesc.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCELFObjectWriter.h"
@@ -48,8 +48,9 @@ RISCVELFObjectWriter::~RISCVELFObjectWriter() = default;
 unsigned RISCVELFObjectWriter::getRelocType(const MCFixup &Fixup,
                                             const MCValue &Target,
                                             bool IsPCRel) const {
+  const MCExpr *Expr = Fixup.getValue();
   unsigned Kind = Fixup.getTargetKind();
-  auto Spec = Target.getSpecifier();
+  auto Spec = RISCVMCExpr::Specifier(Target.getSpecifier());
   switch (Spec) {
   case ELF::R_RISCV_TPREL_HI20:
   case ELF::R_RISCV_TLS_GOT_HI20:
@@ -62,7 +63,7 @@ unsigned RISCVELFObjectWriter::getRelocType(const MCFixup &Fixup,
   case ELF::R_RISCV_GOT32_PCREL:
     if (Kind == FK_Data_4)
       break;
-    reportError(Fixup.getLoc(), "%" + RISCV::getSpecifierName(Spec) +
+    reportError(Fixup.getLoc(), "%" + RISCVMCExpr::getSpecifierName(Spec) +
                                     " can only be used in a .word directive");
     return ELF::R_RISCV_NONE;
   default:
@@ -118,11 +119,14 @@ unsigned RISCVELFObjectWriter::getRelocType(const MCFixup &Fixup,
     reportError(Fixup.getLoc(), "2-byte data relocations not supported");
     return ELF::R_RISCV_NONE;
   case FK_Data_4:
-    switch (Spec) {
-    case ELF::R_RISCV_32_PCREL:
-    case ELF::R_RISCV_GOT32_PCREL:
-    case ELF::R_RISCV_PLT32:
-      return Spec;
+    if (Expr->getKind() == MCExpr::Target) {
+      auto Spec = cast<RISCVMCExpr>(Expr)->getSpecifier();
+      switch (Spec) {
+      case ELF::R_RISCV_32_PCREL:
+      case ELF::R_RISCV_GOT32_PCREL:
+      case ELF::R_RISCV_PLT32:
+        return Spec;
+      }
     }
     return ELF::R_RISCV_32;
   case FK_Data_8:

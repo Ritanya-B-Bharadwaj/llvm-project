@@ -8,7 +8,6 @@
 
 #include "MCTargetDesc/LoongArchBaseInfo.h"
 #include "MCTargetDesc/LoongArchInstPrinter.h"
-#include "MCTargetDesc/LoongArchMCAsmInfo.h"
 #include "MCTargetDesc/LoongArchMCExpr.h"
 #include "MCTargetDesc/LoongArchMCTargetDesc.h"
 #include "MCTargetDesc/LoongArchMatInt.h"
@@ -756,7 +755,7 @@ LoongArchAsmParser::parseOperandWithModifier(OperandVector &Operands) {
   if (getLexer().getKind() != AsmToken::Identifier)
     return Error(getLoc(), "expected valid identifier for operand modifier");
   StringRef Identifier = getParser().getTok().getIdentifier();
-  auto VK = LoongArch::parseSpecifier(Identifier);
+  LoongArchMCExpr::Specifier VK = LoongArchMCExpr::parseSpecifier(Identifier);
   if (VK == LoongArchMCExpr::VK_None)
     return Error(getLoc(), "invalid relocation specifier");
 

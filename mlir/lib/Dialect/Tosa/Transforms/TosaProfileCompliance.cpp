@@ -215,8 +215,15 @@ LogicalResult ProfileInfoDepot::populateProfileInfo(tosa::MatMulOp op) {
 
 template <>
 LogicalResult ProfileInfoDepot::populateProfileInfo(tosa::VariableOp op) {
-  addType(op.getType());
-  return success();
+  ::mlir::Attribute attr = op.getInitialValueAttr();
+  if (attr == nullptr)
+    return failure();
+
+  if (auto typedAttr = dyn_cast<TypedAttr>(attr)) {
+    addType(getElementTypeOrSelf(typedAttr));
+    return success();
+  }
+  return failure();
 }
 
 template <>

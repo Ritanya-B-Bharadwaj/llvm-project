@@ -1137,7 +1137,7 @@ static void cloneInstructionsIntoPredecessorBlockAndUpdateSSAUses(
         // branch, drop it. When we fold the bonus instructions we want to make
         // sure we reset their debug locations in order to avoid stepping on
         // dead code caused by folding dead branches.
-        NewBonusInst->setDebugLoc(DebugLoc::getDropped());
+        NewBonusInst->setDebugLoc(DebugLoc());
       } else if (const DebugLoc &DL = NewBonusInst->getDebugLoc()) {
         mapAtomInstance(DL, VMap);
       }
@@ -2095,11 +2095,11 @@ bool SimplifyCFGOpt::hoistSuccIdenticalTerminatorToSwitchOrIf(
 
   // Ensure terminator gets a debug location, even an unknown one, in case
   // it involves inlinable calls.
-  SmallVector<DebugLoc, 4> Locs;
+  SmallVector<DILocation *, 4> Locs;
   Locs.push_back(I1->getDebugLoc());
   for (auto *OtherSuccTI : OtherSuccTIs)
     Locs.push_back(OtherSuccTI->getDebugLoc());
-  NT->setDebugLoc(DebugLoc::getMergedLocations(Locs));
+  NT->setDebugLoc(DILocation::getMergedLocations(Locs));
 
   // PHIs created below will adopt NT's merged DebugLoc.
   IRBuilder<NoFolder> Builder(NT);
@@ -2821,8 +2821,7 @@ static void mergeCompatibleInvokesImpl(ArrayRef<InvokeInst *> Invokes,
       // so just form a new block with unreachable terminator.
       BasicBlock *MergedNormalDest = BasicBlock::Create(
           Ctx, II0BB->getName() + ".cont", Func, InsertBeforeBlock);
-      auto *UI = new UnreachableInst(Ctx, MergedNormalDest);
-      UI->setDebugLoc(DebugLoc::getTemporary());
+      new UnreachableInst(Ctx, MergedNormalDest);
       MergedInvoke->setNormalDest(MergedNormalDest);
     }
 
@@ -2896,7 +2895,7 @@ static void mergeCompatibleInvokesImpl(ArrayRef<InvokeInst *> Invokes,
       MergedDebugLoc = II->getDebugLoc();
     else
       MergedDebugLoc =
-          DebugLoc::getMergedLocation(MergedDebugLoc, II->getDebugLoc());
+          DILocation::getMergedLocation(MergedDebugLoc, II->getDebugLoc());
 
     // And replace the old `invoke` with an unconditionally branch
     // to the block with the merged `invoke`.
@@ -3390,7 +3389,7 @@ bool SimplifyCFGOpt::speculativelyExecuteBB(BranchInst *BI,
     if (!SpeculatedStoreValue || &I != SpeculatedStore) {
       // Don't update the DILocation of dbg.assign intrinsics.
       if (!isa<DbgAssignIntrinsic>(&I))
-        I.setDebugLoc(DebugLoc::getDropped());
+        I.setDebugLoc(DebugLoc());
     }
     I.dropUBImplyingAttrsAndMetadata();
 
@@ -4055,11 +4054,13 @@ static bool performBranchToCommonDestFolding(BranchInst *BI, BranchInst *PBI,
 
   Module *M = BB->getModule();
 
-  PredBlock->getTerminator()->cloneDebugInfoFrom(BB->getTerminator());
-  for (DbgVariableRecord &DVR :
-       filterDbgVars(PredBlock->getTerminator()->getDbgRecordRange())) {
-    RemapDbgRecord(M, &DVR, VMap,
-                   RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  if (PredBlock->IsNewDbgInfoFormat) {
+    PredBlock->getTerminator()->cloneDebugInfoFrom(BB->getTerminator());
+    for (DbgVariableRecord &DVR :
+         filterDbgVars(PredBlock->getTerminator()->getDbgRecordRange())) {
+      RemapDbgRecord(M, &DVR, VMap,
+                     RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+    }
   }
 
   // Now that the Cond was cloned into the predecessor basic block,
@@ -5706,8 +5707,7 @@ static void createUnreachableSwitchDefault(SwitchInst *Switch,
   BasicBlock *NewDefaultBlock = BasicBlock::Create(
       BB->getContext(), BB->getName() + ".unreachabledefault", BB->getParent(),
       OrigDefaultBlock);
-  auto *UI = new UnreachableInst(Switch->getContext(), NewDefaultBlock);
-  UI->setDebugLoc(DebugLoc::getTemporary());
+  new UnreachableInst(Switch->getContext(), NewDefaultBlock);
   Switch->setDefaultDest(&*NewDefaultBlock);
   if (DTU) {
     SmallVector<DominatorTree::UpdateType, 2> Updates;
@@ -5854,13 +5854,13 @@ static bool eliminateDeadSwitchCases(SwitchInst *SI, DomTreeUpdater *DTU,
                                      AssumptionCache *AC,
                                      const DataLayout &DL) {
   Value *Cond = SI->getCondition();
-  KnownBits Known = computeKnownBits(Cond, DL, AC, SI);
+  KnownBits Known = computeKnownBits(Cond, DL, 0, AC, SI);
 
   // We can also eliminate cases by determining that their values are outside of
   // the limited range of the condition based on how many significant (non-sign)
   // bits are in the condition value.
   unsigned MaxSignificantBitsInCond =
-      ComputeMaxSignificantBits(Cond, DL, AC, SI);
+      ComputeMaxSignificantBits(Cond, DL, 0, AC, SI);
 
   // Gather dead cases.
   SmallVector<ConstantInt *, 8> DeadCases;
@@ -8108,7 +8108,6 @@ bool SimplifyCFGOpt::simplifyCondBranch(BranchInst *BI, IRBuilder<> &Builder) {
 
 /// Check if passing a value to an instruction will cause undefined behavior.
 static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValueMayBeModified) {
-  assert(V->getType() == I->getType() && "Mismatched types");
   Constant *C = dyn_cast<Constant>(V);
   if (!C)
     return false;
@@ -8166,10 +8165,6 @@ static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValu
     // Look through GEPs. A load from a GEP derived from NULL is still undefined
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(User))
       if (GEP->getPointerOperand() == I) {
-        // The type of GEP may differ from the type of base pointer.
-        // Bail out on vector GEPs, as they are not handled by other checks.
-        if (GEP->getType()->isVectorTy())
-          return false;
         // The current base address is null, there are four cases to consider:
         // getelementptr (TY, null, 0)                 -> null
         // getelementptr (TY, null, not zero)          -> may be modified

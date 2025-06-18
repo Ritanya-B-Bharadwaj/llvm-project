@@ -78,13 +78,6 @@ public:
   static bool checkPerfDataMagic(StringRef FileName);
 
 private:
-  struct LBREntry {
-    uint64_t From;
-    uint64_t To;
-    bool Mispred;
-  };
-  friend raw_ostream &operator<<(raw_ostream &OS, const LBREntry &);
-
   struct PerfBranchSample {
     SmallVector<LBREntry, 32> LBR;
   };
@@ -483,6 +476,7 @@ private:
 
   /// Debugging dump methods
   void dump() const;
+  void dump(const LBREntry &LBR) const;
   void dump(const PerfBranchSample &Sample) const;
   void dump(const PerfMemSample &Sample) const;
 
@@ -510,12 +504,6 @@ public:
 
   friend class YAMLProfileWriter;
 };
-
-inline raw_ostream &operator<<(raw_ostream &OS,
-                               const DataAggregator::LBREntry &L) {
-  OS << formatv("{0:x} -> {1:x}/{2}", L.From, L.To, L.Mispred ? 'M' : 'P');
-  return OS;
-}
 } // namespace bolt
 } // namespace llvm
 

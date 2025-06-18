@@ -2181,22 +2181,25 @@ FunctionDecl *TypeSystemClang::CreateFunctionDeclaration(
 }
 
 CompilerType TypeSystemClang::CreateFunctionType(
-    const CompilerType &result_type, llvm::ArrayRef<CompilerType> args,
-    bool is_variadic, unsigned type_quals, clang::CallingConv cc,
-    clang::RefQualifierKind ref_qual) {
+    const CompilerType &result_type, const CompilerType *args,
+    unsigned num_args, bool is_variadic, unsigned type_quals,
+    clang::CallingConv cc, clang::RefQualifierKind ref_qual) {
   if (!result_type || !ClangUtil::IsClangType(result_type))
     return CompilerType(); // invalid return type
 
   std::vector<QualType> qual_type_args;
+  if (num_args > 0 && args == nullptr)
+    return CompilerType(); // invalid argument array passed in
+
   // Verify that all arguments are valid and the right type
-  for (const auto &arg : args) {
-    if (arg) {
+  for (unsigned i = 0; i < num_args; ++i) {
+    if (args[i]) {
       // Make sure we have a clang type in args[i] and not a type from another
       // language whose name might match
-      const bool is_clang_type = ClangUtil::IsClangType(arg);
+      const bool is_clang_type = ClangUtil::IsClangType(args[i]);
       lldbassert(is_clang_type);
       if (is_clang_type)
-        qual_type_args.push_back(ClangUtil::GetQualType(arg));
+        qual_type_args.push_back(ClangUtil::GetQualType(args[i]));
       else
         return CompilerType(); //  invalid argument type (must be a clang type)
     } else

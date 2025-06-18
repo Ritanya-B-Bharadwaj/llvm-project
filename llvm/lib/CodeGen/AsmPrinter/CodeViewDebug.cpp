@@ -125,8 +125,6 @@ static CPUType mapArchToCVCPUType(Triple::ArchType Type) {
     return CPUType::ARM64;
   case Triple::ArchType::mipsel:
     return CPUType::MIPS;
-  case Triple::ArchType::UnknownArch:
-    return CPUType::Unknown;
   default:
     report_fatal_error("target architecture doesn't map to a CodeView CPUType");
   }
@@ -613,33 +611,21 @@ static SourceLanguage MapDWLangToCVLang(unsigned DWLang) {
 }
 
 void CodeViewDebug::beginModule(Module *M) {
-  // If COFF debug section is not available, skip any debug info related stuff.
-  if (!Asm->getObjFileLowering().getCOFFDebugSymbolsSection()) {
+  // If module doesn't have named metadata anchors or COFF debug section
+  // is not available, skip any debug info related stuff.
+  if (!Asm->hasDebugInfo() ||
+      !Asm->getObjFileLowering().getCOFFDebugSymbolsSection()) {
     Asm = nullptr;
     return;
   }
 
-  CompilerInfoAsm = Asm;
   TheCPU = mapArchToCVCPUType(M->getTargetTriple().getArch());
 
   // Get the current source language.
-  const MDNode *Node;
-  if (Asm->hasDebugInfo()) {
-    Node = *M->debug_compile_units_begin();
-  } else {
-    // When emitting only compiler information, we may have only NoDebug CUs,
-    // which would be skipped by debug_compile_units_begin.
-    NamedMDNode *CUs = MMI->getModule()->getNamedMetadata("llvm.dbg.cu");
-    Node = *CUs->operands().begin();
-  }
+  const MDNode *Node = *M->debug_compile_units_begin();
   const auto *CU = cast<DICompileUnit>(Node);
 
   CurrentSourceLanguage = MapDWLangToCVLang(CU->getSourceLanguage());
-  if (!M->getCodeViewFlag() ||
-      CU->getEmissionKind() == DICompileUnit::NoDebug) {
-    Asm = nullptr;
-    return;
-  }
 
   collectGlobalVariableInfo();
 
@@ -650,7 +636,7 @@ void CodeViewDebug::beginModule(Module *M) {
 }
 
 void CodeViewDebug::endModule() {
-  if (!CompilerInfoAsm)
+  if (!Asm || !Asm->hasDebugInfo())
     return;
 
   // The COFF .debug$S section consists of several subsections, each starting
@@ -666,8 +652,6 @@ void CodeViewDebug::endModule() {
   emitObjName();
   emitCompilerInformation();
   endCVSubsection(CompilerInfo);
-  if (!Asm)
-    return;
 
   emitInlineeLinesSubsection();
 
@@ -804,7 +788,7 @@ void CodeViewDebug::emitTypeGlobalHashes() {
 void CodeViewDebug::emitObjName() {
   MCSymbol *CompilerEnd = beginSymbolRecord(SymbolKind::S_OBJNAME);
 
-  StringRef PathRef(CompilerInfoAsm->TM.Options.ObjectFilenameForDebug);
+  StringRef PathRef(Asm->TM.Options.ObjectFilenameForDebug);
   llvm::SmallString<256> PathStore(PathRef);
 
   if (PathRef.empty() || PathRef == "-") {
@@ -862,7 +846,7 @@ void CodeViewDebug::emitCompilerInformation() {
   }
   using ArchType = llvm::Triple::ArchType;
   ArchType Arch = MMI->getModule()->getTargetTriple().getArch();
-  if (CompilerInfoAsm->TM.Options.Hotpatch || Arch == ArchType::thumb ||
+  if (Asm->TM.Options.Hotpatch || Arch == ArchType::thumb ||
       Arch == ArchType::aarch64) {
     Flags |= static_cast<uint32_t>(CompileSym3Flags::HotPatch);
   }
@@ -1031,7 +1015,7 @@ void CodeViewDebug::switchToDebugSectionForSymbol(const MCSymbol *GVSym) {
   const MCSymbol *KeySym = GVSec ? GVSec->getCOMDATSymbol() : nullptr;
 
   MCSectionCOFF *DebugSec = cast<MCSectionCOFF>(
-      CompilerInfoAsm->getObjFileLowering().getCOFFDebugSymbolsSection());
+      Asm->getObjFileLowering().getCOFFDebugSymbolsSection());
   DebugSec = OS.getContext().getAssociativeCOFFSection(DebugSec, KeySym);
 
   OS.switchSection(DebugSec);

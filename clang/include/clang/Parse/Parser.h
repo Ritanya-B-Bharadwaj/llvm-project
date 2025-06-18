@@ -290,7 +290,9 @@ public:
     return ConsumeToken();
   }
 
-  SourceLocation getEndOfPreviousToken() const;
+  SourceLocation getEndOfPreviousToken() {
+    return PP.getLocForEndOfToken(PrevTokLocation);
+  }
 
   /// GetLookAheadToken - This peeks ahead N tokens and returns that token
   /// without consuming any tokens.  LookAhead(0) returns 'Tok', LookAhead(1)
@@ -2596,7 +2598,8 @@ private:
   void ParseTypeQualifierListOpt(
       DeclSpec &DS, unsigned AttrReqs = AR_AllAttributesParsed,
       bool AtomicOrPtrauthAllowed = true, bool IdentifierRequired = false,
-      llvm::function_ref<void()> CodeCompletionHandler = {});
+      std::optional<llvm::function_ref<void()>> CodeCompletionHandler =
+          std::nullopt);
 
   /// ParseDirectDeclarator
   /// \verbatim
@@ -4169,7 +4172,8 @@ private:
   bool ParseExpressionList(SmallVectorImpl<Expr *> &Exprs,
                            llvm::function_ref<void()> ExpressionStarts =
                                llvm::function_ref<void()>(),
-                           bool FailImmediatelyOnInvalidExpr = false);
+                           bool FailImmediatelyOnInvalidExpr = false,
+                           bool EarlyTypoCorrection = false);
 
   /// ParseSimpleExpressionList - A simple comma-separated list of expressions,
   /// used for misc language extensions.
@@ -7069,10 +7073,6 @@ private:
   // #pragma optimize("gsty", on|off)
   bool HandlePragmaMSOptimize(StringRef PragmaName,
                               SourceLocation PragmaLocation);
-
-  // #pragma intrinsic("foo")
-  bool HandlePragmaMSIntrinsic(StringRef PragmaName,
-                               SourceLocation PragmaLocation);
 
   /// Handle the annotation token produced for
   /// #pragma align...

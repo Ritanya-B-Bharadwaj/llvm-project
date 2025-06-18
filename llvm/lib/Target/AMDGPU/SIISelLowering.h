@@ -145,7 +145,6 @@ private:
 
   /// Custom lowering for ISD::FP_ROUND for MVT::f16.
   SDValue lowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const;
-  SDValue splitFP_ROUNDVectorOp(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFMINNUM_FMAXNUM(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFMINIMUM_FMAXIMUM(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFLDEXP(SDValue Op, SelectionDAG &DAG) const;
@@ -259,8 +258,6 @@ public:
                                        const GCNSubtarget *Subtarget);
 
   bool shouldExpandVectorDynExt(SDNode *N) const;
-
-  bool shouldPreservePtrArith(const Function &F, EVT PtrVT) const override;
 
 private:
   // Analyze a combined offset from an amdgcn_s_buffer_load intrinsic and store

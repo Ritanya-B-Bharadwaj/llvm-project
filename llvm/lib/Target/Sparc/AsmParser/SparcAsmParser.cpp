@@ -848,14 +848,14 @@ bool SparcAsmParser::expandSETX(MCInst &Inst, SMLoc IDLoc,
   // sethi %hh(val), tmp
   Instructions.push_back(MCInstBuilder(SP::SETHIi)
                              .addReg(MCTmpOp.getReg())
-                             .addExpr(MCSpecifierExpr::create(
-                                 ValExpr, ELF::R_SPARC_HH22, getContext())));
+                             .addExpr(SparcMCExpr::create(
+                                 ELF::R_SPARC_HH22, ValExpr, getContext())));
   // or    tmp, %hm(val), tmp
   Instructions.push_back(MCInstBuilder(SP::ORri)
                              .addReg(MCTmpOp.getReg())
                              .addReg(MCTmpOp.getReg())
-                             .addExpr(MCSpecifierExpr::create(
-                                 ValExpr, ELF::R_SPARC_HM10, getContext())));
+                             .addExpr(SparcMCExpr::create(
+                                 ELF::R_SPARC_HM10, ValExpr, getContext())));
   // sllx  tmp, 32, tmp
   Instructions.push_back(MCInstBuilder(SP::SLLXri)
                              .addReg(MCTmpOp.getReg())
@@ -1165,7 +1165,7 @@ ParseStatus SparcAsmParser::parseTailRelocSym(OperandVector &Operands) {
     return Error(getLoc(), "expected valid identifier for operand modifier");
 
   StringRef Name = getParser().getTok().getIdentifier();
-  uint16_t RelType = Sparc::parseSpecifier(Name);
+  uint16_t RelType = SparcMCExpr::parseSpecifier(Name);
   if (RelType == 0)
     return Error(getLoc(), "invalid relocation specifier");
 
@@ -1661,9 +1661,6 @@ static bool hasGOTReference(const MCExpr *Expr) {
 
   case MCExpr::Unary:
     return hasGOTReference(cast<MCUnaryExpr>(Expr)->getSubExpr());
-
-  case MCExpr::Specifier:
-    llvm_unreachable("unused by this backend");
   }
   return false;
 }
@@ -1689,7 +1686,7 @@ const SparcMCExpr *SparcAsmParser::adjustPICRelocation(uint16_t RelType,
     }
   }
 
-  return MCSpecifierExpr::create(subExpr, RelType, getContext());
+  return SparcMCExpr::create(RelType, subExpr, getContext());
 }
 
 bool SparcAsmParser::matchSparcAsmModifiers(const MCExpr *&EVal,
@@ -1700,7 +1697,7 @@ bool SparcAsmParser::matchSparcAsmModifiers(const MCExpr *&EVal,
 
   StringRef name = Tok.getString();
 
-  auto VK = Sparc::parseSpecifier(name);
+  auto VK = SparcMCExpr::parseSpecifier(name);
   switch (VK) {
   case 0:
     Error(getLoc(), "invalid relocation specifier");

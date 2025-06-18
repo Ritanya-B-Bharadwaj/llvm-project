@@ -25,9 +25,8 @@ using namespace llvm;
 char LoongArchDAGToDAGISelLegacy::ID;
 
 LoongArchDAGToDAGISelLegacy::LoongArchDAGToDAGISelLegacy(
-    LoongArchTargetMachine &TM, CodeGenOptLevel OptLevel)
-    : SelectionDAGISelLegacy(
-          ID, std::make_unique<LoongArchDAGToDAGISel>(TM, OptLevel)) {}
+    LoongArchTargetMachine &TM)
+    : SelectionDAGISelLegacy(ID, std::make_unique<LoongArchDAGToDAGISel>(TM)) {}
 
 INITIALIZE_PASS(LoongArchDAGToDAGISelLegacy, DEBUG_TYPE, PASS_NAME, false,
                 false)
@@ -457,7 +456,6 @@ bool LoongArchDAGToDAGISel::selectVSplatUimmPow2(SDValue N,
 
 // This pass converts a legalized DAG into a LoongArch-specific DAG, ready
 // for instruction scheduling.
-FunctionPass *llvm::createLoongArchISelDag(LoongArchTargetMachine &TM,
-                                           CodeGenOptLevel OptLevel) {
-  return new LoongArchDAGToDAGISelLegacy(TM, OptLevel);
+FunctionPass *llvm::createLoongArchISelDag(LoongArchTargetMachine &TM) {
+  return new LoongArchDAGToDAGISelLegacy(TM);
 }

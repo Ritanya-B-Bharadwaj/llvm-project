@@ -300,12 +300,11 @@ template <typename T> [[nodiscard]] T bit_ceil(T Value) {
   return T(1) << llvm::bit_width<T>(Value - 1u);
 }
 
-/// Count the number of set bits in a value.
-/// Ex. popcount(0xF000F000) = 8
-/// Returns 0 if the word is zero.
-template <typename T, typename = std::enable_if_t<std::is_unsigned_v<T>>>
-[[nodiscard]] inline int popcount(T Value) noexcept {
-  if constexpr (sizeof(T) <= 4) {
+namespace detail {
+template <typename T, std::size_t SizeOfT> struct PopulationCounter {
+  static int count(T Value) {
+    // Generic version, forward to 32 bits.
+    static_assert(SizeOfT <= 4, "Not implemented!");
 #if defined(__GNUC__)
     return (int)__builtin_popcount(Value);
 #else
@@ -314,7 +313,11 @@ template <typename T, typename = std::enable_if_t<std::is_unsigned_v<T>>>
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
     return int(((v + (v >> 4) & 0xF0F0F0F) * 0x1010101) >> 24);
 #endif
-  } else if constexpr (sizeof(T) <= 8) {
+  }
+};
+
+template <typename T> struct PopulationCounter<T, 8> {
+  static int count(T Value) {
 #if defined(__GNUC__)
     return (int)__builtin_popcountll(Value);
 #else
@@ -324,9 +327,16 @@ template <typename T, typename = std::enable_if_t<std::is_unsigned_v<T>>>
     v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
     return int((uint64_t)(v * 0x0101010101010101ULL) >> 56);
 #endif
-  } else {
-    static_assert(sizeof(T) == 0, "T must be 8 bytes or less");
   }
+};
+} // namespace detail
+
+/// Count the number of set bits in a value.
+/// Ex. popcount(0xF000F000) = 8
+/// Returns 0 if the word is zero.
+template <typename T, typename = std::enable_if_t<std::is_unsigned_v<T>>>
+[[nodiscard]] inline int popcount(T Value) noexcept {
+  return detail::PopulationCounter<T, sizeof(T)>::count(Value);
 }
 
 // Forward-declare rotr so that rotl can use it.

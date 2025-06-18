@@ -18,7 +18,6 @@ void f(int x) {
 // CHECK: %3 = load ptr, ptr %n
 // CHECK: store i32 %2, ptr %3{{.*}}, !dbg [[G3R1:!.*]]
   *n = x;
-// CHECK: ret{{.*}}, !dbg [[RET:!.*]]
 }
 
 // CHECK: [[G1R2_C12]] = !DILocation({{.*}}, atomGroup: 1, atomRank: 2)
@@ -33,5 +32,3 @@ void f(int x) {
 
 // CHECK: [[G3R2]] = !DILocation({{.*}}, atomGroup: 3, atomRank: 2)
 // CHECK: [[G3R1]] = !DILocation({{.*}}, atomGroup: 3, atomRank: 1)
-
-// CHECK: [[RET]] = !DILocation({{.*}}, atomGroup: 4, atomRank: 1)

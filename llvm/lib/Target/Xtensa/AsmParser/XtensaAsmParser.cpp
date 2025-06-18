@@ -393,7 +393,9 @@ bool XtensaAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
   case Xtensa::L32R: {
     const MCSymbolRefExpr *OpExpr =
         static_cast<const MCSymbolRefExpr *>(Inst.getOperand(1).getExpr());
-    Inst.getOperand(1).setExpr(OpExpr);
+    XtensaMCExpr::Specifier Kind = XtensaMCExpr::VK_None;
+    const MCExpr *NewOpExpr = XtensaMCExpr::create(OpExpr, Kind, getContext());
+    Inst.getOperand(1).setExpr(NewOpExpr);
     break;
   }
   case Xtensa::MOVI: {
@@ -411,8 +413,10 @@ bool XtensaAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
         const MCExpr *Value = MCConstantExpr::create(ImmOp64, getContext());
         MCSymbol *Sym = getContext().createTempSymbol();
         const MCExpr *Expr = MCSymbolRefExpr::create(Sym, getContext());
+        const MCExpr *OpExpr =
+            XtensaMCExpr::create(Expr, XtensaMCExpr::VK_None, getContext());
         TmpInst.addOperand(Inst.getOperand(0));
-        MCOperand Op1 = MCOperand::createExpr(Expr);
+        MCOperand Op1 = MCOperand::createExpr(OpExpr);
         TmpInst.addOperand(Op1);
         TS.emitLiteral(Sym, Value, true, IDLoc);
         Inst = TmpInst;
@@ -424,8 +428,10 @@ bool XtensaAsmParser::processInstruction(MCInst &Inst, SMLoc IDLoc,
       const MCExpr *Value = Inst.getOperand(1).getExpr();
       MCSymbol *Sym = getContext().createTempSymbol();
       const MCExpr *Expr = MCSymbolRefExpr::create(Sym, getContext());
+      const MCExpr *OpExpr =
+          XtensaMCExpr::create(Expr, XtensaMCExpr::VK_None, getContext());
       TmpInst.addOperand(Inst.getOperand(0));
-      MCOperand Op1 = MCOperand::createExpr(Expr);
+      MCOperand Op1 = MCOperand::createExpr(OpExpr);
       TmpInst.addOperand(Op1);
       Inst = TmpInst;
       TS.emitLiteral(Sym, Value, true, IDLoc);

@@ -70,18 +70,19 @@ struct SymbolAndDesignatorExtractor {
 
   static void verify(const SymbolWithDesignator &sd) {
     const semantics::Symbol *symbol = std::get<0>(sd);
-    const std::optional<evaluate::Expr<evaluate::SomeType>> &maybeDsg =
-        std::get<1>(sd);
+    assert(symbol && "Expecting symbol");
+    auto &maybeDsg = std::get<1>(sd);
     if (!maybeDsg)
       return; // Symbol with no designator -> OK
-    assert(symbol && "Expecting symbol");
-    std::optional<evaluate::DataRef> maybeRef = evaluate::ExtractDataRef(
-        *maybeDsg, /*intoSubstring=*/true, /*intoComplexPart=*/true);
+    std::optional<evaluate::DataRef> maybeRef =
+        evaluate::ExtractDataRef(*maybeDsg);
     if (maybeRef) {
       if (&maybeRef->GetLastSymbol() == symbol)
         return; // Symbol with a designator for it -> OK
       llvm_unreachable("Expecting designator for given symbol");
     } else {
+      // This could still be a Substring or ComplexPart, but at least Substring
+      // is not allowed in OpenMP.
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
       maybeDsg->dump();
 #endif

@@ -217,26 +217,6 @@ Value *InstCombinerImpl::EmitGEPOffset(GEPOperator *GEP, bool RewriteGEP) {
   return Offset;
 }
 
-Value *InstCombinerImpl::EmitGEPOffsets(ArrayRef<GEPOperator *> GEPs,
-                                        GEPNoWrapFlags NW, Type *IdxTy,
-                                        bool RewriteGEPs) {
-  Value *Sum = nullptr;
-  for (GEPOperator *GEP : reverse(GEPs)) {
-    Value *Offset = EmitGEPOffset(GEP, RewriteGEPs);
-    if (Offset->getType() != IdxTy)
-      Offset = Builder.CreateVectorSplat(
-          cast<VectorType>(IdxTy)->getElementCount(), Offset);
-    if (Sum)
-      Sum = Builder.CreateAdd(Sum, Offset, "", NW.hasNoUnsignedWrap(),
-                              NW.isInBounds());
-    else
-      Sum = Offset;
-  }
-  if (!Sum)
-    return Constant::getNullValue(IdxTy);
-  return Sum;
-}
-
 /// Legal integers and common types are considered desirable. This is used to
 /// avoid creating instructions with types that may not be supported well by the
 /// the backend.
@@ -1739,15 +1719,6 @@ Instruction *InstCombinerImpl::FoldOpIntoSelect(Instruction &Op, SelectInst *SI,
   if (SI->getType()->isIntOrIntVectorTy(1))
     return nullptr;
 
-  // Avoid breaking min/max reduction pattern,
-  // which is necessary for vectorization later.
-  if (isa<MinMaxIntrinsic>(&Op))
-    for (Value *IntrinOp : Op.operands())
-      if (auto *PN = dyn_cast<PHINode>(IntrinOp))
-        for (Value *PhiOp : PN->operands())
-          if (PhiOp == &Op)
-            return nullptr;
-
   // Test if a FCmpInst instruction is used exclusively by a select as
   // part of a minimum or maximum operation. If so, refrain from doing
   // any other folding. This helps out other analyses which understand
@@ -1758,8 +1729,7 @@ Instruction *InstCombinerImpl::FoldOpIntoSelect(Instruction &Op, SelectInst *SI,
   if (auto *CI = dyn_cast<FCmpInst>(SI->getCondition())) {
     if (CI->hasOneUse()) {
       Value *Op0 = CI->getOperand(0), *Op1 = CI->getOperand(1);
-      if (((TV == Op0 && FV == Op1) || (FV == Op0 && TV == Op1)) &&
-          !CI->isCommutative())
+      if ((TV == Op0 && FV == Op1) || (FV == Op0 && TV == Op1))
         return nullptr;
     }
   }
@@ -3650,7 +3620,7 @@ Instruction *InstCombinerImpl::visitReturnInst(ReturnInst &RI) {
 
   KnownFPClass KnownClass;
   Value *Simplified =
-      SimplifyDemandedUseFPClass(RetVal, ~ReturnClass, KnownClass, &RI);
+      SimplifyDemandedUseFPClass(RetVal, ~ReturnClass, KnownClass, 0, &RI);
   if (!Simplified)
     return nullptr;
 
@@ -3987,7 +3957,7 @@ Instruction *InstCombinerImpl::visitSwitchInst(SwitchInst &SI) {
       return replaceOperand(SI, 0, V);
   }
 
-  KnownBits Known = computeKnownBits(Cond, &SI);
+  KnownBits Known = computeKnownBits(Cond, 0, &SI);
   unsigned LeadingKnownZeros = Known.countMinLeadingZeros();
   unsigned LeadingKnownOnes = Known.countMinLeadingOnes();
 
@@ -5369,7 +5339,8 @@ bool InstCombinerImpl::run() {
         // We copy the old instruction's DebugLoc to the new instruction, unless
         // InstCombine already assigned a DebugLoc to it, in which case we
         // should trust the more specifically selected DebugLoc.
-        Result->setDebugLoc(Result->getDebugLoc().orElse(I->getDebugLoc()));
+        if (!Result->getDebugLoc())
+          Result->setDebugLoc(I->getDebugLoc());
         // We also copy annotation metadata to the new instruction.
         Result->copyMetadata(*I, LLVMContext::MD_annotation);
         // Everything uses the new instruction now.

@@ -44,14 +44,10 @@ class PatternRewriter;
 
 namespace tosa {
 
-ParseResult parseVariableOpTypeOrInitialValue(OpAsmParser &parser,
-                                              DenseElementsAttr &varShapeAttr,
-                                              TypeAttr &typeAttr,
-                                              Attribute &initialValueAttr);
-void printVariableOpTypeOrInitialValue(OpAsmPrinter &p, Operation *op,
-                                       DenseElementsAttr varShapeAttr,
-                                       TypeAttr typeAttr,
-                                       Attribute initialValueAttr);
+ParseResult parseTypeOrAttr(OpAsmParser &parser, TypeAttr &typeAttr,
+                            Attribute &attr);
+void printTypeOrAttr(OpAsmPrinter &p, Operation *op, TypeAttr type,
+                     Attribute attr);
 
 #include "mlir/Dialect/Tosa/IR/TosaInterfaces.h.inc"
 
@@ -175,9 +171,6 @@ std::optional<Value> createZeroPointTensor(OpBuilder &builder, Location loc,
 // Create a pad-const const tensor with value of `val` of required data-type
 Value createPadConstTensor(OpBuilder &builder, Location loc, Value src,
                            int32_t val = 0);
-
-// returns type of variable op
-RankedTensorType getVariableType(VariableOp variableOp);
 
 } // namespace tosa
 } // namespace mlir

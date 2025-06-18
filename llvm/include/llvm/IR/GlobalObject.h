@@ -67,7 +67,12 @@ private:
 public:
   GlobalObject(const GlobalObject &) = delete;
 
-protected:
+  /// FIXME: Remove this function once transition to Align is over.
+  uint64_t getAlignment() const {
+    MaybeAlign Align = getAlign();
+    return Align ? Align->value() : 0;
+  }
+
   /// Returns the alignment of the given variable or function.
   ///
   /// Note that for functions this is the alignment of the code, not the
@@ -98,7 +103,6 @@ protected:
     assert(getGlobalObjectSubClassData() == Val && "representation error");
   }
 
-public:
   /// Check if this global has a custom object file section.
   ///
   /// This is more efficient than calling getSection() and checking for an empty

@@ -12592,38 +12592,19 @@ struct AAAddressSpaceImpl : public AAAddressSpace {
 
   ChangeStatus updateImpl(Attributor &A) override {
     uint32_t OldAddressSpace = AssumedAddressSpace;
-    unsigned FlatAS = A.getInfoCache().getFlatAddressSpace().value();
 
     auto CheckAddressSpace = [&](Value &Obj) {
-      // Ignore undef.
       if (isa<UndefValue>(&Obj))
         return true;
-
-      // If the object already has a non-flat address space, we simply take it.
-      unsigned ObjAS = Obj.getType()->getPointerAddressSpace();
-      if (ObjAS != FlatAS)
-        return takeAddressSpace(ObjAS);
-
-      // At this point, we know Obj is in the flat address space. For a final
-      // attempt, we want to use getAssumedAddrSpace, but first we must get the
-      // associated function, if possible.
-      Function *F = nullptr;
-      if (auto *Arg = dyn_cast<Argument>(&Obj))
-        F = Arg->getParent();
-      else if (auto *I = dyn_cast<Instruction>(&Obj))
-        F = I->getFunction();
-
-      // Use getAssumedAddrSpace if the associated function exists.
-      if (F) {
+      if (auto *Arg = dyn_cast<Argument>(&Obj)) {
         auto *TTI =
-            A.getInfoCache().getAnalysisResultForFunction<TargetIRAnalysis>(*F);
-        unsigned AssumedAS = TTI->getAssumedAddrSpace(&Obj);
+            A.getInfoCache().getAnalysisResultForFunction<TargetIRAnalysis>(
+                *Arg->getParent());
+        unsigned AssumedAS = TTI->getAssumedAddrSpace(Arg);
         if (AssumedAS != ~0U)
           return takeAddressSpace(AssumedAS);
       }
-
-      // Now we can't do anything else but to take the flat AS.
-      return takeAddressSpace(FlatAS);
+      return takeAddressSpace(Obj.getType()->getPointerAddressSpace());
     };
 
     auto *AUO = A.getOrCreateAAFor<AAUnderlyingObjects>(getIRPosition(), this,

@@ -8789,7 +8789,7 @@ void Sema::CheckVariableDeclarationType(VarDecl *NewVD) {
         FunctionDecl *FD = getCurFunctionDecl();
         // OpenCL v1.1 s6.5.2 and s6.5.3: no local or constant variables
         // in functions.
-        if (FD && !FD->hasAttr<DeviceKernelAttr>()) {
+        if (FD && !FD->hasAttr<OpenCLKernelAttr>()) {
           if (T.getAddressSpace() == LangAS::opencl_constant)
             Diag(NewVD->getLocation(), diag::err_opencl_function_variable)
                 << 0 /*non-kernel only*/ << "constant";
@@ -8801,7 +8801,7 @@ void Sema::CheckVariableDeclarationType(VarDecl *NewVD) {
         }
         // OpenCL v2.0 s6.5.2 and s6.5.3: local and constant variables must be
         // in the outermost scope of a kernel function.
-        if (FD && FD->hasAttr<DeviceKernelAttr>()) {
+        if (FD && FD->hasAttr<OpenCLKernelAttr>()) {
           if (!getCurScope()->isFunctionScope()) {
             if (T.getAddressSpace() == LangAS::opencl_constant)
               Diag(NewVD->getLocation(), diag::err_opencl_addrspace_scope)
@@ -10930,7 +10930,9 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
 
   MarkUnusedFileScopedDecl(NewFD);
 
-  if (getLangOpts().OpenCL && NewFD->hasAttr<DeviceKernelAttr>()) {
+
+
+  if (getLangOpts().OpenCL && NewFD->hasAttr<OpenCLKernelAttr>()) {
     // OpenCL v1.2 s6.8 static is invalid for kernel functions.
     if (SC == SC_Static) {
       Diag(D.getIdentifierLoc(), diag::err_static_kernel);
@@ -12435,7 +12437,7 @@ void Sema::CheckMain(FunctionDecl *FD, const DeclSpec &DS) {
 
   if (getLangOpts().OpenCL) {
     Diag(FD->getLocation(), diag::err_opencl_no_main)
-        << FD->hasAttr<DeviceKernelAttr>();
+        << FD->hasAttr<OpenCLKernelAttr>();
     FD->setInvalidDecl();
     return;
   }
@@ -13518,28 +13520,8 @@ bool Sema::GloballyUniqueObjectMightBeAccidentallyDuplicated(
 
   // If the object isn't hidden, the dynamic linker will prevent duplication.
   clang::LinkageInfo Lnk = Target->getLinkageAndVisibility();
-
-  // The target is "hidden" (from the dynamic linker) if:
-  // 1. On posix, it has hidden visibility, or
-  // 2. On windows, it has no import/export annotation
-  if (Context.getTargetInfo().shouldDLLImportComdatSymbols()) {
-    if (Target->hasAttr<DLLExportAttr>() || Target->hasAttr<DLLImportAttr>())
-      return false;
-
-    // If the variable isn't directly annotated, check to see if it's a member
-    // of an annotated class.
-    const VarDecl *VD = dyn_cast<VarDecl>(Target);
-
-    if (VD && VD->isStaticDataMember()) {
-      const CXXRecordDecl *Ctx = dyn_cast<CXXRecordDecl>(VD->getDeclContext());
-      if (Ctx &&
-          (Ctx->hasAttr<DLLExportAttr>() || Ctx->hasAttr<DLLImportAttr>()))
-        return false;
-    }
-  } else if (Lnk.getVisibility() != HiddenVisibility) {
-    // Posix case
+  if (Lnk.getVisibility() != HiddenVisibility)
     return false;
-  }
 
   // If the obj doesn't have external linkage, it's supposed to be duplicated.
   if (!isExternalFormalLinkage(Lnk.getLinkage()))
@@ -13570,16 +13552,19 @@ void Sema::DiagnoseUniqueObjectDuplication(const VarDecl *VD) {
   // duplicated when built into a shared library, which causes problems if it's
   // mutable (since the copies won't be in sync) or its initialization has side
   // effects (since it will run once per copy instead of once globally).
+  // FIXME: Windows uses dllexport/dllimport instead of visibility, and we don't
+  // handle that yet. Disable the warning on Windows for now.
 
   // Don't diagnose if we're inside a template, because it's not practical to
   // fix the warning in most cases.
-  if (!VD->isTemplated() &&
+  if (!Context.getTargetInfo().shouldDLLImportComdatSymbols() &&
+      !VD->isTemplated() &&
       GloballyUniqueObjectMightBeAccidentallyDuplicated(VD)) {
 
     QualType Type = VD->getType();
     if (looksMutable(Type, VD->getASTContext())) {
       Diag(VD->getLocation(), diag::warn_possible_object_duplication_mutable)
-          << VD << Context.getTargetInfo().shouldDLLImportComdatSymbols();
+          << VD;
     }
 
     // To keep false positives low, only warn if we're certain that the
@@ -13592,7 +13577,7 @@ void Sema::DiagnoseUniqueObjectDuplication(const VarDecl *VD) {
                              /*IncludePossibleEffects=*/false) &&
         !isa<CXXNewExpr>(Init->IgnoreParenImpCasts())) {
       Diag(Init->getExprLoc(), diag::warn_possible_object_duplication_init)
-          << VD << Context.getTargetInfo().shouldDLLImportComdatSymbols();
+          << VD;
     }
   }
 }
@@ -13601,6 +13586,7 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
   // If there is no declaration, there was an error parsing it.  Just ignore
   // the initializer.
   if (!RealDecl) {
+    CorrectDelayedTyposInExpr(Init, dyn_cast_or_null<VarDecl>(RealDecl));
     return;
   }
 
@@ -13623,8 +13609,12 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
   }
 
   if (VDecl->isInvalidDecl()) {
+    ExprResult Res = CorrectDelayedTyposInExpr(Init, VDecl);
+    SmallVector<Expr *> SubExprs;
+    if (Res.isUsable())
+      SubExprs.push_back(Res.get());
     ExprResult Recovery =
-        CreateRecoveryExpr(Init->getBeginLoc(), Init->getEndLoc(), {Init});
+        CreateRecoveryExpr(Init->getBeginLoc(), Init->getEndLoc(), SubExprs);
     if (Expr *E = Recovery.get())
       VDecl->setInit(E);
     return;
@@ -13639,12 +13629,23 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
 
   // C++11 [decl.spec.auto]p6. Deduce the type which 'auto' stands in for.
   if (VDecl->getType()->isUndeducedType()) {
-    if (Init->containsErrors()) {
-      // Invalidate the decl as we don't know the type for recovery-expr yet.
+    // Attempt typo correction early so that the type of the init expression can
+    // be deduced based on the chosen correction if the original init contains a
+    // TypoExpr.
+    ExprResult Res = CorrectDelayedTyposInExpr(Init, VDecl);
+    if (!Res.isUsable()) {
+      // There are unresolved typos in Init, just drop them.
+      // FIXME: improve the recovery strategy to preserve the Init.
       RealDecl->setInvalidDecl();
-      VDecl->setInit(Init);
       return;
     }
+    if (Res.get()->containsErrors()) {
+      // Invalidate the decl as we don't know the type for recovery-expr yet.
+      RealDecl->setInvalidDecl();
+      VDecl->setInit(Res.get());
+      return;
+    }
+    Init = Res.get();
 
     if (DeduceVariableDeclarationType(VDecl, DirectInit, Init))
       return;
@@ -13789,6 +13790,23 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init, bool DirectInit) {
       Args = CXXDirectInit->getInitExprs();
       InitializedFromParenListExpr = true;
     }
+
+    // Try to correct any TypoExprs in the initialization arguments.
+    for (size_t Idx = 0; Idx < Args.size(); ++Idx) {
+      ExprResult Res = CorrectDelayedTyposInExpr(
+          Args[Idx], VDecl, /*RecoverUncorrectedTypos=*/true,
+          [this, Entity, Kind](Expr *E) {
+            InitializationSequence Init(*this, Entity, Kind, MultiExprArg(E));
+            return Init.Failed() ? ExprError() : E;
+          });
+      if (!Res.isUsable()) {
+        VDecl->setInvalidDecl();
+      } else if (Res.get() != Args[Idx]) {
+        Args[Idx] = Res.get();
+      }
+    }
+    if (VDecl->isInvalidDecl())
+      return;
 
     InitializationSequence InitSeq(*this, Entity, Kind, Args,
                                    /*TopLevelOfInitList=*/false,
@@ -14399,12 +14417,6 @@ void Sema::ActOnUninitializedDecl(Decl *RealDecl) {
 
     // Handle HLSL uninitialized decls
     if (getLangOpts().HLSL && HLSL().ActOnUninitializedVarDecl(Var))
-      return;
-
-    // HLSL input variables are expected to be externally initialized, even
-    // when marked `static`.
-    if (getLangOpts().HLSL &&
-        Var->getType().getAddressSpace() == LangAS::hlsl_input)
       return;
 
     // C++03 [dcl.init]p9:
@@ -15695,7 +15707,7 @@ ShouldWarnAboutMissingPrototype(const FunctionDecl *FD,
     return false;
 
   // Don't warn for OpenCL kernels.
-  if (FD->hasAttr<DeviceKernelAttr>())
+  if (FD->hasAttr<OpenCLKernelAttr>())
     return false;
 
   // Don't warn on explicitly deleted functions.
@@ -20498,11 +20510,14 @@ void Sema::ActOnEnumBody(SourceLocation EnumLoc, SourceRange BraceRange,
     CheckAlignasUnderalignment(Enum);
 }
 
-Decl *Sema::ActOnFileScopeAsmDecl(Expr *expr, SourceLocation StartLoc,
+Decl *Sema::ActOnFileScopeAsmDecl(Expr *expr,
+                                  SourceLocation StartLoc,
                                   SourceLocation EndLoc) {
+  StringLiteral *AsmString = cast<StringLiteral>(expr);
 
-  FileScopeAsmDecl *New =
-      FileScopeAsmDecl::Create(Context, CurContext, expr, StartLoc, EndLoc);
+  FileScopeAsmDecl *New = FileScopeAsmDecl::Create(Context, CurContext,
+                                                   AsmString, StartLoc,
+                                                   EndLoc);
   CurContext->addDecl(New);
   return New;
 }
@@ -20586,7 +20601,7 @@ Sema::FunctionEmissionStatus Sema::getEmissionStatus(const FunctionDecl *FD,
 
   // SYCL functions can be template, so we check if they have appropriate
   // attribute prior to checking if it is a template.
-  if (LangOpts.SYCLIsDevice && FD->hasAttr<DeviceKernelAttr>())
+  if (LangOpts.SYCLIsDevice && FD->hasAttr<SYCLKernelAttr>())
     return FunctionEmissionStatus::Emitted;
 
   // Templates are emitted when they're instantiated.

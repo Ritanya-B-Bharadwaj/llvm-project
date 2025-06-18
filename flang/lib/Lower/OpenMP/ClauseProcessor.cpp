@@ -926,10 +926,14 @@ bool ClauseProcessor::processDepend(lower::SymMap &symMap,
     for (const omp::Object &object : objects) {
       assert(object.ref() && "Expecting designator");
       mlir::Value dependVar;
-      SomeExpr expr = *object.ref();
 
-      if (evaluate::IsArrayElement(expr) || evaluate::ExtractSubstring(expr)) {
-        // Array Section or character (sub)string
+      if (evaluate::ExtractSubstring(*object.ref())) {
+        TODO(converter.getCurrentLocation(),
+             "substring not supported for task depend");
+      } else if (evaluate::IsArrayElement(*object.ref())) {
+        // Array Section
+        SomeExpr expr = *object.ref();
+
         if (isVectorSubscript(expr)) {
           // OpenMP needs the address of the first indexed element (required by
           // the standard to be the lowest index) to identify the dependency. We
@@ -943,8 +947,7 @@ bool ClauseProcessor::processDepend(lower::SymMap &symMap,
               converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);
           dependVar = entity.getBase();
         }
-      } else if (evaluate::isStructureComponent(expr) ||
-                 evaluate::ExtractComplexPart(expr)) {
+      } else if (evaluate::isStructureComponent(*object.ref())) {
         SomeExpr expr = *object.ref();
         hlfir::EntityWithAttributes entity = convertExprToHLFIR(
             converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);

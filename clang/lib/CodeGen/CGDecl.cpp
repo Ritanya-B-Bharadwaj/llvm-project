@@ -766,15 +766,14 @@ void CodeGenFunction::EmitNullabilityCheck(LValue LHS, llvm::Value *RHS,
 
   // Check if the right hand side of the assignment is nonnull, if the left
   // hand side must be nonnull.
-  auto CheckOrdinal = SanitizerKind::SO_NullabilityAssign;
-  auto CheckHandler = SanitizerHandler::TypeMismatch;
-  SanitizerDebugLocation SanScope(this, {CheckOrdinal}, CheckHandler);
+  SanitizerScope SanScope(this);
   llvm::Value *IsNotNull = Builder.CreateIsNotNull(RHS);
   llvm::Constant *StaticData[] = {
       EmitCheckSourceLocation(Loc), EmitCheckTypeDescriptor(LHS.getType()),
       llvm::ConstantInt::get(Int8Ty, 0), // The LogAlignment info is unused.
       llvm::ConstantInt::get(Int8Ty, TCK_NonnullAssign)};
-  EmitCheck({{IsNotNull, CheckOrdinal}}, CheckHandler, StaticData, RHS);
+  EmitCheck({{IsNotNull, SanitizerKind::SO_NullabilityAssign}},
+            SanitizerHandler::TypeMismatch, StaticData, RHS);
 }
 
 void CodeGenFunction::EmitScalarInit(const Expr *init, const ValueDecl *D,

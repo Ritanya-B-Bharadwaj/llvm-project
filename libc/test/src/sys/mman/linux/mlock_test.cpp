@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "src/__support/OSUtil/syscall.h" // For internal syscall function.
-#include "src/__support/libc_errno.h"
+#include "src/errno/libc_errno.h"
 #include "src/sys/mman/madvise.h"
 #include "src/sys/mman/mincore.h"
 #include "src/sys/mman/mlock.h"
@@ -149,8 +149,9 @@ TEST_F(LlvmLibcMlockTest, MLockAll) {
         Succeeds());
     auto retval = LIBC_NAMESPACE::mlockall(MCL_CURRENT);
     if (retval == -1) {
-      EXPECT_TRUE(libc_errno == ENOMEM || libc_errno == EPERM);
-      libc_errno = 0;
+      EXPECT_TRUE(LIBC_NAMESPACE::libc_errno == ENOMEM ||
+                  LIBC_NAMESPACE::libc_errno == EPERM);
+      LIBC_NAMESPACE::libc_errno = 0;
       return;
     }
     unsigned char vec;
@@ -162,8 +163,9 @@ TEST_F(LlvmLibcMlockTest, MLockAll) {
   {
     auto retval = LIBC_NAMESPACE::mlockall(MCL_FUTURE);
     if (retval == -1) {
-      EXPECT_TRUE(libc_errno == ENOMEM || libc_errno == EPERM);
-      libc_errno = 0;
+      EXPECT_TRUE(LIBC_NAMESPACE::libc_errno == ENOMEM ||
+                  LIBC_NAMESPACE::libc_errno == EPERM);
+      LIBC_NAMESPACE::libc_errno = 0;
       return;
     }
     PageHolder holder;
@@ -178,8 +180,9 @@ TEST_F(LlvmLibcMlockTest, MLockAll) {
   {
     auto retval = LIBC_NAMESPACE::mlockall(MCL_FUTURE | MCL_ONFAULT);
     if (retval == -1) {
-      EXPECT_TRUE(libc_errno == ENOMEM || libc_errno == EPERM);
-      libc_errno = 0;
+      EXPECT_TRUE(LIBC_NAMESPACE::libc_errno == ENOMEM ||
+                  LIBC_NAMESPACE::libc_errno == EPERM);
+      LIBC_NAMESPACE::libc_errno = 0;
       return;
     }
     PageHolder holder;

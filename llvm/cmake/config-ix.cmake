@@ -1,3 +1,8 @@
+if( WIN32 AND NOT CYGWIN )
+  # We consider Cygwin as another Unix
+  set(PURE_WINDOWS 1)
+endif()
+
 include(CheckIncludeFile)
 include(CheckLibraryExists)
 include(CheckSymbolExists)
@@ -26,7 +31,7 @@ elseif (APPLE)
   set(HAVE_SYS_MMAN_H 1)
   set(HAVE_SYSEXITS_H 1)
   set(HAVE_UNISTD_H 1)
-elseif (WIN32)
+elseif (PURE_WINDOWS)
   set(HAVE_MACH_MACH_H 0)
   set(HAVE_MALLOC_MALLOC_H 0)
   set(HAVE_PTHREAD_H 0)
@@ -127,7 +132,7 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
 endif()
 
 # library checks
-if(NOT WIN32)
+if( NOT PURE_WINDOWS )
   check_library_exists(pthread pthread_create "" HAVE_LIBPTHREAD)
   if (HAVE_LIBPTHREAD)
     check_library_exists(pthread pthread_rwlock_init "" HAVE_PTHREAD_RWLOCK_INIT)
@@ -270,7 +275,7 @@ endif()
 # party code may call MSan interceptors like strlen, leading to false positives.
 if(NOT LLVM_USE_SANITIZER MATCHES "Memory.*")
   # Don't look for these libraries on Windows.
-  if (NOT WIN32)
+  if (NOT PURE_WINDOWS)
     # Skip libedit if using ASan as it contains memory leaks.
     if (LLVM_ENABLE_LIBEDIT AND NOT LLVM_USE_SANITIZER MATCHES ".*Address.*")
       if(LLVM_ENABLE_LIBEDIT STREQUAL FORCE_ON)
@@ -379,7 +384,7 @@ check_symbol_exists(sbrk unistd.h HAVE_SBRK)
 check_symbol_exists(strerror_r string.h HAVE_STRERROR_R)
 check_symbol_exists(strerror_s string.h HAVE_DECL_STRERROR_S)
 check_symbol_exists(setenv stdlib.h HAVE_SETENV)
-if(WIN32)
+if( PURE_WINDOWS )
   check_symbol_exists(_chsize_s io.h HAVE__CHSIZE_S)
 
   check_function_exists(_alloca HAVE__ALLOCA)
@@ -415,7 +420,8 @@ else()
       "sys/types.h;sys/stat.h" HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC)
 endif()
 
-if (NOT WIN32)
+# This check requires _GNU_SOURCE.
+if (NOT PURE_WINDOWS)
   if (LLVM_PTHREAD_LIB)
     list(APPEND CMAKE_REQUIRED_LIBRARIES ${LLVM_PTHREAD_LIB})
   endif()

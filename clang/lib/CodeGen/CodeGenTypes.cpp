@@ -726,7 +726,7 @@ llvm::Type *CodeGenTypes::ConvertType(QualType T) {
     auto *MPTy = cast<MemberPointerType>(Ty);
     if (!getCXXABI().isMemberPointerConvertible(MPTy)) {
       auto *C = MPTy->getMostRecentCXXRecordDecl()->getTypeForDecl();
-      auto Insertion = RecordsWithOpaqueMemberPointers.try_emplace(C);
+      auto Insertion = RecordsWithOpaqueMemberPointers.insert({C, nullptr});
       if (Insertion.second)
         Insertion.first->second = llvm::StructType::create(getLLVMContext());
       ResultType = Insertion.first->second;

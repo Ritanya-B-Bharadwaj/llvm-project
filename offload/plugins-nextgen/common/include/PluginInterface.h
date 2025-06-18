@@ -24,13 +24,13 @@
 #include "Shared/Debug.h"
 #include "Shared/Environment.h"
 #include "Shared/EnvironmentVar.h"
+#include "Shared/OffloadError.h"
 #include "Shared/Requirements.h"
 #include "Shared/Utils.h"
 
 #include "GlobalHandler.h"
 #include "JIT.h"
 #include "MemoryManager.h"
-#include "OffloadError.h"
 #include "RPC.h"
 #include "omptarget.h"
 
@@ -112,100 +112,77 @@ private:
   __tgt_async_info *AsyncInfoPtr;
 };
 
-/// Tree node for device information
-///
-/// This information is either printed or used by liboffload to extract certain
-/// device queries. Each property has an optional key, an optional value
-/// and optional children. The children can be used to store additional
-/// information (such as x, y and z components of ranges).
-struct InfoTreeNode {
-  static constexpr uint64_t IndentSize = 4;
+/// The information level represents the level of a key-value property in the
+/// info tree print (i.e. indentation). The first level should be the default.
+enum InfoLevelKind { InfoLevel1 = 1, InfoLevel2, InfoLevel3 };
 
-  std::string Key;
-  std::string Value;
-  std::string Units;
-  // Need to specify a default value number of elements here as `InfoTreeNode`'s
-  // size is unknown. This is a vector (rather than a Key->Value map) since:
-  // * The keys need to be owned and thus `std::string`s
-  // * The order of keys is important
-  // * The same key can appear multiple times
-  std::unique_ptr<llvm::SmallVector<InfoTreeNode, 8>> Children;
-
-  InfoTreeNode() : InfoTreeNode("", "", "") {}
-  InfoTreeNode(std::string Key, std::string Value, std::string Units)
-      : Key(Key), Value(Value), Units(Units) {}
-
-  /// Add a new info entry as a child of this node. The entry requires at least
-  /// a key string in \p Key. The value in \p Value is optional and can be any
-  /// type that is representable as a string. The units in \p Units is optional
-  /// and must be a string.
-  template <typename T = std::string>
-  InfoTreeNode *add(std::string Key, T Value = T(),
-                    const std::string &Units = std::string()) {
-    assert(!Key.empty() && "Invalid info key");
-
-    if (!Children)
-      Children = std::make_unique<llvm::SmallVector<InfoTreeNode, 8>>();
-
-    std::string ValueStr;
-    if constexpr (std::is_same_v<T, bool>)
-      ValueStr = Value ? "Yes" : "No";
-    else if constexpr (std::is_arithmetic_v<T>)
-      ValueStr = std::to_string(Value);
-    else
-      ValueStr = Value;
-
-    return &Children->emplace_back(Key, ValueStr, Units);
-  }
-
-  std::optional<InfoTreeNode *> get(StringRef Key) {
-    if (!Children)
-      return std::nullopt;
-
-    auto It = std::find_if(Children->begin(), Children->end(),
-                           [&](auto &V) { return V.Key == Key; });
-    if (It == Children->end())
-      return std::nullopt;
-    return It;
-  }
-
-  /// Print all info entries in the tree
-  void print() const {
-    // Fake an additional indent so that values are offset from the keys
-    doPrint(0, maxKeySize(1));
-  }
+/// Class for storing device information and later be printed. An object of this
+/// type acts as a queue of key-value properties. Each property has a key, a
+/// a value, and an optional unit for the value. For printing purposes, the
+/// information can be classified into several levels. These levels are useful
+/// for defining sections and subsections. Thus, each key-value property also
+/// has an additional field indicating to which level belongs to. Notice that
+/// we use the level to determine the indentation of the key-value property at
+/// printing time. See the enum InfoLevelKind for the list of accepted levels.
+class InfoQueueTy {
+public:
+  struct InfoQueueEntryTy {
+    std::string Key;
+    std::string Value;
+    std::string Units;
+    uint64_t Level;
+  };
 
 private:
-  void doPrint(int Level, uint64_t MaxKeySize) const {
-    if (Key.size()) {
-      // Compute the indentations for the current entry.
-      uint64_t KeyIndentSize = Level * IndentSize;
-      uint64_t ValIndentSize =
-          MaxKeySize - (Key.size() + KeyIndentSize) + IndentSize;
+  std::deque<InfoQueueEntryTy> Queue;
 
-      llvm::outs() << std::string(KeyIndentSize, ' ') << Key
-                   << std::string(ValIndentSize, ' ') << Value
-                   << (Units.empty() ? "" : " ") << Units << "\n";
-    }
+public:
+  /// Add a new info entry to the queue. The entry requires at least a key
+  /// string in \p Key. The value in \p Value is optional and can be any type
+  /// that is representable as a string. The units in \p Units is optional and
+  /// must be a string. The info level is a template parameter that defaults to
+  /// the first level (top level).
+  template <InfoLevelKind L = InfoLevel1, typename T = std::string>
+  void add(const std::string &Key, T Value = T(),
+           const std::string &Units = std::string()) {
+    assert(!Key.empty() && "Invalid info key");
 
-    // Print children
-    if (Children)
-      for (const auto &Entry : *Children)
-        Entry.doPrint(Level + 1, MaxKeySize);
+    // Convert the value to a string depending on its type.
+    if constexpr (std::is_same_v<T, bool>)
+      Queue.push_back({Key, Value ? "Yes" : "No", Units, L});
+    else if constexpr (std::is_arithmetic_v<T>)
+      Queue.push_back({Key, std::to_string(Value), Units, L});
+    else
+      Queue.push_back({Key, Value, Units, L});
   }
 
-  // Recursively calculates the maximum width of each key, including indentation
-  uint64_t maxKeySize(int Level) const {
+  const std::deque<InfoQueueEntryTy> &getQueue() const { return Queue; }
+
+  /// Print all info entries added to the queue.
+  void print() const {
+    // We print four spances for each level.
+    constexpr uint64_t IndentSize = 4;
+
+    // Find the maximum key length (level + key) to compute the individual
+    // indentation of each entry.
     uint64_t MaxKeySize = 0;
+    for (const auto &Entry : Queue) {
+      uint64_t KeySize = Entry.Key.size() + Entry.Level * IndentSize;
+      if (KeySize > MaxKeySize)
+        MaxKeySize = KeySize;
+    }
 
-    if (Children)
-      for (const auto &Entry : *Children) {
-        uint64_t KeySize = Entry.Key.size() + Level * IndentSize;
-        MaxKeySize = std::max(MaxKeySize, KeySize);
-        MaxKeySize = std::max(MaxKeySize, Entry.maxKeySize(Level + 1));
-      }
+    // Print all info entries.
+    for (const auto &Entry : Queue) {
+      // Compute the indentations for the current entry.
+      uint64_t KeyIndentSize = Entry.Level * IndentSize;
+      uint64_t ValIndentSize =
+          MaxKeySize - (Entry.Key.size() + KeyIndentSize) + IndentSize;
 
-    return MaxKeySize;
+      llvm::outs() << std::string(KeyIndentSize, ' ') << Entry.Key
+                   << std::string(ValIndentSize, ' ') << Entry.Value
+                   << (Entry.Units.empty() ? "" : " ") << Entry.Units << "\n";
+    }
   }
 };
 
@@ -894,7 +871,7 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
 
   /// Print information about the device.
   Error printInfo();
-  virtual Expected<InfoTreeNode> obtainInfoImpl() = 0;
+  virtual Error obtainInfoImpl(InfoQueueTy &Info) = 0;
 
   /// Getters of the grid values.
   uint32_t getWarpSize() const { return GridValues.GV_Warp_Size; }
