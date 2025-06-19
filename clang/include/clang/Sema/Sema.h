@@ -922,7 +922,14 @@ public:
 
   /// Print out statistics about the semantic analysis.
   void PrintStats() const;
-
+  /// Prints the auto inferences for auto variables, return types
+  void DumpAutoTypeInference(SourceManager &SM, SourceLocation Loc, bool isVar,
+                             ASTContext &Context, llvm::StringRef Name,
+                             QualType DeducedType);
+  /// Prints the auto inferences for NTTPs
+  void DumpNTTPTypeInference(SourceManager &SM, SourceLocation Loc,
+                           ASTContext &Context, llvm::StringRef Name,
+                           QualType DeducedType);
   /// Run some code with "sufficient" stack space. (Currently, at least 256K is
   /// guaranteed). Produces a warning if we're low on stack space and allocates
   /// more in that case. Use this in code that may recurse deeply (for example,
