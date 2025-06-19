@@ -626,6 +626,62 @@ Sema::~Sema() {
   SemaPPCallbackHandler->reset();
 }
 
+void Sema::DumpAutoTypeInference(SourceManager &SM, SourceLocation Loc,
+                                 bool isVar, ASTContext &Context,
+                                 llvm::StringRef Name, QualType DeducedType) {
+  if (!Loc.isValid() || SM.isInSystemHeader(Loc))
+    return;
+
+  // Setup pretty-printing policy
+  PrintingPolicy Policy(Context.getLangOpts());
+  Policy.SuppressUnwrittenScope = false;
+  Policy.FullyQualifiedName = true;
+  Policy.adjustForCPlusPlus();
+
+  std::string FullTypeStr;
+  llvm::raw_string_ostream OS(FullTypeStr);
+  
+  QualType Canonical = DeducedType.getCanonicalType();
+  Canonical.print(OS, Policy);
+  OS.flush();
+
+  // Emit diagnostic based on valid flag  -fdiagnostics-show-note-include-stack
+  Diag(Loc, diag::note_auto_type_deduced) << Name << FullTypeStr;
+
+  // Print to stderr
+  llvm::errs() << SM.getFilename(Loc) << ":"
+               << SM.getSpellingLineNumber(Loc) << ":"
+               << SM.getSpellingColumnNumber(Loc)
+               << ": note: type of '" << Name << "' deduced as '"
+               << FullTypeStr << "'\n";
+}
+
+void Sema::DumpNTTPTypeInference(SourceManager &SM, SourceLocation Loc,
+                                 ASTContext &Context, llvm::StringRef Name,
+                                 QualType DeducedType) {
+  if (!Loc.isValid() || SM.isInSystemHeader(Loc))
+    return;
+  PrintingPolicy Policy(Context.getLangOpts());
+  Policy.SuppressUnwrittenScope = false;
+  Policy.FullyQualifiedName = true;
+
+  std::string TypeStr;
+  llvm::raw_string_ostream OS(TypeStr);
+  QualType Canon = Context.getCanonicalType(DeducedType);
+  Canon.print(OS, Policy);
+  OS.flush();
+
+  // Emit diagnostic based on valid flag  -fdiagnostics-show-note-include-stack
+  Diag(Loc, diag::note_auto_type_deduced) << Name << TypeStr;
+
+  // Print to stderr
+  llvm::errs() << SM.getFilename(Loc) << ":"
+               << SM.getSpellingLineNumber(Loc) << ":"
+               << SM.getSpellingColumnNumber(Loc)
+               << ": note: NTTP '" << Name << "' deduced as '"
+               << TypeStr << "'\n";
+}
+
 void Sema::runWithSufficientStackSpace(SourceLocation Loc,
                                        llvm::function_ref<void()> Fn) {
   StackHandler.runWithSufficientStackSpace(Loc, Fn);
