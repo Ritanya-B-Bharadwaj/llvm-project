@@ -5128,6 +5128,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // are provided.
   TC.addClangWarningOptions(CmdArgs);
 
+  if (Args.hasArg(options::OPT_function_cycle_count))
+    CmdArgs.push_back("-function-cycle-count");
+
+
   // FIXME: Subclass ToolChain for SPIR and move this to addClangWarningOptions.
   if (Triple.isSPIR() || Triple.isSPIRV())
     CmdArgs.push_back("-Wspir-compat");
@@ -7360,8 +7364,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   }
 
   // Unwind v2 (epilog) information for x64 Windows.
-  Args.addOptInFlag(CmdArgs, options::OPT_fwinx64_eh_unwindv2,
-                    options::OPT_fno_winx64_eh_unwindv2);
+  Args.AddLastArg(CmdArgs, options::OPT_winx64_eh_unwindv2);
 
   // C++ "sane" operator new.
   Args.addOptOutFlag(CmdArgs, options::OPT_fassume_sane_operator_new,
@@ -8418,8 +8421,10 @@ void Clang::AddClangCLArgs(const ArgList &Args, types::ID InputType,
     CmdArgs.push_back("-fms-kernel");
 
   // Unwind v2 (epilog) information for x64 Windows.
-  if (Args.hasArg(options::OPT__SLASH_d2epilogunwind))
-    CmdArgs.push_back("-fwinx64-eh-unwindv2");
+  if (Args.hasArg(options::OPT__SLASH_d2epilogunwindrequirev2))
+    CmdArgs.push_back("-fwinx64-eh-unwindv2=required");
+  else if (Args.hasArg(options::OPT__SLASH_d2epilogunwind))
+    CmdArgs.push_back("-fwinx64-eh-unwindv2=best-effort");
 
   for (const Arg *A : Args.filtered(options::OPT__SLASH_guard)) {
     StringRef GuardArgs = A->getValue();
