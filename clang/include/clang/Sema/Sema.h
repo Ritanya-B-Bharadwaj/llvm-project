@@ -7501,7 +7501,10 @@ public:
                                   ParsedType ParsedArgTy,
                                   ArrayRef<OffsetOfComponent> Components,
                                   SourceLocation RParenLoc);
-
+  
+  //Declaring function for HPE Project
+  ExprResult ActOnNameofExpr(SourceLocation Loc, Expr *Arg, SourceLocation RParenLoc);
+                                  
   // __builtin_choose_expr(constExpr, expr1, expr2)
   ExprResult ActOnChooseExpr(SourceLocation BuiltinLoc, Expr *CondExpr,
                              Expr *LHSExpr, Expr *RHSExpr,

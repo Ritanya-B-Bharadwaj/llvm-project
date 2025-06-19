@@ -1110,6 +1110,16 @@ ExprResult Sema::DefaultVariadicArgumentPromotion(Expr *E, VariadicCallType CT,
   return E;
 }
 
+//Semantic Analysis function for HPE Project
+ExprResult Sema::ActOnNameofExpr(SourceLocation Loc, Expr *Arg, SourceLocation EndLoc) {
+  if (!Arg)
+    return ExprError();
+
+  // Set the return type to 'const char *'
+  QualType NameofType = Context.getPointerType(Context.CharTy.withConst());
+  return new (Context) NameofExpr(Loc, Arg, EndLoc, NameofType);
+}
+
 /// Convert complex integers to complex floats and real integers to
 /// real floats as required for complex arithmetic. Helper function of
 /// UsualArithmeticConversions()

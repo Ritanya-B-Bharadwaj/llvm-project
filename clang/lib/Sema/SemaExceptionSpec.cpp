@@ -1614,6 +1614,10 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
     return mergeCanThrow(CT, canThrow(TS->getTryBody()));
   }
 
+  //Addition for HPE Project
+  case Stmt::NameofExprClass: {
+    break;
+  }
   case Stmt::SYCLUniqueStableNameExprClass:
     return CT_Cannot;
   case Stmt::OpenACCAsteriskSizeExprClass:

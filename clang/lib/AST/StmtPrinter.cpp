@@ -2970,6 +2970,13 @@ void Stmt::printJson(raw_ostream &Out, PrinterHelper *Helper,
   Out << JsonFormat(TempOut.str(), AddQuotes);
 }
 
+//Pretty Printing fro HPE Project
+void StmtPrinter::VisitNameofExpr(NameofExpr *E) {
+  OS << "__nameof(";
+  PrintExpr(E->getArgument());
+  OS << ")";
+}
+
 //===----------------------------------------------------------------------===//
 // PrinterHelper
 //===----------------------------------------------------------------------===//

@@ -3143,3 +3143,11 @@ void ASTRecordWriter::FlushSubStmts() {
 
   StmtsToEmit.clear();
 }
+
+//Addition for HPE Project
+void ASTStmtWriter::VisitNameofExpr(NameofExpr *E) {
+  VisitExpr(E);             // visit base Expr parts
+  Record.AddStmt(E->getArgument());  // serialize the inner expression
+  Record.AddSourceLocation(E->getLocation());
+  Record.AddSourceLocation(E->getEndLoc());
+}

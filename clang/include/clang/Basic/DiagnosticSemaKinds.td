@@ -724,6 +724,10 @@ def err_using_enum_decl_redeclaration : Error<
   "redeclaration of using-enum declaration">;
 def note_using_enum_decl : Note<"%select{|previous }0using-enum declaration">;
 
+//diagnostic error mage for semantic function
+def err_nameof_requires_enum_constant : Error<
+  "__nameof requires an enum constant as its argument">;
+  
 def warn_access_decl_deprecated : Warning<
   "access declarations are deprecated; use using declarations instead">,
   InGroup<Deprecated>;
