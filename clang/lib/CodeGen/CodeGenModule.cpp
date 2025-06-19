@@ -7057,7 +7057,65 @@ void CodeGenModule::EmitDeclContext(const DeclContext *DC) {
     EmitTopLevelDecl(I);
   }
 }
+// In clang/lib/CodeGen/CodeGenModule.cpp
+// REPLACE your old function with this new, corrected one.
 
+// In clang/lib/CodeGen/CodeGenModule.cpp
+// REPLACE your old function with this new, final version.
+
+void CodeGenModule::EmitEnumSymbolicMap(const EnumDecl *ED) {
+  // We can't generate a map for an anonymous enum, as it has no name
+  // to derive our variable name from. e.g., enum { A, B };
+  if (!ED->getDeclName() || ED->getName().empty()) {
+    return;
+  }
+  
+  // Also, don't generate a map for an empty enum.
+  if (ED->enumerator_begin() == ED->enumerator_end()) {
+    return;
+  }
+  
+  // We only want to emit this for the definition of the enum, not for
+  // forward declarations.
+  if (!ED->isThisDeclarationADefinition()) {
+    return;
+  }
+
+  // Collect the enumerator names.
+  std::vector<llvm::Constant *> EnumeratorNames;
+  
+  for (const EnumConstantDecl *ECD : ED->enumerators()) {
+    // FIX #1 & #2: Use the correct function 'GetAddrOfConstantCString'
+    // and convert the StringRef from getName() to a std::string using .str().
+    EnumeratorNames.push_back(
+        GetAddrOfConstantCString(ECD->getName().str()).getPointer());
+  }
+
+  // FIX #3: Get the 'i8*' type using the fundamental, two-step method.
+  llvm::Type *I8Ty = llvm::Type::getInt8Ty(getLLVMContext());
+  llvm::PointerType *CharPtrTy = llvm::PointerType::get(I8Ty, 0);
+  
+  llvm::ArrayType *ArrayTy = llvm::ArrayType::get(CharPtrTy, EnumeratorNames.size());
+
+  // Create the constant array initializer with the collected string pointers.
+  llvm::Constant *Initializer = llvm::ConstantArray::get(ArrayTy, EnumeratorNames);
+
+  // Construct the name for our global variable, e.g., "__nameof_Day".
+  std::string VarName = "__nameof_" + ED->getNameAsString();
+
+  // Create the global variable in the LLVM Module.
+  auto *GV = new llvm::GlobalVariable(
+      getModule(),
+      ArrayTy,
+      true, // isConstant
+      llvm::GlobalValue::WeakODRLinkage,
+      Initializer,
+      VarName
+  );
+
+  // Pass the required address space argument (0 for the default).
+  GV->setAlignment(llvm::MaybeAlign(getDataLayout().getPointerABIAlignment(0)));
+}
 /// EmitTopLevelDecl - Emit code for a single top level declaration.
 void CodeGenModule::EmitTopLevelDecl(Decl *D) {
   // Ignore dependent declarations.
@@ -7125,6 +7183,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
         EmitTopLevelDecl(I);
     break;
   }
+  
     // No code generation needed.
   case Decl::UsingShadow:
   case Decl::ClassTemplate:
@@ -7343,11 +7402,22 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
         DI->EmitAndRetainType(getContext().getRecordType(cast<RecordDecl>(D)));
     break;
 
-  case Decl::Enum:
-    if (CGDebugInfo *DI = getModuleDebugInfo())
-      if (cast<EnumDecl>(D)->getDefinition())
-        DI->EmitAndRetainType(getContext().getEnumType(cast<EnumDecl>(D)));
-    break;
+    case Decl::Enum: {
+      // Cast the declaration to the specific Enum type
+      auto *ED = cast<EnumDecl>(D);
+  
+      // Call your function *only if* the command-line flag was used
+      if (getLangOpts().SymbolicMap) {
+        EmitEnumSymbolicMap(ED);
+      }
+  
+      // Handle debug info, which is standard for enums
+      if (CGDebugInfo *DI = getModuleDebugInfo())
+        if (ED->getDefinition())
+          DI->EmitAndRetainType(getContext().getEnumType(ED));
+  
+      break;
+    }
 
   case Decl::HLSLBuffer:
     getHLSLRuntime().addBuffer(cast<HLSLBufferDecl>(D));
@@ -7990,4 +8060,8 @@ void CodeGenModule::moveLazyEmissionStates(CodeGenModule *NewBuilder) {
   NewBuilder->WeakRefReferences = std::move(WeakRefReferences);
 
   NewBuilder->ABI->MangleCtx = std::move(ABI->MangleCtx);
+
+  // In clang/lib/CodeGen/CodeGenModule.cpp (e.g., at the end of the file)
+
+
 }
