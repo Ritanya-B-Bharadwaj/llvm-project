@@ -109,7 +109,7 @@ public:
   }
 };
 
-} 
+} // namespace
 
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "HighlightPass", LLVM_VERSION_STRING,
