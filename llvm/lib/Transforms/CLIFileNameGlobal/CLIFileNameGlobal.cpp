@@ -6,17 +6,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/CLIFileNameGlobal/CLIFileNameGlobal.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Path.h"
-#include "llvm/ADT/SmallString.h"
 using namespace llvm;
 
 PreservedAnalyses CLIFileNameGlobal::run(Module &M, ModuleAnalysisManager &) {
-  StringRef FileName = !M.getSourceFileName().empty()
-                           ? M.getSourceFileName()
-                           : M.getName();
+  StringRef FileName =
+      !M.getSourceFileName().empty() ? M.getSourceFileName() : M.getName();
 
   SmallString<256> BaseName = sys::path::filename(FileName);
 
@@ -30,8 +29,8 @@ PreservedAnalyses CLIFileNameGlobal::run(Module &M, ModuleAnalysisManager &) {
 
   auto *GV = new GlobalVariable(M, StrConstant->getType(),
                                 true, // isConstant
-                                GlobalValue::ExternalLinkage,
-                                StrConstant, MangledName);
+                                GlobalValue::ExternalLinkage, StrConstant,
+                                MangledName);
 
   GV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
   GV->setAlignment(Align(1));
