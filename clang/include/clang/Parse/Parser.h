@@ -370,6 +370,9 @@ public:
     return MightBeCXXScopeToken() && TryAnnotateCXXScopeToken(EnteringContext);
   }
 
+  //Adding the declaration as member of Parser class for HPE Project
+  ExprResult ParseNameofExpression();
+  
   //===--------------------------------------------------------------------===//
   // Scope manipulation
 

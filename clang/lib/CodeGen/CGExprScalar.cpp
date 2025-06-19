@@ -270,6 +270,11 @@ public:
   //                               Utilities
   //===--------------------------------------------------------------------===//
 
+  //Addition for HPE Project
+  Value *VisitNameofExpr(NameofExpr *E) {
+  return CGF.EmitNameofExpr(E);  // Call your function from CGExpr.cpp
+  }
+
   bool TestAndClearIgnoreResultAssign() {
     bool I = IgnoreResultAssign;
     IgnoreResultAssign = false;

@@ -17657,6 +17657,16 @@ ExprResult TreeTransform<Derived>::TransformHLSLOutArgExpr(HLSLOutArgExpr *E) {
   return getDerived().TransformExpr(E->getArgLValue());
 }
 
+template<typename Derived>
+ExprResult TreeTransform<Derived>::TransformNameofExpr(NameofExpr *E) {
+  ExprResult Arg = getDerived().TransformExpr(E->getArgument());
+  if (Arg.isInvalid())
+    return ExprError();
+  QualType NameofType = SemaRef.Context.getPointerType(SemaRef.Context.CharTy.withConst());
+
+  return new (SemaRef.Context) NameofExpr(E->getLocation(), Arg.get(), E->getEndLoc(), NameofType);
+}
+
 } // end namespace clang
 
 #endif // LLVM_CLANG_LIB_SEMA_TREETRANSFORM_H

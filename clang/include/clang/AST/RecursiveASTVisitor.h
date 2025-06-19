@@ -2649,6 +2649,12 @@ bool RecursiveASTVisitor<Derived>::TraverseInitListExpr(
   return true;
 }
 
+//Add node for traversal for HPE Project
+template <typename Derived>
+bool RecursiveASTVisitor<Derived>::TraverseNameofExpr(NameofExpr *E,  DataRecursionQueue *Queue) {
+  return TraverseStmt(E->getArgument());
+}
+
 // GenericSelectionExpr is a special case because the types and expressions
 // are interleaved.  We also need to watch out for null types (default
 // generic associations).

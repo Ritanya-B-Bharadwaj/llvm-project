@@ -272,6 +272,10 @@ public:
     unsigned Index;
   };
 
+  //Addition for HPE Project
+  llvm::Value *EmitNameofExpr(const NameofExpr *E);
+  llvm::Value *VisitNameofExpr(NameofExpr *E);
+
   CodeGenModule &CGM; // Per-module state.
   const TargetInfo &Target;
 

@@ -555,6 +555,20 @@ Parser::ParseRHSOfBinaryExpression(ExprResult LHS, prec::Level MinPrec) {
   }
 }
 
+//Parser Handler for HPE Project
+ExprResult Parser::ParseNameofExpression() {
+  assert(Tok.is(tok::kw___nameof) && "Expected __nameof token");
+
+  SourceLocation NameofLoc = ConsumeToken(); // eat __nameof
+  if (ExpectAndConsume(tok::l_paren)) return ExprError();
+
+  ExprResult Arg = ParseExpression();
+
+  if (ExpectAndConsume(tok::r_paren)) return ExprError();
+
+  return Actions.ActOnNameofExpr(NameofLoc, Arg.get(), Tok.getLocation());
+}
+
 ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
                                        bool isAddressOfOperand,
                                        TypeCastState isTypeCast,
@@ -723,7 +737,12 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
   tok::TokenKind SavedKind = Tok.getKind();
   auto SavedType = PreferredType;
   NotCastExpr = false;
-
+  
+  if (Tok.is(tok::kw___nameof)) {
+    NotCastExpr = false;
+    return ParseNameofExpression();
+  }
+  
   // Are postfix-expression suffix operators permitted after this
   // cast-expression? If not, and we find some, we'll parse them anyway and
   // diagnose them.

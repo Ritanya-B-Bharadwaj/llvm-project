@@ -2860,3 +2860,8 @@ void Stmt::ProcessODRHash(llvm::FoldingSetNodeID &ID,
   StmtProfilerWithoutPointers Profiler(ID, Hash);
   Profiler.Visit(this);
 }
+
+void StmtProfiler::VisitNameofExpr(const NameofExpr *S) {
+  VisitExpr(S);
+  VisitStmt(S->getArgument());
+}

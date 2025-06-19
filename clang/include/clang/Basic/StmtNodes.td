@@ -326,3 +326,6 @@ def OpenACCAsteriskSizeExpr : StmtNode<Expr>;
 
 // HLSL Constructs.
 def HLSLOutArgExpr : StmtNode<Expr>;
+
+//For HPE Project
+def NameofExpr : StmtNode<Expr>;

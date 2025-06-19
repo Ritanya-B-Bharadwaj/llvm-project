@@ -7400,6 +7400,41 @@ private:
   friend class ASTStmtWriter;
 };
 
+//Addition for HPE Project
+class NameofExpr : public Expr {
+  SourceLocation Loc;
+  SourceLocation EndLoc;
+  Stmt *Arg;
+
+public:
+  NameofExpr(SourceLocation L, Expr *A, SourceLocation EL, QualType QT)
+    : Expr(NameofExprClass, QT, VK_PRValue, OK_Ordinary),
+      Loc(L), EndLoc(EL), Arg(A) {
+  setDependence(ExprDependence::None);
+}
+
+  Expr *getArgument() const { return cast_or_null<Expr>(Arg); }
+  SourceLocation getLocation() const { return Loc; }
+  SourceLocation getBeginLoc() const { return Loc; }
+  SourceLocation getEndLoc() const { return EndLoc; }
+
+  void setLocation(SourceLocation L) { Loc = L; }
+  void setEndLoc(SourceLocation EL) { EndLoc = EL; }
+  void setArgument(Expr *E) { Arg = E; }
+
+  child_range children() {
+    return child_range(&Arg, &Arg + 1);
+  }
+
+  const_child_range children() const {
+    return const_child_range(&Arg, &Arg + 1);
+  }
+
+  static bool classof(const Stmt *T) {
+    return T->getStmtClass() == NameofExprClass;
+  }
+};
+
 /// Insertion operator for diagnostics.  This allows sending
 /// Expr into a diagnostic with <<.
 inline const StreamingDiagnostic &operator<<(const StreamingDiagnostic &DB,

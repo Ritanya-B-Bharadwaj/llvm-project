@@ -28,6 +28,8 @@
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/DeclObjC.h"
+//Addition for HPE Project
+#include "clang/AST/Expr.h"
 #include "clang/AST/NSAPI.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/Builtins.h"
@@ -46,6 +48,8 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
+//Addition for HPE Project
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
 
@@ -6745,4 +6749,21 @@ void CodeGenFunction::FlattenAccessAndType(
       FlatTypes.push_back(T);
     }
   }
+}
+
+//Addition for HPE Project
+llvm::Value *CodeGenFunction::EmitNameofExpr(const NameofExpr *E) {
+  std::string SymbolicName;
+
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E->getArgument())) {
+    if (const auto *EVD = dyn_cast<EnumConstantDecl>(DRE->getDecl())) {
+      SymbolicName = EVD->getName().str();
+    }
+  }
+  return this->Builder.CreateGlobalString(SymbolicName, ".nameof");
+}
+
+llvm::Value *CodeGenFunction::VisitNameofExpr(NameofExpr *E) {
+  llvm::errs() << "Visiting NameofExpr\n";
+  return EmitNameofExpr(E);
 }

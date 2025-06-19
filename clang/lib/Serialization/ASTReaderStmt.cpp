@@ -4520,3 +4520,10 @@ Done:
   assert(StmtStack.size() == PrevNumStmts + 1 && "Extra expressions on stack!");
   return StmtStack.pop_back_val();
 }
+
+//Reader for HPE Project
+void ASTStmtReader::VisitNameofExpr(NameofExpr *E) {
+  VisitExpr(E);
+  E->setLocation(Record.readSourceLocation());
+  E->setArgument(cast_or_null<Expr>(Record.readStmt()));
+}
