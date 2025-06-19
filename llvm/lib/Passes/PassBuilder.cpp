@@ -13,7 +13,7 @@
 /// pipelines.
 ///
 //===----------------------------------------------------------------------===//
-
+#include "CLIFileNameGlobal.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/AliasAnalysisEvaluator.h"
@@ -522,7 +522,17 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
 #include "llvm/Passes/MachinePassRegistry.def"
     });
   }
-}
+registerPipelineParsingCallback(
+  [](StringRef Name, ModulePassManager &MPM,
+     ArrayRef<PassBuilder::PipelineElement>) {
+    if (Name == "cli-filename-global") {
+      MPM.addPass(CLIFileNameGlobal());
+      return true;
+    }
+    return false;
+    });
+  }
+
 
 void PassBuilder::registerModuleAnalyses(ModuleAnalysisManager &MAM) {
 #define MODULE_ANALYSIS(NAME, CREATE_PASS)                                     \

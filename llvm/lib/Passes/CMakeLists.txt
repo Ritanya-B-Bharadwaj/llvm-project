@@ -33,4 +33,8 @@ add_llvm_component_library(LLVMPasses
   TransformUtils
   Vectorize
   Instrumentation
+
+  LINK_LIBS
+    LLVMCLIFileNameGlobal
   )
+  include_directories(${LLVM_MAIN_SRC_DIR}/lib/Transforms/CLIFileNameGlobal)
