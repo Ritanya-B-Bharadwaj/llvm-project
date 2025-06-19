@@ -7,6 +7,8 @@ add_llvm_component_library(LLVMPasses
   PassPlugin.cpp
   StandardInstrumentations.cpp
 
+  ../../lib/Transforms/CLIFileNameGlobal/CLIFileNameGlobal.cpp
+
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Passes
@@ -33,8 +35,11 @@ add_llvm_component_library(LLVMPasses
   TransformUtils
   Vectorize
   Instrumentation
+)
 
-  LINK_LIBS
-    LLVMCLIFileNameGlobal
-  )
-  include_directories(${LLVM_MAIN_SRC_DIR}/lib/Transforms/CLIFileNameGlobal)
+# ✅ Add include path for CLIFileNameGlobal.h
+include_directories(${LLVM_MAIN_SRC_DIR}/llvm/lib/Transforms)
+
+# ✅ Link to your custom pass (if needed)
+# NOTE: Usually not needed unless you split into multiple libraries.
+# target_link_libraries(LLVMPasses PRIVATE LLVMCLIFileNameGlobal)

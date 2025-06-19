@@ -13,7 +13,7 @@
 /// pipelines.
 ///
 //===----------------------------------------------------------------------===//
-#include "CLIFileNameGlobal.h"
+#include "llvm/Transforms/CLIFileNameGlobal/CLIFileNameGlobal.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/AliasAnalysisEvaluator.h"
@@ -530,8 +530,8 @@ registerPipelineParsingCallback(
       return true;
     }
     return false;
-    });
-  }
+  });
+}
 
 
 void PassBuilder::registerModuleAnalyses(ModuleAnalysisManager &MAM) {
