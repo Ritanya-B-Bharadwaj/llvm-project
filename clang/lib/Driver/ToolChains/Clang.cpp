@@ -5128,6 +5128,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // are provided.
   TC.addClangWarningOptions(CmdArgs);
 
+  if (Args.hasArg(options::OPT_function_cycle_count))
+    CmdArgs.push_back("-function-cycle-count");
+
+
   // FIXME: Subclass ToolChain for SPIR and move this to addClangWarningOptions.
   if (Triple.isSPIR() || Triple.isSPIRV())
     CmdArgs.push_back("-Wspir-compat");

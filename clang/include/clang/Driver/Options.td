@@ -4048,6 +4048,9 @@ def fsyntax_only : Flag<["-"], "fsyntax-only">,
   Visibility<[ClangOption, CLOption, DXCOption, CC1Option, FC1Option, FlangOption]>,
   Group<Action_Group>,
   HelpText<"Run the preprocessor, parser and semantic analysis stages">;
+def function_cycle_count : Flag<["-"], "function-cycle-count">,
+  HelpText<"Print estimated cycle count for each function">,
+  Visibility<[CC1Option]>;
 def ftabstop_EQ : Joined<["-"], "ftabstop=">, Group<f_Group>;
 def ftemplate_depth_EQ : Joined<["-"], "ftemplate-depth=">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,

@@ -5,7 +5,10 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-
+#include "llvm/Pass.h"
+namespace llvm {
+  FunctionPass *createFunctionCycleCountPass();
+}
 #include "clang/CodeGen/BackendUtil.h"
 #include "BackendConsumer.h"
 #include "LinkInModulesPass.h"
@@ -88,6 +91,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+
 using namespace clang;
 using namespace llvm;
 
@@ -623,6 +627,10 @@ bool EmitAssemblyHelper::AddEmitPasses(legacy::PassManager &CodeGenPasses,
   std::unique_ptr<TargetLibraryInfoImpl> TLII(
       llvm::driver::createTLII(TargetTriple, CodeGenOpts.getVecLib()));
   CodeGenPasses.add(new TargetLibraryInfoWrapperPass(*TLII));
+  if (CodeGenOpts.FunctionCycleCount) {
+    CodeGenPasses.add(llvm::createFunctionCycleCountPass());
+}
+
 
   // Normal mode, emit a .s or .o file by running the code generator. Note,
   // this also adds codegenerator level optimization passes.

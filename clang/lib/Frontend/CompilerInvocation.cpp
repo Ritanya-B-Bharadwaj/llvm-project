@@ -1967,6 +1967,7 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
       std::string(Args.getLastArgValue(OPT_fbinutils_version_EQ));
 
   Opts.DebugTemplateAlias = Args.hasArg(OPT_gtemplate_alias);
+  Opts.FunctionCycleCount = Args.hasArg(options::OPT_function_cycle_count);
 
   Opts.DebugNameTable = static_cast<unsigned>(
       Args.hasArg(OPT_ggnu_pubnames)
