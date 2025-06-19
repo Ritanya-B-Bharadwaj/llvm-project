@@ -344,6 +344,7 @@ public:
   typedef std::vector<Structor> CtorList;
 
 private:
+  void EmitEnumSymbolicMap(const EnumDecl *ED);
   ASTContext &Context;
   const LangOptions &LangOpts;
   IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS; // Only used for debug info.

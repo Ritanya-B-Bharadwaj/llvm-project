@@ -756,6 +756,7 @@ def E : Flag<["-"], "E">, Flags<[NoXarchOption]>,
   Visibility<[ClangOption, CC1Option, FlangOption, FC1Option]>,
   Group<Action_Group>,
     HelpText<"Only run the preprocessor">;
+
 def F : JoinedOrSeparate<["-"], "F">, Flags<[RenderJoined]>,
   Visibility<[ClangOption, CC1Option]>,
     HelpText<"Add directory to framework include search path">;
@@ -2807,6 +2808,11 @@ def ffreestanding : Flag<["-"], "ffreestanding">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Assert that the compilation takes place in a freestanding environment">,
   MarshallingInfoFlag<LangOpts<"Freestanding">>;
+def symbolic_map : Flag<["-"], "symbolic-map">,
+  Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Generate a symbolic map for enum values">,
+  MarshallingInfoFlag<LangOpts<"SymbolicMap">>;
 def fgnuc_version_EQ : Joined<["-"], "fgnuc-version=">, Group<f_Group>,
   HelpText<"Sets various macros to claim compatibility with the given GCC version (default is 4.2.1)">,
   Visibility<[ClangOption, CC1Option, CLOption]>;
@@ -8636,6 +8642,8 @@ def opt_record_format : Separate<["-"], "opt-record-format">,
 let Visibility = [CC1AsOption] in {
 
 // Language Options
+// This is the definitive, correct version.
+
 def n : Flag<["-"], "n">,
   HelpText<"Don't automatically start assembly file with a text section">;
 
