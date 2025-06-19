@@ -6941,7 +6941,14 @@ ExprResult Sema::CheckTemplateArgument(NonTypeTemplateParmDecl *Param,
       Arg = DeductionArg;
     }
   };
-
+  // Calling DumpNTTPTypeInference for auto NTTPs inference
+  if (getLangOpts().DumpAutoTypeInference && Param && !Param->getName().empty()) {
+    QualType DeducedTy = Arg->getType();
+    if (!DeducedTy.isNull()) {
+      DumpNTTPTypeInference(getSourceManager(), Arg->getExprLoc(), Context,
+                            Param->getName(), DeducedTy);
+    }
+  }
   // If the parameter type somehow involves auto, deduce the type now.
   DeducedType *DeducedT = ParamType->getContainedDeducedType();
   if (getLangOpts().CPlusPlus17 && DeducedT && !DeducedT->isDeduced()) {
