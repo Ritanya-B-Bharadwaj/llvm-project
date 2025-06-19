@@ -80,8 +80,8 @@ public:
         
         IRBuilder<> Builder(Context);
         
-        // Create format strings
-        Value *FuncNameFormat = createGlobalString(M, F.getName().str() + "(),", "func_name_fmt");
+        // SOLUTION 1: Include newline at the beginning of function name format
+        Value *FuncNameFormat = createGlobalString(M, "\n" + F.getName().str() + "(),", "func_name_fmt");
         Value *PointerFormat = createGlobalString(M, " 0x%lx,", "ptr_fmt");
         Value *NewlineFormat = createGlobalString(M, "\n", "newline_fmt");
         
@@ -89,7 +89,7 @@ public:
         BasicBlock &EntryBB = F.getEntryBlock();
         Builder.SetInsertPoint(&EntryBB, EntryBB.getFirstInsertionPt());
         
-        // Print function name at the beginning
+        // Print function name at the beginning (now includes leading newline)
         Builder.CreateCall(PrintFunctionName, {FuncNameFormat});
         
         // Collect all pointer access instructions
@@ -135,14 +135,11 @@ public:
             }
         }
         
-        // Add newline and flush at function exit points
+        // Add flush at function exit points (newline already printed at function entry)
         for (BasicBlock &BB : F) {
             for (Instruction &I : BB) {
                 if (auto *RI = dyn_cast<ReturnInst>(&I)) {
                     Builder.SetInsertPoint(RI);
-                    
-                    // Print newline
-                    Builder.CreateCall(PrintFunctionName, {NewlineFormat});
                     
                     // Flush output to ensure immediate printing
                     Value *NullPtr = ConstantPointerNull::get(PointerType::getUnqual(Context));
