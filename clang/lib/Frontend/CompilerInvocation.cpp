@@ -1492,11 +1492,11 @@ static void setPGOUseInstrumentor(CodeGenOptions &Opts,
   // which is available (might be one or both).
   if (PGOReader->isIRLevelProfile() || PGOReader->hasMemoryProfile()) {
     if (PGOReader->hasCSIRLevelProfile())
-      Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileCSIRInstr);
+      Opts.setProfileUse(CodeGenOptions::ProfileCSIRInstr);
     else
-      Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileIRInstr);
+      Opts.setProfileUse(CodeGenOptions::ProfileIRInstr);
   } else
-    Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileClangInstr);
+    Opts.setProfileUse(CodeGenOptions::ProfileClangInstr);
 }
 
 void CompilerInvocation::setDefaultPointerAuthOptions(
@@ -1857,7 +1857,7 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
     OptimizationLevel = MaxOptLevel;
   }
   Opts.OptimizationLevel = OptimizationLevel;
-
+  Opts.EmitInstrFreq = Args.hasArg(OPT_emit_instr_freq);
   // The key paths of codegen options defined in Options.td start with
   // "CodeGenOpts.". Let's provide the expected variable name and type.
   CodeGenOptions &CodeGenOpts = Opts;
