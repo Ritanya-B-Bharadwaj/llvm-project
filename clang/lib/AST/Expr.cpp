@@ -1,4 +1,51 @@
-//===--- Expr.cpp - Expression AST Node Implementation --------------------===//
+// ...existing code...
+StringRef PredefinedExpr::getIdentKindName(PredefinedIdentKind IK) {
+  switch (IK) {
+  case PredefinedIdentKind::Func:
+    return "__func__";
+  case PredefinedIdentKind::Function:
+    return "__FUNCTION__";
+  case PredefinedIdentKind::FuncDName:
+    return "__FUNCDNAME__";
+  case PredefinedIdentKind::FQFunction:
+    return "__fq_func__";
+  case PredefinedIdentKind::MangledFunction:
+    return "__mangled_func__";
+  case PredefinedIdentKind::LFunction:
+    return "L__FUNCTION__";
+  case PredefinedIdentKind::PrettyFunction:
+    return "__PRETTY_FUNCTION__";
+  case PredefinedIdentKind::FuncSig:
+    return "__FUNCSIG__";
+  case PredefinedIdentKind::LFuncSig:
+    return "L__FUNCSIG__";
+  case PredefinedIdentKind::PrettyFunctionNoVirtual:
+    break;
+  }
+  llvm_unreachable("Unknown ident kind for PredefinedExpr");
+}
+// ...existing code...
+std::string PredefinedExpr::ComputeName(PredefinedIdentKind IK,
+                                        const Decl *CurrentDecl,
+                                        bool ForceElaboratedPrinting) {
+  ASTContext &Context = CurrentDecl->getASTContext();
+
+  if (IK == PredefinedIdentKind::FQFunction) {
+    if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl))
+      return ND->getQualifiedNameAsString();
+    return "<unknown>";
+  }
+
+  if (IK == PredefinedIdentKind::MangledFunction) {
+    if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl)) {
+      std::unique_ptr<MangleContext> MC;
+      MC.reset(Context.createMangleContext());
+      SmallString<256> Buffer;
+      llvm::raw_svector_ostream Out(Buffer);
+      GlobalDecl GD;
+      if (const CXXConstructorDecl *CD = dyn_cast<CXXConstructorDecl>(ND))
+        GD = GlobalDecl(CD, Ctor_Base);
+      else//===--- Expr.cpp - Expression AST Node Implementation --------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -653,6 +700,104 @@ StringRef PredefinedExpr::getIdentKindName(PredefinedIdentKind IK) {
     return "__FUNCTION__";
   case PredefinedIdentKind::FuncDName:
     return "__FUNCDNAME__";
+    // ...existing code...
+  StringRef PredefinedExpr::getIdentKindName(PredefinedIdentKind IK) {
+    switch (IK) {
+    case PredefinedIdentKind::Func:
+      return "__func__";
+    case PredefinedIdentKind::Function:
+      return "__FUNCTION__";
+    case PredefinedIdentKind::FuncDName:
+      return "__FUNCDNAME__";
+    case PredefinedIdentKind::FQFunction:
+      return "__fq_func__";
+    case PredefinedIdentKind::MangledFunction:
+      return "__mangled_func__";
+    case PredefinedIdentKind::LFunction:
+      return "L__FUNCTION__";
+    case PredefinedIdentKind::PrettyFunction:
+      return "__PRETTY_FUNCTION__";
+    case PredefinedIdentKind::FuncSig:
+      return "__FUNCSIG__";
+    case PredefinedIdentKind::LFuncSig:
+      return "L__FUNCSIG__";
+    case PredefinedIdentKind::PrettyFunctionNoVirtual:
+      break;
+    }
+    llvm_unreachable("Unknown ident kind for PredefinedExpr");
+  }
+  // ...existing code...
+  std::string PredefinedExpr::ComputeName(PredefinedIdentKind IK,
+                                          const Decl *CurrentDecl,
+                                          bool ForceElaboratedPrinting) {                                          // ...existing code...
+                                          StringRef PredefinedExpr::getIdentKindName(PredefinedIdentKind IK) {
+                                            switch (IK) {
+                                            case PredefinedIdentKind::Func:
+                                              return "__func__";
+                                            case PredefinedIdentKind::Function:
+                                              return "__FUNCTION__";
+                                            case PredefinedIdentKind::FuncDName:
+                                              return "__FUNCDNAME__";
+                                            case PredefinedIdentKind::FQFunction:
+                                              return "__fq_func__";
+                                            case PredefinedIdentKind::MangledFunction:
+                                              return "__mangled_func__";
+                                            case PredefinedIdentKind::LFunction:
+                                              return "L__FUNCTION__";
+                                            case PredefinedIdentKind::PrettyFunction:
+                                              return "__PRETTY_FUNCTION__";
+                                            case PredefinedIdentKind::FuncSig:
+                                              return "__FUNCSIG__";
+                                            case PredefinedIdentKind::LFuncSig:
+                                              return "L__FUNCSIG__";
+                                            case PredefinedIdentKind::PrettyFunctionNoVirtual:
+                                              break;
+                                            }
+                                            llvm_unreachable("Unknown ident kind for PredefinedExpr");
+                                          }
+                                          // ...existing code...
+                                          std::string PredefinedExpr::ComputeName(PredefinedIdentKind IK,
+                                                                                  const Decl *CurrentDecl,
+                                                                                  bool ForceElaboratedPrinting) {
+                                            ASTContext &Context = CurrentDecl->getASTContext();
+                                          
+                                            if (IK == PredefinedIdentKind::FQFunction) {
+                                              if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl))
+                                                return ND->getQualifiedNameAsString();
+                                              return "<unknown>";
+                                            }
+                                          
+                                            if (IK == PredefinedIdentKind::MangledFunction) {
+                                              if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl)) {
+                                                std::unique_ptr<MangleContext> MC;
+                                                MC.reset(Context.createMangleContext());
+                                                SmallString<256> Buffer;
+                                                llvm::raw_svector_ostream Out(Buffer);
+                                                GlobalDecl GD;
+                                                if (const CXXConstructorDecl *CD = dyn_cast<CXXConstructorDecl>(ND))
+                                                  GD = GlobalDecl(CD, Ctor_Base);
+                                                else
+    ASTContext &Context = CurrentDecl->getASTContext();
+  
+    if (IK == PredefinedIdentKind::FQFunction) {
+      if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl))
+        return ND->getQualifiedNameAsString();
+      return "<unknown>";
+    }
+  
+    if (IK == PredefinedIdentKind::MangledFunction) {
+      if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl)) {
+        std::unique_ptr<MangleContext> MC;
+        MC.reset(Context.createMangleContext());
+        SmallString<256> Buffer;
+        llvm::raw_svector_ostream Out(Buffer);
+        GlobalDecl GD;
+        if (const CXXConstructorDecl *CD = dyn_cast<CXXConstructorDecl>(ND))
+          GD = GlobalDecl(CD, Ctor_Base);
+        elsecase PredefinedIdentKind::FQFunction:
+    return "__fq_func__";
+  case PredefinedIdentKind::MangledFunction:
+    return "__mangled_func__";
   case PredefinedIdentKind::LFunction:
     return "L__FUNCTION__";
   case PredefinedIdentKind::PrettyFunction:

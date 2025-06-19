@@ -2722,7 +2722,10 @@ Parser::ParseParenExpression(ParenParseOption &ExprType, bool stopIfCastExpr,
     else if (tokenKind == tok::kw___bridge_transfer)
       Kind = OBC_BridgeTransfer;
     else if (tokenKind == tok::kw___bridge_retained)
-      Kind = OBC_BridgeRetained;
+      Kind = OBC_BridgeRetained;      // ...existing code...
+      KEYWORD(__fq_func__, KEYALL)
+      KEYWORD(__mangled_func__, KEYALL)
+      // ...existing code...
     else {
       // As a hopefully temporary workaround, allow __bridge_retain as
       // a synonym for __bridge_retained, but only in system headers.
@@ -2862,7 +2865,16 @@ Parser::ParseParenExpression(ParenParseOption &ExprType, bool stopIfCastExpr,
           return ExprResult();
         }
 
-        // Reject the cast of super idiom in ObjC.
+        // Reject the cast of super idiom in ObjC.        // ...existing code...
+          case tok::kw_L__FUNCTION__:
+          case tok::kw_L__FUNCSIG__:
+          case tok::kw___PRETTY_FUNCTION__:
+          // Add below lines
+          case tok::kw___fq_func__:
+          case tok::kw___mangled_func__:
+            // ...existing code for handling function name keywords...
+            break;
+        // ...existing code...
         if (Tok.is(tok::identifier) && getLangOpts().ObjC &&
             Tok.getIdentifierInfo() == Ident_super &&
             getCurScope()->isInObjcMethodScope() &&
@@ -2876,7 +2888,54 @@ Parser::ParseParenExpression(ParenParseOption &ExprType, bool stopIfCastExpr,
         // Parse the cast-expression that follows it next.
         // TODO: For cast expression with CastTy.
         Result = ParseCastExpression(
-            /*isUnaryExpression=*/CastParseKind::AnyCastExpr,
+            /*isUnaryExpression=*/CastParseKind::AnyCastExpr,            // ...existing code...
+            StringRef PredefinedExpr::getIdentKindName(PredefinedIdentKind IK) {
+              switch (IK) {
+              case PredefinedIdentKind::Func:
+                return "__func__";
+              case PredefinedIdentKind::Function:
+                return "__FUNCTION__";
+              case PredefinedIdentKind::FuncDName:
+                return "__FUNCDNAME__";
+              case PredefinedIdentKind::FQFunction:
+                return "__fq_func__";
+              case PredefinedIdentKind::MangledFunction:
+                return "__mangled_func__";
+              case PredefinedIdentKind::LFunction:
+                return "L__FUNCTION__";
+              case PredefinedIdentKind::PrettyFunction:
+                return "__PRETTY_FUNCTION__";
+              case PredefinedIdentKind::FuncSig:
+                return "__FUNCSIG__";
+              case PredefinedIdentKind::LFuncSig:
+                return "L__FUNCSIG__";
+              case PredefinedIdentKind::PrettyFunctionNoVirtual:
+                break;
+              }
+              llvm_unreachable("Unknown ident kind for PredefinedExpr");
+            }
+            // ...existing code...
+            std::string PredefinedExpr::ComputeName(PredefinedIdentKind IK,
+                                                    const Decl *CurrentDecl,
+                                                    bool ForceElaboratedPrinting) {
+              ASTContext &Context = CurrentDecl->getASTContext();
+            
+              if (IK == PredefinedIdentKind::FQFunction) {
+                if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl))
+                  return ND->getQualifiedNameAsString();
+                return "<unknown>";
+              }
+            
+              if (IK == PredefinedIdentKind::MangledFunction) {
+                if (const auto *ND = dyn_cast<NamedDecl>(CurrentDecl)) {
+                  std::unique_ptr<MangleContext> MC;
+                  MC.reset(Context.createMangleContext());
+                  SmallString<256> Buffer;
+                  llvm::raw_svector_ostream Out(Buffer);
+                  GlobalDecl GD;
+                  if (const CXXConstructorDecl *CD = dyn_cast<CXXConstructorDecl>(ND))
+                    GD = GlobalDecl(CD, Ctor_Base);
+                  else
             /*isAddressOfOperand=*/false,
             /*isTypeCast=*/TypeCastState::IsTypeCast);
         if (!Result.isInvalid()) {
