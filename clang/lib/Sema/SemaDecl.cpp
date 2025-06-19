@@ -13157,9 +13157,16 @@ bool Sema::DeduceVariableDeclarationType(VarDecl *VDecl, bool DirectInit,
     return true;
   }
 
+  // Calling DumpAutoTypeInference for auto inference
+  if (getLangOpts().DumpAutoTypeInference &&
+      isa<AutoType>(VDecl->getType().getTypePtr())) {
+    DumpAutoTypeInference(getSourceManager(), VDecl->getLocation(),
+                          true, Context, VDecl->getNameAsString(),
+                          DeducedType);
+  }
   VDecl->setType(DeducedType);
   assert(VDecl->isLinkageValid());
-
+  
   // In ARC, infer lifetime.
   if (getLangOpts().ObjCAutoRefCount && ObjC().inferObjCARCLifetime(VDecl))
     VDecl->setInvalidDecl();

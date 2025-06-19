@@ -8180,6 +8180,9 @@ def fdump_record_layouts : Flag<["-"], "fdump-record-layouts">,
   HelpText<"Dump record layout information">,
   MarshallingInfoFlag<LangOpts<"DumpRecordLayouts">>,
   ImpliedByAnyOf<[fdump_record_layouts_simple.KeyPath, fdump_record_layouts_complete.KeyPath, fdump_record_layouts_canonical.KeyPath]>;
+def fdump_auto_type_inference : Flag<["-"], "fdump-auto-type-inference">,
+  HelpText<"Dump type information inferred for 'auto' keyword including return types and NTTPs">,
+  MarshallingInfoFlag<LangOpts<"DumpAutoTypeInference">>;
 def fix_what_you_can : Flag<["-"], "fix-what-you-can">,
   HelpText<"Apply fix-it advice even in the presence of unfixable errors">,
   MarshallingInfoFlag<FrontendOpts<"FixWhatYouCan">>;

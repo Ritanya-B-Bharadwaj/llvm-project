@@ -3833,7 +3833,9 @@ bool Sema::DeduceFunctionTypeFromReturnExpr(FunctionDecl *FD,
   if (!FD->isInvalidDecl() && AT->getDeducedType() != Deduced)
     // Update all declarations of the function to have the deduced return type.
     Context.adjustDeducedFunctionResultType(FD, Deduced);
-
+  SourceManager &SM = getSourceManager();
+  Sema::DumpAutoTypeInference(SM, FD->getLocation(), false, Context,
+                              FD->getNameAsString(), Deduced);
   return false;
 }
 
