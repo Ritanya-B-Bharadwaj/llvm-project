@@ -1,11 +1,11 @@
-#include "llvm/IR/PassManager.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/DebugInfoMetadata.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/IR/Module.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -22,15 +22,14 @@ public:
     std::vector<DebugLoc> TempMarkers;
     std::vector<HighlightCluster> Clusters;
 
-    
     for (Function &F : M) {
       if (F.getName().starts_with("__highlight_marker")) {
         for (auto &BB : F) {
           for (auto &I : BB) {
             if (auto DL = I.getDebugLoc()) {
               TempMarkers.push_back(DL);
-              outs() << "Collected marker: " << DL->getFilename()
-                     << ":" << DL->getLine() << "\n";
+              outs() << "Collected marker: " << DL->getFilename() << ":"
+                     << DL->getLine() << "\n";
               break;
             }
           }
@@ -39,7 +38,6 @@ public:
       }
     }
 
-    
     for (size_t i = 0; i + 1 < TempMarkers.size(); i += 2) {
       DebugLoc A = TempMarkers[i];
       DebugLoc B = TempMarkers[i + 1];
@@ -58,7 +56,6 @@ public:
              << " to " << cluster.end.getLine() << "\n";
     }
 
-    
     for (Function &F : M) {
       if (F.getName().starts_with("__highlight_marker"))
         continue;
@@ -73,8 +70,6 @@ public:
       unsigned FuncEnd = FuncStart;
       StringRef Filename = SP->getFile()->getFilename();
 
-
-
       for (auto &BB : F) {
         for (auto &I : BB) {
           if (DebugLoc DL = I.getDebugLoc()) {
@@ -85,11 +80,8 @@ public:
         }
       }
 
-      
-  outs() << "Function: " << F.getName()
-  << " spans lines " << FuncStart << " to " << FuncEnd
-  << " in file: " << Filename << "\n";
-
+      outs() << "Function: " << F.getName() << " spans lines " << FuncStart
+             << " to " << FuncEnd << " in file: " << Filename << "\n";
 
       for (const auto &cluster : Clusters) {
         if (Filename == cluster.start->getFilename()) {
@@ -97,18 +89,15 @@ public:
           unsigned ClusterEnd = cluster.end.getLine();
           outs() << "Cluster: " << ClusterStart << " to " << ClusterEnd << "\n";
           if (FuncEnd >= ClusterStart && FuncStart <= ClusterEnd) {
-  
+
             F.addFnAttr("IsHighlighted", "");
 
-
             outs() << " Function " << F.getName()
-                   << " marked as IsHighlighted (lines " << FuncStart
-                   << " to " << FuncEnd << ")\n";
+                   << " marked as IsHighlighted (lines " << FuncStart << " to "
+                   << FuncEnd << ")\n";
 
-            
             if (F.hasFnAttribute("IsHighlighted")) {
-              outs() << " VERIFIED: " << F.getName()
-                     << " has IsHighlighted\n";
+              outs() << " VERIFIED: " << F.getName() << " has IsHighlighted\n";
             }
             break;
           }
@@ -122,20 +111,17 @@ public:
 
 } 
 
-
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {
-    LLVM_PLUGIN_API_VERSION, "HighlightPass", LLVM_VERSION_STRING,
-    [](PassBuilder &PB) {
-      PB.registerPipelineParsingCallback(
-        [](StringRef Name, ModulePassManager &MPM,
-           ArrayRef<PassBuilder::PipelineElement>) {
-          if (Name == "highlight") {
-            MPM.addPass(HighlightPass());
-            return true;
-          }
-          return false;
-        });
-    }
-  };
+  return {LLVM_PLUGIN_API_VERSION, "HighlightPass", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "highlight") {
+                    MPM.addPass(HighlightPass());
+                    return true;
+                  }
+                  return false;
+                });
+          }};
 }
