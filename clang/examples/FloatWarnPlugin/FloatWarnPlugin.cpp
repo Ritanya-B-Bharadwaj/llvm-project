@@ -9,16 +9,19 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/IR/Module.h"
+#include <string>
+
 using namespace clang;
 
 namespace {
 
-// Function to write messages to a log file
+  // Function to write messages to a log file
   void writeToLogFile(const std::string &message, bool newLine = true) {
     std::error_code EC;
-    llvm::raw_fd_ostream outFile("float_log.txt", EC, llvm::sys::fs::OF_Text);
+    llvm::raw_fd_ostream outFile("float_log.txt", EC, llvm::sys::fs::OF_Append); // Open the log file in append mode, truncating it if it exists
 
-    if (EC) { // Check if the file opened successfully
+    if (EC) {
       llvm::errs() << "Error opening log file: " << EC.message() << "\n";
       return;
     }
@@ -46,10 +49,11 @@ namespace {
       DiagnosticsEngine &Diags;
       unsigned DiagID;
       bool EnableDemotion;
+      SourceManager &SM;
       
       // Constructor to initialize the visitor with context, rewriter, and diagnostics
-      FP32VarVisitor(ASTContext &Ctx, Rewriter &Rewriter, DiagnosticsEngine &Diags, bool EnableDemotion)
-          : Ctx(Ctx), TheRewriter(Rewriter), Diags(Diags), EnableDemotion(EnableDemotion) {
+      FP32VarVisitor(ASTContext &Ctx, Rewriter &Rewriter, DiagnosticsEngine &Diags, bool EnableDemotion, SourceManager &SM)
+          : Ctx(Ctx), TheRewriter(Rewriter), Diags(Diags), EnableDemotion(EnableDemotion), SM(SM) {
         DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Warning, "Demoted float variable '%0' to __fp16");
       }
 
@@ -81,8 +85,6 @@ namespace {
           if (VD->getType()->isFloatingType() && VD->getType()->isSpecificBuiltinType(BuiltinType::Float)) { // Check if the variable is of type float
             writeToLogFile("fp32-decl: \"" + VD->getNameAsString() + "\" (kind: " + D->getDeclKindName() + ")");
             bool CanDemote = false;
-            bool NonInitialized = VD->isUninitialized(); // Check if the variable is uninitialized
-            writeToLogFile("Non-initialized: " + std::string(NonInitialized ? "true" : "false"));
             
             if (const Expr *Init = VD->getInit()) { // Check if the variable has an initializer
               llvm::APFloat Value(0.0f);
@@ -105,10 +107,19 @@ namespace {
             if (EnableDemotion && CanDemote) { // If demotion is enabled and the value can be safely demoted
               Diags.Report(VD->getLocation(), DiagID) << VD->getNameAsString();
               SourceLocation TypeLoc = VD->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+              
 
               if (TypeLoc.isValid()) { // Check if the type location is valid
                 std::error_code EC;
-                llvm::raw_fd_ostream Out("test.c", EC); 
+                std::string InputFile;
+
+                if (auto FileEntry = SM.getFileEntryRefForID(SM.getMainFileID())) { // Get the main file entry
+                  InputFile = FileEntry->getName().str();
+                } 
+                else {
+                  InputFile = "default_input";
+                }
+                llvm::raw_fd_ostream Out(InputFile, EC); 
 
                 if (EC) {
                     llvm::errs() << "Error creating output file: " << EC.message() << "\n";
@@ -138,7 +149,7 @@ namespace {
           EnableDemotion(EnableDemotion) {}
 
     void HandleTranslationUnit(ASTContext &context) override {
-      FP32VarVisitor Visitor(context, TheRewriter, Instance.getDiagnostics(), EnableDemotion);
+      FP32VarVisitor Visitor(context, TheRewriter, Instance.getDiagnostics(), EnableDemotion, Instance.getSourceManager());
       Visitor.TraverseDecl(context.getTranslationUnitDecl());
 
       if (!Instance.getLangOpts().DelayedTemplateParsing) //  Check if delayed template parsing is enabled
