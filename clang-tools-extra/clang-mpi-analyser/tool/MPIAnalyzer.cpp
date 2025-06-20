@@ -1,5 +1,3 @@
-// MPIAnalyzer.cpp
-
 #include "MPIAnalyzer.h"
 #include "MPIAnalysisHelperFuncs.h"
 
@@ -16,7 +14,7 @@
 using namespace clang;
 using namespace clang::ast_matchers;
 
-// Implement the constructor for MPIAnalyzerCallback
+// This has the value of the bool which determines whether to run the the analyser or not
 MPIAnalyzerCallback::MPIAnalyzerCallback(ASTContext &Context, bool AnalyzeSG)
     : Context(Context), 
       ShouldAnalyzeScatterGather(AnalyzeSG)
@@ -58,7 +56,7 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
     }
     // llvm::outs() << "😈CheckPoint 2\n";
     // llvm::outs() << "  Analyzing function: " << FD->getNameAsString() << "\n";
-
+    //Not really necessary added this in earlier stages
     const Stmt *Body = FD->getBody();
     std::string RankVarName;
     std::string NumProcsVarName;
@@ -76,7 +74,7 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
     // if (ParamSendBuf) llvm::outs() << "  Function has 'sendbuf' parameter.\n";
 
 
-    // Step 1: Find the variable used to store the rank and num_procs
+    // Find the variable used to store the rank and num_procs
     // by looking for MPI_Comm_rank and MPI_Comm_size calls within the function body.
     for (const Stmt *S : Body->children()) {
         if (const auto *CurrentCall = dyn_cast<CallExpr>(S)) {
@@ -114,10 +112,10 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
     }
     // llvm::outs() << "😈CheckPoint 3\n";
 
-    SourceLocation ReportLoc = FD->getBeginLoc(); // Default report location
+    SourceLocation ReportLoc = FD->getBeginLoc(); 
 
-    // --- Part 1: Existing Gather/Scatter detection (root-based) ---
-    // Iterate through statements in the function body to find 'if (rank == root)' patterns.
+    //  Part 1: Existing Gather/Scatter detection 
+    //Basically itrate trhough the AST to find the if statement
     for (const Stmt *S : Comp->body()) {
         const IfStmt *If = dyn_cast<IfStmt>(S);
         if (!If) continue;
@@ -221,8 +219,9 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
         bool IsGatherCandidate = false;
         bool IsScatterCandidate = false;
         bool IsSendRecvPattern = false;
-        std::string PatternSnippet; // Reset for each candidate
+        std::string PatternSnippet; 
 
+        //Checking the Sendrecv function validity
         if(rootBlockAnalyzed && nonRootBlockAnalyzed){
             bool rootUsesSendrecvLoop = false;
             for (const auto& send : RootSends) {
@@ -256,7 +255,7 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
 
         }
 
-        // --- Heuristics for Gather Pattern Detection ---
+        // Checking the recv function validity
         if (rootBlockAnalyzed && nonRootBlockAnalyzed) {
             bool rootRecvFromVaryingOrNonSelf = false;
             for (const auto& rcv : RootRecvs) {
@@ -283,7 +282,7 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
             }
         }
 
-        // --- Heuristics for Scatter Pattern Detection ---
+        // Ckecking the Send function validity
         if (rootBlockAnalyzed && nonRootBlockAnalyzed && !IsGatherCandidate) {
             bool rootSendsToVarying = false;
             for (const auto& snd : RootSends) {
@@ -365,20 +364,16 @@ void MPIAnalyzerCallback::run(const MatchFinder::MatchResult &Result) {
             llvm::outs() << "Details:\n- Representative code snippet:\n" << PatternSnippet << "\n";
             llvm::outs() << "=============================================================\n\n";
         }
-    } // End of IfStmt analysis loop
+    } 
 
     // --- Part 2: New Allgather/Alltoall detection (loop-based, non-root) ---
-   // ... (previous code)
 
 // llvm::outs() << "😈CheckPoint 6: Starting Allgather/Alltoall analysis.\n";
 
-llvm::SmallVector<MPICallInfo, 8> AllP2PSends; // Collect all sends from the entire function body
-llvm::SmallVector<MPICallInfo, 8> AllP2PRecvs; // Collect all receives from the entire function body
-llvm::SmallVector<LoopInfo, 2> GlobalLoopStack; // Global loop stack for this analysis path
+llvm::SmallVector<MPICallInfo, 8> AllP2PSends; 
+llvm::SmallVector<MPICallInfo, 8> AllP2PRecvs; 
+llvm::SmallVector<LoopInfo, 2> GlobalLoopStack; 
 
-// Analyze the entire function body for all P2P calls within loops
-// Pass nullptr for RootParameterDecl as we're not looking for root-based patterns here
-// Pass nullptr for CurrentLoopVarDecl initially, as it's the top-level call
 bool foundAnyP2PInLoops = analyzeBlockForMPICalls(Comp, Context,
                                                     RankVarName, nullptr, -1 , nullptr,
                                                     AllP2PSends, AllP2PRecvs, GlobalLoopStack);
@@ -455,7 +450,6 @@ if (foundAnyP2PInLoops) {
                 if (rcv.BufferExpr && rcv.IsBufferIndexedByLoopVar) {
                     recvBufIndexedByLoopVar = true;
                 }
-                // Only take the first snippet if send snippet wasn't found
                 if (currentPatternSnippet.empty()) currentPatternSnippet = Lexer::getSourceText(CharSourceRange::getTokenRange(rcv.Call->getSourceRange()), SM, LangOptions()).str();
             }
         }
@@ -497,7 +491,7 @@ if (foundAnyP2PInLoops) {
                 llvm::outs() << "    - Specifically, each process sends its local data to every other process, and receives data from every other process into a collective buffer indexed by the iterating rank.\n";
                 llvm::outs() << "- Suggestion: Consider using MPI_Allgather for better performance and scalability.\n";
                 llvm::outs() << "- Note : This may also be a case of manual data gathering at a root process using MPI_Sendrecv so use MPI_Gather if the data is being gathered at root process else use MPI_Allgather.\n";
-            } else { // isAlltoallCandidate
+            } else { 
                 llvm::outs() << "Pattern Detected: Manual All-to-All Data Exchange (Alltoall)\n";
                 llvm::outs() << "- Issue: This function implements a manual Alltoall operation. Data is being exchanged between all processes using point-to-point communication within a loop.\n";
                 llvm::outs() << "    - Specifically, each process sends a distinct chunk of its data to every other process (indexed by iterating rank) and receives a distinct chunk from every other process (indexed by iterating rank).\n";
@@ -513,7 +507,6 @@ if (foundAnyP2PInLoops) {
     // llvm::outs() << "  No P2P calls found in loops for Allgather/Alltoall analysis.\n";
 }
 }
-// ... (rest of the code)// End of MPIAnalyzerCallback::run
 
 void registerMPIMatchers(MatchFinder &Finder, MPIAnalyzerCallback &Callback) {
     Finder.addMatcher(

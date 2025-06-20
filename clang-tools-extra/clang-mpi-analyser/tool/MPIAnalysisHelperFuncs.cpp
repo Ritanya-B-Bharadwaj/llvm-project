@@ -1,5 +1,3 @@
-// MPIAnalysisHelperFuncs.cpp
-
 #include "MPIAnalysisHelperFuncs.h"
 
 #include "clang/AST/ASTContext.h"
@@ -96,10 +94,10 @@ bool ast_matchers::analyzeBlockForMPICalls(const Stmt *S, ASTContext &Context,
             if (!Callee) continue;
 
             std::string funcName = Callee->getNameAsString();
-            MPICallInfo callInfo(Call); // Initialize once
+            MPICallInfo callInfo(Call); 
             callInfo.FunctionName = funcName;
 
-            bool isMPICall = false; // Flag to indicate if it's an MPI call at all
+            bool isMPICall = false; 
 
             if (funcName.find("MPI_Sendrecv") != std::string::npos) {
                 isMPICall = true;
@@ -111,7 +109,7 @@ bool ast_matchers::analyzeBlockForMPICalls(const Stmt *S, ASTContext &Context,
                     const Expr *RecvBuf = Call->getArg(5)->IgnoreImpCasts();
                     const Expr *SourceRankExpr = Call->getArg(8)->IgnoreImpCasts();
 
-                    // --- Analyze the SEND part of Sendrecv ---
+                    //  Analyze the SEND part of Sendrecv 
                     MPICallInfo sendPartInfo = callInfo;
                     sendPartInfo.IsSend = true;
                     sendPartInfo.BufferExpr = SendBuf;
@@ -136,7 +134,7 @@ bool ast_matchers::analyzeBlockForMPICalls(const Stmt *S, ASTContext &Context,
                     }
                     Sends.push_back(sendPartInfo);
 
-                    // --- Analyze the RECV part of Sendrecv ---
+                    // Analyze the RECV part of Sendrecv
                     MPICallInfo recvPartInfo = callInfo;
                     recvPartInfo.IsRecv = true;
                     recvPartInfo.BufferExpr = RecvBuf;
@@ -164,7 +162,7 @@ bool ast_matchers::analyzeBlockForMPICalls(const Stmt *S, ASTContext &Context,
                     }
                     Recvs.push_back(recvPartInfo);
                 }
-            } else if (funcName.find("MPI_Send") != std::string::npos) { // For MPI_Send
+            } else if (funcName.find("MPI_Send") != std::string::npos) { 
                 isMPICall = true;
                 callInfo.IsSend = true;
                 if (Call->getNumArgs() > 3) {
@@ -192,10 +190,10 @@ bool ast_matchers::analyzeBlockForMPICalls(const Stmt *S, ASTContext &Context,
                 }
                 Sends.push_back(callInfo);
 
-            } else if (funcName.find("MPI_Recv") != std::string::npos) { // For MPI_Recv
+            } else if (funcName.find("MPI_Recv") != std::string::npos) { 
                 isMPICall = true;
                 callInfo.IsRecv = true;
-                if (Call->getNumArgs() > 3) { // Source argument for MPI_Recv is typically arg 3
+                if (Call->getNumArgs() > 3) { 
                     callInfo.RankArgExpr = Call->getArg(3)->IgnoreImpCasts();
                     if (const auto *DRE = dyn_cast<DeclRefExpr>(callInfo.RankArgExpr)) {
                         const Decl *TargetDecl = DRE->getDecl();
