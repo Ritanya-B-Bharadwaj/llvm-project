@@ -68,8 +68,8 @@ clang -O3 -S -emit-llvm ../tests/<testFile.c> -o ../tests/<testFile.c>.ll
 ══════════════════════════════════════════════════════════════
 Analyzing Function: heavy_compute       
 ══════════════════════════════════════════════════════════════
-Function 'heavy_compute
-' has HIGH Computational Intensity  
+Function 'heavy_compute'
+has HIGH Computational Intensity  
 ══════════════════════════════════════════════════════════════
  Arithmetic Ops : 11       
  Memory Ops     : 1                                  
