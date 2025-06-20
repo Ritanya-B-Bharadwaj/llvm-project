@@ -1,0 +1,170 @@
+diff --git a/flang/include/flang/Lower/ConvertVariable.h b/flang/include/flang/Lower/ConvertVariable.h
+index 515f4695951b4..de394a39e112e 100644
+--- a/flang/include/flang/Lower/ConvertVariable.h
++++ b/flang/include/flang/Lower/ConvertVariable.h
+@@ -62,6 +62,14 @@ using AggregateStoreMap = llvm::DenseMap<AggregateStoreKey, mlir::Value>;
+ void instantiateVariable(AbstractConverter &, const pft::Variable &var,
+                          SymMap &symMap, AggregateStoreMap &storeMap);
+ 
++/// Does this variable have a default initialization?
++bool hasDefaultInitialization(const Fortran::semantics::Symbol &sym);
++
++/// Call default initialization runtime routine to initialize \p var.
++void defaultInitializeAtRuntime(Fortran::lower::AbstractConverter &converter,
++                                const Fortran::semantics::Symbol &sym,
++                                Fortran::lower::SymMap &symMap);
++
+ /// Create a fir::GlobalOp given a module variable definition. This is intended
+ /// to be used when lowering a module definition, not when lowering variables
+ /// used from a module. For used variables instantiateVariable must directly be
+diff --git a/flang/lib/Lower/ConvertVariable.cpp b/flang/lib/Lower/ConvertVariable.cpp
+index 47ad48fb322cc..4fcfa0b126e04 100644
+--- a/flang/lib/Lower/ConvertVariable.cpp
++++ b/flang/lib/Lower/ConvertVariable.cpp
+@@ -72,7 +72,8 @@ static mlir::Value genScalarValue(Fortran::lower::AbstractConverter &converter,
+ }
+ 
+ /// Does this variable have a default initialization?
+-static bool hasDefaultInitialization(const Fortran::semantics::Symbol &sym) {
++bool Fortran::lower::hasDefaultInitialization(
++    const Fortran::semantics::Symbol &sym) {
+   if (sym.has<Fortran::semantics::ObjectEntityDetails>() && sym.size())
+     if (!Fortran::semantics::IsAllocatableOrPointer(sym))
+       if (const Fortran::semantics::DeclTypeSpec *declTypeSpec = sym.GetType())
+@@ -353,7 +354,7 @@ static mlir::Value genComponentDefaultInit(
+       // global constructor since this has no runtime cost.
+       componentValue = fir::factory::createUnallocatedBox(
+           builder, loc, componentTy, std::nullopt);
+-    } else if (hasDefaultInitialization(component)) {
++    } else if (Fortran::lower::hasDefaultInitialization(component)) {
+       // Component type has default initialization.
+       componentValue = genDefaultInitializerValue(converter, loc, component,
+                                                   componentTy, stmtCtx);
+@@ -556,7 +557,7 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+                 builder.createConvert(loc, symTy, fir::getBase(initVal));
+             builder.create<fir::HasValueOp>(loc, castTo);
+           });
+-    } else if (hasDefaultInitialization(sym)) {
++    } else if (Fortran::lower::hasDefaultInitialization(sym)) {
+       Fortran::lower::createGlobalInitialization(
+           builder, global, [&](fir::FirOpBuilder &builder) {
+             Fortran::lower::StatementContext stmtCtx(
+@@ -752,17 +753,15 @@ mustBeDefaultInitializedAtRuntime(const Fortran::lower::pft::Variable &var) {
+     return true;
+   // Local variables (including function results), and intent(out) dummies must
+   // be default initialized at runtime if their type has default initialization.
+-  return hasDefaultInitialization(sym);
++  return Fortran::lower::hasDefaultInitialization(sym);
+ }
+ 
+ /// Call default initialization runtime routine to initialize \p var.
+-static void
+-defaultInitializeAtRuntime(Fortran::lower::AbstractConverter &converter,
+-                           const Fortran::lower::pft::Variable &var,
+-                           Fortran::lower::SymMap &symMap) {
++void Fortran::lower::defaultInitializeAtRuntime(
++    Fortran::lower::AbstractConverter &converter,
++    const Fortran::semantics::Symbol &sym, Fortran::lower::SymMap &symMap) {
+   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+   mlir::Location loc = converter.getCurrentLocation();
+-  const Fortran::semantics::Symbol &sym = var.getSymbol();
+   fir::ExtendedValue exv = converter.getSymbolExtendedValue(sym, &symMap);
+   if (Fortran::semantics::IsOptional(sym)) {
+     // 15.5.2.12 point 3, absent optional dummies are not initialized.
+@@ -927,7 +926,8 @@ static void instantiateLocal(Fortran::lower::AbstractConverter &converter,
+   if (needDummyIntentoutFinalization(var))
+     finalizeAtRuntime(converter, var, symMap);
+   if (mustBeDefaultInitializedAtRuntime(var))
+-    defaultInitializeAtRuntime(converter, var, symMap);
++    Fortran::lower::defaultInitializeAtRuntime(converter, var.getSymbol(),
++                                               symMap);
+   if (Fortran::semantics::NeedCUDAAlloc(var.getSymbol())) {
+     auto *builder = &converter.getFirOpBuilder();
+     mlir::Location loc = converter.getCurrentLocation();
+@@ -1168,7 +1168,8 @@ static void instantiateAlias(Fortran::lower::AbstractConverter &converter,
+   // do not try optimizing this to single default initializations of
+   // the equivalenced storages. Keep lowering simple.
+   if (mustBeDefaultInitializedAtRuntime(var))
+-    defaultInitializeAtRuntime(converter, var, symMap);
++    Fortran::lower::defaultInitializeAtRuntime(converter, var.getSymbol(),
++                                               symMap);
+ }
+ 
+ //===--------------------------------------------------------------===//
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 7e76a81e0df92..a340b62eb7b66 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -13,6 +13,7 @@
+ #include "DataSharingProcessor.h"
+ 
+ #include "Utils.h"
++#include "flang/Lower/ConvertVariable.h"
+ #include "flang/Lower/PFTBuilder.h"
+ #include "flang/Lower/SymbolMap.h"
+ #include "flang/Optimizer/Builder/HLFIRTools.h"
+@@ -117,6 +118,11 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
+   bool success = converter.createHostAssociateVarClone(*sym);
+   (void)success;
+   assert(success && "Privatization failed due to existing binding");
++
++  bool isFirstPrivate = sym->test(semantics::Symbol::Flag::OmpFirstPrivate);
++  if (!isFirstPrivate &&
++      Fortran::lower::hasDefaultInitialization(sym->GetUltimate()))
++    Fortran::lower::defaultInitializeAtRuntime(converter, *sym, *symTable);
+ }
+ 
+ void DataSharingProcessor::copyFirstPrivateSymbol(
+diff --git a/flang/test/Lower/OpenMP/private-derived-type.f90 b/flang/test/Lower/OpenMP/private-derived-type.f90
+new file mode 100644
+index 0000000000000..230484f20c11d
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/private-derived-type.f90
+@@ -0,0 +1,47 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp -o - %s | FileCheck %s
++
++subroutine s4
++  type y3
++    integer,allocatable::x
++  end type y3
++  type(y3)::v
++  !$omp parallel
++  !$omp do private(v)
++  do i=1,10
++    v%x=1
++  end do
++  !$omp end do
++  !$omp end parallel
++end subroutine s4
++
++
++! CHECK-LABEL:   func.func @_QPs4() {
++!                  Example of how the lowering for regular derived type variables:
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}> {bindc_name = "v", uniq_name = "_QFs4Ev"}
++! CHECK:           %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFs4Ev"} : (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>, !fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>)
++! CHECK:           %[[VAL_10:.*]] = fir.embox %[[VAL_9]]#1 : (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>
++! CHECK:           %[[VAL_11:.*]] = fir.address_of
++! CHECK:           %[[VAL_12:.*]] = arith.constant 4 : i32
++! CHECK:           %[[VAL_13:.*]] = fir.convert %[[VAL_10]] : (!fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<none>
++! CHECK:           %[[VAL_14:.*]] = fir.convert %[[VAL_11]] : (!fir.ref<!fir.char<1,{{.*}}>>) -> !fir.ref<i8>
++! CHECK:           %[[VAL_15:.*]] = fir.call @_FortranAInitialize(%[[VAL_13]], %[[VAL_14]], %[[VAL_12]]) fastmath<contract> : (!fir.box<none>, !fir.ref<i8>, i32) -> none
++! CHECK:           omp.parallel {
++! CHECK:             %[[VAL_23:.*]] = fir.alloca !fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}> {bindc_name = "v", pinned, uniq_name = "_QFs4Ev"}
++! CHECK:             %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFs4Ev"} : (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>, !fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>)
++! CHECK:             %[[VAL_25:.*]] = fir.embox %[[VAL_24]]#1 : (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>
++! CHECK:             %[[VAL_26:.*]] = fir.address_of
++! CHECK:             %[[VAL_27:.*]] = arith.constant 4 : i32
++! CHECK:             %[[VAL_28:.*]] = fir.convert %[[VAL_25]] : (!fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<none>
++! CHECK:             %[[VAL_29:.*]] = fir.convert %[[VAL_26]] : (!fir.ref<!fir.char<1,{{.*}}>>) -> !fir.ref<i8>
++!                    Check we do call FortranAInitialize on the derived type
++! CHECK:             %[[VAL_30:.*]] = fir.call @_FortranAInitialize(%[[VAL_28]], %[[VAL_29]], %[[VAL_27]]) fastmath<contract> : (!fir.box<none>, !fir.ref<i8>, i32) -> none
++! CHECK:             omp.wsloop {
++! CHECK:             omp.terminator
++! CHECK:           }
++! CHECK:           %[[VAL_39:.*]] = fir.embox %[[VAL_9]]#1 : (!fir.ref<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>
++! CHECK:           %[[VAL_40:.*]] = fir.convert %[[VAL_39]] : (!fir.box<!fir.type<_QFs4Ty3{x:!fir.box<!fir.heap<i32>>}>>) -> !fir.box<none>
++!                  Check the derived type is destroyed
++! CHECK:           %[[VAL_41:.*]] = fir.call @_FortranADestroy(%[[VAL_40]]) fastmath<contract> : (!fir.box<none>) -> none
++! CHECK:           return
++! CHECK:         }

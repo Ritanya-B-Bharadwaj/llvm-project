@@ -1,0 +1,325 @@
+diff --git a/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp b/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
+index cf045a84a5f76..0c2e37c4446aa 100644
+--- a/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
++++ b/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
+@@ -380,6 +380,33 @@ getAttrsFromVariable(fir::FortranVariableOpInterface var) {
+   return attrs;
+ }
+ 
++template <typename OMPTypeOp, typename DeclTypeOp>
++static Value getPrivateArg(omp::BlockArgOpenMPOpInterface &argIface,
++                           OMPTypeOp &op, DeclTypeOp &declOp) {
++  Value privateArg;
++  if (!op.getPrivateSyms().has_value())
++    return privateArg;
++  for (auto [opSym, blockArg] :
++       llvm::zip_equal(*op.getPrivateSyms(), argIface.getPrivateBlockArgs())) {
++    if (blockArg == declOp.getMemref()) {
++      omp::PrivateClauseOp privateOp =
++          SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
++              op, cast<SymbolRefAttr>(opSym));
++      privateOp.walk([&](omp::YieldOp yieldOp) {
++        // TODO Extend alias analysis if omp.yield points to
++        // block argument value
++        if (!yieldOp.getResults()[0].getDefiningOp())
++          return;
++        llvm::TypeSwitch<Operation *>(yieldOp.getResults()[0].getDefiningOp())
++            .template Case<fir::DeclareOp, hlfir::DeclareOp>(
++                [&](auto declOp) { privateArg = declOp.getMemref(); });
++      });
++      return privateArg;
++    }
++  }
++  return privateArg;
++}
++
+ AliasAnalysis::Source AliasAnalysis::getSource(mlir::Value v,
+                                                bool getInstantiationPoint) {
+   auto *defOp = v.getDefiningOp();
+@@ -478,20 +505,37 @@ AliasAnalysis::Source AliasAnalysis::getSource(mlir::Value v,
+           breakFromLoop = true;
+         })
+         .Case<hlfir::DeclareOp, fir::DeclareOp>([&](auto op) {
+-          // If declare operation is inside omp target region,
+-          // continue alias analysis outside the target region
+-          if (auto targetOp =
+-                  llvm::dyn_cast<omp::TargetOp>(op->getParentOp())) {
+-            auto argIface = cast<omp::BlockArgOpenMPOpInterface>(*targetOp);
+-            for (auto [opArg, blockArg] : llvm::zip_equal(
+-                     targetOp.getMapVars(), argIface.getMapBlockArgs())) {
+-              if (blockArg == op.getMemref()) {
+-                omp::MapInfoOp mapInfo =
+-                    llvm::cast<omp::MapInfoOp>(opArg.getDefiningOp());
+-                v = mapInfo.getVarPtr();
+-                defOp = v.getDefiningOp();
+-                return;
+-              }
++          if (omp::BlockArgOpenMPOpInterface argIface =
++                  dyn_cast<omp::BlockArgOpenMPOpInterface>(op->getParentOp())) {
++            Value ompValArg;
++            llvm::TypeSwitch<Operation *>(op->getParentOp())
++                .template Case<omp::TargetOp>([&](auto targetOp) {
++                  // If declare operation is inside omp target region,
++                  // continue alias analysis outside the target region
++                  for (auto [opArg, blockArg] : llvm::zip_equal(
++                           targetOp.getMapVars(), argIface.getMapBlockArgs())) {
++                    if (blockArg == op.getMemref()) {
++                      omp::MapInfoOp mapInfo =
++                          llvm::cast<omp::MapInfoOp>(opArg.getDefiningOp());
++                      ompValArg = mapInfo.getVarPtr();
++                      break;
++                    }
++                  }
++                  // If given operation does not reflect mapping item,
++                  // check private clause
++                  if (!ompValArg)
++                    ompValArg = getPrivateArg(argIface, targetOp, op);
++                })
++                .template Case<omp::DistributeOp, omp::ParallelOp,
++                               omp::SectionsOp, omp::SimdOp, omp::SingleOp,
++                               omp::TaskloopOp, omp::TaskOp, omp::WsloopOp>(
++                    [&](auto privateOp) {
++                      ompValArg = getPrivateArg(argIface, privateOp, op);
++                    });
++            if (ompValArg) {
++              v = ompValArg;
++              defOp = ompValArg.getDefiningOp();
++              return;
+             }
+           }
+           auto varIf = llvm::cast<fir::FortranVariableOpInterface>(defOp);
+diff --git a/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private-ptr.mlir b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private-ptr.mlir
+new file mode 100644
+index 0000000000000..78207d21c45bf
+--- /dev/null
++++ b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private-ptr.mlir
+@@ -0,0 +1,102 @@
++// Use --mlir-disable-threading so that the AA queries are serialized
++// as well as its diagnostic output.
++// RUN: fir-opt %s -pass-pipeline='builtin.module(func.func(test-fir-alias-analysis))' -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
++
++// Fortran code:
++// program main
++// integer, target :: arrayA(10)
++// integer, pointer, dimension(:) :: ptrA
++// integer :: i
++// ptrA => arrayA
++// !$omp teams distribute parallel do firstprivate(ptrA)
++// do i = 1, 10
++//   arrayA(i) = arrayA(i) + ptrA(i);
++// end do
++// end program main
++
++// CHECK-LABEL: Testing : "_QQmain"
++// CHECK-DAG:   ptrA#0 <-> ArrayA#0: MayAlias
++
++omp.private {type = private} @_QFEi_private_ref_i32 : !fir.ref<i32> alloc {
++^bb0(%arg0: !fir.ref<i32>):
++  %0 = fir.alloca i32 {bindc_name = "i", pinned, uniq_name = "_QFEi"}
++  %1:2 = hlfir.declare %0 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  omp.yield(%1#0 : !fir.ref<i32>)
++}
++omp.private {type = firstprivate} @_QFEptra_firstprivate_ref_box_ptr_Uxi32 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>> alloc {
++^bb0(%arg0: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++  %0 = fir.alloca !fir.box<!fir.ptr<!fir.array<?xi32>>> {bindc_name = "ptra", pinned, uniq_name = "_QFEptra"}
++  %1:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEptra"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++  omp.yield(%1#0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++} copy {
++^bb0(%arg0: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, %arg1: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++  %0 = fir.load %arg0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++  fir.store %0 to %arg1 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++  omp.yield(%arg1 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++}
++func.func @_QQmain() attributes {fir.bindc_name = "main"} {
++  %0 = fir.address_of(@_QFEarraya) : !fir.ref<!fir.array<10xi32>>
++  %c10 = arith.constant 10 : index
++  %1 = fir.shape %c10 : (index) -> !fir.shape<1>
++  %2:2 = hlfir.declare %0(%1) {fortran_attrs = #fir.var_attrs<target>, uniq_name = "_QFEarraya"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++  %3 = fir.address_of(@_QFEarrayb) : !fir.ref<!fir.array<10xi32>>
++  %c10_0 = arith.constant 10 : index
++  %4 = fir.shape %c10_0 : (index) -> !fir.shape<1>
++  %5:2 = hlfir.declare %3(%4) {uniq_name = "_QFEarrayb"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++  %6 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFEi"}
++  %7:2 = hlfir.declare %6 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  %8 = fir.address_of(@_QFEptra) : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++  %9:2 = hlfir.declare %8 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEptra"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++  %10 = fir.shape %c10 : (index) -> !fir.shape<1>
++  %11 = fir.embox %2#1(%10) : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> !fir.box<!fir.ptr<!fir.array<?xi32>>>
++  fir.store %11 to %9#1 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++  omp.teams {
++    omp.parallel private(@_QFEptra_firstprivate_ref_box_ptr_Uxi32 %9#0 -> %arg0, @_QFEi_private_ref_i32 %7#0 -> %arg1 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<i32>) {
++      %12:2 = hlfir.declare %arg0 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEptra"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++      %13:2 = hlfir.declare %arg1 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++      %c1_i32 = arith.constant 1 : i32
++      %c10_i32 = arith.constant 10 : i32
++      %c1_i32_1 = arith.constant 1 : i32
++      omp.distribute {
++        omp.wsloop {
++          omp.loop_nest (%arg2) : i32 = (%c1_i32) to (%c10_i32) inclusive step (%c1_i32_1) {
++            fir.store %arg2 to %13#1 : !fir.ref<i32>
++            %14 = fir.load %13#0 : !fir.ref<i32>
++            %15 = fir.convert %14 : (i32) -> i64
++            %16 = hlfir.designate %2#0 (%15)  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++            %17 = fir.load %16 : !fir.ref<i32>
++            %18 = fir.load %12#0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++            %19 = fir.load %13#0 : !fir.ref<i32>
++            %20 = fir.convert %19 : (i32) -> i64
++            %21 = hlfir.designate %18 (%20) {test.ptr = "ptrA" } : (!fir.box<!fir.ptr<!fir.array<?xi32>>>, i64) -> !fir.ref<i32>
++            %22 = fir.load %21 : !fir.ref<i32>
++            %23 = arith.addi %17, %22 : i32
++            %24 = fir.load %13#0 : !fir.ref<i32>
++            %25 = fir.convert %24 : (i32) -> i64
++            %26 = hlfir.designate %2#0 (%25) {test.ptr = "ArrayA"}  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++            hlfir.assign %23 to %26 : i32, !fir.ref<i32>
++            omp.yield
++          }
++        } {omp.composite}
++      } {omp.composite}
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  }
++  return
++}
++fir.global internal @_QFEarraya target : !fir.array<10xi32> {
++  %0 = fir.zero_bits !fir.array<10xi32>
++  fir.has_value %0 : !fir.array<10xi32>
++}
++fir.global internal @_QFEarrayb : !fir.array<10xi32> {
++  %0 = fir.zero_bits !fir.array<10xi32>
++  fir.has_value %0 : !fir.array<10xi32>
++}
++fir.global internal @_QFEptra : !fir.box<!fir.ptr<!fir.array<?xi32>>> {
++  %0 = fir.zero_bits !fir.ptr<!fir.array<?xi32>>
++  %c0 = arith.constant 0 : index
++  %1 = fir.shape %c0 : (index) -> !fir.shape<1>
++  %2 = fir.embox %0(%1) : (!fir.ptr<!fir.array<?xi32>>, !fir.shape<1>) -> !fir.box<!fir.ptr<!fir.array<?xi32>>>
++  fir.has_value %2 : !fir.box<!fir.ptr<!fir.array<?xi32>>>
++}
+diff --git a/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private.mlir b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private.mlir
+new file mode 100644
+index 0000000000000..4668b2c215c8c
+--- /dev/null
++++ b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-teams-distribute-private.mlir
+@@ -0,0 +1,121 @@
++// Use --mlir-disable-threading so that the AA queries are serialized
++// as well as its diagnostic output.
++// RUN: fir-opt %s -pass-pipeline='builtin.module(func.func(test-fir-alias-analysis))' -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
++
++// Fortran code:
++//
++// program main
++// integer :: arrayA(10,10)
++// integer :: tmp(2)
++// integer :: i,j
++// !$omp teams distribute parallel do private(tmp)
++// do j = 1, 10
++//   do i = 1,10
++//     tmp = [i,j]
++//     arrayA = tmp(1)
++//   end do
++// end do
++// end program main
++
++// CHECK-LABEL: Testing : "_QQmain"
++// CHECK-DAG: tmp_private_array#0 <-> unnamed_array#0: NoAlias
++// CHECK-DAG: tmp_private_array#1 <-> unnamed_array#0: NoAlias
++
++omp.private {type = private} @_QFEi_private_ref_i32 : !fir.ref<i32> alloc {
++^bb0(%arg0: !fir.ref<i32>):
++  %0 = fir.alloca i32 {bindc_name = "i", pinned, uniq_name = "_QFEi"}
++  %1:2 = hlfir.declare %0 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  omp.yield(%1#0 : !fir.ref<i32>)
++}
++omp.private {type = private} @_QFEj_private_ref_i32 : !fir.ref<i32> alloc {
++^bb0(%arg0: !fir.ref<i32>):
++  %0 = fir.alloca i32 {bindc_name = "j", pinned, uniq_name = "_QFEj"}
++  %1:2 = hlfir.declare %0 {uniq_name = "_QFEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  omp.yield(%1#0 : !fir.ref<i32>)
++}
++omp.private {type = private} @_QFEtmp_private_ref_2xi32 : !fir.ref<!fir.array<2xi32>> alloc {
++^bb0(%arg0: !fir.ref<!fir.array<2xi32>>):
++  %c2 = arith.constant 2 : index
++  %0 = fir.alloca !fir.array<2xi32> {bindc_name = "tmp", pinned, uniq_name = "_QFEtmp"}
++  %1 = fir.shape %c2 : (index) -> !fir.shape<1>
++  %2:2 = hlfir.declare %0(%1) {uniq_name = "_QFEtmp"} : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<2xi32>>, !fir.ref<!fir.array<2xi32>>)
++  omp.yield(%2#0 : !fir.ref<!fir.array<2xi32>>)
++}
++func.func @_QQmain() attributes {fir.bindc_name = "main"} {
++  %0 = fir.address_of(@_QFEarraya) : !fir.ref<!fir.array<10x10xi32>>
++  %c10 = arith.constant 10 : index
++  %c10_0 = arith.constant 10 : index
++  %1 = fir.shape %c10, %c10_0 : (index, index) -> !fir.shape<2>
++  %2:2 = hlfir.declare %0(%1) {uniq_name = "_QFEarraya"} : (!fir.ref<!fir.array<10x10xi32>>, !fir.shape<2>) -> (!fir.ref<!fir.array<10x10xi32>>, !fir.ref<!fir.array<10x10xi32>>)
++  %3 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFEi"}
++  %4:2 = hlfir.declare %3 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  %5 = fir.alloca i32 {bindc_name = "j", uniq_name = "_QFEj"}
++  %6:2 = hlfir.declare %5 {uniq_name = "_QFEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  %c2 = arith.constant 2 : index
++  %7 = fir.alloca !fir.array<2xi32> {bindc_name = "tmp", uniq_name = "_QFEtmp"}
++  %8 = fir.shape %c2 : (index) -> !fir.shape<1>
++  %9:2 = hlfir.declare %7(%8) {uniq_name = "_QFEtmp"} : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<2xi32>>, !fir.ref<!fir.array<2xi32>>)
++  omp.teams {
++    omp.parallel private(@_QFEtmp_private_ref_2xi32 %9#0 -> %arg0, @_QFEj_private_ref_i32 %6#0 -> %arg1, @_QFEi_private_ref_i32 %4#0 -> %arg2 : !fir.ref<!fir.array<2xi32>>, !fir.ref<i32>, !fir.ref<i32>) {
++      %c2_1 = arith.constant 2 : index
++      %10 = fir.shape %c2_1 : (index) -> !fir.shape<1>
++      %11:2 = hlfir.declare %arg0(%10) {uniq_name = "_QFEtmp", test.ptr = "tmp_private_array"} : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<2xi32>>, !fir.ref<!fir.array<2xi32>>)
++      %12:2 = hlfir.declare %arg1 {uniq_name = "_QFEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++      %13:2 = hlfir.declare %arg2 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++      %c1_i32 = arith.constant 1 : i32
++      %c10_i32 = arith.constant 10 : i32
++      %c1_i32_2 = arith.constant 1 : i32
++      omp.distribute {
++        omp.wsloop {
++          omp.loop_nest (%arg3) : i32 = (%c1_i32) to (%c10_i32) inclusive step (%c1_i32_2) {
++            fir.store %arg3 to %12#1 : !fir.ref<i32>
++            %c1_i32_3 = arith.constant 1 : i32
++            %14 = fir.convert %c1_i32_3 : (i32) -> index
++            %c10_i32_4 = arith.constant 10 : i32
++            %15 = fir.convert %c10_i32_4 : (i32) -> index
++            %c1 = arith.constant 1 : index
++            %16 = fir.convert %14 : (index) -> i32
++            %17:2 = fir.do_loop %arg4 = %14 to %15 step %c1 iter_args(%arg5 = %16) -> (index, i32) {
++              fir.store %arg5 to %13#1 : !fir.ref<i32>
++              %c2_5 = arith.constant 2 : index
++              %c1_6 = arith.constant 1 : index
++              %c1_7 = arith.constant 1 : index
++              %18 = fir.allocmem !fir.array<2xi32> {bindc_name = ".tmp.arrayctor", uniq_name = ""}
++              %19 = fir.shape %c2_5 : (index) -> !fir.shape<1>
++              %20:2 = hlfir.declare %18(%19) {uniq_name = ".tmp.arrayctor"} : (!fir.heap<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.heap<!fir.array<2xi32>>, !fir.heap<!fir.array<2xi32>>)
++              %21 = fir.load %13#0 : !fir.ref<i32>
++              %22 = arith.addi %c1_6, %c1_7 : index
++              %23 = hlfir.designate %20#0 (%c1_6)  : (!fir.heap<!fir.array<2xi32>>, index) -> !fir.ref<i32>
++              hlfir.assign %21 to %23 : i32, !fir.ref<i32>
++              %24 = fir.load %12#0 : !fir.ref<i32>
++              %25 = hlfir.designate %20#0 (%22)  : (!fir.heap<!fir.array<2xi32>>, index) -> !fir.ref<i32>
++              hlfir.assign %24 to %25 : i32, !fir.ref<i32>
++              %true = arith.constant true
++              %26 = hlfir.as_expr %20#0 move %true {test.ptr = "unnamed_array"} : (!fir.heap<!fir.array<2xi32>>, i1) -> !hlfir.expr<2xi32>
++              hlfir.assign %26 to %11#0 : !hlfir.expr<2xi32>, !fir.ref<!fir.array<2xi32>>
++              hlfir.destroy %26 : !hlfir.expr<2xi32>
++              %c1_8 = arith.constant 1 : index
++              %27 = hlfir.designate %11#0 (%c1_8)  : (!fir.ref<!fir.array<2xi32>>, index) -> !fir.ref<i32>
++              %28 = fir.load %27 : !fir.ref<i32>
++              hlfir.assign %28 to %2#0 : i32, !fir.ref<!fir.array<10x10xi32>>
++              %29 = arith.addi %arg4, %c1 : index
++              %30 = fir.convert %c1 : (index) -> i32
++              %31 = fir.load %13#1 : !fir.ref<i32>
++              %32 = arith.addi %31, %30 : i32
++              fir.result %29, %32 : index, i32
++            }
++            fir.store %17#1 to %13#1 : !fir.ref<i32>
++            omp.yield
++          }
++        } {omp.composite}
++      } {omp.composite}
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  }
++  return
++}
++fir.global internal @_QFEarraya : !fir.array<10x10xi32> {
++  %0 = fir.zero_bits !fir.array<10x10xi32>
++  fir.has_value %0 : !fir.array<10x10xi32>
++}

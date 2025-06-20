@@ -1,0 +1,396 @@
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.h b/llvm/include/llvm/Frontend/OpenMP/OMP.h
+index 6f7a39acac1d3..54ae672755ba8 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.h
+@@ -17,6 +17,7 @@
+ 
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/StringRef.h"
+ 
+ namespace llvm::omp {
+ ArrayRef<Directive> getLeafConstructs(Directive D);
+@@ -30,6 +31,14 @@ Directive getCompoundConstruct(ArrayRef<Directive> Parts);
+ bool isLeafConstruct(Directive D);
+ bool isCompositeConstruct(Directive D);
+ bool isCombinedConstruct(Directive D);
++
++/// Create a nicer version of a function name for humans to look at.
++std::string prettifyFunctionName(StringRef FunctionName);
++
++/// Deconstruct an OpenMP kernel name into the parent function name and the line
++/// number.
++std::string deconstructOpenMPKernelName(StringRef KernelName, unsigned &LineNo);
++
+ } // namespace llvm::omp
+ 
+ #endif // LLVM_FRONTEND_OPENMP_OMP_H
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index 1614d5716d28c..9cb311834907b 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -196,6 +196,9 @@ class OpenMPIRBuilderConfig {
+ /// Data structure to contain the information needed to uniquely identify
+ /// a target entry.
+ struct TargetRegionEntryInfo {
++  /// The prefix used for kernel names.
++  static constexpr const char *KernelNamePrefix = "__omp_offloading_";
++
+   std::string ParentName;
+   unsigned DeviceID;
+   unsigned FileID;
+diff --git a/llvm/lib/Frontend/OpenMP/CMakeLists.txt b/llvm/lib/Frontend/OpenMP/CMakeLists.txt
+index 67aedf5c2b61a..82d2a9ae7c533 100644
+--- a/llvm/lib/Frontend/OpenMP/CMakeLists.txt
++++ b/llvm/lib/Frontend/OpenMP/CMakeLists.txt
+@@ -17,6 +17,7 @@ add_llvm_component_library(LLVMFrontendOpenMP
+   TargetParser
+   TransformUtils
+   Analysis
++  Demangle
+   MC
+   Scalar
+   BitReader
+diff --git a/llvm/lib/Frontend/OpenMP/OMP.cpp b/llvm/lib/Frontend/OpenMP/OMP.cpp
+index c1556ff3c74d7..5720655442be3 100644
+--- a/llvm/lib/Frontend/OpenMP/OMP.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMP.cpp
+@@ -10,13 +10,19 @@
+ 
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallString.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/ADT/StringSwitch.h"
++#include "llvm/Demangle/Demangle.h"
++#include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/StringSaver.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <iterator>
++#include <string>
+ #include <type_traits>
+ 
+ using namespace llvm;
+@@ -186,4 +192,42 @@ bool isCombinedConstruct(Directive D) {
+   // Otherwise directive-name is a combined construct.
+   return !getLeafConstructs(D).empty() && !isCompositeConstruct(D);
+ }
++
++std::string prettifyFunctionName(StringRef FunctionName) {
++  // Internalized functions have the right name, but simply a suffix.
++  if (FunctionName.ends_with(".internalized"))
++    return FunctionName.drop_back(sizeof("internalized")).str() +
++           " (internalized)";
++  unsigned LineNo = 0;
++  auto ParentName = deconstructOpenMPKernelName(FunctionName, LineNo);
++  if (LineNo == 0)
++    return FunctionName.str();
++  return ("omp target in " + ParentName + " @ " + std::to_string(LineNo) +
++          " (" + FunctionName + ")")
++      .str();
++}
++
++std::string deconstructOpenMPKernelName(StringRef KernelName,
++                                        unsigned &LineNo) {
++
++  // Only handle functions with an OpenMP kernel prefix for now. Naming scheme:
++  // __omp_offloading_<hex_hash1>_<hex_hash2>_<name>_l<line>_[<count>_]<suffix>
++  if (!KernelName.starts_with(TargetRegionEntryInfo::KernelNamePrefix))
++    return "";
++
++  auto PrettyName = KernelName.drop_front(
++      sizeof(TargetRegionEntryInfo::KernelNamePrefix) - /*'\0'*/ 1);
++  for (int I = 0; I < 3; ++I) {
++    PrettyName = PrettyName.drop_while([](char c) { return c != '_'; });
++    PrettyName = PrettyName.drop_front();
++  }
++
++  // Look for the last '_l<line>'.
++  size_t LineIdx = PrettyName.rfind("_l");
++  if (LineIdx == StringRef::npos)
++    return "";
++  if (PrettyName.drop_front(LineIdx + 2).consumeInteger(10, LineNo))
++    return "";
++  return demangle(PrettyName.take_front(LineIdx));
++}
+ } // namespace llvm::omp
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 77e350e7276ab..3f8e64315849e 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -8581,7 +8581,7 @@ void TargetRegionEntryInfo::getTargetRegionEntryFnName(
+     SmallVectorImpl<char> &Name, StringRef ParentName, unsigned DeviceID,
+     unsigned FileID, unsigned Line, unsigned Count) {
+   raw_svector_ostream OS(Name);
+-  OS << "__omp_offloading" << llvm::format("_%x", DeviceID)
++  OS << KernelNamePrefix << llvm::format("%x", DeviceID)
+      << llvm::format("_%x_", FileID) << ParentName << "_l" << Line;
+   if (Count)
+     OS << "_" << Count;
+diff --git a/offload/plugins-nextgen/common/include/ErrorReporting.h b/offload/plugins-nextgen/common/include/ErrorReporting.h
+index 72cfb5273ae3c..e557b32c2c24f 100644
+--- a/offload/plugins-nextgen/common/include/ErrorReporting.h
++++ b/offload/plugins-nextgen/common/include/ErrorReporting.h
+@@ -17,6 +17,7 @@
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallString.h"
+ #include "llvm/ADT/StringRef.h"
++#include "llvm/Frontend/OpenMP/OMP.h"
+ #include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/WithColor.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -237,8 +238,11 @@ class ErrorReporter {
+     }
+ 
+     auto KTI = KTIR.getKernelTraceInfo(Idx);
+-    if (KTI.AsyncInfo && (AsyncInfoWrapperMatcher(*KTI.AsyncInfo)))
+-      reportError("Kernel '%s'", KTI.Kernel->getName());
++    if (KTI.AsyncInfo && (AsyncInfoWrapperMatcher(*KTI.AsyncInfo))) {
++      auto PrettyKernelName =
++          llvm::omp::prettifyFunctionName(KTI.Kernel->getName());
++      reportError("Kernel '%s'", PrettyKernelName.c_str());
++    }
+     reportError("execution interrupted by hardware trap instruction");
+     if (KTI.AsyncInfo && (AsyncInfoWrapperMatcher(*KTI.AsyncInfo))) {
+       if (!KTI.LaunchTrace.empty())
+@@ -284,10 +288,13 @@ class ErrorReporter {
+ 
+     for (uint32_t Idx = 0, I = 0; I < NumKTIs; ++Idx) {
+       auto KTI = KTIR.getKernelTraceInfo(Idx);
++      auto PrettyKernelName =
++          llvm::omp::prettifyFunctionName(KTI.Kernel->getName());
+       if (NumKTIs == 1)
+-        print(BoldLightPurple, "Kernel '%s'\n", KTI.Kernel->getName());
++        print(BoldLightPurple, "Kernel '%s'\n", PrettyKernelName.c_str());
+       else
+-        print(BoldLightPurple, "Kernel %d: '%s'\n", I, KTI.Kernel->getName());
++        print(BoldLightPurple, "Kernel %d: '%s'\n", I,
++              PrettyKernelName.c_str());
+       reportStackTrace(KTI.LaunchTrace);
+       ++I;
+     }
+diff --git a/offload/src/CMakeLists.txt b/offload/src/CMakeLists.txt
+index efa5cdab33ec9..344069b6fcdcf 100644
+--- a/offload/src/CMakeLists.txt
++++ b/offload/src/CMakeLists.txt
+@@ -28,6 +28,7 @@ add_llvm_library(omptarget
+   ${LIBOMPTARGET_BINARY_INCLUDE_DIR}
+ 
+   LINK_COMPONENTS
++  FrontendOpenMP
+   Support
+   Object
+ 
+diff --git a/offload/test/sanitizer/kernel_crash.c b/offload/test/sanitizer/kernel_crash.c
+index 457d953a33a05..c69219d97d3d0 100644
+--- a/offload/test/sanitizer/kernel_crash.c
++++ b/offload/test/sanitizer/kernel_crash.c
+@@ -36,12 +36,12 @@ int main(void) {
+   }
+ }
+ // TRACE: Display 1 of the 3 last kernel launch traces
+-// TRACE: Kernel 0: '__omp_offloading_{{.*}}_main_l30'
++// TRACE: Kernel 0: {{.*}} (__omp_offloading_{{.*}}_main_l30)
+ // TRACE:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash.c:30
+ //
+ // CHECK: Display last 3 kernels launched:
+-// CHECK: Kernel 0: '__omp_offloading_{{.*}}_main_l30'
+-// CHECK: Kernel 1: '__omp_offloading_{{.*}}_main_l27'
+-// CHECK: Kernel 2: '__omp_offloading_{{.*}}_main_l24'
++// CHECK: Kernel 0: {{.*}} (__omp_offloading_{{.*}}_main_l30)
++// CHECK: Kernel 1: {{.*}} (__omp_offloading_{{.*}}_main_l27)
++// CHECK: Kernel 2: {{.*}} (__omp_offloading_{{.*}}_main_l24)
+diff --git a/offload/test/sanitizer/kernel_crash_async.c b/offload/test/sanitizer/kernel_crash_async.c
+index 6aebf1b42a535..6a0461b0045b2 100644
+--- a/offload/test/sanitizer/kernel_crash_async.c
++++ b/offload/test/sanitizer/kernel_crash_async.c
+@@ -34,7 +34,7 @@ int main(void) {
+ #pragma omp taskwait
+ }
+ 
+-// TRACE: Kernel {{.*}}'__omp_offloading_{{.*}}_main_
++// TRACE: Kernel {{.*}} (__omp_offloading_{{.*}}_main_l30)
+ // TRACE:     launchKernel
+ //
+-// CHECK-DAG: Kernel {{[0-9]}}: '__omp_offloading_{{.*}}_main_l30'
++// CHECK: Kernel {{[0-9]}}: {{.*}} (__omp_offloading_{{.*}}_main_l30)
+diff --git a/offload/test/sanitizer/kernel_crash_many.c b/offload/test/sanitizer/kernel_crash_many.c
+index 9e3f4f1630acd..25986e0a459c1 100644
+--- a/offload/test/sanitizer/kernel_crash_many.c
++++ b/offload/test/sanitizer/kernel_crash_many.c
+@@ -30,42 +30,42 @@ int main(void) {
+   }
+ }
+ // CHECK: Display 8 of the 8 last kernel launch traces
+-// CHECK: Kernel 0: '__omp_offloading_{{.*}}_main_l27'
++// CHECK: Kernel 0: {{.*}} (__omp_offloading_{{.*}}_main_l27)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:27
+ //
+-// CHECK: Kernel 1: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 1: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 2: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 2: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 3: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 3: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 4: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 4: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 5: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 5: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 6: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 6: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+ //
+-// CHECK: Kernel 7: '__omp_offloading_{{.*}}_main_l23'
++// CHECK: Kernel 7: {{.*}} (__omp_offloading_{{.*}}_main_l23)
+ // CHECK:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_many.c:
+diff --git a/offload/test/sanitizer/kernel_crash_single.c b/offload/test/sanitizer/kernel_crash_single.c
+index 16a8159f074e5..075c3de7ffabb 100644
+--- a/offload/test/sanitizer/kernel_crash_single.c
++++ b/offload/test/sanitizer/kernel_crash_single.c
+@@ -27,10 +27,10 @@ int main(void) {
+   }
+ }
+ // TRACE: Display kernel launch trace
+-// TRACE: Kernel '__omp_offloading_{{.*}}_main_l24'
++// TRACE: Kernel {{.*}} (__omp_offloading_{{.*}}_main_l24)
+ // TRACE:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_crash_single.c:24
+ //
+ // CHECK: Display only launched kernel:
+-// CHECK: Kernel '__omp_offloading_{{.*}}_main_l24'
++// CHECK: Kernel {{.*}} (__omp_offloading_{{.*}}_main_l24)
+diff --git a/offload/test/sanitizer/kernel_trap.c b/offload/test/sanitizer/kernel_trap.c
+index 13fe6f2fb71e8..db243001c9056 100644
+--- a/offload/test/sanitizer/kernel_trap.c
++++ b/offload/test/sanitizer/kernel_trap.c
+@@ -35,8 +35,10 @@ int main(void) {
+   {
+   }
+ }
+-// CHECK: OFFLOAD ERROR: Kernel '__omp_offloading_{{.*}}_main_l30'
++// clang-format off
++// CHECK: OFFLOAD ERROR: Kernel 'omp target in main @ 30 (__omp_offloading_{{.*}}_main_l30)'
+ // CHECK: OFFLOAD ERROR: execution interrupted by hardware trap instruction
+ // TRACE:     launchKernel
+ // NDEBG:     main
+ // DEBUG:     main {{.*}}kernel_trap.c:
++// clang-format on
+diff --git a/offload/test/sanitizer/kernel_trap.cpp b/offload/test/sanitizer/kernel_trap.cpp
+new file mode 100644
+index 0000000000000..899b608d579a7
+--- /dev/null
++++ b/offload/test/sanitizer/kernel_trap.cpp
+@@ -0,0 +1,52 @@
++
++// clang-format off
++// RUN: %libomptarget-compilexx-generic
++// RUN: %not --crash env -u LLVM_DISABLE_SYMBOLIZATION OFFLOAD_TRACK_NUM_KERNEL_LAUNCH_TRACES=1 %libomptarget-run-generic 2>&1 | %fcheck-generic --check-prefixes=CHECK,TRACE,NDEBG 
++// RUN: %not --crash %libomptarget-run-generic 2>&1 | %fcheck-generic --check-prefixes=CHECK
++// RUN: %libomptarget-compilexx-generic -g
++// RUN: %not --crash env -u LLVM_DISABLE_SYMBOLIZATION OFFLOAD_TRACK_NUM_KERNEL_LAUNCH_TRACES=1 %libomptarget-run-generic 2>&1 | %fcheck-generic --check-prefixes=CHECK,TRACE,DEBUG
++// RUN: %not --crash %libomptarget-run-generic 2>&1 | %fcheck-generic --check-prefixes=CHECK
++// clang-format on
++
++// UNSUPPORTED: nvptx64-nvidia-cuda
++// UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++// UNSUPPORTED: aarch64-unknown-linux-gnu
++// UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++// UNSUPPORTED: x86_64-pc-linux-gnu
++// UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++// UNSUPPORTED: s390x-ibm-linux-gnu
++// UNSUPPORTED: s390x-ibm-linux-gnu-LTO
++
++struct S {};
++
++template <typename T> void cxx_function_name(int I, T *) {
++
++#pragma omp target
++  {
++  }
++#pragma omp target
++  {
++  }
++#pragma omp target
++  {
++    __builtin_trap();
++  }
++#pragma omp target
++  {
++  }
++}
++
++int main(void) {
++  struct S s;
++  cxx_function_name(1, &s);
++}
++
++// clang-format off
++// CHECK: OFFLOAD ERROR: Kernel 'omp target in void cxx_function_name<S>(int, S*) @ [[LINE:[0-9]+]] (__omp_offloading_{{.*}}__Z17cxx_function_nameI1SEviPT__l[[LINE]])'
++// CHECK: OFFLOAD ERROR: execution interrupted by hardware trap instruction
++// TRACE:     launchKernel
++// NDEBG:     cxx_function_name<S>(int, S*)
++// NDEBG:     main
++// DEBUG:     cxx_function_name<S>(int, S*) {{.*}}kernel_trap.cpp:
++// DEBUG:     main {{.*}}kernel_trap.cpp:
++// clang-format on
+diff --git a/offload/test/sanitizer/kernel_trap_async.c b/offload/test/sanitizer/kernel_trap_async.c
+index 65e8880798343..ee0d772fef9b8 100644
+--- a/offload/test/sanitizer/kernel_trap_async.c
++++ b/offload/test/sanitizer/kernel_trap_async.c
+@@ -34,7 +34,9 @@ int main(void) {
+ #pragma omp taskwait
+ }
+ 
+-// CHECK: OFFLOAD ERROR: Kernel '__omp_offloading_{{.*}}_main_l30'
++// clang-format off
++// CHECK: OFFLOAD ERROR: Kernel {{.*}} (__omp_offloading_{{.*}}_main_l30)
+ // CHECK: OFFLOAD ERROR: execution interrupted by hardware trap instruction
+ // TRACE:     launchKernel
+ // DEBUG:     kernel_trap_async.c:
++// clang-format on
+diff --git a/offload/test/sanitizer/kernel_trap_many.c b/offload/test/sanitizer/kernel_trap_many.c
+index 3f1796e8913ea..b3bdad9f07b4a 100644
+--- a/offload/test/sanitizer/kernel_trap_many.c
++++ b/offload/test/sanitizer/kernel_trap_many.c
+@@ -29,7 +29,7 @@ int main(void) {
+     __builtin_trap();
+   }
+ }
+-// TRACE: OFFLOAD ERROR: Kernel '__omp_offloading_{{.*}}_main_l27'
++// TRACE: OFFLOAD ERROR: Kernel {{.*}} (__omp_offloading_{{.*}}_main_l27)
+ // TRACE: OFFLOAD ERROR: execution interrupted by hardware trap instruction
+ // TRACE:     launchKernel
+ // NDEBG:     main

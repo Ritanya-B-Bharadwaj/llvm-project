@@ -1,0 +1,440 @@
+diff --git a/flang/lib/Lower/OpenMP/PrivateReductionUtils.cpp b/flang/lib/Lower/OpenMP/PrivateReductionUtils.cpp
+index 21ade77d82d37..268c7828ab56f 100644
+--- a/flang/lib/Lower/OpenMP/PrivateReductionUtils.cpp
++++ b/flang/lib/Lower/OpenMP/PrivateReductionUtils.cpp
+@@ -122,10 +122,9 @@ static void createCleanupRegion(Fortran::lower::AbstractConverter &converter,
+   typeError();
+ }
+ 
+-fir::ShapeShiftOp
+-Fortran::lower::omp::getShapeShift(fir::FirOpBuilder &builder,
+-                                   mlir::Location loc, mlir::Value box,
+-                                   bool cannotHaveNonDefaultLowerBounds) {
++fir::ShapeShiftOp Fortran::lower::omp::getShapeShift(
++    fir::FirOpBuilder &builder, mlir::Location loc, mlir::Value box,
++    bool cannotHaveNonDefaultLowerBounds, bool useDefaultLowerBounds) {
+   fir::SequenceType sequenceType = mlir::cast<fir::SequenceType>(
+       hlfir::getFortranElementOrSequenceType(box.getType()));
+   const unsigned rank = sequenceType.getDimension();
+@@ -134,15 +133,24 @@ Fortran::lower::omp::getShapeShift(fir::FirOpBuilder &builder,
+   lbAndExtents.reserve(rank * 2);
+   mlir::Type idxTy = builder.getIndexType();
+ 
+-  if (cannotHaveNonDefaultLowerBounds && !sequenceType.hasDynamicExtents()) {
++  mlir::Value oneVal;
++  auto one = [&] {
++    if (!oneVal)
++      oneVal = builder.createIntegerConstant(loc, idxTy, 1);
++    return oneVal;
++  };
++
++  if ((cannotHaveNonDefaultLowerBounds || useDefaultLowerBounds) &&
++      !sequenceType.hasDynamicExtents()) {
+     // We don't need fir::BoxDimsOp if all of the extents are statically known
+     // and we can assume default lower bounds. This helps avoids reads from the
+     // mold arg.
+-    mlir::Value one = builder.createIntegerConstant(loc, idxTy, 1);
++    // We may also want to use default lower bounds to iterate through array
++    // elements without having to adjust each index.
+     for (int64_t extent : sequenceType.getShape()) {
+       assert(extent != sequenceType.getUnknownExtent());
++      lbAndExtents.push_back(one());
+       mlir::Value extentVal = builder.createIntegerConstant(loc, idxTy, extent);
+-      lbAndExtents.push_back(one);
+       lbAndExtents.push_back(extentVal);
+     }
+   } else {
+@@ -153,7 +161,8 @@ Fortran::lower::omp::getShapeShift(fir::FirOpBuilder &builder,
+       mlir::Value dim = builder.createIntegerConstant(loc, idxTy, i);
+       auto dimInfo =
+           builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy, box, dim);
+-      lbAndExtents.push_back(dimInfo.getLowerBound());
++      lbAndExtents.push_back(useDefaultLowerBounds ? one()
++                                                   : dimInfo.getLowerBound());
+       lbAndExtents.push_back(dimInfo.getExtent());
+     }
+   }
+diff --git a/flang/lib/Lower/OpenMP/PrivateReductionUtils.h b/flang/lib/Lower/OpenMP/PrivateReductionUtils.h
+index 0a3513bff19b0..9f8c9aee4d8ec 100644
+--- a/flang/lib/Lower/OpenMP/PrivateReductionUtils.h
++++ b/flang/lib/Lower/OpenMP/PrivateReductionUtils.h
+@@ -59,9 +59,15 @@ void populateByRefInitAndCleanupRegions(
+     bool cannotHaveNonDefaultLowerBounds = false);
+ 
+ /// Generate a fir::ShapeShift op describing the provided boxed array.
++/// `cannotHaveNonDefaultLowerBounds` should be set if `box` is known to have
++/// default lower bounds. This can improve code generation.
++/// `useDefaultLowerBounds` can be set to force the returned fir::ShapeShiftOp
++/// to have default lower bounds, which is useful to iterate through array
++/// elements without having to adjust each index.
+ fir::ShapeShiftOp getShapeShift(fir::FirOpBuilder &builder, mlir::Location loc,
+                                 mlir::Value box,
+-                                bool cannotHaveNonDefaultLowerBounds = false);
++                                bool cannotHaveNonDefaultLowerBounds = false,
++                                bool useDefaultLowerBounds = false);
+ 
+ } // namespace omp
+ } // namespace lower
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index aa1187669ca8b..729bd3689ad4f 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -337,7 +337,12 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
+     return;
+   }
+ 
+-  fir::ShapeShiftOp shapeShift = getShapeShift(builder, loc, lhs);
++  // Get ShapeShift with default lower bounds. This makes it possible to use
++  // unmodified LoopNest's indices with ArrayCoorOp.
++  fir::ShapeShiftOp shapeShift =
++      getShapeShift(builder, loc, lhs,
++                    /*cannotHaveNonDefaultLowerBounds=*/false,
++                    /*useDefaultLowerBounds=*/true);
+ 
+   // Iterate over array elements, applying the equivalent scalar reduction:
+ 
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+index 47fcd3d8941b1..6c7a3cbbb9671 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+@@ -55,7 +55,8 @@ program reduce
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+index 59902bd13a1c2..86dac33409c7a 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+@@ -38,16 +38,15 @@ program reduce
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = arith.constant 1 : index
+-! CHECK:           %[[VAL_7:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_6]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_8:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1, %[[VAL_7]]#0, %[[VAL_7]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
+-! CHECK:           %[[VAL_9:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[VAL_9]] to %[[VAL_7]]#1 step %[[VAL_9]] unordered {
+-! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[VAL_9]] to %[[VAL_5]]#1 step %[[VAL_9]] unordered {
+-! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
+-! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C3:.*]] = arith.constant 3 : index
++! CHECK:           %[[C2:.*]] = arith.constant 2 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C3]], %[[C1]], %[[C2]] : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[C1_0]] to %[[C2]] step %[[C1_0]] unordered {
++! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[C1_0]] to %[[C3]] step %[[C1_0]] unordered {
++! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
++! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]] = fir.load %[[VAL_12]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_13]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_16:.*]] = arith.addi %[[VAL_14]], %[[VAL_15]] : i32
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+index 8835c1f5b5e18..575dbdae9b61a 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+@@ -37,13 +37,13 @@ program reduce
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+-! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+-! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+-! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C3:.*]] = arith.constant 3 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C3]] : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[C1_0]] to %[[C3]] step %[[C1_0]] unordered {
++! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_12:.*]] = fir.load %[[VAL_10]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_13:.*]] = arith.addi %[[VAL_11]], %[[VAL_12]] : i32
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+index 2d4c0239b5d2e..733b7aa67fcaf 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+@@ -36,13 +36,13 @@ program reduce
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+-! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+-! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+-! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C3:.*]] = arith.constant 3 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C3]] : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[C1_0]] to %[[C3]] step %[[C1_0]] unordered {
++! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<3xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_12:.*]] = fir.load %[[VAL_10]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_13:.*]] = arith.addi %[[VAL_11]], %[[VAL_12]] : i32
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+index a3ad7c67971f2..40acacc105687 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+@@ -56,7 +56,8 @@ program reduce
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.ptr<!fir.array<?xi32>>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.ptr<!fir.array<?xi32>>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 552cd00076c83..e9ca0db39d142 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -27,7 +27,8 @@
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90 b/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
+index d7af34923827c..ae5952eb662e0 100644
+--- a/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
++++ b/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
+@@ -35,7 +35,8 @@ subroutine max_array_reduction(l, r)
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+index de9136fe08fb7..a554211129360 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+@@ -69,7 +69,8 @@ program reduce15
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+@@ -130,7 +131,8 @@ program reduce15
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index 9ef0e64629977..44b282322d666 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -48,7 +48,8 @@ subroutine reduce(r)
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<?xf64>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[C1]], %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+ ! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+ ! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<?xf64>>, !fir.shapeshift<1>, index) -> !fir.ref<f64>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-lb.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-lb.f90
+new file mode 100644
+index 0000000000000..9f0dd16002baf
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-lb.f90
+@@ -0,0 +1,35 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++program reduce
++  integer a(0:1)
++
++  !$omp parallel do reduction(+:a)
++    do i = 1, 10
++      a(0) = a(0) + 1
++    end do
++  !$omp end parallel do
++end program
++
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> alloc {
++! CHECK:         } combiner {
++! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[ARG1:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
++! CHECK:           %[[ARR0:.*]] = fir.load %[[ARG0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:           %[[ARR1:.*]] = fir.load %[[ARG1]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C2:.*]] = arith.constant 2 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C2]] : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[ARG2:.*]] = %[[C1_0]] to %[[C2]] step %[[C1_0]] unordered {
++! CHECK:             %[[COOR0:.*]] = fir.array_coor %[[ARR0]](%[[SHAPE_SHIFT]]) %[[ARG2]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[COOR1:.*]] = fir.array_coor %[[ARR1]](%[[SHAPE_SHIFT]]) %[[ARG2]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[ELEM0:.*]] = fir.load %[[COOR0]] : !fir.ref<i32>
++! CHECK:             %[[ELEM1:.*]] = fir.load %[[COOR1]] : !fir.ref<i32>
++! CHECK:             %[[SUM:.*]] = arith.addi %[[ELEM0]], %[[ELEM1]] : i32
++! CHECK:             fir.store %[[SUM]] to %[[COOR0]] : !fir.ref<i32>
++! CHECK:           }
++! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
++! CHECK:         }
++
++! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "reduce"} {
++! CHECK:           omp.wsloop {{.*}} reduction(byref @add_reduction_byref_box_2xi32 %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.array<2xi32>>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-lb2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-lb2.f90
+new file mode 100644
+index 0000000000000..5ada623a0ed23
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-lb2.f90
+@@ -0,0 +1,44 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++program reduce
++  integer a(0:1)
++
++  call sub(a, 0, 1)
++
++contains
++  subroutine sub(a, lb, ub)
++    integer :: i, lb, ub, a(lb:ub)
++
++    !$omp parallel do reduction(+:a)
++      do i = 1, 10
++        a(0) = a(0) + 1
++      end do
++    !$omp end parallel do
++  end subroutine
++
++end program
++
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxi32 : !fir.ref<!fir.box<!fir.array<?xi32>>> alloc {
++! CHECK:         } combiner {
++! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[ARG1:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
++! CHECK:           %[[ARR0:.*]] = fir.load %[[ARG0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:           %[[ARR1:.*]] = fir.load %[[ARG1]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[ARR0]], %[[C0]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[ARG2:.*]] = %[[C1_0]] to %[[DIMS]]#1 step %[[C1_0]] unordered {
++! CHECK:             %[[COOR0:.*]] = fir.array_coor %[[ARR0]](%[[SHAPE_SHIFT]]) %[[ARG2]] : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[COOR1:.*]] = fir.array_coor %[[ARR1]](%[[SHAPE_SHIFT]]) %[[ARG2]] : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[ELEM0:.*]] = fir.load %[[COOR0]] : !fir.ref<i32>
++! CHECK:             %[[ELEM1:.*]] = fir.load %[[COOR1]] : !fir.ref<i32>
++! CHECK:             %[[SUM:.*]] = arith.addi %[[ELEM0]], %[[ELEM1]] : i32
++! CHECK:             fir.store %[[SUM]] to %[[COOR0]] : !fir.ref<i32>
++! CHECK:           }
++! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
++! CHECK:         }
++
++! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "reduce"} {
++! CHECK:           omp.wsloop {{.*}} reduction(byref @add_reduction_byref_box_Uxi32 %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.array<?xi32>>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index 166d0ad437180..219c87ad47569 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -38,13 +38,13 @@ program reduce
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<2xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+-! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+-! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+-! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C2:.*]] = arith.constant 2 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C2]] : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[C1_0]] to %[[C2]] step %[[C1_0]] unordered {
++! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_12:.*]] = fir.load %[[VAL_10]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_13:.*]] = arith.addi %[[VAL_11]], %[[VAL_12]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index 4cee25d220a08..fdb5ac6c6b816 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -38,13 +38,13 @@ program reduce
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<2xi32>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1 : (index, index) -> !fir.shapeshift<1>
+-! CHECK:           %[[VAL_7:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[VAL_7]] to %[[VAL_5]]#1 step %[[VAL_7]] unordered {
+-! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+-! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_6]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C2:.*]] = arith.constant 2 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C2]] : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[C1_0:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_8:.*]] = %[[C1_0]] to %[[C2]] step %[[C1_0]] unordered {
++! CHECK:             %[[VAL_9:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
++! CHECK:             %[[VAL_10:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_8]] : (!fir.box<!fir.array<2xi32>>, !fir.shapeshift<1>, index) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_12:.*]] = fir.load %[[VAL_10]] : !fir.ref<i32>
+ ! CHECK:             %[[VAL_13:.*]] = arith.addi %[[VAL_11]], %[[VAL_12]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+index 15cfd6a349e76..c90d0b3167408 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+@@ -51,16 +51,15 @@ program main
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+-! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_6:.*]] = arith.constant 1 : index
+-! CHECK:           %[[VAL_7:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_6]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
+-! CHECK:           %[[VAL_8:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1, %[[VAL_7]]#0, %[[VAL_7]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
+-! CHECK:           %[[VAL_9:.*]] = arith.constant 1 : index
+-! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[VAL_9]] to %[[VAL_7]]#1 step %[[VAL_9]] unordered {
+-! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[VAL_9]] to %[[VAL_5]]#1 step %[[VAL_9]] unordered {
+-! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
+-! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
++! CHECK:           %[[C1:.*]] = arith.constant 1 : index
++! CHECK:           %[[C3:.*]] = arith.constant 3 : index
++! CHECK:           %[[C3_0:.*]] = arith.constant 3 : index
++! CHECK:           %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[C1]], %[[C3]], %[[C1]], %[[C3_0]] : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[C1_1:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[C1_1]] to %[[C3_0]] step %[[C1_1]] unordered {
++! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[C1_1]] to %[[C3]] step %[[C1_1]] unordered {
++! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[SHAPE_SHIFT]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
++! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[SHAPE_SHIFT]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
+ ! CHECK:               %[[VAL_14:.*]] = fir.load %[[VAL_12]] : !fir.ref<f64>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_13]] : !fir.ref<f64>
+ ! CHECK:               %[[VAL_16:.*]] = arith.addf %[[VAL_14]], %[[VAL_15]] fastmath<contract> : f64

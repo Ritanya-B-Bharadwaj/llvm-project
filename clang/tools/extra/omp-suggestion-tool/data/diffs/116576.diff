@@ -1,0 +1,707 @@
+diff --git a/flang/lib/Optimizer/OpenMP/MapsForPrivatizedSymbols.cpp b/flang/lib/Optimizer/OpenMP/MapsForPrivatizedSymbols.cpp
+index d2c814cc958dd..c990bebcabde4 100644
+--- a/flang/lib/Optimizer/OpenMP/MapsForPrivatizedSymbols.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapsForPrivatizedSymbols.cpp
+@@ -49,13 +49,6 @@ class MapsForPrivatizedSymbolsPass
+     : public flangomp::impl::MapsForPrivatizedSymbolsPassBase<
+           MapsForPrivatizedSymbolsPass> {
+ 
+-  bool privatizerNeedsMap(omp::PrivateClauseOp &privatizer) {
+-    Region &allocRegion = privatizer.getAllocRegion();
+-    Value blockArg0 = allocRegion.getArgument(0);
+-    if (blockArg0.use_empty())
+-      return false;
+-    return true;
+-  }
+   omp::MapInfoOp createMapInfo(Location loc, Value var,
+                                fir::FirOpBuilder &builder) {
+     uint64_t mapTypeTo = static_cast<
+@@ -134,7 +127,7 @@ class MapsForPrivatizedSymbolsPass
+         omp::PrivateClauseOp privatizer =
+             SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
+                 targetOp, privatizerName);
+-        if (!privatizerNeedsMap(privatizer)) {
++        if (!privatizer.needsMap()) {
+           privVarMapIdx.push_back(-1);
+           continue;
+         }
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 21004e6a15d49..764e2ca8fe4f4 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -6821,8 +6821,11 @@ static Expected<Function *> createOutlinedFunction(
+     OMPBuilder.ConstantAllocaRaiseCandidates.emplace_back(Func);
+ 
+   // Insert target deinit call in the device compilation pass.
+-  llvm::OpenMPIRBuilder::InsertPointOrErrorTy AfterIP =
+-      CBFunc(Builder.saveIP(), Builder.saveIP());
++  BasicBlock *OutlinedBodyBB =
++      splitBB(Builder, /*CreateBranch=*/true, "outlined.body");
++  llvm::OpenMPIRBuilder::InsertPointOrErrorTy AfterIP = CBFunc(
++      Builder.saveIP(),
++      OpenMPIRBuilder::InsertPointTy(OutlinedBodyBB, OutlinedBodyBB->begin()));
+   if (!AfterIP)
+     return AfterIP.takeError();
+   Builder.restoreIP(*AfterIP);
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index 630cd03c68801..d7ac108249118 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -6358,7 +6358,13 @@ TEST_F(OpenMPIRBuilderTest, TargetRegionDevice) {
+   auto *Load2 = Load1->getNextNode();
+   EXPECT_TRUE(isa<LoadInst>(Load2));
+ 
+-  auto *Value1 = Load2->getNextNode();
++  auto *OutlinedBlockBr = Load2->getNextNode();
++  EXPECT_TRUE(isa<BranchInst>(OutlinedBlockBr));
++
++  auto *OutlinedBlock = OutlinedBlockBr->getSuccessor(0);
++  EXPECT_EQ(OutlinedBlock->getName(), "outlined.body");
++
++  auto *Value1 = OutlinedBlock->getFirstNonPHI();
+   EXPECT_EQ(Value1, Value);
+   EXPECT_EQ(Value1->getNextNode(), TargetStore);
+   auto *Deinit = TargetStore->getNextNode();
+@@ -6510,7 +6516,14 @@ TEST_F(OpenMPIRBuilderTest, ConstantAllocaRaise) {
+   EXPECT_EQ(UserCodeBlock->getName(), "user_code.entry");
+   auto *Load1 = UserCodeBlock->getFirstNonPHI();
+   EXPECT_TRUE(isa<LoadInst>(Load1));
+-  auto *Load2 = Load1->getNextNode();
++
++  auto *OutlinedBlockBr = Load1->getNextNode();
++  EXPECT_TRUE(isa<BranchInst>(OutlinedBlockBr));
++
++  auto *OutlinedBlock = OutlinedBlockBr->getSuccessor(0);
++  EXPECT_EQ(OutlinedBlock->getName(), "outlined.body");
++
++  auto *Load2 = OutlinedBlock->getFirstNonPHI();
+   EXPECT_TRUE(isa<LoadInst>(Load2));
+   EXPECT_EQ(Load2, Value);
+   EXPECT_EQ(Load2->getNextNode(), TargetStore);
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 85b6a6638036f..89c7ed46ff500 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -135,6 +135,14 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove, RecipeInterface]>
+       auto &region = getDeallocRegion();
+       return region.empty() ? nullptr : region.getArgument(0);
+     }
++
++    /// needsMap returns true if the value being privatized should additionally
++    /// be mapped to the target region using a MapInfoOp. This is most common
++    /// when an allocatable is privatized. In such cases, the descriptor is used
++    /// in privatization and needs to be mapped on to the device.
++    bool needsMap() {
++      return !getAllocMoldArg().use_empty();
++    }
+   }];
+ 
+   let hasRegionVerifier = 1;
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 49fe509800491..8d2a8b291f5f9 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -299,10 +299,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+             if (privatizer.getDataSharingType() ==
+                 omp::DataSharingClauseType::FirstPrivate)
+               result = todo("firstprivate");
+-
+-            if (!privatizer.getDeallocRegion().empty())
+-              result = op.emitError("not yet implemented: privatization of "
+-                                    "structures in omp.target operation");
+           }
+         }
+         checkThreadLimit(op, result);
+@@ -1290,6 +1286,41 @@ static LogicalResult allocAndInitializeReductionVars(
+                            isByRef, deferredStores);
+ }
+ 
++/// Return the llvm::Value * corresponding to the `privateVar` that
++/// is being privatized. It isn't always as simple as looking up
++/// moduleTranslation with privateVar. For instance, in case of
++/// an allocatable, the descriptor for the allocatable is privatized.
++/// This descriptor is mapped using an MapInfoOp. So, this function
++/// will return a pointer to the llvm::Value corresponding to the
++/// block argument for the mapped descriptor.
++static llvm::Value *
++findAssociatedValue(Value privateVar, llvm::IRBuilderBase &builder,
++                    LLVM::ModuleTranslation &moduleTranslation,
++                    llvm::DenseMap<Value, Value> *mappedPrivateVars = nullptr) {
++  if (mappedPrivateVars == nullptr || !mappedPrivateVars->contains(privateVar))
++    return moduleTranslation.lookupValue(privateVar);
++
++  Value blockArg = (*mappedPrivateVars)[privateVar];
++  Type privVarType = privateVar.getType();
++  Type blockArgType = blockArg.getType();
++  assert(isa<LLVM::LLVMPointerType>(blockArgType) &&
++         "A block argument corresponding to a mapped var should have "
++         "!llvm.ptr type");
++
++  if (privVarType == blockArgType)
++    return moduleTranslation.lookupValue(blockArg);
++
++  // This typically happens when the privatized type is lowered from
++  // boxchar<KIND> and gets lowered to !llvm.struct<(ptr, i64)>. That is the
++  // struct/pair is passed by value. But, mapped values are passed only as
++  // pointers, so before we privatize, we must load the pointer.
++  if (!isa<LLVM::LLVMPointerType>(privVarType))
++    return builder.CreateLoad(moduleTranslation.convertType(privVarType),
++                              moduleTranslation.lookupValue(blockArg));
++
++  return moduleTranslation.lookupValue(privateVar);
++}
++
+ /// Allocate delayed private variables. Returns the basic block which comes
+ /// after all of these allocations. llvm::Value * for each of these private
+ /// variables are populated in llvmPrivateVars.
+@@ -1300,7 +1331,8 @@ allocatePrivateVars(llvm::IRBuilderBase &builder,
+                     MutableArrayRef<omp::PrivateClauseOp> privateDecls,
+                     MutableArrayRef<mlir::Value> mlirPrivateVars,
+                     llvm::SmallVectorImpl<llvm::Value *> &llvmPrivateVars,
+-                    const llvm::OpenMPIRBuilder::InsertPointTy &allocaIP) {
++                    const llvm::OpenMPIRBuilder::InsertPointTy &allocaIP,
++                    llvm::DenseMap<Value, Value> *mappedPrivateVars = nullptr) {
+   llvm::IRBuilderBase::InsertPointGuard guard(builder);
+   // Allocate private vars
+   llvm::BranchInst *allocaTerminator =
+@@ -1330,7 +1362,8 @@ allocatePrivateVars(llvm::IRBuilderBase &builder,
+     Region &allocRegion = privDecl.getAllocRegion();
+ 
+     // map allocation region block argument
+-    llvm::Value *nonPrivateVar = moduleTranslation.lookupValue(mlirPrivVar);
++    llvm::Value *nonPrivateVar = findAssociatedValue(
++        mlirPrivVar, builder, moduleTranslation, mappedPrivateVars);
+     assert(nonPrivateVar);
+     moduleTranslation.mapValue(privDecl.getAllocMoldArg(), nonPrivateVar);
+ 
+@@ -1345,6 +1378,7 @@ allocatePrivateVars(llvm::IRBuilderBase &builder,
+     } else {
+       builder.SetInsertPoint(privAllocBlock->getTerminator());
+     }
++
+     if (failed(inlineConvertOmpRegions(allocRegion, "omp.private.alloc",
+                                        builder, moduleTranslation, &phis)))
+       return llvm::createStringError(
+@@ -3829,6 +3863,17 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   bool isTargetDevice = ompBuilder->Config.isTargetDevice();
+   auto parentFn = opInst.getParentOfType<LLVM::LLVMFuncOp>();
+   auto &targetRegion = targetOp.getRegion();
++  // Holds the private vars that have been mapped along with the block argument
++  // that corresponds to the MapInfoOp corresponding to the private var in
++  // question. So, for instance:
++  //
++  // %10 = omp.map.info var_ptr(%6#0 : !fir.ref<!fir.box<!fir.heap<i32>>>, ..)
++  // omp.target map_entries(%10 -> %arg0) private(@box.privatizer %6#0-> %arg1)
++  //
++  // Then, %10 has been created so that the descriptor can be used by the
++  // privatizer @box.privatizer on the device side. Here we'd record {%6#0,
++  // %arg0} in the mappedPrivateVars map.
++  llvm::DenseMap<Value, Value> mappedPrivateVars;
+   DataLayout dl = DataLayout(opInst.getParentOfType<ModuleOp>());
+   SmallVector<Value> mapVars = targetOp.getMapVars();
+   ArrayRef<BlockArgument> mapBlockArgs =
+@@ -3840,6 +3885,57 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   bool isOffloadEntry =
+       isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
+ 
++  // For some private variables, the MapsForPrivatizedVariablesPass
++  // creates MapInfoOp instances. Go through the private variables and
++  // the mapped variables so that during codegeneration we are able
++  // to quickly look up the corresponding map variable, if any for each
++  // private variable.
++  if (!targetOp.getPrivateVars().empty() && !targetOp.getMapVars().empty()) {
++    auto argIface = llvm::cast<omp::BlockArgOpenMPOpInterface>(*targetOp);
++    OperandRange privateVars = targetOp.getPrivateVars();
++    std::optional<ArrayAttr> privateSyms = targetOp.getPrivateSyms();
++    std::optional<DenseI64ArrayAttr> privateMapIndices =
++        targetOp.getPrivateMapsAttr();
++
++    for (auto [privVarIdx, privVarSymPair] :
++         llvm::enumerate(llvm::zip_equal(privateVars, *privateSyms))) {
++      auto privVar = std::get<0>(privVarSymPair);
++      auto privSym = std::get<1>(privVarSymPair);
++
++      SymbolRefAttr privatizerName = llvm::cast<SymbolRefAttr>(privSym);
++      omp::PrivateClauseOp privatizer =
++          findPrivatizer(targetOp, privatizerName);
++
++      if (!privatizer.needsMap())
++        continue;
++
++      mlir::Value mappedValue =
++          targetOp.getMappedValueForPrivateVar(privVarIdx);
++      assert(mappedValue && "Expected to find mapped value for a privatized "
++                            "variable that needs mapping");
++
++      // The MapInfoOp defining the map var isn't really needed later.
++      // So, we don't store it in any datastructure. Instead, we just
++      // do some sanity checks on it right now.
++      auto mapInfoOp = mappedValue.getDefiningOp<omp::MapInfoOp>();
++      Type varType = mapInfoOp.getVarType();
++
++      // Check #1: Check that the type of the private variable matches
++      // the type of the variable being mapped.
++      if (!isa<LLVM::LLVMPointerType>(privVar.getType()))
++        assert(
++            varType == privVar.getType() &&
++            "Type of private var doesn't match the type of the mapped value");
++
++      // Ok, only 1 sanity check for now.
++      // Record the block argument corresponding to this mapvar.
++      mappedPrivateVars.insert(
++          {privVar,
++           targetRegion.getArgument(argIface.getMapBlockArgsStart() +
++                                    (*privateMapIndices)[privVarIdx])});
++    }
++  }
++
+   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+   auto bodyCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP)
+       -> llvm::OpenMPIRBuilder::InsertPointOrErrorTy {
+@@ -3859,7 +3955,6 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+         attr.isStringAttribute())
+       llvmOutlinedFn->addFnAttr(attr);
+ 
+-    builder.restoreIP(codeGenIP);
+     for (auto [arg, mapOp] : llvm::zip_equal(mapBlockArgs, mapVars)) {
+       auto mapInfoOp = cast<omp::MapInfoOp>(mapOp.getDefiningOp());
+       llvm::Value *mapOpValue =
+@@ -3869,50 +3964,52 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+     // Do privatization after moduleTranslation has already recorded
+     // mapped values.
+-    if (!targetOp.getPrivateVars().empty()) {
+-      builder.restoreIP(allocaIP);
+-
+-      OperandRange privateVars = targetOp.getPrivateVars();
+-      std::optional<ArrayAttr> privateSyms = targetOp.getPrivateSyms();
+-      MutableArrayRef<BlockArgument> privateBlockArgs =
+-          cast<omp::BlockArgOpenMPOpInterface>(opInst).getPrivateBlockArgs();
+-
+-      for (auto [privVar, privatizerNameAttr, privBlockArg] :
+-           llvm::zip_equal(privateVars, *privateSyms, privateBlockArgs)) {
+-
+-        SymbolRefAttr privSym = cast<SymbolRefAttr>(privatizerNameAttr);
+-        omp::PrivateClauseOp privatizer = findPrivatizer(&opInst, privSym);
+-        assert(privatizer.getDataSharingType() !=
+-                   omp::DataSharingClauseType::FirstPrivate &&
+-               privatizer.getDeallocRegion().empty() &&
+-               "unsupported privatizer");
+-        moduleTranslation.mapValue(privatizer.getAllocMoldArg(),
+-                                   moduleTranslation.lookupValue(privVar));
+-        Region &allocRegion = privatizer.getAllocRegion();
+-        SmallVector<llvm::Value *, 1> yieldedValues;
+-        if (failed(inlineConvertOmpRegions(
+-                allocRegion, "omp.targetop.privatizer", builder,
+-                moduleTranslation, &yieldedValues))) {
+-          return llvm::createStringError(
+-              "failed to inline `alloc` region of `omp.private`");
+-        }
+-        assert(yieldedValues.size() == 1);
+-        moduleTranslation.mapValue(privBlockArg, yieldedValues.front());
+-        moduleTranslation.forgetMapping(allocRegion);
+-        builder.restoreIP(builder.saveIP());
+-      }
+-    }
++    MutableArrayRef<BlockArgument> privateBlockArgs =
++        cast<omp::BlockArgOpenMPOpInterface>(opInst).getPrivateBlockArgs();
++    SmallVector<mlir::Value> mlirPrivateVars;
++    SmallVector<llvm::Value *> llvmPrivateVars;
++    SmallVector<omp::PrivateClauseOp> privateDecls;
++    mlirPrivateVars.reserve(privateBlockArgs.size());
++    llvmPrivateVars.reserve(privateBlockArgs.size());
++    collectPrivatizationDecls(targetOp, privateDecls);
++    for (mlir::Value privateVar : targetOp.getPrivateVars())
++      mlirPrivateVars.push_back(privateVar);
++
++    llvm::Expected<llvm::BasicBlock *> afterAllocas = allocatePrivateVars(
++        builder, moduleTranslation, privateBlockArgs, privateDecls,
++        mlirPrivateVars, llvmPrivateVars, allocaIP, &mappedPrivateVars);
+ 
++    if (failed(handleError(afterAllocas, *targetOp)))
++      return llvm::make_error<PreviouslyReportedError>();
++
++    SmallVector<Region *> privateCleanupRegions;
++    llvm::transform(privateDecls, std::back_inserter(privateCleanupRegions),
++                    [](omp::PrivateClauseOp privatizer) {
++                      return &privatizer.getDeallocRegion();
++                    });
++
++    builder.restoreIP(codeGenIP);
+     llvm::Expected<llvm::BasicBlock *> exitBlock = convertOmpOpRegions(
+         targetRegion, "omp.target", builder, moduleTranslation);
++
+     if (!exitBlock)
+       return exitBlock.takeError();
+ 
+     builder.SetInsertPoint(*exitBlock);
+-    return builder.saveIP();
++    if (!privateCleanupRegions.empty()) {
++      if (failed(inlineOmpRegionCleanup(
++              privateCleanupRegions, llvmPrivateVars, moduleTranslation,
++              builder, "omp.targetop.private.cleanup",
++              /*shouldLoadCleanupRegionArg=*/false))) {
++        return llvm::createStringError(
++            "failed to inline `dealloc` region of `omp.private` "
++            "op in the target region");
++      }
++    }
++
++    return InsertPointTy(exitBlock.get(), exitBlock.get()->end());
+   };
+ 
+-  llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+   StringRef parentName = parentFn.getName();
+ 
+   llvm::TargetRegionEntryInfo entryInfo;
+@@ -3923,9 +4020,6 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   int32_t defaultValTeams = -1;
+   int32_t defaultValThreads = 0;
+ 
+-  llvm::OpenMPIRBuilder::InsertPointTy allocaIP =
+-      findAllocaInsertPoint(builder, moduleTranslation);
+-
+   MapInfoData mapData;
+   collectMapDataFromMapOperands(mapData, mapVars, moduleTranslation, dl,
+                                 builder);
+@@ -3973,6 +4067,10 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   buildDependData(targetOp.getDependKinds(), targetOp.getDependVars(),
+                   moduleTranslation, dds);
+ 
++  llvm::OpenMPIRBuilder::InsertPointTy allocaIP =
++      findAllocaInsertPoint(builder, moduleTranslation);
++  llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
++
+   llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+       moduleTranslation.getOpenMPBuilder()->createTarget(
+           ompLoc, isOffloadEntry, allocaIP, builder.saveIP(), entryInfo,
+diff --git a/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-device.mlir b/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-device.mlir
+index 9549de1258efc..2550730f3fdf2 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-device.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-device.mlir
+@@ -33,9 +33,12 @@ module attributes {omp.is_target_device = true} {
+ 
+ // CHECK: user_code.entry:                                  ; preds = %entry
+ // CHECK: %[[LOAD_BYREF:.*]] = load ptr, ptr %[[ALLOCA_BYREF]], align 8
++// CHECK: br label %outlined.body
++
++// CHECK: outlined.body:
+ // CHECK: br label %omp.target
+ 
+-// CHECK: omp.target:                                       ; preds = %user_code.entry
++// CHECK: omp.target:
+ // CHECK:  %[[VAL_LOAD_BYCOPY:.*]] = load i32, ptr %[[ALLOCA_BYCOPY]], align 4
+ // CHECK:  store i32 %[[VAL_LOAD_BYCOPY]], ptr %[[LOAD_BYREF]], align 4
+ // CHECK: br label %omp.region.cont
+diff --git a/mlir/test/Target/LLVMIR/omptarget-declare-target-llvm-device.mlir b/mlir/test/Target/LLVMIR/omptarget-declare-target-llvm-device.mlir
+index e0c4c02e03a65..b59e03bc465a2 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-declare-target-llvm-device.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-declare-target-llvm-device.mlir
+@@ -17,7 +17,7 @@ module attributes {omp.is_target_device = true} {
+   llvm.func @_QQmain() attributes {} {
+     %0 = llvm.mlir.addressof @_QMtest_0Esp : !llvm.ptr
+ 
+-  // CHECK-DAG:   omp.target:                                       ; preds = %user_code.entry
++  // CHECK-DAG:   omp.target:                                       ; preds = %outlined.body
+   // CHECK-DAG: %[[V:.*]] = load ptr, ptr @_QMtest_0Esp_decl_tgt_ref_ptr, align 8
+   // CHECK-DAG: store i32 1, ptr %[[V]], align 4
+   // CHECK-DAG: br label %omp.region.cont
+diff --git a/mlir/test/Target/LLVMIR/openmp-target-multiple-private.mlir b/mlir/test/Target/LLVMIR/openmp-target-multiple-private.mlir
+new file mode 100644
+index 0000000000000..c632a0ee42f8a
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-target-multiple-private.mlir
+@@ -0,0 +1,80 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++llvm.func @dealloc_foo_0(!llvm.ptr)
++
++omp.private {type = private} @box.heap_privatizer0 : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %7 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>  : (i32) -> !llvm.ptr
++  omp.yield(%7 : !llvm.ptr)
++} dealloc {
++^bb0(%arg0: !llvm.ptr):
++  llvm.call @dealloc_foo_0(%arg0) : (!llvm.ptr) -> ()
++  omp.yield
++}
++
++llvm.func @alloc_foo_1(!llvm.ptr)
++llvm.func @dealloc_foo_1(!llvm.ptr)
++
++omp.private {type = private} @box.heap_privatizer1 : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %7 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>  : (i32) -> !llvm.ptr
++  llvm.call @alloc_foo_1(%arg0) : (!llvm.ptr) -> ()
++  omp.yield(%7 : !llvm.ptr)
++} dealloc {
++^bb0(%arg0: !llvm.ptr):
++  llvm.call @dealloc_foo_1(%arg0) : (!llvm.ptr) -> ()
++  omp.yield
++}
++
++llvm.func @target_allocatable_(%arg0: !llvm.ptr {fir.bindc_name = "lb"}, %arg1: !llvm.ptr {fir.bindc_name = "ub"}, %arg2: !llvm.ptr {fir.bindc_name = "l"}) attributes {fir.internal_name = "_QPtarget_allocatable"} {
++  %6 = llvm.mlir.constant(1 : i64) : i64
++  %7 = llvm.alloca %6 x i32 {bindc_name = "mapped_var"} : (i64) -> !llvm.ptr
++  %13 = llvm.alloca %6 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {bindc_name = "alloc_var0"} : (i64) -> !llvm.ptr
++  %14 = llvm.alloca %6 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {bindc_name = "alloc_var1"} : (i64) -> !llvm.ptr
++  %53 = omp.map.info var_ptr(%7 : !llvm.ptr, i32) map_clauses(implicit, exit_release_or_enter_alloc) capture(ByCopy) -> !llvm.ptr {name = "mapped_var"}
++  %54 = omp.map.info var_ptr(%13 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(to) capture(ByRef) -> !llvm.ptr
++  %55 = omp.map.info var_ptr(%14 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(to) capture(ByRef) -> !llvm.ptr
++  omp.target map_entries(%53 -> %arg3, %54 -> %arg4, %55 ->%arg5 : !llvm.ptr, !llvm.ptr, !llvm.ptr) private(@box.heap_privatizer0 %13 -> %arg6 [map_idx=1], @box.heap_privatizer1 %14 -> %arg7  [map_idx=2]: !llvm.ptr, !llvm.ptr) {
++    llvm.call @use_private_var0(%arg6) : (!llvm.ptr) -> ()
++    llvm.call @use_private_var1(%arg7) : (!llvm.ptr) -> ()
++    omp.terminator
++  }
++  llvm.return
++}
++
++
++llvm.func @use_private_var0(!llvm.ptr) -> ()
++llvm.func @use_private_var1(!llvm.ptr) -> ()
++
++// The first set of checks ensure that we are calling the offloaded function
++// with the right arguments, especially the second argument which needs to
++// be a memory reference to the descriptor for the privatized allocatable
++// CHECK: define void @target_allocatable_
++// CHECK-NOT: define internal void
++// CHECK: %[[DESC_ALLOC0:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1
++// CHECK: %[[DESC_ALLOC1:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1
++// CHECK: call void @__omp_offloading_[[OFFLOADED_FUNCTION:.*]](ptr {{[^,]+}},
++// CHECK-SAME: ptr %[[DESC_ALLOC0]], ptr %[[DESC_ALLOC1]])
++
++// CHECK: define internal void @__omp_offloading_[[OFFLOADED_FUNCTION]]
++// CHECK-SAME: (ptr {{[^,]+}}, ptr %[[DESCRIPTOR_ARG0:[^,]+]],
++// CHECK-SAME: ptr %[[DESCRIPTOR_ARG1:.*]]) {
++
++// `var0` privatrizer `alloc`
++// CHECK: %[[PRIV_DESC0:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }
++
++// `var1` privatrizer  `alloc`
++// CHECK: %[[PRIV_DESC1:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }
++// CHECK: call void @alloc_foo_1(ptr %[[DESCRIPTOR_ARG1]])
++
++// target op body
++// CHECK: call void @use_private_var0(ptr %[[PRIV_DESC0]]
++// CHECK: call void @use_private_var1(ptr %[[PRIV_DESC1]]
++
++// `var0` privatrizer `dealloc`
++// CHECK:  call void @dealloc_foo_0(ptr %[[PRIV_DESC0]])
++
++// `var1` privatrizer `dealloc`
++// CHECK:  call void @dealloc_foo_1(ptr %[[PRIV_DESC1]])
+diff --git a/mlir/test/Target/LLVMIR/openmp-target-private-allocatable.mlir b/mlir/test/Target/LLVMIR/openmp-target-private-allocatable.mlir
+new file mode 100644
+index 0000000000000..88b4a6a63c7eb
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-target-private-allocatable.mlir
+@@ -0,0 +1,64 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++llvm.func @alloc_foo_1(!llvm.ptr)
++llvm.func @dealloc_foo_1(!llvm.ptr)
++
++omp.private {type = private} @box.heap_privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %7 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>  : (i32) -> !llvm.ptr
++  llvm.call @alloc_foo_1(%arg0) : (!llvm.ptr) -> ()
++  omp.yield(%7 : !llvm.ptr)
++} dealloc {
++^bb0(%arg0: !llvm.ptr):
++  llvm.call @dealloc_foo_1(%arg0) : (!llvm.ptr) -> ()
++  omp.yield
++}
++
++llvm.func @target_allocatable_(%arg0: !llvm.ptr {fir.bindc_name = "lb"}, %arg1: !llvm.ptr {fir.bindc_name = "ub"}, %arg2: !llvm.ptr {fir.bindc_name = "l"}) attributes {fir.internal_name = "_QPtarget_allocatable"} {
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++  %3 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++  %4 = llvm.mlir.constant(1 : i64) : i64
++  %5 = llvm.alloca %4 x f32 {bindc_name = "real_var"} : (i64) -> !llvm.ptr
++  %7 = llvm.alloca %4 x i32 {bindc_name = "mapped_var"} : (i64) -> !llvm.ptr
++  %9 = llvm.alloca %4 x !llvm.struct<(f32, f32)> {bindc_name = "comp_var"} : (i64) -> !llvm.ptr
++  %11 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++  %13 = llvm.alloca %4 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {bindc_name = "alloc_var"} : (i64) -> !llvm.ptr
++  %39 = llvm.load %arg2 : !llvm.ptr -> i64
++  %52 = llvm.alloca %39 x f32 {bindc_name = "real_arr"} : (i64) -> !llvm.ptr
++  %53 = omp.map.info var_ptr(%7 : !llvm.ptr, i32) map_clauses(implicit, exit_release_or_enter_alloc) capture(ByCopy) -> !llvm.ptr {name = "mapped_var"}
++  %54 = omp.map.info var_ptr(%13 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(to) capture(ByRef) -> !llvm.ptr
++  omp.target map_entries(%53 -> %arg3, %54 -> %arg4 : !llvm.ptr, !llvm.ptr) private(@box.heap_privatizer %13 -> %arg5 [map_idx=1] : !llvm.ptr) {
++    llvm.call @use_private_var(%arg5) : (!llvm.ptr) -> ()
++    omp.terminator
++  }
++  llvm.return
++}
++
++llvm.func @use_private_var(!llvm.ptr) -> ()
++
++llvm.func @_FortranAAssign(!llvm.ptr, !llvm.ptr, !llvm.ptr, i32) -> !llvm.struct<()> attributes {fir.runtime, sym_visibility = "private"}
++
++// The first set of checks ensure that we are calling the offloaded function
++// with the right arguments, especially the second argument which needs to
++// be a memory reference to the descriptor for the privatized allocatable
++// CHECK: define void @target_allocatable_
++// CHECK-NOT: define internal void
++// CHECK: %[[DESC_ALLOC:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1
++// CHECK: call void @__omp_offloading_[[OFFLOADED_FUNCTION:.*]](ptr {{[^,]+}},
++// CHECK-SAME: ptr %[[DESC_ALLOC]])
++
++// The second set of checks ensure that to allocate memory for the
++// allocatable, we are, in fact, using the memory reference of the descriptor
++// passed as the second argument to the offloaded function.
++// CHECK: define internal void @__omp_offloading_[[OFFLOADED_FUNCTION]]
++// CHECK-SAME: (ptr {{[^,]+}}, ptr %[[DESCRIPTOR_ARG:.*]]) {
++// CHECK: %[[DESC_TO_DEALLOC:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }
++// CHECK: call void @alloc_foo_1(ptr %[[DESCRIPTOR_ARG]])
++
++
++// CHECK: call void @use_private_var(ptr %[[DESC_TO_DEALLOC]]
++
++// Now, check the deallocation of the private var.
++// CHECK:  call void @dealloc_foo_1(ptr %[[DESC_TO_DEALLOC]])
+diff --git a/mlir/test/Target/LLVMIR/openmp-target-private.mlir b/mlir/test/Target/LLVMIR/openmp-target-private.mlir
+index e41b18f593efe..c9d5f37384a0b 100644
+--- a/mlir/test/Target/LLVMIR/openmp-target-private.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-target-private.mlir
+@@ -94,3 +94,92 @@ llvm.func @target_op_private_multi_block(%arg0: !llvm.ptr) {
+ // CHECK: %[[PRIV_ALLOC:.*]] = alloca float, i32 %[[ONE]], align 4
+ // CHECK: %[[PHI_ALLOCA:.*]]  = phi ptr [ %[[PRIV_ALLOC]], {{.*}} ]
+ // CHECK: %[[RESULT:.*]] = load float, ptr %[[PHI_ALLOCA]], align 4
++
++// Descriptors are needed for CHARACTER arrays and their type is
++// !fir.boxchar<KIND>. When such arrays are used in the private construct, the
++// privatizer takes a !fir.boxchar<KIND> as input. This type is lowered to
++// !llvm.struct<(ptr, i64)>. This is unique because with other types of data,
++// typically, the privatizer funtion takes a !llvm.ptr. Now, on the host side,
++// we map the descriptor using the map clause of the omp.target op. Map clauses
++// take only !llvm.ptr types. This means, we have a case where the descriptor is
++// mapped by its pointer whereas the privatizer function expects the descriptor
++// by value. So, we have this test to ensure that the compiler correctly loads
++// from the mapped pointer before passing that to the privatizer function.
++omp.private {type = private} @_QFtarget_boxcharEchar_var_private_boxchar_c8xU : !llvm.struct<(ptr, i64)> alloc {
++^bb0(%arg0: !llvm.struct<(ptr, i64)>):
++  %0 = llvm.extractvalue %arg0[0] : !llvm.struct<(ptr, i64)>
++  %1 = llvm.extractvalue %arg0[1] : !llvm.struct<(ptr, i64)>
++  %2 = llvm.mlir.constant(1 : i64) : i64
++  %3 = llvm.alloca %1 x i8 {bindc_name = "char_var", pinned} : (i64) -> !llvm.ptr
++  %4 = llvm.mlir.undef : !llvm.struct<(ptr, i64)>
++  %5 = llvm.insertvalue %3, %4[0] : !llvm.struct<(ptr, i64)>
++  %6 = llvm.insertvalue %1, %5[1] : !llvm.struct<(ptr, i64)>
++  omp.yield(%6 : !llvm.struct<(ptr, i64)>)
++}
++llvm.func @target_boxchar_(%arg0: !llvm.ptr {fir.bindc_name = "l"}) attributes {fir.internal_name = "_QPtarget_boxchar"} {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x i32 {bindc_name = "mapped_var"} : (i64) -> !llvm.ptr
++  %3 = llvm.alloca %0 x !llvm.struct<(ptr, i64)> : (i64) -> !llvm.ptr
++  %4 = llvm.mlir.constant(0 : i64) : i64
++  %5 = llvm.load %arg0 : !llvm.ptr -> i64
++  %6 = llvm.icmp "sgt" %5, %4 : i64
++  %7 = llvm.select %6, %5, %4 : i1, i64
++  %9 = llvm.alloca %7 x i8 {bindc_name = "char_var"} : (i64) -> !llvm.ptr
++  %10 = llvm.mlir.undef : !llvm.struct<(ptr, i64)>
++  %11 = llvm.insertvalue %9, %10[0] : !llvm.struct<(ptr, i64)>
++  %12 = llvm.insertvalue %7, %11[1] : !llvm.struct<(ptr, i64)>
++  %13 = omp.map.info var_ptr(%1 : !llvm.ptr, i32) map_clauses(implicit, exit_release_or_enter_alloc) capture(ByCopy) -> !llvm.ptr {name = "mapped_var"}
++  llvm.store %12, %3 : !llvm.struct<(ptr, i64)>, !llvm.ptr
++  %14 = omp.map.info var_ptr(%3 : !llvm.ptr, !llvm.struct<(ptr, i64)>) map_clauses(to) capture(ByRef) -> !llvm.ptr
++  omp.target map_entries(%13 -> %arg1, %14 -> %arg2 : !llvm.ptr, !llvm.ptr) private(@_QFtarget_boxcharEchar_var_private_boxchar_c8xU %12 -> %arg3 [map_idx=1] : !llvm.struct<(ptr, i64)>) {
++    %15 = llvm.mlir.constant(0 : index) : i64
++    %16 = llvm.mlir.constant(32 : i8) : i8
++    %17 = llvm.mlir.constant(1 : index) : i64
++    %18 = llvm.mlir.constant(false) : i1
++    %19 = llvm.mlir.constant(5 : index) : i64
++    %20 = llvm.mlir.constant(5 : i32) : i32
++    %21 = llvm.extractvalue %arg3[0] : !llvm.struct<(ptr, i64)>
++    %22 = llvm.extractvalue %arg3[1] : !llvm.struct<(ptr, i64)>
++    llvm.store %20, %arg1 : i32, !llvm.ptr
++    %23 = llvm.mlir.addressof @_QQclX68656C6C6F : !llvm.ptr
++    %24 = llvm.icmp "slt" %22, %19 : i64
++    %25 = llvm.select %24, %22, %19 : i1, i64
++    llvm.call @llvm.memmove.p0.p0.i64(%21, %23, %25, %18) : (!llvm.ptr, !llvm.ptr, i64, i1) -> ()
++    %26 = llvm.sub %22, %17 : i64
++    %27 = llvm.mlir.undef : !llvm.array<1 x i8>
++    %28 = llvm.insertvalue %16, %27[0] : !llvm.array<1 x i8>
++    %29 = llvm.sub %26, %25 : i64
++    %30 = llvm.add %29, %17 : i64
++    llvm.br ^bb1(%25, %30 : i64, i64)
++  ^bb1(%31: i64, %32: i64):  // 2 preds: ^bb0, ^bb2
++    %33 = llvm.icmp "sgt" %32, %15 : i64
++    llvm.cond_br %33, ^bb2, ^bb3
++  ^bb2:  // pred: ^bb1
++    %34 = llvm.getelementptr %21[%31] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.array<1 x i8>
++    llvm.store %28, %34 : !llvm.array<1 x i8>, !llvm.ptr
++    %35 = llvm.add %31, %17 : i64
++    %36 = llvm.sub %32, %17 : i64
++    llvm.br ^bb1(%35, %36 : i64, i64)
++  ^bb3:  // pred: ^bb1
++    omp.terminator
++  }
++  llvm.return
++}
++llvm.mlir.global linkonce constant @_QQclX68656C6C6F() comdat(@__llvm_comdat::@_QQclX68656C6C6F) {addr_space = 0 : i32} : !llvm.array<5 x i8> {
++  %0 = llvm.mlir.constant("hello") : !llvm.array<5 x i8>
++  llvm.return %0 : !llvm.array<5 x i8>
++}
++llvm.comdat @__llvm_comdat {
++  llvm.comdat_selector @_QQclX68656C6C6F any
++}
++llvm.func @llvm.memmove.p0.p0.i64(!llvm.ptr, !llvm.ptr, i64, i1) attributes {sym_visibility = "private"}
++
++
++
++// CHECK: define internal void @__omp_offloading_{{.*}}(ptr %{{[^,]+}}, ptr %[[MAPPED_ARG:.*]]) {
++// CHECK: %[[BOXCHAR:.*]] = load { ptr, i64 }, ptr %[[MAPPED_ARG]]
++// CHECK: %[[BOXCHAR_PTR:.*]] = extractvalue { ptr, i64 } %[[BOXCHAR]], 0
++// CHECK: %[[BOXCHAR_i64:.*]] = extractvalue { ptr, i64 } %[[BOXCHAR]], 1
++// CHECK: %[[MEM_ALLOC:.*]] = alloca i8, i64 %[[BOXCHAR_i64]]
++// CHECK: %[[PRIV_BOXCHAR0:.*]] = insertvalue { ptr, i64 } undef, ptr %[[MEM_ALLOC]], 0
++// CHECK: %[[PRIV_BOXCHAR1:.*]] = insertvalue { ptr, i64 } %[[PRIV_BOXCHAR0]], i64 %[[BOXCHAR_i64]], 1
+diff --git a/mlir/test/Target/LLVMIR/openmp-target-use-device-nested.mlir b/mlir/test/Target/LLVMIR/openmp-target-use-device-nested.mlir
+index 3a71778e7d0a7..a94bbdce891f9 100644
+--- a/mlir/test/Target/LLVMIR/openmp-target-use-device-nested.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-target-use-device-nested.mlir
+@@ -13,7 +13,11 @@
+ // CHECK:            user_code.entry:                                  ; preds = %[[VAL_10:.*]]
+ // CHECK-NEXT:         %[[VAL_11:.*]] = load ptr, ptr %[[VAL_3]], align 8
+ // CHECK-NEXT:         br label %[[VAL_12:.*]]
+-// CHECK:            omp.target:                                       ; preds = %[[VAL_8]]
++
++// CHECK:            [[VAL_12]]:
++// CHECK-NEXT:         br label %[[TARGET_REG_ENTRY:.*]]
++
++// CHECK:            [[TARGET_REG_ENTRY]]:                                       ; preds = %[[VAL_12]]
+ // CHECK-NEXT:         %[[VAL_13:.*]] = load ptr, ptr %[[VAL_11]], align 8
+ // CHECK-NEXT:         store i32 999, ptr %[[VAL_13]], align 4
+ // CHECK-NEXT:         br label %[[VAL_14:.*]]
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index c1e0014d1f571..8f3e466cfbbeb 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -346,24 +346,6 @@ llvm.func @target_firstprivate(%x : !llvm.ptr) {
+ 
+ // -----
+ 
+-omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
+-^bb0(%arg0: !llvm.ptr):
+-  omp.yield(%arg0 : !llvm.ptr)
+-} dealloc {
+-^bb0(%arg0: !llvm.ptr):
+-  omp.yield
+-}
+-llvm.func @target_struct_privatization(%x : !llvm.ptr) {
+-  // expected-error@below {{not yet implemented: privatization of structures in omp.target operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
+-  omp.target private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
+-    omp.terminator
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ llvm.func @target_thread_limit(%x : i32) {
+   // expected-error@below {{not yet implemented: Unhandled clause thread_limit in omp.target operation}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.target}}

@@ -1,0 +1,142 @@
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 090a5a9836b79..c9c074707d3b1 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -257,10 +257,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+   LogicalResult result = success();
+   llvm::TypeSwitch<Operation &>(op)
+       .Case([&](omp::DistributeOp op) {
+-        if (op.isComposite() &&
+-            isa_and_present<omp::WsloopOp>(op.getNestedWrapper()))
+-          result = op.emitError() << "not yet implemented: "
+-                                     "composite omp.distribute + omp.wsloop";
+         checkAllocate(op, result);
+         checkDistSchedule(op, result);
+         checkOrder(op, result);
+@@ -1990,6 +1986,14 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+   bool isSimd = wsloopOp.getScheduleSimd();
+   bool loopNeedsBarrier = !wsloopOp.getNowait();
+ 
++  // The only legal way for the direct parent to be omp.distribute is that this
++  // represents 'distribute parallel do'. Otherwise, this is a regular
++  // worksharing loop.
++  llvm::omp::WorksharingLoopType workshareLoopType =
++      llvm::isa_and_present<omp::DistributeOp>(opInst.getParentOp())
++          ? llvm::omp::WorksharingLoopType::DistributeForStaticLoop
++          : llvm::omp::WorksharingLoopType::ForStaticLoop;
++
+   llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+   llvm::Expected<llvm::BasicBlock *> regionBlock = convertOmpOpRegions(
+       wsloopOp.getRegion(), "omp.wsloop.region", builder, moduleTranslation);
+@@ -2005,7 +2009,8 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+           ompLoc.DL, loopInfo, allocaIP, loopNeedsBarrier,
+           convertToScheduleKind(schedule), chunk, isSimd,
+           scheduleMod == omp::ScheduleModifier::monotonic,
+-          scheduleMod == omp::ScheduleModifier::nonmonotonic, isOrdered);
++          scheduleMod == omp::ScheduleModifier::nonmonotonic, isOrdered,
++          workshareLoopType);
+ 
+   if (failed(handleError(wsloopIP, opInst)))
+     return failure();
+@@ -3896,6 +3901,12 @@ convertOmpDistribute(Operation &opInst, llvm::IRBuilderBase &builder,
+       return regionBlock.takeError();
+     builder.SetInsertPoint(*regionBlock, (*regionBlock)->begin());
+ 
++    // Skip applying a workshare loop below when translating 'distribute
++    // parallel do' (it's been already handled by this point while translating
++    // the nested omp.wsloop).
++    if (isa_and_present<omp::WsloopOp>(distributeOp.getNestedWrapper()))
++      return llvm::Error::success();
++
+     // TODO: Add support for clauses which are valid for DISTRIBUTE constructs.
+     // Static schedule is the default.
+     auto schedule = omp::ClauseScheduleKind::Static;
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index a5a490e527d79..e4f26239b945f 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -3307,3 +3307,54 @@ llvm.func @distribute() {
+ // CHECK:         store i64 1, ptr %[[STRIDE]]
+ // CHECK:         %[[TID:.*]] = call i32 @__kmpc_global_thread_num({{.*}})
+ // CHECK:         call void @__kmpc_for_static_init_{{.*}}(ptr @{{.*}}, i32 %[[TID]], i32 92, ptr %[[LASTITER]], ptr %[[LB]], ptr %[[UB]], ptr %[[STRIDE]], i64 1, i64 0)
++
++// -----
++
++llvm.func @distribute_wsloop(%lb : i32, %ub : i32, %step : i32) {
++  omp.parallel {
++    omp.distribute {
++      omp.wsloop {
++        omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++      } {omp.composite}
++    } {omp.composite}
++    omp.terminator
++  } {omp.composite}
++  llvm.return
++}
++
++// CHECK-LABEL: define void @distribute_wsloop
++// CHECK:         call void{{.*}}@__kmpc_fork_call({{.*}}, ptr @[[OUTLINED_PARALLEL:.*]],
++
++// CHECK:       define internal void @[[OUTLINED_PARALLEL]]
++// CHECK:         call void @[[OUTLINED_DISTRIBUTE:.*]]({{.*}})
++
++// CHECK:       define internal void @[[OUTLINED_DISTRIBUTE]]
++// CHECK:         %[[LASTITER:.*]] = alloca i32
++// CHECK:         %[[LB:.*]] = alloca i32
++// CHECK:         %[[UB:.*]] = alloca i32
++// CHECK:         %[[STRIDE:.*]] = alloca i32
++// CHECK:         br label %[[AFTER_ALLOCA:.*]]
++
++// CHECK:       [[AFTER_ALLOCA]]:
++// CHECK:         br label %[[DISTRIBUTE_BODY:.*]]
++
++// CHECK:       [[DISTRIBUTE_BODY]]:
++// CHECK-NEXT:    br label %[[DISTRIBUTE_REGION:.*]]
++
++// CHECK:       [[DISTRIBUTE_REGION]]:
++// CHECK-NEXT:    br label %[[WSLOOP_REGION:.*]]
++
++// CHECK:       [[WSLOOP_REGION]]:
++// CHECK:         %omp_loop.tripcount = select {{.*}}
++// CHECK-NEXT:    br label %[[PREHEADER:.*]]
++
++// CHECK:       [[PREHEADER]]:
++// CHECK:         store i32 0, ptr %[[LB]]
++// CHECK:         %[[TRIPCOUNT:.*]] = sub i32 %omp_loop.tripcount, 1
++// CHECK:         store i32 %[[TRIPCOUNT]], ptr %[[UB]]
++// CHECK:         store i32 1, ptr %[[STRIDE]]
++// CHECK:         %[[TID:.*]] = call i32 @__kmpc_global_thread_num({{.*}})
++// CHECK:         %[[DIST_UB:.*]] = alloca i32
++// CHECK:         call void @__kmpc_dist_for_static_init_{{.*}}(ptr @{{.*}}, i32 %[[TID]], i32 34, ptr %[[LASTITER]], ptr %[[LB]], ptr %[[UB]], ptr %[[DIST_UB]], ptr %[[STRIDE]], i32 1, i32 0)
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index 71dbc061c3104..d1c745af9bff5 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -66,25 +66,6 @@ llvm.func @do_simd(%lb : i32, %ub : i32, %step : i32) {
+ 
+ // -----
+ 
+-llvm.func @distribute_wsloop(%lb : i32, %ub : i32, %step : i32) {
+-  // expected-error@below {{LLVM Translation failed for operation: omp.parallel}}
+-  omp.parallel {
+-    // expected-error@below {{not yet implemented: composite omp.distribute + omp.wsloop}}
+-    // expected-error@below {{LLVM Translation failed for operation: omp.distribute}}
+-    omp.distribute {
+-      omp.wsloop {
+-        omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+-          omp.yield
+-        }
+-      } {omp.composite}
+-    } {omp.composite}
+-    omp.terminator
+-  } {omp.composite}
+-  llvm.return
+-}
+-
+-// -----
+-
+ llvm.func @distribute_allocate(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
+   // expected-error@below {{not yet implemented: Unhandled clause allocate in omp.distribute operation}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.distribute}}

@@ -1,0 +1,150 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index a89029b720e78..83bd18bc9fbe3 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2073,7 +2073,9 @@ static void genStandaloneSimd(lower::AbstractConverter &converter,
+                      loopNestClauseOps, iv);
+ 
+   EntryBlockArgs simdArgs;
+-  // TODO: Add private, reduction syms and vars.
++  // TODO: Add private syms and vars.
++  simdArgs.reduction.syms = simdReductionSyms;
++  simdArgs.reduction.vars = simdClauseOps.reductionVars;
+   auto simdOp =
+       genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps, simdArgs);
+ 
+@@ -2231,7 +2233,9 @@ static void genCompositeDistributeParallelDoSimd(
+   wsloopOp.setComposite(/*val=*/true);
+ 
+   EntryBlockArgs simdArgs;
+-  // TODO: Add private, reduction syms and vars.
++  // TODO: Add private syms and vars.
++  simdArgs.reduction.syms = simdReductionSyms;
++  simdArgs.reduction.vars = simdClauseOps.reductionVars;
+   auto simdOp =
+       genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps, simdArgs);
+   simdOp.setComposite(/*val=*/true);
+@@ -2288,7 +2292,9 @@ static void genCompositeDistributeSimd(lower::AbstractConverter &converter,
+   distributeOp.setComposite(/*val=*/true);
+ 
+   EntryBlockArgs simdArgs;
+-  // TODO: Add private, reduction syms and vars.
++  // TODO: Add private syms and vars.
++  simdArgs.reduction.syms = simdReductionSyms;
++  simdArgs.reduction.vars = simdClauseOps.reductionVars;
+   auto simdOp =
+       genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps, simdArgs);
+   simdOp.setComposite(/*val=*/true);
+@@ -2345,7 +2351,9 @@ static void genCompositeDoSimd(lower::AbstractConverter &converter,
+   wsloopOp.setComposite(/*val=*/true);
+ 
+   EntryBlockArgs simdArgs;
+-  // TODO: Add private, reduction syms and vars.
++  // TODO: Add private syms and vars.
++  simdArgs.reduction.syms = simdReductionSyms;
++  simdArgs.reduction.vars = simdClauseOps.reductionVars;
+   auto simdOp =
+       genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps, simdArgs);
+   simdOp.setComposite(/*val=*/true);
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index 3b2aeceb4c3f9..520c78043283d 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -4,6 +4,8 @@
+ ! RUN: %flang_fc1 -flang-experimental-hlfir -emit-hlfir -fopenmp -fopenmp-version=50 %s -o - | FileCheck %s
+ ! RUN: bbc -hlfir -emit-hlfir -fopenmp -fopenmp-version=50 %s -o - | FileCheck %s
+ 
++!CHECK: omp.declare_reduction @[[REDUCER:.*]] : i32
++
+ !CHECK-LABEL: func @_QPsimd()
+ subroutine simd
+   integer :: i
+@@ -274,3 +276,25 @@ subroutine lastprivate_with_simd
+     sum = i + 1
+   end do
+ end subroutine
++
++!CHECK-LABEL: func @_QPsimd_with_reduction_clause()
++subroutine simd_with_reduction_clause
++  integer :: i, x
++  x = 0
++  ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB:.*]] = arith.constant 9 : i32
++  ! CHECK-NEXT: %[[STEP:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: omp.simd reduction(@[[REDUCER]] %[[X:.*]]#0 -> %[[X_RED:.*]] : !fir.ref<i32>) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  !$omp simd reduction(+:x)
++  do i=1, 9
++    ! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X_RED]] {uniq_name = "_QFsimd_with_reduction_clauseEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: %[[X_LD:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++    ! CHECK: %[[I_LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
++    ! CHECK: %[[SUM:.*]] = arith.addi %[[X_LD]], %[[I_LD]] : i32
++    ! CHECK: hlfir.assign %[[SUM]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
++    x = x+i
++  end do
++  !$OMP end simd
++end subroutine
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index f552221bbdcaf..fb11cd5f25828 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2016,14 +2016,16 @@ void SimdOp::build(OpBuilder &builder, OperationState &state,
+                    const SimdOperands &clauses) {
+   MLIRContext *ctx = builder.getContext();
+   // TODO Store clauses in op: linearVars, linearStepVars, privateVars,
+-  // privateSyms, reductionVars, reductionByref, reductionSyms.
++  // privateSyms.
+   SimdOp::build(builder, state, clauses.alignedVars,
+                 makeArrayAttr(ctx, clauses.alignments), clauses.ifExpr,
+                 /*linear_vars=*/{}, /*linear_step_vars=*/{},
+                 clauses.nontemporalVars, clauses.order, clauses.orderMod,
+                 /*private_vars=*/{}, /*private_syms=*/nullptr,
+-                /*reduction_vars=*/{}, /*reduction_byref=*/nullptr,
+-                /*reduction_syms=*/nullptr, clauses.safelen, clauses.simdlen);
++                clauses.reductionVars,
++                makeDenseBoolArrayAttr(ctx, clauses.reductionByref),
++                makeArrayAttr(ctx, clauses.reductionSyms), clauses.safelen,
++                clauses.simdlen);
+ }
+ 
+ LogicalResult SimdOp::verify() {
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 19d80fbbd699b..3611ea4da318b 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -1786,6 +1786,20 @@ convertOrderKind(std::optional<omp::ClauseOrderKind> o) {
+   llvm_unreachable("Unknown ClauseOrderKind kind");
+ }
+ 
++static LogicalResult simdOpSupported(omp::SimdOp op) {
++  if (!op.getLinearVars().empty() || !op.getLinearStepVars().empty())
++    return op.emitError("linear clause not yet supported");
++
++  if (!op.getPrivateVars().empty() || op.getPrivateSyms())
++    return op.emitError("privatization clauses not yet supported");
++
++  if (!op.getReductionVars().empty() || op.getReductionByref() ||
++      op.getReductionSyms())
++    return op.emitError("reduction clause not yet supported");
++
++  return success();
++}
++
+ /// Converts an OpenMP simd loop into LLVM IR using OpenMPIRBuilder.
+ static LogicalResult
+ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
+@@ -1793,11 +1807,8 @@ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
+   auto simdOp = cast<omp::SimdOp>(opInst);
+   auto loopOp = cast<omp::LoopNestOp>(simdOp.getWrappedLoop());
+ 
+-  if (!simdOp.getLinearVars().empty() || !simdOp.getLinearStepVars().empty() ||
+-      !simdOp.getPrivateVars().empty() || simdOp.getPrivateSyms() ||
+-      !simdOp.getReductionVars().empty() || simdOp.getReductionByref() ||
+-      simdOp.getReductionSyms())
+-    return opInst.emitError("unhandled clauses for translation to LLVM IR");
++  if (failed(simdOpSupported(simdOp)))
++    return failure();
+ 
+   llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+ 

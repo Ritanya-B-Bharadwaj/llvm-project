@@ -1,0 +1,220 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 11649ef2d0337..45313200d4f0b 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -137,7 +137,7 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove, RecipeInterface]>
+     }
+   }];
+ 
+-  let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -175,6 +175,7 @@ def ParallelOp : OpenMP_Op<"parallel", traits = [
+   }];
+ 
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ def TerminatorOp : OpenMP_Op<"terminator", [Terminator, Pure]> {
+@@ -426,6 +427,7 @@ def WsloopOp : OpenMP_Op<"wsloop", traits = [
+   }];
+ 
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -479,6 +481,7 @@ def SimdOp : OpenMP_Op<"simd", traits = [
+   }];
+ 
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ 
+@@ -556,6 +559,7 @@ def DistributeOp : OpenMP_Op<"distribute", traits = [
+   }];
+ 
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -693,6 +697,7 @@ def TaskloopOp : OpenMP_Op<"taskloop", traits = [
+   }] # clausesExtraClassDeclaration;
+ 
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ def TaskgroupOp : OpenMP_Op<"taskgroup", traits = [
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+index 22521b08637cf..8b72689dc3fd8 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+@@ -258,6 +258,7 @@ def LoopWrapperInterface : OpInterface<"LoopWrapperInterface"> {
+   let verify = [{
+     return ::llvm::cast<::mlir::omp::LoopWrapperInterface>($_op).verifyImpl();
+   }];
++  let verifyWithRegions = 1;
+ }
+ 
+ def ComposableOpInterface : OpInterface<"ComposableOpInterface"> {
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 3217542e10560..e1df647d6a3c7 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1760,6 +1760,18 @@ static LogicalResult verifyPrivateVarList(OpType &op) {
+ }
+ 
+ LogicalResult ParallelOp::verify() {
++  if (getAllocateVars().size() != getAllocatorVars().size())
++    return emitError(
++        "expected equal sizes for allocate and allocator variables");
++
++  if (failed(verifyPrivateVarList(*this)))
++    return failure();
++
++  return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
++                                getReductionByref());
++}
++
++LogicalResult ParallelOp::verifyRegions() {
+   auto distributeChildOps = getOps<DistributeOp>();
+   if (!distributeChildOps.empty()) {
+     if (!isComposite())
+@@ -1780,16 +1792,7 @@ LogicalResult ParallelOp::verify() {
+     return emitError()
+            << "'omp.composite' attribute present in non-composite operation";
+   }
+-
+-  if (getAllocateVars().size() != getAllocatorVars().size())
+-    return emitError(
+-        "expected equal sizes for allocate and allocator variables");
+-
+-  if (failed(verifyPrivateVarList(*this)))
+-    return failure();
+-
+-  return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
+-                                getReductionByref());
++  return success();
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1979,6 +1982,11 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+ }
+ 
+ LogicalResult WsloopOp::verify() {
++  return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
++                                getReductionByref());
++}
++
++LogicalResult WsloopOp::verifyRegions() {
+   bool isCompositeChildLeaf =
+       llvm::dyn_cast_if_present<LoopWrapperInterface>((*this)->getParentOp());
+ 
+@@ -2000,8 +2008,7 @@ LogicalResult WsloopOp::verify() {
+            << "'omp.composite' attribute missing from composite wrapper";
+   }
+ 
+-  return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
+-                                getReductionByref());
++  return success();
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -2037,9 +2044,6 @@ LogicalResult SimdOp::verify() {
+   if (verifyNontemporalClause(*this, getNontemporalVars()).failed())
+     return failure();
+ 
+-  if (getNestedWrapper())
+-    return emitOpError() << "must wrap an 'omp.loop_nest' directly";
+-
+   bool isCompositeChildLeaf =
+       llvm::dyn_cast_if_present<LoopWrapperInterface>((*this)->getParentOp());
+ 
+@@ -2054,6 +2058,13 @@ LogicalResult SimdOp::verify() {
+   return success();
+ }
+ 
++LogicalResult SimdOp::verifyRegions() {
++  if (getNestedWrapper())
++    return emitOpError() << "must wrap an 'omp.loop_nest' directly";
++
++  return success();
++}
++
+ //===----------------------------------------------------------------------===//
+ // Distribute construct [2.9.4.1]
+ //===----------------------------------------------------------------------===//
+@@ -2076,6 +2087,10 @@ LogicalResult DistributeOp::verify() {
+     return emitError(
+         "expected equal sizes for allocate and allocator variables");
+ 
++  return success();
++}
++
++LogicalResult DistributeOp::verifyRegions() {
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
+     if (!isComposite())
+       return emitError()
+@@ -2281,6 +2296,10 @@ LogicalResult TaskloopOp::verify() {
+         "may not appear on the same taskloop directive");
+   }
+ 
++  return success();
++}
++
++LogicalResult TaskloopOp::verifyRegions() {
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
+     if (!isComposite())
+       return emitError()
+@@ -2725,7 +2744,7 @@ void PrivateClauseOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                                      DataSharingClauseType::Private));
+ }
+ 
+-LogicalResult PrivateClauseOp::verify() {
++LogicalResult PrivateClauseOp::verifyRegions() {
+   Type symType = getType();
+ 
+   auto verifyTerminator = [&](Operation *terminator,
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index f7a87713aca35..fd89ec31c64a6 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -136,9 +136,11 @@ func.func @invalid_nested_wrapper(%lb : index, %ub : index, %step : index) {
+   // expected-error @below {{only supported nested wrapper is 'omp.simd'}}
+   omp.wsloop {
+     omp.distribute {
+-      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+-        omp.yield
+-      }
++      omp.simd {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++      } {omp.composite}
+     } {omp.composite}
+   } {omp.composite}
+ }
+@@ -1975,7 +1977,7 @@ func.func @taskloop(%lb: i32, %ub: i32, %step: i32) {
+       omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+         omp.yield
+       }
+-    } {omp.composite}
++    }
+   } {omp.composite}
+   return
+ }
+@@ -2188,7 +2190,7 @@ func.func @omp_distribute_nested_wrapper2(%lb: index, %ub: index, %step: index)
+       omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+         "omp.yield"() : () -> ()
+       }
+-    }) {omp.composite} : () -> ()
++    }) : () -> ()
+   } {omp.composite}
+ }
+ 

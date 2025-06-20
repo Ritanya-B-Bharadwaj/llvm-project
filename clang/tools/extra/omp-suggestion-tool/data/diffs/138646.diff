@@ -1,0 +1,399 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 47e7c266ff7d3..fcd3de9671098 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1804,6 +1804,21 @@ static void genTaskgroupClauses(lower::AbstractConverter &converter,
+                                         llvm::omp::Directive::OMPD_taskgroup);
+ }
+ 
++static void genTaskloopClauses(lower::AbstractConverter &converter,
++                               semantics::SemanticsContext &semaCtx,
++                               const List<Clause> &clauses, mlir::Location loc,
++                               mlir::omp::TaskloopOperands &clauseOps) {
++
++  ClauseProcessor cp(converter, semaCtx, clauses);
++
++  cp.processTODO<clause::Allocate, clause::Collapse, clause::Default,
++                 clause::Final, clause::Grainsize, clause::If,
++                 clause::InReduction, clause::Lastprivate, clause::Mergeable,
++                 clause::Nogroup, clause::NumTasks, clause::Priority,
++                 clause::Reduction, clause::Shared, clause::Untied>(
++      loc, llvm::omp::Directive::OMPD_taskloop);
++}
++
+ static void genTaskwaitClauses(lower::AbstractConverter &converter,
+                                semantics::SemanticsContext &semaCtx,
+                                const List<Clause> &clauses, mlir::Location loc,
+@@ -3256,8 +3271,30 @@ static mlir::omp::TaskloopOp genStandaloneTaskloop(
+     semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+     mlir::Location loc, const ConstructQueue &queue,
+     ConstructQueue::const_iterator item) {
+-  TODO(loc, "Taskloop construct");
+-  return nullptr;
++  mlir::omp::TaskloopOperands taskloopClauseOps;
++  genTaskloopClauses(converter, semaCtx, item->clauses, loc, taskloopClauseOps);
++
++  DataSharingProcessor dsp(converter, semaCtx, item->clauses, eval,
++                           /*shouldCollectPreDeterminedSymbols=*/true,
++                           enableDelayedPrivatization, symTable);
++  dsp.processStep1(&taskloopClauseOps);
++
++  mlir::omp::LoopNestOperands loopNestClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> iv;
++  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
++                     loopNestClauseOps, iv);
++
++  EntryBlockArgs taskloopArgs;
++  taskloopArgs.priv.syms = dsp.getDelayedPrivSymbols();
++  taskloopArgs.priv.vars = taskloopClauseOps.privateVars;
++
++  auto taskLoopOp = genWrapperOp<mlir::omp::TaskloopOp>(
++      converter, loc, taskloopClauseOps, taskloopArgs);
++
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
++                loopNestClauseOps, iv, {{taskLoopOp, taskloopArgs}},
++                llvm::omp::Directive::OMPD_taskloop, dsp);
++  return taskLoopOp;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/flang/test/Lower/OpenMP/Todo/taskloop-cancel.f90 b/flang/test/Lower/OpenMP/Todo/taskloop-cancel.f90
+deleted file mode 100644
+index 5045c621e4d77..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/taskloop-cancel.f90
++++ /dev/null
+@@ -1,14 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-
+-! CHECK: not yet implemented: Taskloop construct
+-subroutine omp_taskloop
+-integer :: i
+-!$omp parallel
+-    !$omp taskloop
+-      do i = 1, 10
+-      !$omp cancel taskgroup
+-      end do
+-    !$omp end taskloop
+-!$omp end parallel
+-end subroutine omp_taskloop
+diff --git a/flang/test/Lower/OpenMP/Todo/taskloop.f90 b/flang/test/Lower/OpenMP/Todo/taskloop.f90
+deleted file mode 100644
+index aca050584cbbe..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/taskloop.f90
++++ /dev/null
+@@ -1,13 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-
+-! CHECK: not yet implemented: Taskloop construct
+-subroutine omp_taskloop
+-  integer :: res, i
+-  !$omp taskloop
+-  do i = 1, 10
+-     res = res + 1
+-  end do
+-  !$omp end taskloop
+-end subroutine omp_taskloop
+-
+diff --git a/flang/test/Lower/OpenMP/masked_taskloop.f90 b/flang/test/Lower/OpenMP/masked_taskloop.f90
+new file mode 100644
+index 0000000000000..abe20ec1fd87c
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/masked_taskloop.f90
+@@ -0,0 +1,55 @@
++! This test checks lowering of OpenMP masked taskloop Directive.
++
++! RUN:  bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN:  %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++! CHECK-LABEL:  omp.private {type = private} 
++! CHECK-SAME:        @[[I_PRIVATE:.*]] : i32
++
++! CHECK-LABEL:  omp.private 
++! CHECK-SAME:      {type = firstprivate} @[[J_FIRSTPRIVATE:.*]] : i32 
++! CHECK-SAME:      copy {
++! CHECK:            hlfir.assign 
++
++! CHECK-LABEL:  func.func @_QPtest_masked_taskloop() {
++! CHECK:          %[[VAL_0:.*]] = fir.dummy_scope : !fir.dscope
++! CHECK:          %[[ALLOCA_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFtest_masked_taskloopEi"}
++! CHECK:          %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOCA_I]] 
++! CHECK-SAME:         {uniq_name = "_QFtest_masked_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          %[[ALLOCA_J:.*]] = fir.address_of(@_QFtest_masked_taskloopEj) : !fir.ref<i32>
++! CHECK:          %[[DECL_J:.*]]:2 = hlfir.declare %[[ALLOCA_J]] {uniq_name = "_QFtest_masked_taskloopEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          omp.masked {
++! CHECK:            %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:            %[[C10_I32:.*]] = arith.constant 10 : i32
++! CHECK:            %[[C1_I32_0:.*]] = arith.constant 1 : i32
++! CHECK:            omp.taskloop private(
++! CHECK-SAME:          @[[J_FIRSTPRIVATE]] %[[DECL_J]]#0 -> %[[ARG0:.*]], @[[I_PRIVATE]] %[[DECL_I]]#0 -> %[[ARG1:.*]] : !fir.ref<i32>, !fir.ref<i32>) {
++! CHECK:              omp.loop_nest (%arg2) : i32 = (%[[C1_I32]]) to (%[[C10_I32]]) inclusive step (%[[C1_I32_0]]) {
++! CHECK:                %[[VAL1:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_QFtest_masked_taskloopEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:                %[[VAL2:.*]]:2 = hlfir.declare %[[ARG1]] {uniq_name = "_QFtest_masked_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:                hlfir.assign %arg2 to %[[VAL2]]#0 : i32, !fir.ref<i32>
++! CHECK:                %[[LOAD_J:.*]] = fir.load %[[VAL1]]#0 : !fir.ref<i32>
++! CHECK:                %[[C1_I32_1:.*]] = arith.constant 1 : i32
++! CHECK:                %[[RES_J:.*]] = arith.addi %[[LOAD_J]], %[[C1_I32_1]] : i32
++! CHECK:                hlfir.assign %[[RES_J]] to %[[VAL1]]#0 : i32, !fir.ref<i32>
++! CHECK:                omp.yield
++! CHECK:              }
++! CHECK:            }
++! CHECK:            omp.terminator
++! CHECK:          }
++! CHECK:          return
++! CHECK:        }
++! CHECK:        fir.global internal @_QFtest_masked_taskloopEj : i32 {
++! CHECK:          %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:          fir.has_value %[[C1_I32]] : i32
++! CHECK:        }
++
++
++subroutine test_masked_taskloop
++  integer :: i, j = 1
++  !$omp masked taskloop
++  do i=1,10
++   j = j + 1
++  end do
++  !$omp end masked taskloop 
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/master_taskloop.f90 b/flang/test/Lower/OpenMP/master_taskloop.f90
+deleted file mode 100644
+index 26f664b2662dc..0000000000000
+--- a/flang/test/Lower/OpenMP/master_taskloop.f90
++++ /dev/null
+@@ -1,14 +0,0 @@
+-! This test checks lowering of OpenMP master taskloop Directive.
+-
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-subroutine test_master_taskloop
+-  integer :: i, j = 1
+-  !CHECK: not yet implemented: Taskloop construct
+-  !$omp master taskloop
+-  do i=1,10
+-   j = j + 1
+-  end do
+-  !$omp end master taskloop 
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/parallel-masked-taskloop.f90 b/flang/test/Lower/OpenMP/parallel-masked-taskloop.f90
+new file mode 100644
+index 0000000000000..497cc396a5a02
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/parallel-masked-taskloop.f90
+@@ -0,0 +1,48 @@
++! This test checks lowering of OpenMP parallel masked taskloop Directive.
++
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++! CHECK-LABEL:  omp.private {type = private} 
++! CHECK-SAME:        @[[I_PRIVATE:.*]] : i32
++! CHECK-LABEL:    func.func @_QPtest_parallel_master_taskloop() {
++! CHECK:          %[[VAL0:.*]] = fir.dummy_scope : !fir.dscope
++! CHECK:          %[[ALLOCA_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFtest_parallel_master_taskloopEi"}
++! CHECK:          %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOCA_I]] {uniq_name = "_QFtest_parallel_master_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          %[[ADDR_J:.*]] = fir.address_of(@_QFtest_parallel_master_taskloopEj) : !fir.ref<i32>
++! CHECK:          %[[DECL_J:.*]]:2 = hlfir.declare %[[ADDR_J]] {uniq_name = "_QFtest_parallel_master_taskloopEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          omp.parallel {
++! CHECK:            omp.masked {
++! CHECK:              %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:              %[[C10_I32:.*]] = arith.constant 10 : i32
++! CHECK:              %[[C1_I32_0:.*]] = arith.constant 1 : i32
++! CHECK:              omp.taskloop private(@[[I_PRIVATE]] %[[DECL_I]]#0 -> %[[ARG0:.*]] : !fir.ref<i32>) {
++! CHECK:                omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[C1_I32]]) to (%[[C10_I32]]) inclusive step (%c1_i32_0) {
++! CHECK:                  %[[VAL1:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_QFtest_parallel_master_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:                  hlfir.assign %[[ARG1]] to %[[VAL1]]#0 : i32, !fir.ref<i32>
++! CHECK:                  %[[LOAD_J:.*]] = fir.load %[[DECL_J]]#0 : !fir.ref<i32>
++! CHECK:                  %c1_i32_1 = arith.constant 1 : i32
++! CHECK:                  %[[RES_ADD:.*]] = arith.addi %[[LOAD_J]], %c1_i32_1 : i32
++! CHECK:                  hlfir.assign %[[RES_ADD]] to %[[DECL_J]]#0 : i32, !fir.ref<i32>
++! CHECK:                  omp.yield
++! CHECK:                }
++! CHECK:              }
++! CHECK:              omp.terminator
++! CHECK:            }
++! CHECK:            omp.terminator
++! CHECK:          }
++! CHECK:          return
++! CHECK:        }
++! CHECK:        fir.global internal @_QFtest_parallel_master_taskloopEj : i32 {
++! CHECK:          %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:          fir.has_value %[[C1_I32]] : i32
++! CHECK:        }
++
++subroutine test_parallel_master_taskloop
++  integer :: i, j = 1
++  !$omp parallel masked taskloop
++  do i=1,10
++   j = j + 1
++  end do
++  !$omp end parallel masked taskloop 
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/parallel-master-taskloop.f90 b/flang/test/Lower/OpenMP/parallel-master-taskloop.f90
+deleted file mode 100644
+index 17ceb9496c8d3..0000000000000
+--- a/flang/test/Lower/OpenMP/parallel-master-taskloop.f90
++++ /dev/null
+@@ -1,14 +0,0 @@
+-! This test checks lowering of OpenMP parallel master taskloop Directive.
+-
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-subroutine test_parallel_master_taskloop
+-  integer :: i, j = 1
+-  !CHECK: not yet implemented: Taskloop construct
+-  !$omp parallel master taskloop
+-  do i=1,10
+-   j = j + 1
+-  end do
+-  !$omp end parallel master taskloop 
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/taskloop-cancel.f90 b/flang/test/Lower/OpenMP/taskloop-cancel.f90
+new file mode 100644
+index 0000000000000..2bc0f17428c36
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/taskloop-cancel.f90
+@@ -0,0 +1,37 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
++
++! CHECK-LABEL:  omp.private {type = private} 
++! CHECK-SAME:        @[[I_PRIVATE:.*]] : i32
++
++! CHECK-LABEL: func.func @_QPomp_taskloop() {
++! CHECK:         %[[VAL_0:.*]] = fir.dummy_scope : !fir.dscope
++! CHECK:         %[[ALLOCA_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomp_taskloopEi"}
++! CHECK:         %[[DECL_I:.*]]:2 = hlfir.declare %1 {uniq_name = "_QFomp_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:         omp.parallel {
++! CHECK:           %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:           %[[C10_I32:.*]] = arith.constant 10 : i32
++! CHECK:           %[[C1_I32_0:.*]] = arith.constant 1 : i32
++! CHECK:           omp.taskloop private(@[[I_PRIVATE]] %2#0 -> %[[ARG0:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[C1_I32]]) to (%[[C10_I32]]) inclusive step (%[[C1_I32_0]]) {
++! CHECK:               %[[IDX:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_QFomp_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:               hlfir.assign %[[ARG1]] to %[[IDX]]#0 : i32, !fir.ref<i32>
++! CHECK:               omp.cancel cancellation_construct_type(taskgroup)
++! CHECK:               omp.yield
++! CHECK:             }
++! CHECK:           }
++! CHECK:           omp.terminator
++! CHECK:         }
++! CHECK:         return
++! CHECK:       }
++
++subroutine omp_taskloop
++integer :: i
++!$omp parallel
++    !$omp taskloop
++      do i = 1, 10
++      !$omp cancel taskgroup
++      end do
++    !$omp end taskloop
++!$omp end parallel
++end subroutine omp_taskloop
+diff --git a/flang/test/Lower/OpenMP/taskloop.f90 b/flang/test/Lower/OpenMP/taskloop.f90
+new file mode 100644
+index 0000000000000..79b0c20e176c0
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/taskloop.f90
+@@ -0,0 +1,72 @@
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++! CHECK-LABEL:  omp.private 
++! CHECK-SAME:       {type = private} @[[I_PRIVATE_TEST2:.*]] : i32
++
++! CHECK-LABEL:  omp.private 
++! CHECK-SAME:       {type = private} @[[RES_PRIVATE_TEST2:.*]] : i32
++
++! CHECK-LABEL:  omp.private 
++! CHECK-SAME:       {type = private} @[[I_PRIVATE:.*]] : i32
++
++! CHECK-LABEL:  omp.private 
++! CHECK-SAME:        {type = firstprivate} @[[RES_FIRSTPRIVATE:.*]] : i32 
++! CHECK-SAME:   copy {
++! CHECK:         hlfir.assign 
++
++! CHECK-LABEL:  func.func @_QPomp_taskloop
++! CHECK:          %[[ALLOCA_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomp_taskloopEi"}
++! CHECK:          %[[I_VAL:.*]]:2 = hlfir.declare %[[ALLOCA_I]] {uniq_name = "_QFomp_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          %[[ALLOCA_RES:.*]] = fir.alloca i32 {bindc_name = "res", uniq_name = "_QFomp_taskloopEres"}
++! CHECK:          %[[RES_VAL:.*]]:2 = hlfir.declare %[[ALLOCA_RES]] {uniq_name = "_QFomp_taskloopEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:          %[[C1_I32:.*]] = arith.constant 1 : i32
++! CHECK:          %[[C10_I32:.*]] = arith.constant 10 : i32
++! CHECK:          %[[C1_I32_0:.*]] = arith.constant 1 : i32
++! CHECK:          omp.taskloop private(@[[RES_FIRSTPRIVATE]] %[[RES_VAL]]#0 -> %[[PRIV_RES:.*]], @[[I_PRIVATE]] %[[I_VAL]]#0 -> %[[PRIV_I:.*]] : !fir.ref<i32>, !fir.ref<i32>) {
++! CHECK:            omp.loop_nest (%[[ARG2:.*]]) : i32 = (%[[C1_I32]]) to (%[[C10_I32]]) inclusive step (%[[C1_I32_0]]) {
++! CHECK:              %[[RES_DECL:.*]]:2 = hlfir.declare %[[PRIV_RES]] {uniq_name = "_QFomp_taskloopEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:              %[[I_DECL:.*]]:2 = hlfir.declare %[[PRIV_I]] {uniq_name = "_QFomp_taskloopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:              hlfir.assign %[[ARG2]] to %[[I_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK:              %[[LOAD_RES:.*]] = fir.load %[[RES_DECL]]#0 : !fir.ref<i32>
++! CHECK:              %[[C1_I32_1:.*]] = arith.constant 1 : i32
++! CHECK:              %[[OUT_VAL:.*]] = arith.addi %[[LOAD_RES]], %[[C1_I32_1]] : i32
++! CHECK:              hlfir.assign %[[OUT_VAL]] to %[[RES_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK:              omp.yield
++! CHECK:            }
++! CHECK:          }
++! CHECK:          return
++! CHECK:        }
++
++subroutine omp_taskloop
++  integer :: res, i
++  !$omp taskloop
++  do i = 1, 10
++     res = res + 1
++  end do
++  !$omp end taskloop
++end subroutine omp_taskloop
++
++
++! CHECK-LABEL:  func.func @_QPomp_taskloop_private
++! CHECK:           %[[ALLOCA_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomp_taskloop_privateEi"}
++! CHECK:           %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOCA_I]] {uniq_name = "_QFomp_taskloop_privateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:           %[[ALLOCA_RES:.*]] = fir.alloca i32 {bindc_name = "res", uniq_name = "_QFomp_taskloop_privateEres"}
++! CHECK:           %[[DECL_RES:.*]]:2 = hlfir.declare %[[ALLOCA_RES]] {uniq_name = "_QFomp_taskloop_privateEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++subroutine omp_taskloop_private
++  integer :: res, i
++! CHECK:           omp.taskloop private(@[[RES_PRIVATE_TEST2]] %[[DECL_RES]]#0 -> %[[ARG0:.*]], @[[I_PRIVATE_TEST2]] %[[DECL_I]]#0 -> %[[ARG1:.*]] : !fir.ref<i32>, !fir.ref<i32>) {
++! CHECK:             omp.loop_nest (%{{.*}}) : i32 = (%{{.*}}) to (%{{.*}}) inclusive step (%{{.*}}) {
++! CHECK:               %[[VAL1:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_QFomp_taskloop_privateEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  !$omp taskloop private(res)
++  do i = 1, 10
++! CHECK:               %[[LOAD_RES:.*]] = fir.load %[[VAL1]]#0 : !fir.ref<i32>
++! CHECK:               %[[C1_I32_1:.*]] = arith.constant 1 : i32
++! CHECK:               %[[ADD_VAL:.*]] = arith.addi %[[LOAD_RES]], %[[C1_I32_1]] : i32
++! CHECK:               hlfir.assign %[[ADD_VAL]] to %[[VAL1]]#0 : i32, !fir.ref<i32>
++     res = res + 1
++  end do
++! CHECK:           return
++! CHECK:         }
++  !$omp end taskloop
++end subroutine omp_taskloop_private
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 186f14de22f70..eb6e710cae69e 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2785,16 +2785,16 @@ LogicalResult TaskgroupOp::verify() {
+ void TaskloopOp::build(OpBuilder &builder, OperationState &state,
+                        const TaskloopOperands &clauses) {
+   MLIRContext *ctx = builder.getContext();
+-  // TODO Store clauses in op: privateVars, privateSyms.
+   TaskloopOp::build(builder, state, clauses.allocateVars, clauses.allocatorVars,
+                     clauses.final, clauses.grainsizeMod, clauses.grainsize,
+                     clauses.ifExpr, clauses.inReductionVars,
+                     makeDenseBoolArrayAttr(ctx, clauses.inReductionByref),
+                     makeArrayAttr(ctx, clauses.inReductionSyms),
+                     clauses.mergeable, clauses.nogroup, clauses.numTasksMod,
+-                    clauses.numTasks, clauses.priority, /*private_vars=*/{},
+-                    /*private_syms=*/nullptr, clauses.reductionMod,
+-                    clauses.reductionVars,
++                    clauses.numTasks, clauses.priority,
++                    /*private_vars=*/clauses.privateVars,
++                    /*private_syms=*/makeArrayAttr(ctx, clauses.privateSyms),
++                    clauses.reductionMod, clauses.reductionVars,
+                     makeDenseBoolArrayAttr(ctx, clauses.reductionByref),
+                     makeArrayAttr(ctx, clauses.reductionSyms), clauses.untied);
+ }

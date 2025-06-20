@@ -1,0 +1,273 @@
+diff --git a/clang/docs/OpenMPSupport.rst b/clang/docs/OpenMPSupport.rst
+index 3f996ceaff156..481362dba3f51 100644
+--- a/clang/docs/OpenMPSupport.rst
++++ b/clang/docs/OpenMPSupport.rst
+@@ -290,7 +290,7 @@ implementation.
+ +------------------------------+--------------------------------------------------------------+--------------------------+-----------------------------------------------------------------------+
+ | memory management            | changes to omp_alloctrait_key enum                           | :none:`unclaimed`        |                                                                       |
+ +------------------------------+--------------------------------------------------------------+--------------------------+-----------------------------------------------------------------------+
+-| memory model                 | seq_cst clause on flush construct                            | :none:`unclaimed`        |                                                                       |
++| memory model                 | seq_cst clause on flush construct                            | :good:`done`             | https://github.com/llvm/llvm-project/pull/114072                      |
+ +------------------------------+--------------------------------------------------------------+--------------------------+-----------------------------------------------------------------------+
+ | misc                         | 'omp_all_memory' keyword and use in 'depend' clause          | :good:`done`             | D125828, D126321                                                      |
+ +------------------------------+--------------------------------------------------------------+--------------------------+-----------------------------------------------------------------------+
+diff --git a/clang/include/clang/AST/OpenMPClause.h b/clang/include/clang/AST/OpenMPClause.h
+index 00c87e71bde31..d2f5267e4da5e 100644
+--- a/clang/include/clang/AST/OpenMPClause.h
++++ b/clang/include/clang/AST/OpenMPClause.h
+@@ -2670,8 +2670,8 @@ class OMPCompareClause final : public OMPClause {
+   }
+ };
+ 
+-/// This represents 'seq_cst' clause in the '#pragma omp atomic'
+-/// directive.
++/// This represents 'seq_cst' clause in the '#pragma omp atomic|flush'
++/// directives.
+ ///
+ /// \code
+ /// #pragma omp atomic seq_cst
+diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+index eb05a6a77978a..6ff24c2bc8faa 100644
+--- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
++++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+@@ -11396,7 +11396,7 @@ def err_omp_atomic_weak_no_equality : Error<"expected '==' operator for 'weak' c
+ def err_omp_atomic_several_clauses : Error<
+   "directive '#pragma omp atomic' cannot contain more than one 'read', 'write', 'update', 'capture', or 'compare' clause">;
+ def err_omp_several_mem_order_clauses : Error<
+-  "directive '#pragma omp %0' cannot contain more than one %select{'seq_cst', 'relaxed', |}1'acq_rel', 'acquire' or 'release' clause">;
++  "directive '#pragma omp %0' cannot contain more than one 'seq_cst',%select{ 'relaxed',|}1 'acq_rel', 'acquire' or 'release' clause">;
+ def err_omp_atomic_incompatible_mem_order_clause : Error<
+   "directive '#pragma omp atomic%select{ %0|}1' cannot be used with '%2' clause">;
+ def note_omp_previous_mem_order_clause : Note<
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 5d6b835e6da82..976d48e124913 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -11102,7 +11102,8 @@ StmtResult SemaOpenMP::ActOnOpenMPFlushDirective(ArrayRef<OMPClause *> Clauses,
+   for (const OMPClause *C : Clauses) {
+     if (C->getClauseKind() == OMPC_acq_rel ||
+         C->getClauseKind() == OMPC_acquire ||
+-        C->getClauseKind() == OMPC_release) {
++        C->getClauseKind() == OMPC_release ||
++        C->getClauseKind() == OMPC_seq_cst /*OpenMP 5.1*/) {
+       if (MemOrderKind != OMPC_unknown) {
+         Diag(C->getBeginLoc(), diag::err_omp_several_mem_order_clauses)
+             << getOpenMPDirectiveName(OMPD_flush) << 1
+diff --git a/clang/test/OpenMP/flush_ast_print.cpp b/clang/test/OpenMP/flush_ast_print.cpp
+index 9578ada020227..768282422032f 100644
+--- a/clang/test/OpenMP/flush_ast_print.cpp
++++ b/clang/test/OpenMP/flush_ast_print.cpp
+@@ -1,10 +1,10 @@
+-// RUN: %clang_cc1 -verify -fopenmp -ast-print %s | FileCheck %s
+-// RUN: %clang_cc1 -fopenmp -x c++ -std=c++11 -emit-pch -o %t %s
+-// RUN: %clang_cc1 -fopenmp -std=c++11 -include-pch %t -verify %s -ast-print | FileCheck %s
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=51 -ast-print %s | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -std=c++11 -include-pch %t  -verify %s -ast-print | FileCheck %s
+ 
+-// RUN: %clang_cc1 -verify -fopenmp-simd -ast-print %s | FileCheck %s
+-// RUN: %clang_cc1 -fopenmp-simd -x c++ -std=c++11 -emit-pch -o %t %s
+-// RUN: %clang_cc1 -fopenmp-simd -std=c++11 -include-pch %t -verify %s -ast-print | FileCheck %s
++// RUN: %clang_cc1 -verify -fopenmp-simd -fopenmp-version=51 -ast-print %s | FileCheck %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=51 -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=51 -std=c++11 -include-pch %t -verify %s -ast-print | FileCheck %s
+ // expected-no-diagnostics
+ 
+ #ifndef HEADER
+@@ -19,6 +19,7 @@ T tmain(T argc) {
+ #pragma omp flush acq_rel
+ #pragma omp flush acquire
+ #pragma omp flush release
++#pragma omp flush seq_cst
+ #pragma omp flush(a)
+   return a + argc;
+ }
+@@ -27,18 +28,21 @@ T tmain(T argc) {
+ // CHECK-NEXT: #pragma omp flush acq_rel{{$}}
+ // CHECK-NEXT: #pragma omp flush acquire{{$}}
+ // CHECK-NEXT: #pragma omp flush release{{$}}
++// CHECK-NEXT: #pragma omp flush seq_cst{{$}}
+ // CHECK-NEXT: #pragma omp flush (a)
+ // CHECK:      static int a;
+ // CHECK-NEXT: #pragma omp flush
+ // CHECK-NEXT: #pragma omp flush acq_rel{{$}}
+ // CHECK-NEXT: #pragma omp flush acquire{{$}}
+ // CHECK-NEXT: #pragma omp flush release{{$}}
++// CHECK-NEXT: #pragma omp flush seq_cst{{$}}
+ // CHECK-NEXT: #pragma omp flush (a)
+ // CHECK:      static char a;
+ // CHECK-NEXT: #pragma omp flush
+ // CHECK-NEXT: #pragma omp flush acq_rel{{$}}
+ // CHECK-NEXT: #pragma omp flush acquire{{$}}
+ // CHECK-NEXT: #pragma omp flush release{{$}}
++// CHECK-NEXT: #pragma omp flush seq_cst{{$}}
+ // CHECK-NEXT: #pragma omp flush (a)
+ 
+ int main(int argc, char **argv) {
+@@ -48,11 +52,13 @@ int main(int argc, char **argv) {
+ #pragma omp flush acq_rel
+ #pragma omp flush acquire
+ #pragma omp flush release
++#pragma omp flush seq_cst
+ #pragma omp flush(a)
+ // CHECK-NEXT: #pragma omp flush
+ // CHECK-NEXT: #pragma omp flush acq_rel
+ // CHECK-NEXT: #pragma omp flush acquire{{$}}
+ // CHECK-NEXT: #pragma omp flush release
++// CHECK-NEXT: #pragma omp flush seq_cst
+ // CHECK-NEXT: #pragma omp flush (a)
+   return tmain(argc) + tmain(argv[0][0]) + a;
+ }
+diff --git a/clang/test/OpenMP/flush_codegen.cpp b/clang/test/OpenMP/flush_codegen.cpp
+index c7dd88ef9ac31..fa2586d9fe258 100644
+--- a/clang/test/OpenMP/flush_codegen.cpp
++++ b/clang/test/OpenMP/flush_codegen.cpp
+@@ -1,13 +1,13 @@
+-// RUN: %clang_cc1 -verify -fopenmp -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck %s
+-// RUN: %clang_cc1 -fopenmp -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
+-// RUN: %clang_cc1 -fopenmp -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
+-// RUN: %clang_cc1 -verify -fopenmp -fopenmp-enable-irbuilder -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck %s
+-// RUN: %clang_cc1 -fopenmp -fopenmp-enable-irbuilder -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
+-// RUN: %clang_cc1 -fopenmp -fopenmp-enable-irbuilder -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=51 -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=51 -fopenmp-enable-irbuilder -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -fopenmp-enable-irbuilder -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=51 -fopenmp-enable-irbuilder -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
+ 
+-// RUN: %clang_cc1 -verify -fopenmp-simd -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck --check-prefix SIMD-ONLY0 %s
+-// RUN: %clang_cc1 -fopenmp-simd -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
+-// RUN: %clang_cc1 -fopenmp-simd -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck --check-prefix SIMD-ONLY0 %s
++// RUN: %clang_cc1 -verify -fopenmp-simd -fopenmp-version=51 -x c++ -emit-llvm %s -fexceptions -fcxx-exceptions -o - | FileCheck --check-prefix SIMD-ONLY0 %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=51 -x c++ -std=c++11 -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=51 -x c++ -triple x86_64-unknown-unknown -fexceptions -fcxx-exceptions -debug-info-kind=limited -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck --check-prefix SIMD-ONLY0 %s
+ // SIMD-ONLY0-NOT: {{__kmpc|__tgt}}
+ // expected-no-diagnostics
+ #ifndef HEADER
+@@ -17,6 +17,7 @@ template <class T>
+ T tmain(T argc) {
+   static T a;
+ #pragma omp flush
++#pragma omp flush seq_cst
+ #pragma omp flush acq_rel
+ #pragma omp flush acquire
+ #pragma omp flush release
+@@ -28,6 +29,7 @@ T tmain(T argc) {
+ int main() {
+   static int a;
+ #pragma omp flush
++#pragma omp flush seq_cst
+ #pragma omp flush acq_rel
+ #pragma omp flush acquire
+ #pragma omp flush release
+@@ -37,6 +39,7 @@ int main() {
+   // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+   // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+   // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
++  // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+   return tmain(a);
+   // CHECK: call {{.*}} [[TMAIN:@.+]](
+   // CHECK: ret
+@@ -48,6 +51,7 @@ int main() {
+ // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+ // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+ // CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
++// CHECK: call {{.*}}void @__kmpc_flush(ptr {{(@|%).+}})
+ // CHECK: ret
+ 
+ // CHECK-NOT: line: 0,
+diff --git a/clang/test/OpenMP/flush_messages.cpp b/clang/test/OpenMP/flush_messages.cpp
+index ad4830b5bf94f..e78949bc924e1 100644
+--- a/clang/test/OpenMP/flush_messages.cpp
++++ b/clang/test/OpenMP/flush_messages.cpp
+@@ -134,14 +134,12 @@ label1 : {
+ #pragma omp flush(argc) flush(argc) // expected-warning {{extra tokens at the end of '#pragma omp flush' are ignored}}
+ #pragma omp parallel flush(argc) // expected-warning {{extra tokens at the end of '#pragma omp parallel' are ignored}}
+   ;
+-#pragma omp flush seq_cst // expected-error {{unexpected OpenMP clause 'seq_cst' in directive '#pragma omp flush'}}
+ #pragma omp flush acq_rel // omp45-error {{unexpected OpenMP clause 'acq_rel' in directive '#pragma omp flush'}}
+ #pragma omp flush acquire // omp45-error {{unexpected OpenMP clause 'acquire' in directive '#pragma omp flush'}}
+ #pragma omp flush release // omp45-error {{unexpected OpenMP clause 'release' in directive '#pragma omp flush'}}
+ #pragma omp flush relaxed // expected-error {{unexpected OpenMP clause 'relaxed' in directive '#pragma omp flush'}}
+-#pragma omp flush seq_cst // expected-error {{unexpected OpenMP clause 'seq_cst' in directive '#pragma omp flush'}}
+-#pragma omp flush acq_rel acquire // omp45-error {{unexpected OpenMP clause 'acq_rel' in directive '#pragma omp flush'}} omp45-error {{unexpected OpenMP clause 'acquire' in directive '#pragma omp flush'}} omp51-error {{directive '#pragma omp flush' cannot contain more than one 'acq_rel', 'acquire' or 'release' clause}} omp51-note {{'acq_rel' clause used here}}
+-#pragma omp flush release acquire // omp45-error {{unexpected OpenMP clause 'release' in directive '#pragma omp flush'}} omp45-error {{unexpected OpenMP clause 'acquire' in directive '#pragma omp flush'}} omp51-error {{directive '#pragma omp flush' cannot contain more than one 'acq_rel', 'acquire' or 'release' clause}} omp51-note {{'release' clause used here}}
++#pragma omp flush acq_rel acquire // omp45-error {{unexpected OpenMP clause 'acq_rel' in directive '#pragma omp flush'}} omp45-error {{unexpected OpenMP clause 'acquire' in directive '#pragma omp flush'}} omp51-error {{directive '#pragma omp flush' cannot contain more than one 'seq_cst', 'acq_rel', 'acquire' or 'release' clause}} omp51-note {{'acq_rel' clause used here}}
++#pragma omp flush release acquire // omp45-error {{unexpected OpenMP clause 'release' in directive '#pragma omp flush'}} omp45-error {{unexpected OpenMP clause 'acquire' in directive '#pragma omp flush'}} omp51-error {{directive '#pragma omp flush' cannot contain more than one 'seq_cst', 'acq_rel', 'acquire' or 'release' clause}} omp51-note {{'release' clause used here}}
+ #pragma omp flush acq_rel (argc) // omp45-error {{unexpected OpenMP clause 'acq_rel' in directive '#pragma omp flush'}} expected-warning {{extra tokens at the end of '#pragma omp flush' are ignored}}
+ #pragma omp flush(argc) acq_rel // omp45-error {{unexpected OpenMP clause 'acq_rel' in directive '#pragma omp flush'}} omp51-error {{'flush' directive with memory order clause 'acq_rel' cannot have the list}} omp51-note {{memory order clause 'acq_rel' is specified here}}
+   return tmain(argc);
+diff --git a/flang/test/Lower/OpenMP/Todo/flush-seq-cst.f90 b/flang/test/Lower/OpenMP/Todo/flush-seq-cst.f90
+new file mode 100644
+index 0000000000000..753e1cfcd7aa5
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/flush-seq-cst.f90
+@@ -0,0 +1,6 @@
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s -fopenmp-version=51 2>&1 | FileCheck %s
++
++! CHECK: not yet implemented: Unhandled clause SEQ_CST in FLUSH construct
++program flush_seq_cst
++  !$omp flush seq_cst
++end program
+\ No newline at end of file
+diff --git a/flang/test/Semantics/OpenMP/clause-validity01.f90 b/flang/test/Semantics/OpenMP/clause-validity01.f90
+index 406d30b38948e..8dd6d10200cd3 100644
+--- a/flang/test/Semantics/OpenMP/clause-validity01.f90
++++ b/flang/test/Semantics/OpenMP/clause-validity01.f90
+@@ -1,6 +1,6 @@
+ ! REQUIRES: openmp_runtime
+ 
+-! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags %openmp_module_flag -fopenmp-version=50
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags %openmp_module_flag -fopenmp-version=51
+ use omp_lib
+ ! Check OpenMP clause validity for the following directives:
+ !
+@@ -507,7 +507,6 @@
+   !$omp flush acquire
+   !ERROR: If memory-order-clause is RELEASE, ACQUIRE, or ACQ_REL, list items must not be specified on the FLUSH directive
+   !$omp flush release (c)
+-  !ERROR: SEQ_CST clause is not allowed on the FLUSH directive
+   !$omp flush seq_cst
+   !ERROR: RELAXED clause is not allowed on the FLUSH directive
+   !$omp flush relaxed
+diff --git a/flang/test/Semantics/OpenMP/flush02.f90 b/flang/test/Semantics/OpenMP/flush02.f90
+index ed0cf6602d574..615332c6cf31c 100644
+--- a/flang/test/Semantics/OpenMP/flush02.f90
++++ b/flang/test/Semantics/OpenMP/flush02.f90
+@@ -1,6 +1,6 @@
+ ! REQUIRES: openmp_runtime
+ 
+-! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=50
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=51
+ 
+ ! Check OpenMP 5.0 - 2.17.8 flush Construct
+ ! Restriction -
+@@ -27,7 +27,6 @@
+   !Only memory-order-clauses.
+   if (omp_get_thread_num() == 1) THEN
+     ! Not allowed clauses.
+-    !ERROR: SEQ_CST clause is not allowed on the FLUSH directive
+     !$omp flush seq_cst
+     !ERROR: RELAXED clause is not allowed on the FLUSH directive
+     !$omp flush relaxed
+@@ -41,7 +40,6 @@
+     !$omp flush acquire acquire
+ 
+     ! Mix of allowed and not allowed.
+-    !ERROR: SEQ_CST clause is not allowed on the FLUSH directive
+     !$omp flush seq_cst acquire
+   END IF
+ 
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 75e73bedd9348..bd7fb2361aaeb 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -769,6 +769,7 @@ def OMP_Flush : Directive<"flush"> {
+     // OMPKinds.def.
+     VersionedClause<OMPC_Flush>,
+     VersionedClause<OMPC_Release, 50>,
++    VersionedClause<OMPC_SeqCst, 51>,
+   ];
+   let association = AS_None;
+   let category = CA_Executable;

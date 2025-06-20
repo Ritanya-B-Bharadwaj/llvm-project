@@ -1,0 +1,211 @@
+diff --git a/llvm/include/llvm/Frontend/OpenMP/ConstructCompositionT.h b/llvm/include/llvm/Frontend/OpenMP/ConstructCompositionT.h
+index 9dcb115a0c514..f6ee963bd8855 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/ConstructCompositionT.h
++++ b/llvm/include/llvm/Frontend/OpenMP/ConstructCompositionT.h
+@@ -343,13 +343,31 @@ template <typename C> void ConstructCompositionT<C>::mergeDSA() {
+     }
+   }
+ 
+-  // Check reductions as well, clear "shared" if set.
++  // Check other privatizing clauses as well, clear "shared" if set.
++  for (auto &clause : clauseSets[llvm::omp::Clause::OMPC_in_reduction]) {
++    using InReductionTy = tomp::clause::InReductionT<TypeTy, IdTy, ExprTy>;
++    using ListTy = typename InReductionTy::List;
++    for (auto &object : std::get<ListTy>(std::get<InReductionTy>(clause.u).t))
++      getDsa(object).second &= ~DSA::Shared;
++  }
++  for (auto &clause : clauseSets[llvm::omp::Clause::OMPC_linear]) {
++    using LinearTy = tomp::clause::LinearT<TypeTy, IdTy, ExprTy>;
++    using ListTy = typename LinearTy::List;
++    for (auto &object : std::get<ListTy>(std::get<LinearTy>(clause.u).t))
++      getDsa(object).second &= ~DSA::Shared;
++  }
+   for (auto &clause : clauseSets[llvm::omp::Clause::OMPC_reduction]) {
+     using ReductionTy = tomp::clause::ReductionT<TypeTy, IdTy, ExprTy>;
+     using ListTy = typename ReductionTy::List;
+     for (auto &object : std::get<ListTy>(std::get<ReductionTy>(clause.u).t))
+       getDsa(object).second &= ~DSA::Shared;
+   }
++  for (auto &clause : clauseSets[llvm::omp::Clause::OMPC_task_reduction]) {
++    using TaskReductionTy = tomp::clause::TaskReductionT<TypeTy, IdTy, ExprTy>;
++    using ListTy = typename TaskReductionTy::List;
++    for (auto &object : std::get<ListTy>(std::get<TaskReductionTy>(clause.u).t))
++      getDsa(object).second &= ~DSA::Shared;
++  }
+ 
+   tomp::ListT<ObjectTy> privateObj, sharedObj, firstpObj, lastpObj, lastpcObj;
+   for (auto &[object, dsa] : objectDsa) {
+diff --git a/llvm/include/llvm/Frontend/OpenMP/ConstructDecompositionT.h b/llvm/include/llvm/Frontend/OpenMP/ConstructDecompositionT.h
+index 5f12c62b832fc..02c88a58e0993 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/ConstructDecompositionT.h
++++ b/llvm/include/llvm/Frontend/OpenMP/ConstructDecompositionT.h
+@@ -793,9 +793,14 @@ bool ConstructDecompositionT<C, H>::applyClause(
+   // [5.2:340:33]
+   auto canMakePrivateCopy = [](llvm::omp::Clause id) {
+     switch (id) {
++    // Clauses with "privatization" property:
+     case llvm::omp::Clause::OMPC_firstprivate:
++    case llvm::omp::Clause::OMPC_in_reduction:
+     case llvm::omp::Clause::OMPC_lastprivate:
++    case llvm::omp::Clause::OMPC_linear:
+     case llvm::omp::Clause::OMPC_private:
++    case llvm::omp::Clause::OMPC_reduction:
++    case llvm::omp::Clause::OMPC_task_reduction:
+       return true;
+     default:
+       return false;
+diff --git a/llvm/unittests/Frontend/OpenMPDecompositionTest.cpp b/llvm/unittests/Frontend/OpenMPDecompositionTest.cpp
+index df48e9cc0ff4a..8157e41e833a9 100644
+--- a/llvm/unittests/Frontend/OpenMPDecompositionTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPDecompositionTest.cpp
+@@ -288,6 +288,14 @@ std::string stringify(const omp::DirectiveWithClauses &DWC) {
+ 
+ // --- Tests ----------------------------------------------------------
+ 
++namespace red {
++// Make it easier to construct reduction operators from built-in intrinsics.
++omp::clause::ReductionOperator
++makeOp(omp::clause::DefinedOperator::IntrinsicOperator Op) {
++  return omp::clause::ReductionOperator{omp::clause::DefinedOperator{Op}};
++}
++} // namespace red
++
+ namespace {
+ using namespace llvm::omp;
+ 
+@@ -699,6 +707,92 @@ TEST_F(OpenMPDecompositionTest, Order1) {
+ TEST_F(OpenMPDecompositionTest, Allocate1) {
+   omp::Object x{"x"};
+ 
++  // Allocate + firstprivate
++  omp::List<omp::Clause> Clauses{
++      {OMPC_allocate,
++       omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++      {OMPC_firstprivate, omp::clause::Firstprivate{{x}}},
++  };
++
++  omp::ConstructDecomposition Dec(AnyVersion, Helper, OMPD_parallel_sections,
++                                  Clauses);
++  ASSERT_EQ(Dec.output.size(), 2u);
++
++  std::string Dir0 = stringify(Dec.output[0]);
++  std::string Dir1 = stringify(Dec.output[1]);
++  ASSERT_EQ(Dir0, "parallel shared(x)");                           // (33)
++  ASSERT_EQ(Dir1, "sections firstprivate(x) allocate(, , , (x))"); // (33)
++}
++
++TEST_F(OpenMPDecompositionTest, Allocate2) {
++  omp::Object x{"x"};
++  auto Add = red::makeOp(omp::clause::DefinedOperator::IntrinsicOperator::Add);
++
++  // Allocate + in_reduction
++  omp::List<omp::Clause> Clauses{
++      {OMPC_allocate,
++       omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++      {OMPC_in_reduction, omp::clause::InReduction{{{Add}, {x}}}},
++  };
++
++  omp::ConstructDecomposition Dec(AnyVersion, Helper, OMPD_target_parallel,
++                                  Clauses);
++  ASSERT_EQ(Dec.output.size(), 2u);
++
++  std::string Dir0 = stringify(Dec.output[0]);
++  std::string Dir1 = stringify(Dec.output[1]);
++  ASSERT_EQ(Dir0, "target in_reduction((3), (x)) allocate(, , , (x))"); // (33)
++  ASSERT_EQ(Dir1, "parallel");                                          // (33)
++}
++
++TEST_F(OpenMPDecompositionTest, Allocate3) {
++  omp::Object x{"x"};
++
++  // Allocate + linear
++  omp::List<omp::Clause> Clauses{
++      {OMPC_allocate,
++       omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++      {OMPC_linear,
++       omp::clause::Linear{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++  };
++
++  omp::ConstructDecomposition Dec(AnyVersion, Helper, OMPD_parallel_for,
++                                  Clauses);
++  ASSERT_EQ(Dec.output.size(), 2u);
++
++  std::string Dir0 = stringify(Dec.output[0]);
++  std::string Dir1 = stringify(Dec.output[1]);
++  // The "shared" clause is duplicated---this isn't harmful, but it
++  // should be fixed eventually.
++  ASSERT_EQ(Dir0, "parallel shared(x) shared(x)"); // (33)
++  ASSERT_EQ(Dir1, "for linear(, , , (x)) firstprivate(x) lastprivate(, (x)) "
++                  "allocate(, , , (x))"); // (33)
++}
++
++TEST_F(OpenMPDecompositionTest, Allocate4) {
++  omp::Object x{"x"};
++
++  // Allocate + lastprivate
++  omp::List<omp::Clause> Clauses{
++      {OMPC_allocate,
++       omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++      {OMPC_lastprivate, omp::clause::Lastprivate{{std::nullopt, {x}}}},
++  };
++
++  omp::ConstructDecomposition Dec(AnyVersion, Helper, OMPD_parallel_sections,
++                                  Clauses);
++  ASSERT_EQ(Dec.output.size(), 2u);
++
++  std::string Dir0 = stringify(Dec.output[0]);
++  std::string Dir1 = stringify(Dec.output[1]);
++  ASSERT_EQ(Dir0, "parallel shared(x)");                              // (33)
++  ASSERT_EQ(Dir1, "sections lastprivate(, (x)) allocate(, , , (x))"); // (33)
++}
++
++TEST_F(OpenMPDecompositionTest, Allocate5) {
++  omp::Object x{"x"};
++
++  // Allocate + private
+   omp::List<omp::Clause> Clauses{
+       {OMPC_allocate,
+        omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
+@@ -715,6 +809,27 @@ TEST_F(OpenMPDecompositionTest, Allocate1) {
+   ASSERT_EQ(Dir1, "sections private(x) allocate(, , , (x))"); // (33)
+ }
+ 
++TEST_F(OpenMPDecompositionTest, Allocate6) {
++  omp::Object x{"x"};
++  auto Add = red::makeOp(omp::clause::DefinedOperator::IntrinsicOperator::Add);
++
++  // Allocate + reduction
++  omp::List<omp::Clause> Clauses{
++      {OMPC_allocate,
++       omp::clause::Allocate{{std::nullopt, std::nullopt, std::nullopt, {x}}}},
++      {OMPC_reduction, omp::clause::Reduction{{std::nullopt, {Add}, {x}}}},
++  };
++
++  omp::ConstructDecomposition Dec(AnyVersion, Helper, OMPD_parallel_sections,
++                                  Clauses);
++  ASSERT_EQ(Dec.output.size(), 2u);
++
++  std::string Dir0 = stringify(Dec.output[0]);
++  std::string Dir1 = stringify(Dec.output[1]);
++  ASSERT_EQ(Dir0, "parallel shared(x)");                                 // (33)
++  ASSERT_EQ(Dir1, "sections reduction(, (3), (x)) allocate(, , , (x))"); // (33)
++}
++
+ // REDUCTION
+ // [5.2:134:17-18]
+ // Directives: do, for, loop, parallel, scope, sections, simd, taskloop, teams
+@@ -741,14 +856,6 @@ TEST_F(OpenMPDecompositionTest, Allocate1) {
+ // clause on the construct, then the effect is as if the list item in the
+ // reduction clause appears as a list item in a map clause with a map-type of
+ // tofrom.
+-namespace red {
+-// Make is easier to construct reduction operators from built-in intrinsics.
+-omp::clause::ReductionOperator
+-makeOp(omp::clause::DefinedOperator::IntrinsicOperator Op) {
+-  return omp::clause::ReductionOperator{omp::clause::DefinedOperator{Op}};
+-}
+-} // namespace red
+-
+ TEST_F(OpenMPDecompositionTest, Reduction1) {
+   omp::Object x{"x"};
+   auto Add = red::makeOp(omp::clause::DefinedOperator::IntrinsicOperator::Add);

@@ -1,0 +1,82 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index f6cf358119fb7..d9baf3fa82797 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -4791,8 +4791,11 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTargetData(
+     return InsertPointTy();
+ 
+   // Disable TargetData CodeGen on Device pass.
+-  if (Config.IsTargetDevice.value_or(false))
++  if (Config.IsTargetDevice.value_or(false)) {
++    if (BodyGenCB)
++      Builder.restoreIP(BodyGenCB(Builder.saveIP(), BodyGenTy::NoPriv));
+     return Builder.saveIP();
++  }
+ 
+   Builder.restoreIP(CodeGenIP);
+   bool IsStandAlone = !BodyGenCB;
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index e79d0bb2f65ae..35f0591eda02c 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -5711,6 +5711,23 @@ TEST_F(OpenMPIRBuilderTest, TargetDataRegion) {
+   EXPECT_TRUE(TargetDataCall->getOperand(2)->getType()->isIntegerTy(32));
+   EXPECT_TRUE(TargetDataCall->getOperand(8)->getType()->isPointerTy());
+ 
++  // Check that BodyGenCB is still made when IsTargetDevice is set to true.
++  OMPBuilder.Config.setIsTargetDevice(true);
++  bool CheckDevicePassBodyGen = false;
++  auto BodyTargetCB = [&](InsertPointTy CodeGenIP, BodyGenTy BodyGenType) {
++    CheckDevicePassBodyGen = true;
++    Builder.restoreIP(CodeGenIP);
++    CallInst *TargetDataCall =
++        dyn_cast<CallInst>(BB->back().getPrevNode()->getPrevNode());
++    // Make sure no begin_mapper call is present for device pass.
++    EXPECT_EQ(TargetDataCall, nullptr);
++    return Builder.saveIP();
++  };
++  Builder.restoreIP(OMPBuilder.createTargetData(
++      Loc, AllocaIP, Builder.saveIP(), Builder.getInt64(DeviceID),
++      /* IfCond= */ nullptr, Info, GenMapInfoCB, nullptr, BodyTargetCB));
++  EXPECT_TRUE(CheckDevicePassBodyGen);
++
+   Builder.CreateRetVoid();
+   EXPECT_FALSE(verifyModule(*M, &errs()));
+ }
+diff --git a/openmp/libomptarget/test/offloading/fortran/target-nested-target-data.f90 b/openmp/libomptarget/test/offloading/fortran/target-nested-target-data.f90
+new file mode 100644
+index 0000000000000..a694f2464546c
+--- /dev/null
++++ b/openmp/libomptarget/test/offloading/fortran/target-nested-target-data.f90
+@@ -0,0 +1,31 @@
++! Offloading test for target nested inside
++! a target data region
++! REQUIRES: flang
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++   integer :: A(10), B(10), C(10)
++
++   do I = 1, 10
++      A(I) = 1
++      B(I) = 2
++   end do
++   !$omp target data map(to: A, B) map(alloc: C)
++   !$omp target map(from: C)
++   do I = 1, 10
++      C(I) = A(I) + B(I) ! assigns 3, A:1 + B:2
++   end do
++   !$omp end target
++   !$omp target update from(C) ! updates C device -> host
++   !$omp end target data
++
++   print *, C ! should be all 3's
++
++end program
++
++! CHECK: 3 3 3 3 3 3 3 3 3 3

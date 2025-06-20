@@ -1,0 +1,76 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 8cc3a99d92023..0692101d56eb7 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -7258,10 +7258,12 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::emitTargetTask(
+     // If `HasNoWait == true`, we call  @__kmpc_omp_target_task_alloc to provide
+     // the DeviceID to the deferred task and also since
+     // @__kmpc_omp_target_task_alloc creates an untied/async task.
++    bool NeedsTargetTask = HasNoWait && DeviceID;
+     Function *TaskAllocFn =
+-        !HasNoWait ? getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_task_alloc)
+-                   : getOrCreateRuntimeFunctionPtr(
+-                         OMPRTL___kmpc_omp_target_task_alloc);
++        !NeedsTargetTask
++            ? getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_task_alloc)
++            : getOrCreateRuntimeFunctionPtr(
++                  OMPRTL___kmpc_omp_target_task_alloc);
+ 
+     // Arguments - `loc_ref` (Ident) and `gtid` (ThreadID)
+     // call.
+@@ -7310,8 +7312,10 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::emitTargetTask(
+         /*sizeof_task=*/TaskSize, /*sizeof_shared=*/SharedsSize,
+         /*task_func=*/ProxyFn};
+ 
+-    if (HasNoWait)
++    if (NeedsTargetTask) {
++      assert(DeviceID && "Expected non-empty device ID.");
+       TaskAllocArgs.push_back(DeviceID);
++    }
+ 
+     TaskData = Builder.CreateCall(TaskAllocFn, TaskAllocArgs);
+ 
+@@ -7333,7 +7337,7 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::emitTargetTask(
+     // ---------------------------------------------------------------
+     // The above means that the lack of a nowait on the target construct
+     // translates to '#pragma omp task if(0)'
+-    if (!HasNoWait) {
++    if (!NeedsTargetTask) {
+       if (DepArray) {
+         Function *TaskWaitFn =
+             getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_wait_deps);
+diff --git a/mlir/test/Target/LLVMIR/omptarget-nowait-host-only.mlir b/mlir/test/Target/LLVMIR/omptarget-nowait-host-only.mlir
+new file mode 100644
+index 0000000000000..6b634226a3568
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-nowait-host-only.mlir
+@@ -0,0 +1,29 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// Tests `target ... nowait` when code gen targets the host rather than a
++// device.
++
++module attributes {omp.is_target_device = false} {
++  llvm.func @omp_target_nowait_() {
++    %0 = llvm.mlir.constant(1 : i64) : i64
++    %1 = llvm.alloca %0 x f32 {bindc_name = "x"} : (i64) -> !llvm.ptr
++    %3 = omp.map.info var_ptr(%1 : !llvm.ptr, f32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "x"}
++    omp.target nowait map_entries(%3 -> %arg0 : !llvm.ptr) {
++      %4 = llvm.mlir.constant(5.000000e+00 : f32) : f32
++      llvm.store %4, %arg0 : f32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++}
++
++// CHECK: define void @omp_target_nowait_()
++// CHECK-NOT: define {{.*}} @
++// CHECK-NOT: call ptr @__kmpc_omp_target_task_alloc({{.*}})
++// Verify that we directly emit a call to the "target" region's body from the
++// parent function of the the `omp.target` op.
++// CHECK: call void @__omp_offloading_[[DEV:.*]]_[[FIL:.*]]_omp_target_nowait__l[[LINE:.*]](ptr {{.*}})
++// CHECK-NEXT: ret void
++
++// CHECK: define internal void @__omp_offloading_[[DEV]]_[[FIL]]_omp_target_nowait__l[[LINE]](ptr %[[ADDR_X:.*]])
++// CHECK: store float 5{{.*}}, ptr %[[ADDR_X]], align 4

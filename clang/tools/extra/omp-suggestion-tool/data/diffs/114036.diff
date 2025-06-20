@@ -1,0 +1,939 @@
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index e1df647d6a3c7..4a27a5ed8eb74 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2499,13 +2499,7 @@ void OrderedRegionOp::build(OpBuilder &builder, OperationState &state,
+   OrderedRegionOp::build(builder, state, clauses.parLevelSimd);
+ }
+ 
+-LogicalResult OrderedRegionOp::verify() {
+-  // TODO: The code generation for ordered simd directive is not supported yet.
+-  if (getParLevelSimd())
+-    return failure();
+-
+-  return verifyOrderedParent(**this);
+-}
++LogicalResult OrderedRegionOp::verify() { return verifyOrderedParent(**this); }
+ 
+ //===----------------------------------------------------------------------===//
+ // TaskwaitOp
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index d20e5e40076bc..b382edb3143b4 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -89,8 +89,64 @@ class OpenMPVarMappingStackFrame
+ 
+   DenseMap<Value, llvm::Value *> mapping;
+ };
++
++/// Custom error class to signal translation errors that don't need reporting,
++/// since encountering them will have already triggered relevant error messages.
++///
++/// Its purpose is to serve as the glue between MLIR failures represented as
++/// \see LogicalResult instances and \see llvm::Error instances used to
++/// propagate errors through the \see llvm::OpenMPIRBuilder. Generally, when an
++/// error of the first type is raised, a message is emitted directly (the \see
++/// LogicalResult itself does not hold any information). If we need to forward
++/// this error condition as an \see llvm::Error while avoiding triggering some
++/// redundant error reporting later on, we need a custom \see llvm::ErrorInfo
++/// class to just signal this situation has happened.
++///
++/// For example, this class should be used to trigger errors from within
++/// callbacks passed to the \see OpenMPIRBuilder when they were triggered by the
++/// translation of their own regions. This unclutters the error log from
++/// redundant messages.
++class PreviouslyReportedError
++    : public llvm::ErrorInfo<PreviouslyReportedError> {
++public:
++  void log(raw_ostream &) const override {
++    // Do not log anything.
++  }
++
++  std::error_code convertToErrorCode() const override {
++    llvm_unreachable(
++        "PreviouslyReportedError doesn't support ECError conversion");
++  }
++
++  // Used by ErrorInfo::classID.
++  static char ID;
++};
++
++char PreviouslyReportedError::ID = 0;
++
+ } // namespace
+ 
++static LogicalResult handleError(llvm::Error error, Operation &op) {
++  LogicalResult result = success();
++  if (error) {
++    llvm::handleAllErrors(
++        std::move(error),
++        [&](const PreviouslyReportedError &) { result = failure(); },
++        [&](const llvm::ErrorInfoBase &err) {
++          result = op.emitError(err.message());
++        });
++  }
++  return result;
++}
++
++template <typename T>
++static LogicalResult handleError(llvm::Expected<T> &result, Operation &op) {
++  if (!result)
++    return handleError(result.takeError(), op);
++
++  return success();
++}
++
+ /// Find the insertion point for allocas given the current insertion point for
+ /// normal operations in the builder.
+ static llvm::OpenMPIRBuilder::InsertPointTy
+@@ -216,7 +272,7 @@ static llvm::Expected<llvm::BasicBlock *> convertOmpOpRegions(
+     llvm::IRBuilderBase::InsertPointGuard guard(builder);
+     if (failed(
+             moduleTranslation.convertBlock(*bb, bb->isEntryBlock(), builder)))
+-      return llvm::createStringError("failed region translation");
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     // Special handling for `omp.yield` and `omp.terminator` (we may have more
+     // than one): they return the control to the parent OpenMP dialect operation
+@@ -352,8 +408,8 @@ convertOmpMasked(Operation &opInst, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createMasked(ompLoc, bodyGenCB,
+                                                          finiCB, filterVal);
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -382,8 +438,8 @@ convertOmpMaster(Operation &opInst, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createMaster(ompLoc, bodyGenCB,
+                                                          finiCB);
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -429,8 +485,8 @@ convertOmpCritical(Operation &opInst, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createCritical(
+           ompLoc, bodyGenCB, finiCB, criticalOp.getName().value_or(""), hint);
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -537,9 +593,8 @@ static LogicalResult inlineConvertOmpRegions(
+   llvm::Expected<llvm::BasicBlock *> continuationBlock =
+       convertOmpOpRegions(region, blockName, builder, moduleTranslation, &phis);
+ 
+-  if (!continuationBlock)
+-    return region.getParentOp()->emitError(
+-        llvm::toString(continuationBlock.takeError()));
++  if (failed(handleError(continuationBlock, *region.getParentOp())))
++    return failure();
+ 
+   if (continuationBlockArgs)
+     llvm::append_range(*continuationBlockArgs, phis);
+@@ -661,7 +716,7 @@ convertOmpOrderedRegion(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   // TODO: The code generation for ordered simd directive is not supported yet.
+   if (orderedRegionOp.getParLevelSimd())
+-    return failure();
++    return opInst.emitError("unhandled clauses for translation to LLVM IR");
+ 
+   auto bodyGenCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP) {
+     // OrderedOp has only one region associated with it.
+@@ -681,8 +736,8 @@ convertOmpOrderedRegion(Operation &opInst, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createOrderedThreadsSimd(
+           ompLoc, bodyGenCB, finiCB, !orderedRegionOp.getParLevelSimd());
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -887,8 +942,8 @@ static LogicalResult createReductionsAndCleanup(
+       ompBuilder->createReductions(builder.saveIP(), allocaIP, reductionInfos,
+                                    isByRef, op.getNowait());
+ 
+-  if (!contInsertPoint)
+-    return op.emitError(llvm::toString(contInsertPoint.takeError()));
++  if (failed(handleError(contInsertPoint, *op)))
++    return failure();
+ 
+   if (!contInsertPoint->getBlock())
+     return op->emitOpError() << "failed to convert reductions";
+@@ -896,8 +951,8 @@ static LogicalResult createReductionsAndCleanup(
+   llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+       ompBuilder->createBarrier(*contInsertPoint, llvm::omp::OMPD_for);
+ 
+-  if (!afterIP)
+-    return op.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *op)))
++    return failure();
+ 
+   tempTerminator->eraseFromParent();
+   builder.restoreIP(*afterIP);
+@@ -1100,8 +1155,8 @@ convertOmpSections(Operation &opInst, llvm::IRBuilderBase &builder,
+           ompLoc, allocaIP, sectionCBs, privCB, finiCB, false,
+           sectionsOp.getNowait());
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+ 
+@@ -1147,8 +1202,8 @@ convertOmpSingle(omp::SingleOp &singleOp, llvm::IRBuilderBase &builder,
+           ompLoc, bodyCB, finiCB, singleOp.getNowait(), llvmCPVars,
+           llvmCPFuncs);
+ 
+-  if (!afterIP)
+-    return singleOp.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *singleOp)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -1193,8 +1248,8 @@ convertOmpTeams(omp::TeamsOp op, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createTeams(
+           ompLoc, bodyCB, numTeamsLower, numTeamsUpper, threadLimit, ifExpr);
+ 
+-  if (!afterIP)
+-    return op.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *op)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -1262,8 +1317,8 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
+           moduleTranslation.lookupValue(taskOp.getFinal()),
+           moduleTranslation.lookupValue(taskOp.getIfExpr()), dds);
+ 
+-  if (!afterIP)
+-    return taskOp.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *taskOp)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -1290,8 +1345,8 @@ convertOmpTaskgroupOp(omp::TaskgroupOp tgOp, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createTaskgroup(ompLoc, allocaIP,
+                                                             bodyCB);
+ 
+-  if (!afterIP)
+-    return tgOp.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *tgOp)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -1418,15 +1473,15 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+       computeIP = loopInfos.front()->getPreheaderIP();
+     }
+ 
+-    llvm::Expected<llvm::CanonicalLoopInfo *> result =
++    llvm::Expected<llvm::CanonicalLoopInfo *> loopResult =
+         ompBuilder->createCanonicalLoop(
+             loc, bodyGen, lowerBound, upperBound, step,
+             /*IsSigned=*/true, loopOp.getLoopInclusive(), computeIP);
+ 
+-    if (!result)
+-      return loopOp.emitError(llvm::toString(result.takeError()));
++    if (failed(handleError(loopResult, *loopOp)))
++      return failure();
+ 
+-    loopInfos.push_back(*result);
++    loopInfos.push_back(*loopResult);
+   }
+ 
+   // Collapse loops. Store the insertion point because LoopInfos may get
+@@ -1449,8 +1504,8 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+           scheduleMod == omp::ScheduleModifier::monotonic,
+           scheduleMod == omp::ScheduleModifier::nonmonotonic, isOrdered);
+ 
+-  if (!wsloopIP)
+-    return opInst.emitError(llvm::toString(wsloopIP.takeError()));
++  if (failed(handleError(wsloopIP, opInst)))
++    return failure();
+ 
+   // Continue building IR after the loop. Note that the LoopInfo returned by
+   // `collapseLoops` points inside the outermost loop and is intended for
+@@ -1732,7 +1787,7 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+         return contInsertPoint.takeError();
+ 
+       if (!contInsertPoint->getBlock())
+-        return llvm::createStringError("failed to convert reductions");
++        return llvm::make_error<PreviouslyReportedError>();
+ 
+       tempTerminator->eraseFromParent();
+       builder.restoreIP(*contInsertPoint);
+@@ -1803,8 +1858,9 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+   llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+       ompBuilder->createParallel(ompLoc, allocaIP, bodyGenCB, privCB, finiCB,
+                                  ifCond, numThreads, pbKind, isCancellable);
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++
++  if (failed(handleError(afterIP, *opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -1896,15 +1952,15 @@ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
+       computeIP = loopInfos.front()->getPreheaderIP();
+     }
+ 
+-    llvm::Expected<llvm::CanonicalLoopInfo *> result =
++    llvm::Expected<llvm::CanonicalLoopInfo *> loopResult =
+         ompBuilder->createCanonicalLoop(
+             loc, bodyGen, lowerBound, upperBound, step,
+             /*IsSigned=*/true, /*InclusiveStop=*/true, computeIP);
+ 
+-    if (!result)
+-      return loopOp->emitError(llvm::toString(result.takeError()));
++    if (failed(handleError(loopResult, *loopOp)))
++      return failure();
+ 
+-    loopInfos.push_back(*result);
++    loopInfos.push_back(*loopResult);
+   }
+ 
+   // Collapse loops.
+@@ -2063,8 +2119,7 @@ convertOmpAtomicUpdate(omp::AtomicUpdateOp &opInst,
+     moduleTranslation.mapValue(*opInst.getRegion().args_begin(), atomicx);
+     moduleTranslation.mapBlock(&bb, builder.GetInsertBlock());
+     if (failed(moduleTranslation.convertBlock(bb, true, builder)))
+-      return llvm::createStringError(
+-          "unable to convert update operation to llvm IR");
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     omp::YieldOp yieldop = dyn_cast<omp::YieldOp>(bb.getTerminator());
+     assert(yieldop && yieldop.getResults().size() == 1 &&
+@@ -2081,8 +2136,8 @@ convertOmpAtomicUpdate(omp::AtomicUpdateOp &opInst,
+                                      atomicOrdering, binop, updateFn,
+                                      isXBinopExpr);
+ 
+-  if (!afterIP)
+-    return opInst.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *opInst)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -2156,8 +2211,7 @@ convertOmpAtomicCapture(omp::AtomicCaptureOp atomicCaptureOp,
+                                atomicx);
+     moduleTranslation.mapBlock(&bb, builder.GetInsertBlock());
+     if (failed(moduleTranslation.convertBlock(bb, true, builder)))
+-      return llvm::createStringError(
+-          "unable to convert update operation to llvm IR");
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     omp::YieldOp yieldop = dyn_cast<omp::YieldOp>(bb.getTerminator());
+     assert(yieldop && yieldop.getResults().size() == 1 &&
+@@ -2174,8 +2228,8 @@ convertOmpAtomicCapture(omp::AtomicCaptureOp atomicCaptureOp,
+           ompLoc, allocaIP, llvmAtomicX, llvmAtomicV, llvmExpr, atomicOrdering,
+           binop, updateFn, atomicUpdateOp, isPostfixUpdate, isXBinopExpr);
+ 
+-  if (!afterIP)
+-    return atomicCaptureOp.emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *atomicCaptureOp)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -3192,8 +3246,7 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+ 
+         if (failed(inlineConvertOmpRegions(region, "omp.data.region", builder,
+                                            moduleTranslation)))
+-          return llvm::createStringError(
+-              "failed to inline region of an `omp.target_data` op");
++          return llvm::make_error<PreviouslyReportedError>();
+       }
+       break;
+     case BodyGenTy::DupNoPriv:
+@@ -3215,8 +3268,7 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+ 
+         if (failed(inlineConvertOmpRegions(region, "omp.data.region", builder,
+                                            moduleTranslation)))
+-          return llvm::createStringError(
+-              "failed to inline region of an `omp.target_data` op");
++          return llvm::make_error<PreviouslyReportedError>();
+       }
+       break;
+     }
+@@ -3236,8 +3288,8 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+                                         info, genMapInfoCB, &RTLFn);
+   }();
+ 
+-  if (!afterIP)
+-    return op->emitError(llvm::toString(afterIP.takeError()));
++  if (failed(handleError(afterIP, *op)))
++    return failure();
+ 
+   builder.restoreIP(*afterIP);
+   return success();
+@@ -3641,16 +3693,16 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   buildDependData(targetOp.getDependKinds(), targetOp.getDependVars(),
+                   moduleTranslation, dds);
+ 
+-  llvm::OpenMPIRBuilder::InsertPointOrErrorTy result =
++  llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+       moduleTranslation.getOpenMPBuilder()->createTarget(
+           ompLoc, isOffloadEntry, allocaIP, builder.saveIP(), entryInfo,
+           defaultValTeams, defaultValThreads, kernelInput, genMapInfoCB, bodyCB,
+           argAccessorCB, dds, targetOp.getNowait());
+ 
+-  if (!result)
+-    return opInst.emitError(llvm::toString(result.takeError()));
++  if (failed(handleError(afterIP, opInst)))
++    return failure();
+ 
+-  builder.restoreIP(*result);
++  builder.restoreIP(*afterIP);
+ 
+   // Remap access operations to declare target reference pointers for the
+   // device, essentially generating extra loadop's as necessary
+@@ -3780,13 +3832,10 @@ convertHostOrTargetOperation(Operation *op, llvm::IRBuilderBase &builder,
+ 
+   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
+       .Case([&](omp::BarrierOp) -> LogicalResult {
+-        llvm::OpenMPIRBuilder::InsertPointOrErrorTy result =
++        llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+             ompBuilder->createBarrier(builder.saveIP(),
+                                       llvm::omp::OMPD_barrier);
+-        if (!result)
+-          return op->emitError(llvm::toString(result.takeError()));
+-
+-        return success();
++        return handleError(afterIP, *op);
+       })
+       .Case([&](omp::TaskyieldOp) {
+         ompBuilder->createTaskyield(builder.saveIP());
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+new file mode 100644
+index 0000000000000..f09c9e5785d88
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -0,0 +1,512 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file -verify-diagnostics %s
++
++llvm.func @cancel() {
++  // expected-error@below {{LLVM Translation failed for operation: omp.parallel}}
++  omp.parallel {
++    // expected-error@below {{unsupported OpenMP operation: omp.cancel}}
++    // expected-error@below {{LLVM Translation failed for operation: omp.cancel}}
++    omp.cancel cancellation_construct_type(parallel)
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @cancellation_point() {
++  // expected-error@below {{LLVM Translation failed for operation: omp.parallel}}
++  omp.parallel {
++    // expected-error@below {{unsupported OpenMP operation: omp.cancellation_point}}
++    // expected-error@below {{LLVM Translation failed for operation: omp.cancellation_point}}
++    omp.cancellation_point cancellation_construct_type(parallel)
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @distribute(%lb : i32, %ub : i32, %step : i32) {
++  // expected-error@below {{unsupported OpenMP operation: omp.distribute}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.distribute}}
++  omp.distribute {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @ordered_region_par_level_simd() {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.ordered.region}}
++  omp.ordered.region par_level_simd {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @sections_allocate(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.sections}}
++  omp.sections allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @sections_private(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.sections}}
++  omp.sections private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @simd_linear(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
++  // expected-error@below {{linear clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.simd}}
++  omp.simd linear(%x = %step : !llvm.ptr) {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @simd_private(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
++  // expected-error@below {{privatization clauses not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.simd}}
++  omp.simd private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32):
++  %0 = llvm.mlir.constant(0.0 : f32) : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = llvm.fadd %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++atomic {
++^bb2(%arg2: !llvm.ptr, %arg3: !llvm.ptr):
++  %2 = llvm.load %arg3 : !llvm.ptr -> f32
++  llvm.atomicrmw fadd %arg2, %2 monotonic : !llvm.ptr, f32
++  omp.yield
++}
++llvm.func @simd_reduction(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
++  // expected-error@below {{reduction clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.simd}}
++  omp.simd reduction(@add_f32 %x -> %prv : !llvm.ptr) {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @single_private(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.single}}
++  omp.single private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_allocate(%x : !llvm.ptr) {
++  // expected-error@below {{Allocate clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
++  omp.target allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_device(%x : i32) {
++  // expected-error@below {{Device clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
++  omp.target device(%x : i32) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_if(%x : i1) {
++  // expected-error@below {{If clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
++  omp.target if(%x) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32):
++  %0 = llvm.mlir.constant(0.0 : f32) : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = llvm.fadd %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++atomic {
++^bb2(%arg2: !llvm.ptr, %arg3: !llvm.ptr):
++  %2 = llvm.load %arg3 : !llvm.ptr -> f32
++  llvm.atomicrmw fadd %arg2, %2 monotonic : !llvm.ptr, f32
++  omp.yield
++}
++llvm.func @target_in_reduction(%x : !llvm.ptr) {
++  // expected-error@below {{In reduction clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
++  omp.target in_reduction(@add_f32 %x -> %prv : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_thread_limit(%x : i32) {
++  // expected-error@below {{Thread limit clause not yet supported}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
++  omp.target thread_limit(%x : i32) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_enter_data_depend(%x: !llvm.ptr) {
++  // expected-error@below {{`depend` is not supported yet}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target_enter_data}}
++  omp.target_enter_data depend(taskdependin -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_exit_data_depend(%x: !llvm.ptr) {
++  // expected-error@below {{`depend` is not supported yet}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target_exit_data}}
++  omp.target_exit_data depend(taskdependin -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @target_update_depend(%x: !llvm.ptr) {
++  // expected-error@below {{`depend` is not supported yet}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.target_update}}
++  omp.target_update depend(taskdependin -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @task_allocate(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32):
++  %0 = llvm.mlir.constant(0.0 : f32) : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = llvm.fadd %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++atomic {
++^bb2(%arg2: !llvm.ptr, %arg3: !llvm.ptr):
++  %2 = llvm.load %arg3 : !llvm.ptr -> f32
++  llvm.atomicrmw fadd %arg2, %2 monotonic : !llvm.ptr, f32
++  omp.yield
++}
++llvm.func @task_in_reduction(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task in_reduction(@add_f32 %x -> %prv : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @task_mergeable() {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task mergeable {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @task_priority(%x : i32) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task priority(%x : i32) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @task_private(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @task_untied() {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
++  omp.task untied {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @taskgroup_allocate(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskgroup}}
++  omp.taskgroup allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32):
++  %0 = llvm.mlir.constant(0.0 : f32) : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = llvm.fadd %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++atomic {
++^bb2(%arg2: !llvm.ptr, %arg3: !llvm.ptr):
++  %2 = llvm.load %arg3 : !llvm.ptr -> f32
++  llvm.atomicrmw fadd %arg2, %2 monotonic : !llvm.ptr, f32
++  omp.yield
++}
++llvm.func @taskgroup_task_reduction(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskgroup}}
++  omp.taskgroup task_reduction(@add_f32 %x -> %prv : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @taskloop(%lb : i32, %ub : i32, %step : i32) {
++  // expected-error@below {{unsupported OpenMP operation: omp.taskloop}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskloop}}
++  omp.taskloop {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @taskwait_depend(%x: !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskwait}}
++  omp.taskwait depend(taskdependin -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @taskwait_nowait() {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskwait}}
++  omp.taskwait nowait {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @teams_allocate(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.teams}}
++  omp.teams allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @teams_private(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.teams}}
++  omp.teams private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32):
++  %0 = llvm.mlir.constant(0.0 : f32) : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = llvm.fadd %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++atomic {
++^bb2(%arg2: !llvm.ptr, %arg3: !llvm.ptr):
++  %2 = llvm.load %arg3 : !llvm.ptr -> f32
++  llvm.atomicrmw fadd %arg2, %2 monotonic : !llvm.ptr, f32
++  omp.yield
++}
++llvm.func @teams_reduction(%x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.teams}}
++  omp.teams reduction(@add_f32 %x -> %prv : !llvm.ptr) {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
++llvm.func @wsloop_allocate(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.wsloop}}
++  omp.wsloop allocate(%x : !llvm.ptr -> %x : !llvm.ptr) {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i32) : i32
++  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++llvm.func @wsloop_private(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
++  // expected-error@below {{unhandled clauses for translation to LLVM IR}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.wsloop}}
++  omp.wsloop private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}

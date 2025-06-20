@@ -1,0 +1,170 @@
+diff --git a/flang/include/flang/Semantics/tools.h b/flang/include/flang/Semantics/tools.h
+index f25babb3c1f6d..3839bc1d2a215 100644
+--- a/flang/include/flang/Semantics/tools.h
++++ b/flang/include/flang/Semantics/tools.h
+@@ -764,19 +764,14 @@ inline bool checkForSingleVariableOnRHS(
+   return designator != nullptr;
+ }
+ 
+-/// Checks if the symbol on the LHS of the assignment statement is present in
+-/// the RHS expression.
+-inline bool checkForSymbolMatch(
+-    const Fortran::parser::AssignmentStmt &assignmentStmt) {
+-  const auto &var{std::get<Fortran::parser::Variable>(assignmentStmt.t)};
+-  const auto &expr{std::get<Fortran::parser::Expr>(assignmentStmt.t)};
+-  const auto *e{Fortran::semantics::GetExpr(expr)};
+-  const auto *v{Fortran::semantics::GetExpr(var)};
+-  auto varSyms{Fortran::evaluate::GetSymbolVector(*v)};
+-  const Fortran::semantics::Symbol &varSymbol{*varSyms.front()};
++/// Checks if the symbol on the LHS is present in the RHS expression.
++inline bool checkForSymbolMatch(const Fortran::semantics::SomeExpr *lhs,
++    const Fortran::semantics::SomeExpr *rhs) {
++  auto lhsSyms{Fortran::evaluate::GetSymbolVector(*lhs)};
++  const Fortran::semantics::Symbol &lhsSymbol{*lhsSyms.front()};
+   for (const Fortran::semantics::Symbol &symbol :
+-      Fortran::evaluate::GetSymbolVector(*e)) {
+-    if (varSymbol == symbol) {
++      Fortran::evaluate::GetSymbolVector(*rhs)) {
++    if (lhsSymbol == symbol) {
+       return true;
+     }
+   }
+diff --git a/flang/lib/Lower/OpenACC.cpp b/flang/lib/Lower/OpenACC.cpp
+index bc94e860ff10b..052d29e875444 100644
+--- a/flang/lib/Lower/OpenACC.cpp
++++ b/flang/lib/Lower/OpenACC.cpp
+@@ -654,7 +654,9 @@ void genAtomicCapture(Fortran::lower::AbstractConverter &converter,
+   mlir::Block &block = atomicCaptureOp->getRegion(0).back();
+   firOpBuilder.setInsertionPointToStart(&block);
+   if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
+-    if (Fortran::semantics::checkForSymbolMatch(stmt2)) {
++    if (Fortran::semantics::checkForSymbolMatch(
++            Fortran::semantics::GetExpr(stmt2Var),
++            Fortran::semantics::GetExpr(stmt2Expr))) {
+       // Atomic capture construct is of the form [capture-stmt, update-stmt]
+       const Fortran::semantics::SomeExpr &fromExpr =
+           *Fortran::semantics::GetExpr(stmt1Expr);
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 02c09d4eea041..5a975384bd371 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -3198,7 +3198,8 @@ static void genAtomicCapture(lower::AbstractConverter &converter,
+   mlir::Block &block = atomicCaptureOp->getRegion(0).back();
+   firOpBuilder.setInsertionPointToStart(&block);
+   if (semantics::checkForSingleVariableOnRHS(stmt1)) {
+-    if (semantics::checkForSymbolMatch(stmt2)) {
++    if (semantics::checkForSymbolMatch(semantics::GetExpr(stmt2Var),
++                                       semantics::GetExpr(stmt2Expr))) {
+       // Atomic capture construct is of the form [capture-stmt, update-stmt]
+       const semantics::SomeExpr &fromExpr = *semantics::GetExpr(stmt1Expr);
+       mlir::Type elementType = converter.genType(fromExpr);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index c6c4fdf8a8198..3f8980b226174 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2910,45 +2910,47 @@ void OmpStructureChecker::CheckAtomicCaptureConstruct(
+           .v.statement;
+   const auto &stmt1Var{std::get<parser::Variable>(stmt1.t)};
+   const auto &stmt1Expr{std::get<parser::Expr>(stmt1.t)};
++  const auto *v1 = GetExpr(context_, stmt1Var);
++  const auto *e1 = GetExpr(context_, stmt1Expr);
+ 
+   const parser::AssignmentStmt &stmt2 =
+       std::get<parser::OmpAtomicCapture::Stmt2>(atomicCaptureConstruct.t)
+           .v.statement;
+   const auto &stmt2Var{std::get<parser::Variable>(stmt2.t)};
+   const auto &stmt2Expr{std::get<parser::Expr>(stmt2.t)};
+-
+-  if (semantics::checkForSingleVariableOnRHS(stmt1)) {
+-    CheckAtomicCaptureStmt(stmt1);
+-    if (semantics::checkForSymbolMatch(stmt2)) {
+-      // ATOMIC CAPTURE construct is of the form [capture-stmt, update-stmt]
+-      CheckAtomicUpdateStmt(stmt2);
++  const auto *v2 = GetExpr(context_, stmt2Var);
++  const auto *e2 = GetExpr(context_, stmt2Expr);
++
++  if (e1 && v1 && e2 && v2) {
++    if (semantics::checkForSingleVariableOnRHS(stmt1)) {
++      CheckAtomicCaptureStmt(stmt1);
++      if (semantics::checkForSymbolMatch(v2, e2)) {
++        // ATOMIC CAPTURE construct is of the form [capture-stmt, update-stmt]
++        CheckAtomicUpdateStmt(stmt2);
++      } else {
++        // ATOMIC CAPTURE construct is of the form [capture-stmt, write-stmt]
++        CheckAtomicWriteStmt(stmt2);
++      }
++      if (!(*e1 == *v2)) {
++        context_.Say(stmt1Expr.source,
++            "Captured variable/array element/derived-type component %s expected to be assigned in the second statement of ATOMIC CAPTURE construct"_err_en_US,
++            stmt1Expr.source);
++      }
++    } else if (semantics::checkForSymbolMatch(v1, e1) &&
++        semantics::checkForSingleVariableOnRHS(stmt2)) {
++      // ATOMIC CAPTURE construct is of the form [update-stmt, capture-stmt]
++      CheckAtomicUpdateStmt(stmt1);
++      CheckAtomicCaptureStmt(stmt2);
++      // Variable updated in stmt1 should be captured in stmt2
++      if (!(*v1 == *e2)) {
++        context_.Say(stmt1Var.GetSource(),
++            "Updated variable/array element/derived-type component %s expected to be captured in the second statement of ATOMIC CAPTURE construct"_err_en_US,
++            stmt1Var.GetSource());
++      }
+     } else {
+-      // ATOMIC CAPTURE construct is of the form [capture-stmt, write-stmt]
+-      CheckAtomicWriteStmt(stmt2);
+-    }
+-    auto *v{stmt2Var.typedExpr.get()};
+-    auto *e{stmt1Expr.typedExpr.get()};
+-    if (v && e && !(v->v == e->v)) {
+       context_.Say(stmt1Expr.source,
+-          "Captured variable/array element/derived-type component %s expected to be assigned in the second statement of ATOMIC CAPTURE construct"_err_en_US,
+-          stmt1Expr.source);
+-    }
+-  } else if (semantics::checkForSymbolMatch(stmt1) &&
+-      semantics::checkForSingleVariableOnRHS(stmt2)) {
+-    // ATOMIC CAPTURE construct is of the form [update-stmt, capture-stmt]
+-    CheckAtomicUpdateStmt(stmt1);
+-    CheckAtomicCaptureStmt(stmt2);
+-    // Variable updated in stmt1 should be captured in stmt2
+-    auto *v{stmt1Var.typedExpr.get()};
+-    auto *e{stmt2Expr.typedExpr.get()};
+-    if (v && e && !(v->v == e->v)) {
+-      context_.Say(stmt1Var.GetSource(),
+-          "Updated variable/array element/derived-type component %s expected to be captured in the second statement of ATOMIC CAPTURE construct"_err_en_US,
+-          stmt1Var.GetSource());
++          "Invalid ATOMIC CAPTURE construct statements. Expected one of [update-stmt, capture-stmt], [capture-stmt, update-stmt], or [capture-stmt, write-stmt]"_err_en_US);
+     }
+-  } else {
+-    context_.Say(stmt1Expr.source,
+-        "Invalid ATOMIC CAPTURE construct statements. Expected one of [update-stmt, capture-stmt], [capture-stmt, update-stmt], or [capture-stmt, write-stmt]"_err_en_US);
+   }
+ }
+ 
+diff --git a/flang/test/Semantics/OpenMP/atomic-capture-invalid.f90 b/flang/test/Semantics/OpenMP/atomic-capture-invalid.f90
+new file mode 100644
+index 0000000000000..cb9c73cc940db
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/atomic-capture-invalid.f90
+@@ -0,0 +1,22 @@
++! REQUIRES: openmp_runtime
++
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags
++! Semantic checks on invalid atomic capture clause
++
++use omp_lib
++    logical x
++    complex y
++    !$omp atomic capture
++    !ERROR: No intrinsic or user-defined ASSIGNMENT(=) matches operand types LOGICAL(4) and COMPLEX(4)
++    x = y
++    !ERROR: Operands of + must be numeric; have COMPLEX(4) and LOGICAL(4)
++    y = y + x
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Operands of + must be numeric; have COMPLEX(4) and LOGICAL(4)
++    y = y + x
++    !ERROR: No intrinsic or user-defined ASSIGNMENT(=) matches operand types LOGICAL(4) and COMPLEX(4)
++    x = y
++    !$omp end atomic
++end

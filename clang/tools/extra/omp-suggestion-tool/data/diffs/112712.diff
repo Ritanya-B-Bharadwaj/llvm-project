@@ -1,0 +1,140 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 21b4a344dbc43..4a3c992c4ec51 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -26,6 +26,7 @@
+ #include "flang/Common/idioms.h"
+ #include "flang/Common/indirection.h"
+ #include "llvm/Frontend/OpenACC/ACC.h.inc"
++#include "llvm/Frontend/OpenMP/OMP.h"
+ #include "llvm/Frontend/OpenMP/OMPConstants.h"
+ #include <cinttypes>
+ #include <list>
+@@ -3660,6 +3661,7 @@ struct OmpLastprivateClause {
+ // OpenMP Clauses
+ struct OmpClause {
+   UNION_CLASS_BOILERPLATE(OmpClause);
++  llvm::omp::Clause Id() const;
+ 
+ #define GEN_FLANG_CLAUSE_PARSER_CLASSES
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 812551de68574..64d661256a187 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -22,26 +22,6 @@
+ #include <utility>
+ #include <variant>
+ 
+-namespace detail {
+-template <typename C>
+-llvm::omp::Clause getClauseIdForClass(C &&) {
+-  using namespace Fortran;
+-  using A = llvm::remove_cvref_t<C>; // A is referenced in OMP.inc
+-  // The code included below contains a sequence of checks like the following
+-  // for each OpenMP clause
+-  //   if constexpr (std::is_same_v<A, parser::OmpClause::AcqRel>)
+-  //     return llvm::omp::Clause::OMPC_acq_rel;
+-  //   [...]
+-#define GEN_FLANG_CLAUSE_PARSER_KIND_MAP
+-#include "llvm/Frontend/OpenMP/OMP.inc"
+-}
+-} // namespace detail
+-
+-static llvm::omp::Clause getClauseId(const Fortran::parser::OmpClause &clause) {
+-  return Fortran::common::visit(
+-      [](auto &&s) { return detail::getClauseIdForClass(s); }, clause.u);
+-}
+-
+ namespace Fortran::lower::omp {
+ using SymbolWithDesignator = std::tuple<semantics::Symbol *, MaybeExpr>;
+ 
+@@ -1253,8 +1233,7 @@ Clause makeClause(const parser::OmpClause &cls,
+                   semantics::SemanticsContext &semaCtx) {
+   return Fortran::common::visit(
+       [&](auto &&s) {
+-        return makeClause(getClauseId(cls), clause::make(s, semaCtx),
+-                          cls.source);
++        return makeClause(cls.Id(), clause::make(s, semaCtx), cls.source);
+       },
+       cls.u);
+ }
+diff --git a/flang/lib/Parser/parse-tree.cpp b/flang/lib/Parser/parse-tree.cpp
+index 7f0899aaa1429..948ad04a091a8 100644
+--- a/flang/lib/Parser/parse-tree.cpp
++++ b/flang/lib/Parser/parse-tree.cpp
+@@ -253,3 +253,21 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Name &x) {
+   return os << x.ToString();
+ }
+ } // namespace Fortran::parser
++
++template <typename C> static llvm::omp::Clause getClauseIdForClass(C &&) {
++  using namespace Fortran;
++  using A = llvm::remove_cvref_t<C>; // A is referenced in OMP.inc
++  // The code included below contains a sequence of checks like the following
++  // for each OpenMP clause
++  //   if constexpr (std::is_same_v<A, parser::OmpClause::AcqRel>)
++  //     return llvm::omp::Clause::OMPC_acq_rel;
++  //   [...]
++#define GEN_FLANG_CLAUSE_PARSER_KIND_MAP
++#include "llvm/Frontend/OpenMP/OMP.inc"
++}
++
++namespace Fortran::parser {
++llvm::omp::Clause OmpClause::Id() const {
++  return std::visit([](auto &&s) { return getClauseIdForClass(s); }, u);
++}
++} // namespace Fortran::parser
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index bdb8a7249f1a3..5c9f3c5d64e96 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2336,11 +2336,8 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
+ void OmpStructureChecker::Enter(const parser::OmpClause &x) {
+   SetContextClause(x);
+ 
+-  llvm::omp::Clause clauseId = std::visit(
+-      [this](auto &&s) { return GetClauseKindForParserClass(s); }, x.u);
+-
+   // The visitors for these clauses do their own checks.
+-  switch (clauseId) {
++  switch (x.Id()) {
+   case llvm::omp::Clause::OMPC_copyprivate:
+   case llvm::omp::Clause::OMPC_enter:
+   case llvm::omp::Clause::OMPC_lastprivate:
+@@ -3217,7 +3214,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
+   DirectivesClauseTriple dirClauseTriple;
+   SymbolSourceMap currSymbols;
+   GetSymbolsInObjectList(objectList, currSymbols);
+-  CheckDefinableObjects(currSymbols, GetClauseKindForParserClass(x));
++  CheckDefinableObjects(currSymbols, llvm::omp::Clause::OMPC_lastprivate);
+   CheckCopyingPolymorphicAllocatable(
+       currSymbols, llvm::omp::Clause::OMPC_lastprivate);
+ 
+@@ -3230,7 +3227,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
+           llvm::omp::Directive::OMPD_parallel, llvm::omp::privateReductionSet));
+ 
+   CheckPrivateSymbolsInOuterCxt(
+-      currSymbols, dirClauseTriple, GetClauseKindForParserClass(x));
++      currSymbols, dirClauseTriple, llvm::omp::Clause::OMPC_lastprivate);
+ 
+   using LastprivateModifier = parser::OmpLastprivateClause::LastprivateModifier;
+   const auto &maybeMod{std::get<std::optional<LastprivateModifier>>(x.v.t)};
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index cce9fa4e3016e..70a7779ae1fa2 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -132,13 +132,6 @@ class OmpStructureChecker
+ #define GEN_FLANG_CLAUSE_CHECK_ENTER
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+ 
+-  // Get the OpenMP Clause Kind for the corresponding Parser class
+-  template <typename A>
+-  llvm::omp::Clause GetClauseKindForParserClass(const A &) {
+-#define GEN_FLANG_CLAUSE_PARSER_KIND_MAP
+-#include "llvm/Frontend/OpenMP/OMP.inc"
+-  }
+-
+ private:
+   bool CheckAllowedClause(llvmOmpClause clause);
+   bool IsVariableListItem(const Symbol &sym);

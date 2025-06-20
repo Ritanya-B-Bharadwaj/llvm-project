@@ -1,0 +1,234 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 040065c0cbc02..76d2f164fc4bf 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -476,6 +476,7 @@ class ParseTreeDumper {
+   NODE(parser, OldParameterStmt)
+   NODE(parser, OmpIteratorSpecifier)
+   NODE(parser, OmpIteratorModifier)
++  NODE(parser, OmpAffinityClause)
+   NODE(parser, OmpAlignedClause)
+   NODE(parser, OmpAtomic)
+   NODE(parser, OmpAtomicCapture)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index f727525a759e6..c1884f6e88d1e 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3458,6 +3458,13 @@ struct OmpReductionOperator {
+ 
+ // --- Clauses
+ 
++// OMP 5.0 2.10.1 affinity([aff-modifier:] locator-list)
++//                aff-modifier: interator-modifier
++struct OmpAffinityClause {
++  TUPLE_CLASS_BOILERPLATE(OmpAffinityClause);
++  std::tuple<std::optional<OmpIteratorModifier>, OmpObjectList> t;
++};
++
+ // 2.8.1 aligned-clause -> ALIGNED (variable-name-list[ : scalar-constant])
+ struct OmpAlignedClause {
+   TUPLE_CLASS_BOILERPLATE(OmpAlignedClause);
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 8974b4211b968..ee3d74a7c631a 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -352,8 +352,15 @@ Absent make(const parser::OmpClause::Absent &inp,
+ 
+ Affinity make(const parser::OmpClause::Affinity &inp,
+               semantics::SemanticsContext &semaCtx) {
+-  // inp -> empty
+-  llvm_unreachable("Empty: affinity");
++  // inp.v -> parser::OmpAffinityClause
++  auto &t0 = std::get<std::optional<parser::OmpIteratorModifier>>(inp.v.t);
++  auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
++
++  auto &&maybeIter =
++      maybeApply([&](auto &&s) { return makeIterator(s, semaCtx); }, t0);
++
++  return Affinity{{/*Iterator=*/std::move(maybeIter),
++                   /*LocatorList=*/makeObjects(t1, semaCtx)}};
+ }
+ 
+ Align make(const parser::OmpClause::Align &inp,
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 52a077cd5a797..fc54da8babe63 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2769,7 +2769,8 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ 
+   for (const Clause &clause : clauses) {
+     mlir::Location clauseLocation = converter.genLocation(clause.source);
+-    if (!std::holds_alternative<clause::Allocate>(clause.u) &&
++    if (!std::holds_alternative<clause::Affinity>(clause.u) &&
++        !std::holds_alternative<clause::Allocate>(clause.u) &&
+         !std::holds_alternative<clause::Copyin>(clause.u) &&
+         !std::holds_alternative<clause::Copyprivate>(clause.u) &&
+         !std::holds_alternative<clause::Default>(clause.u) &&
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 4a1daed04f3e9..59a8757e58e8c 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -177,6 +177,11 @@ TYPE_PARSER(construct<OmpIteratorSpecifier>(
+ TYPE_PARSER(construct<OmpIteratorModifier>("ITERATOR" >>
+     parenthesized(nonemptyList(sourced(Parser<OmpIteratorSpecifier>{})))))
+ 
++// [5.0] 2.10.1 affinity([aff-modifier:] locator-list)
++//              aff-modifier: interator-modifier
++TYPE_PARSER(construct<OmpAffinityClause>(
++    maybe(Parser<OmpIteratorModifier>{} / ":"), Parser<OmpObjectList>{}))
++
+ // 2.15.3.1 DEFAULT (PRIVATE | FIRSTPRIVATE | SHARED | NONE)
+ TYPE_PARSER(construct<OmpDefaultClause>(
+     "PRIVATE" >> pure(OmpDefaultClause::Type::Private) ||
+@@ -415,6 +420,8 @@ TYPE_PARSER(construct<OmpLastprivateClause>(
+ TYPE_PARSER(
+     "ACQUIRE" >> construct<OmpClause>(construct<OmpClause::Acquire>()) ||
+     "ACQ_REL" >> construct<OmpClause>(construct<OmpClause::AcqRel>()) ||
++    "AFFINITY" >> construct<OmpClause>(construct<OmpClause::Affinity>(
++                      parenthesized(Parser<OmpAffinityClause>{}))) ||
+     "ALIGNED" >> construct<OmpClause>(construct<OmpClause::Aligned>(
+                      parenthesized(Parser<OmpAlignedClause>{}))) ||
+     "ALLOCATE" >> construct<OmpClause>(construct<OmpClause::Allocate>(
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 5870aba0132c8..04df988223e8f 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2129,6 +2129,10 @@ class UnparseVisitor {
+     Walk(std::get<std::optional<OmpDeviceClause::DeviceModifier>>(x.t), ":");
+     Walk(std::get<ScalarIntExpr>(x.t));
+   }
++  void Unparse(const OmpAffinityClause &x) {
++    Walk(std::get<std::optional<OmpIteratorModifier>>(x.t), ":");
++    Walk(std::get<OmpObjectList>(x.t));
++  }
+   void Unparse(const OmpAlignedClause &x) {
+     Walk(std::get<OmpObjectList>(x.t));
+     Put(",");
+diff --git a/flang/test/Lower/OpenMP/Todo/affinity-clause.f90 b/flang/test/Lower/OpenMP/Todo/affinity-clause.f90
+new file mode 100644
+index 0000000000000..3459dd219e425
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/affinity-clause.f90
+@@ -0,0 +1,10 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: Unhandled clause AFFINITY in TASK construct
++subroutine f00(x)
++  integer :: x(10)
++!$omp task affinity(x)
++  x = x + 1
++!$omp end task
++end
+diff --git a/flang/test/Parser/OpenMP/affinity-clause.f90 b/flang/test/Parser/OpenMP/affinity-clause.f90
+new file mode 100644
+index 0000000000000..804723cad7b2b
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/affinity-clause.f90
+@@ -0,0 +1,79 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=50 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=50 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x(10)
++!$omp task affinity(x)
++  x = x + 1
++!$omp end task
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TASK  AFFINITY(x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TASK
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = task
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Affinity -> OmpAffinityClause
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f01(x)
++  integer :: x(10)
++!$omp task affinity(x(1), x(3))
++  x = x + 1
++!$omp end task
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TASK  AFFINITY(x(1_4),x(3_4))
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TASK
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = task
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Affinity -> OmpAffinityClause
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | | DataRef -> Name = 'x'
++!PARSE-TREE: | | | SectionSubscript -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | | DataRef -> Name = 'x'
++!PARSE-TREE: | | | SectionSubscript -> Integer -> Expr = '3_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '3'
++
++subroutine f02(x)
++  integer :: x(10)
++!$omp task affinity(iterator(i = 1:3): x(i))
++  x = x + 1
++!$omp end task
++end
++
++!UNPARSE: SUBROUTINE f02 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TASK  AFFINITY(ITERATOR(INTEGER i = 1_4:3_4):x(i))
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TASK
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = task
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Affinity -> OmpAffinityClause
++!PARSE-TREE: | | OmpIteratorModifier -> OmpIteratorSpecifier
++!PARSE-TREE: | | | TypeDeclarationStmt
++!PARSE-TREE: | | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | | EntityDecl
++!PARSE-TREE: | | | | | Name = 'i'
++!PARSE-TREE: | | | SubscriptTriplet
++!PARSE-TREE: | | | | Scalar -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | | Scalar -> Integer -> Expr = '3_4'
++!PARSE-TREE: | | | | | LiteralConstant -> IntLiteralConstant = '3'
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | | DataRef -> Name = 'x'
++!PARSE-TREE: | | | SectionSubscript -> Integer -> Expr = 'i'
++!PARSE-TREE: | | | | Designator -> DataRef -> Name = 'i'
+diff --git a/flang/test/Semantics/OpenMP/affinity-clause.f90 b/flang/test/Semantics/OpenMP/affinity-clause.f90
+new file mode 100644
+index 0000000000000..53b2c4fc56677
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/affinity-clause.f90
+@@ -0,0 +1,9 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=45
++
++subroutine f00(x)
++  integer :: x(10)
++!ERROR: AFFINITY clause is not allowed on directive TASK in OpenMP v4.5, try -fopenmp-version=50
++!$omp task affinity(x)
++  x = x + 1
++!$omp end task
++end
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index f784c37cbe955..1834ad4d037f3 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -45,6 +45,7 @@ def OMPC_AdjustArgs : Clause<"adjust_args"> {
+ }
+ def OMPC_Affinity : Clause<"affinity"> {
+   let clangClass = "OMPAffinityClause";
++  let flangClass = "OmpAffinityClause";
+ }
+ def OMPC_Align : Clause<"align"> {
+   let clangClass = "OMPAlignClause";

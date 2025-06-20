@@ -1,0 +1,607 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index bbde77c14f36a..3a9ca5be82a5f 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2063,10 +2063,12 @@ static void genCompositeDistributeSimd(
+   // TODO: Populate entry block arguments with private variables.
+   auto distributeOp = genWrapperOp<mlir::omp::DistributeOp>(
+       converter, loc, distributeClauseOps, /*blockArgTypes=*/{});
++  distributeOp.setComposite(/*val=*/true);
+ 
+   // TODO: Populate entry block arguments with reduction and private variables.
+   auto simdOp = genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps,
+                                                 /*blockArgTypes=*/{});
++  simdOp.setComposite(/*val=*/true);
+ 
+   // Construct wrapper entry block list and associated symbols. It is important
+   // that the symbol order and the block argument order match, so that the
+@@ -2111,10 +2113,12 @@ static void genCompositeDoSimd(lower::AbstractConverter &converter,
+   // TODO: Add private variables to entry block arguments.
+   auto wsloopOp = genWrapperOp<mlir::omp::WsloopOp>(
+       converter, loc, wsloopClauseOps, wsloopReductionTypes);
++  wsloopOp.setComposite(/*val=*/true);
+ 
+   // TODO: Populate entry block arguments with reduction and private variables.
+   auto simdOp = genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps,
+                                                 /*blockArgTypes=*/{});
++  simdOp.setComposite(/*val=*/true);
+ 
+   // Construct wrapper entry block list and associated symbols. It is important
+   // that the symbol and block argument order match, so that the symbol-value
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 68f92e6952694..d63fdd88f7910 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -128,6 +128,7 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove, RecipeInterface]>
+ 
+ def ParallelOp : OpenMP_Op<"parallel", traits = [
+     AttrSizedOperandSegments, AutomaticAllocationScope,
++    DeclareOpInterfaceMethods<ComposableOpInterface>,
+     DeclareOpInterfaceMethods<LoopWrapperInterface>,
+     DeclareOpInterfaceMethods<OutlineableOpenMPOpInterface>,
+     RecursiveMemoryEffects
+@@ -356,7 +357,9 @@ def LoopNestOp : OpenMP_Op<"loop_nest", traits = [
+ //===----------------------------------------------------------------------===//
+ 
+ def WsloopOp : OpenMP_Op<"wsloop", traits = [
+-    AttrSizedOperandSegments, DeclareOpInterfaceMethods<LoopWrapperInterface>,
++    AttrSizedOperandSegments,
++    DeclareOpInterfaceMethods<ComposableOpInterface>,
++    DeclareOpInterfaceMethods<LoopWrapperInterface>,
+     RecursiveMemoryEffects, SingleBlock
+   ], clauses = [
+     OpenMP_AllocateClauseSkip<assemblyFormat = true>,
+@@ -432,7 +435,9 @@ def WsloopOp : OpenMP_Op<"wsloop", traits = [
+ //===----------------------------------------------------------------------===//
+ 
+ def SimdOp : OpenMP_Op<"simd", traits = [
+-    AttrSizedOperandSegments, DeclareOpInterfaceMethods<LoopWrapperInterface>,
++    AttrSizedOperandSegments,
++    DeclareOpInterfaceMethods<ComposableOpInterface>,
++    DeclareOpInterfaceMethods<LoopWrapperInterface>,
+     RecursiveMemoryEffects, SingleBlock
+   ], clauses = [
+     OpenMP_AlignedClause, OpenMP_IfClause, OpenMP_LinearClause,
+@@ -499,7 +504,9 @@ def YieldOp : OpenMP_Op<"yield",
+ // Distribute construct [2.9.4.1]
+ //===----------------------------------------------------------------------===//
+ def DistributeOp : OpenMP_Op<"distribute", traits = [
+-    AttrSizedOperandSegments, DeclareOpInterfaceMethods<LoopWrapperInterface>,
++    AttrSizedOperandSegments,
++    DeclareOpInterfaceMethods<ComposableOpInterface>,
++    DeclareOpInterfaceMethods<LoopWrapperInterface>,
+     RecursiveMemoryEffects, SingleBlock
+   ], clauses = [
+     OpenMP_AllocateClause, OpenMP_DistScheduleClause, OpenMP_OrderClause,
+@@ -587,8 +594,9 @@ def TaskOp : OpenMP_Op<"task", traits = [
+ 
+ def TaskloopOp : OpenMP_Op<"taskloop", traits = [
+     AttrSizedOperandSegments, AutomaticAllocationScope,
+-    DeclareOpInterfaceMethods<LoopWrapperInterface>, RecursiveMemoryEffects,
+-    SingleBlock
++    DeclareOpInterfaceMethods<ComposableOpInterface>,
++    DeclareOpInterfaceMethods<LoopWrapperInterface>,
++    RecursiveMemoryEffects, SingleBlock
+   ], clauses = [
+     OpenMP_AllocateClause, OpenMP_FinalClause, OpenMP_GrainsizeClause,
+     OpenMP_IfClause, OpenMP_InReductionClauseSkip<extraClassDeclaration = true>,
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+index 2d1de37239c82..78637f0ab8c2d 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+@@ -142,6 +142,42 @@ def LoopWrapperInterface : OpInterface<"LoopWrapperInterface"> {
+   ];
+ }
+ 
++def ComposableOpInterface : OpInterface<"ComposableOpInterface"> {
++  let description = [{
++    OpenMP operations that can represent a single leaf of a composite OpenMP
++    construct.
++  }];
++
++  let cppNamespace = "::mlir::omp";
++
++  let methods = [
++    InterfaceMethod<
++      /*description=*/[{
++        Check whether the operation is representing a leaf of a composite OpenMP
++        construct.
++      }],
++      /*retTy=*/"bool",
++      /*methodName=*/"isComposite",
++      (ins ), [{}], [{
++        return $_op->hasAttr("omp.composite");
++      }]
++    >,
++    InterfaceMethod<
++      /*description=*/[{
++        Mark the operation as part of an OpenMP composite construct.
++      }],
++      /*retTy=*/"void",
++      /*methodName=*/"setComposite",
++      (ins "bool":$val), [{}], [{
++        if (val)
++          $_op->setDiscardableAttr("omp.composite", mlir::UnitAttr::get($_op->getContext()));
++        else
++          $_op->removeDiscardableAttr("omp.composite");
++      }]
++    >
++  ];
++}
++
+ def DeclareTargetInterface : OpInterface<"DeclareTargetInterface"> {
+   let description = [{
+     OpenMP operations that support declare target have this interface.
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 11780f84697b1..4c943ebbe3144 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1546,6 +1546,9 @@ LogicalResult ParallelOp::verify() {
+     if (!isWrapper())
+       return emitOpError() << "must take a loop wrapper role if nested inside "
+                               "of 'omp.distribute'";
++    if (!isComposite())
++      return emitError()
++             << "'omp.composite' attribute missing from composite wrapper";
+ 
+     if (LoopWrapperInterface nested = getNestedWrapper()) {
+       // Check for the allowed leaf constructs that may appear in a composite
+@@ -1555,6 +1558,9 @@ LogicalResult ParallelOp::verify() {
+     } else {
+       return emitOpError() << "must not wrap an 'omp.loop_nest' directly";
+     }
++  } else if (isComposite()) {
++    return emitError()
++           << "'omp.composite' attribute present in non-composite wrapper";
+   }
+ 
+   if (getAllocateVars().size() != getAllocatorVars().size())
+@@ -1748,11 +1754,28 @@ LogicalResult WsloopOp::verify() {
+   if (!isWrapper())
+     return emitOpError() << "must be a loop wrapper";
+ 
++  auto wrapper =
++      llvm::dyn_cast_if_present<LoopWrapperInterface>((*this)->getParentOp());
++  bool isCompositeChildLeaf =
++      wrapper && wrapper.isWrapper() &&
++      (!llvm::isa<ParallelOp>(wrapper) ||
++       llvm::isa_and_present<DistributeOp>(wrapper->getParentOp()));
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
++    if (!isComposite())
++      return emitError()
++             << "'omp.composite' attribute missing from composite wrapper";
++
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after DO/FOR.
+     if (!isa<SimdOp>(nested))
+       return emitError() << "only supported nested wrapper is 'omp.simd'";
++
++  } else if (isComposite() && !isCompositeChildLeaf) {
++    return emitError()
++           << "'omp.composite' attribute present in non-composite wrapper";
++  } else if (!isComposite() && isCompositeChildLeaf) {
++    return emitError()
++           << "'omp.composite' attribute missing from composite wrapper";
+   }
+ 
+   return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
+@@ -1796,6 +1819,21 @@ LogicalResult SimdOp::verify() {
+   if (getNestedWrapper())
+     return emitOpError() << "must wrap an 'omp.loop_nest' directly";
+ 
++  auto wrapper =
++      llvm::dyn_cast_if_present<LoopWrapperInterface>((*this)->getParentOp());
++  bool isCompositeChildLeaf =
++      wrapper && wrapper.isWrapper() &&
++      (!llvm::isa<ParallelOp>(wrapper) ||
++       llvm::isa_and_present<DistributeOp>(wrapper->getParentOp()));
++
++  if (!isComposite() && isCompositeChildLeaf)
++    return emitError()
++           << "'omp.composite' attribute missing from composite wrapper";
++
++  if (isComposite() && !isCompositeChildLeaf)
++    return emitError()
++           << "'omp.composite' attribute present in non-composite wrapper";
++
+   return success();
+ }
+ 
+@@ -1825,11 +1863,17 @@ LogicalResult DistributeOp::verify() {
+     return emitOpError() << "must be a loop wrapper";
+ 
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
++    if (!isComposite())
++      return emitError()
++             << "'omp.composite' attribute missing from composite wrapper";
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after DISTRIBUTE.
+     if (!isa<ParallelOp, SimdOp>(nested))
+       return emitError() << "only supported nested wrappers are 'omp.parallel' "
+                             "and 'omp.simd'";
++  } else if (isComposite()) {
++    return emitError()
++           << "'omp.composite' attribute present in non-composite wrapper";
+   }
+ 
+   return success();
+@@ -2031,11 +2075,19 @@ LogicalResult TaskloopOp::verify() {
+     return emitOpError() << "must be a loop wrapper";
+ 
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
++    if (!isComposite())
++      return emitError()
++             << "'omp.composite' attribute missing from composite wrapper";
++
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after TASKLOOP.
+     if (!isa<SimdOp>(nested))
+       return emitError() << "only supported nested wrapper is 'omp.simd'";
++  } else if (isComposite()) {
++    return emitError()
++           << "'omp.composite' attribute present in non-composite wrapper";
+   }
++
+   return success();
+ }
+ 
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index 1d1d93f097758..c76b07ec94a59 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -34,11 +34,11 @@ func.func @invalid_nested_wrapper(%lb : index, %ub : index, %step : index) {
+           omp.yield
+         }
+         omp.terminator
+-      }
++      } {omp.composite}
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ 
+   return
+ }
+@@ -53,9 +53,9 @@ func.func @no_nested_wrapper(%lb : index, %ub : index, %step : index) {
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ 
+   return
+ }
+@@ -208,9 +208,9 @@ func.func @invalid_nested_wrapper(%lb : index, %ub : index, %step : index) {
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ }
+ 
+ // -----
+@@ -1963,9 +1963,9 @@ func.func @taskloop(%lb: i32, %ub: i32, %step: i32) {
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+   return
+ }
+ 
+@@ -2171,9 +2171,9 @@ func.func @omp_distribute_nested_wrapper(%lb: index, %ub: index, %step: index) -
+         "omp.yield"() : () -> ()
+       }
+       "omp.terminator"() : () -> ()
+-    }) : () -> ()
++    }) {omp.composite} : () -> ()
+     "omp.terminator"() : () -> ()
+-  }
++  } {omp.composite}
+ }
+ 
+ // -----
+@@ -2383,3 +2383,165 @@ func.func @masked_arg_count_mismatch(%arg0: i32, %arg1: i32) {
+     }) : (i32, i32) -> ()
+   return
+ }
++
++// -----
++func.func @omp_parallel_missing_composite(%lb: index, %ub: index, %step: index) -> () {
++  omp.distribute {
++    // expected-error@+1 {{'omp.composite' attribute missing from composite wrapper}}
++    omp.parallel {
++      omp.wsloop {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++        omp.terminator
++      } {omp.composite}
++      omp.terminator
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_parallel_invalid_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute present in non-composite wrapper}}
++  omp.parallel {
++    omp.wsloop {
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++      omp.terminator
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_wsloop_missing_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
++  omp.wsloop {
++    omp.simd {
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  }
++  return
++}
++
++// -----
++func.func @omp_wsloop_invalid_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute present in non-composite wrapper}}
++  omp.wsloop {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_wsloop_missing_composite_2(%lb: index, %ub: index, %step: index) -> () {
++  omp.distribute {
++    omp.parallel {
++      // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
++      omp.wsloop {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++        omp.terminator
++      }
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_simd_missing_composite(%lb: index, %ub: index, %step: index) -> () {
++  omp.wsloop {
++    // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
++    omp.simd {
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++      omp.terminator
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_simd_invalid_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute present in non-composite wrapper}}
++  omp.simd {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_distribute_missing_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
++  omp.distribute {
++    omp.parallel {
++      omp.wsloop {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++        omp.terminator
++      } {omp.composite}
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  }
++  return
++}
++
++// -----
++func.func @omp_distribute_invalid_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute present in non-composite wrapper}}
++  omp.distribute {
++    omp.loop_nest (%0) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
++// -----
++func.func @omp_taskloop_missing_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
++  omp.taskloop {
++    omp.simd {
++      omp.loop_nest (%i) : index = (%lb) to (%ub) step (%step)  {
++        omp.yield
++      }
++      omp.terminator
++    } {omp.composite}
++    omp.terminator
++  }
++  return
++}
++
++// -----
++func.func @omp_taskloop_invalid_composite(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{'omp.composite' attribute present in non-composite wrapper}}
++  omp.taskloop {
++    omp.loop_nest (%i) : index = (%lb) to (%ub) step (%step)  {
++      omp.yield
++    }
++    omp.terminator
++  } {omp.composite}
++  return
++}
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index d2924998f41b8..988e0096850bd 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -110,11 +110,11 @@ func.func @omp_parallel(%data_var : memref<i32>, %if_cond : i1, %num_threads : i
+           omp.yield
+         }
+         omp.terminator
+-      }
++      } {omp.composite}
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ 
+   return
+ }
+@@ -434,9 +434,9 @@ func.func @omp_wsloop(%lb : index, %ub : index, %step : index, %data_var : memre
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }) : () -> ()
++  }) {omp.composite} : () -> ()
+ 
+   return
+ }
+@@ -541,9 +541,9 @@ func.func @omp_wsloop_pretty(%lb : index, %ub : index, %step : index, %data_var
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ 
+   return
+ }
+@@ -794,9 +794,9 @@ func.func @omp_distribute(%chunk_size : i32, %data_var : memref<i32>, %arg0 : i3
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+   return
+ }
+ 
+@@ -2101,7 +2101,7 @@ func.func @omp_task(%bool_var: i1, %i64_var: i64, %i32_var: i32, %data_var: memr
+   // CHECK: omp.task allocate(%[[data_var]] : memref<i32> -> %[[data_var]] : memref<i32>)
+   omp.task allocate(%data_var : memref<i32> -> %data_var : memref<i32>)
+       // CHECK-SAME: final(%[[bool_var]]) if(%[[bool_var]])
+-      final(%bool_var) if(%bool_var) 
++      final(%bool_var) if(%bool_var)
+       // CHECK-SAME: in_reduction(@add_f32 -> %[[redn_var1]] : !llvm.ptr, byref @add_f32 -> %[[redn_var2]] : !llvm.ptr)
+       in_reduction(@add_f32 -> %0 : !llvm.ptr, byref @add_f32 -> %1 : !llvm.ptr)
+       // CHECK-SAME: priority(%[[i32_var]] : i32) untied
+@@ -2456,9 +2456,9 @@ func.func @omp_taskloop(%lb: i32, %ub: i32, %step: i32) -> () {
+         omp.yield
+       }
+       omp.terminator
+-    }
++    } {omp.composite}
+     omp.terminator
+-  }
++  } {omp.composite}
+ 
+   // CHECK: return
+   return
+@@ -2585,10 +2585,10 @@ func.func @omp_target_update_data (%if_cond : i1, %device : si32, %map1: memref<
+ // CHECK-LABEL: omp_targets_is_allocatable
+ // CHECK-SAME: (%[[ARG0:.*]]: !llvm.ptr, %[[ARG1:.*]]: !llvm.ptr)
+ func.func @omp_targets_is_allocatable(%arg0: !llvm.ptr, %arg1: !llvm.ptr) -> () {
+-  // CHECK: %[[MAP0:.*]] = omp.map.info var_ptr(%[[ARG0]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}  
++  // CHECK: %[[MAP0:.*]] = omp.map.info var_ptr(%[[ARG0]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv1 = omp.map.info var_ptr(%arg0 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
+   // CHECK: %[[MAP1:.*]] = omp.map.info var_ptr(%[[ARG1]] : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(tofrom) capture(ByRef) members(%[[MAP0]] : [0] : !llvm.ptr) -> !llvm.ptr {name = ""}
+-  %mapv2 = omp.map.info var_ptr(%arg1 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>)   map_clauses(tofrom) capture(ByRef) members(%mapv1 : [0] : !llvm.ptr) -> !llvm.ptr {name = ""}  
++  %mapv2 = omp.map.info var_ptr(%arg1 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>)   map_clauses(tofrom) capture(ByRef) members(%mapv1 : [0] : !llvm.ptr) -> !llvm.ptr {name = ""}
+   // CHECK: omp.target map_entries(%[[MAP0]] -> {{.*}}, %[[MAP1]] -> {{.*}} : !llvm.ptr, !llvm.ptr)
+   omp.target map_entries(%mapv1 -> %arg2, %mapv2 -> %arg3 : !llvm.ptr, !llvm.ptr) {
+     ^bb0(%arg2: !llvm.ptr, %arg3 : !llvm.ptr):
+@@ -2650,27 +2650,27 @@ func.func @omp_target_enter_update_exit_data_depend(%a: memref<?xi32>, %b: memre
+ // CHECK-LABEL: omp_map_with_members
+ // CHECK-SAME: (%[[ARG0:.*]]: !llvm.ptr, %[[ARG1:.*]]: !llvm.ptr, %[[ARG2:.*]]: !llvm.ptr, %[[ARG3:.*]]: !llvm.ptr, %[[ARG4:.*]]: !llvm.ptr, %[[ARG5:.*]]: !llvm.ptr)
+ func.func @omp_map_with_members(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr) -> () {
+-  // CHECK: %[[MAP0:.*]] = omp.map.info var_ptr(%[[ARG0]] : !llvm.ptr, i32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}  
++  // CHECK: %[[MAP0:.*]] = omp.map.info var_ptr(%[[ARG0]] : !llvm.ptr, i32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv1 = omp.map.info var_ptr(%arg0 : !llvm.ptr, i32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+ 
+-  // CHECK: %[[MAP1:.*]] = omp.map.info var_ptr(%[[ARG1]] : !llvm.ptr, f32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}  
++  // CHECK: %[[MAP1:.*]] = omp.map.info var_ptr(%[[ARG1]] : !llvm.ptr, f32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv2 = omp.map.info var_ptr(%arg1 : !llvm.ptr, f32) map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+-  
++
+   // CHECK: %[[MAP2:.*]] = omp.map.info var_ptr(%[[ARG2]] : !llvm.ptr, !llvm.struct<(i32, f32)>) map_clauses(to) capture(ByRef) members(%[[MAP0]], %[[MAP1]] : [0], [1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
+-  %mapv3 = omp.map.info var_ptr(%arg2 : !llvm.ptr, !llvm.struct<(i32, f32)>)   map_clauses(to) capture(ByRef) members(%mapv1, %mapv2 : [0], [1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}  
+-  
++  %mapv3 = omp.map.info var_ptr(%arg2 : !llvm.ptr, !llvm.struct<(i32, f32)>)   map_clauses(to) capture(ByRef) members(%mapv1, %mapv2 : [0], [1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
++
+   // CHECK: omp.target_enter_data map_entries(%[[MAP0]], %[[MAP1]], %[[MAP2]] : !llvm.ptr, !llvm.ptr, !llvm.ptr)
+   omp.target_enter_data map_entries(%mapv1, %mapv2, %mapv3 : !llvm.ptr, !llvm.ptr, !llvm.ptr){}
+ 
+-  // CHECK: %[[MAP3:.*]] = omp.map.info var_ptr(%[[ARG3]] : !llvm.ptr, i32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}  
++  // CHECK: %[[MAP3:.*]] = omp.map.info var_ptr(%[[ARG3]] : !llvm.ptr, i32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv4 = omp.map.info var_ptr(%arg3 : !llvm.ptr, i32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+ 
+-  // CHECK: %[[MAP4:.*]] = omp.map.info var_ptr(%[[ARG4]] : !llvm.ptr, f32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}  
++  // CHECK: %[[MAP4:.*]] = omp.map.info var_ptr(%[[ARG4]] : !llvm.ptr, f32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv5 = omp.map.info var_ptr(%arg4 : !llvm.ptr, f32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+-  
++
+   // CHECK: %[[MAP5:.*]] = omp.map.info var_ptr(%[[ARG5]] : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%[[MAP3]], %[[MAP4]] : [1,0], [1,1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
+-  %mapv6 = omp.map.info var_ptr(%arg5 : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%mapv4, %mapv5 : [1,0], [1,1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}  
+- 
++  %mapv6 = omp.map.info var_ptr(%arg5 : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%mapv4, %mapv5 : [1,0], [1,1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
++
+   // CHECK: omp.target_exit_data map_entries(%[[MAP3]], %[[MAP4]], %[[MAP5]] : !llvm.ptr, !llvm.ptr, !llvm.ptr)
+   omp.target_exit_data map_entries(%mapv4, %mapv5, %mapv6 : !llvm.ptr, !llvm.ptr, !llvm.ptr){}
+ 

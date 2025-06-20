@@ -1,0 +1,622 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index f09542e5b5df1..1f0e9ca8df6c9 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -51,6 +51,30 @@ std::string TryVersion(unsigned version) {
+   return "try -fopenmp-version=" + std::to_string(version);
+ }
+ 
++static const parser::Designator *GetDesignatorFromObj(
++    const parser::OmpObject &object) {
++  return std::get_if<parser::Designator>(&object.u);
++}
++
++static const parser::DataRef *GetDataRefFromObj(
++    const parser::OmpObject &object) {
++  if (auto *desg{GetDesignatorFromObj(object)}) {
++    return std::get_if<parser::DataRef>(&desg->u);
++  }
++  return nullptr;
++}
++
++static const parser::ArrayElement *GetArrayElementFromObj(
++    const parser::OmpObject &object) {
++  if (auto *dataRef{GetDataRefFromObj(object)}) {
++    using ElementIndirection = common::Indirection<parser::ArrayElement>;
++    if (auto *ind{std::get_if<ElementIndirection>(&dataRef->u)}) {
++      return &ind->value();
++    }
++  }
++  return nullptr;
++}
++
+ // 'OmpWorkshareBlockChecker' is used to check the validity of the assignment
+ // statements and the expressions enclosed in an OpenMP Workshare construct
+ class OmpWorkshareBlockChecker {
+@@ -222,6 +246,10 @@ bool OmpStructureChecker::CheckAllowedClause(llvmOmpClause clause) {
+   return CheckAllowed(clause);
+ }
+ 
++bool OmpStructureChecker::IsCommonBlock(const Symbol &sym) {
++  return sym.detailsIf<CommonBlockDetails>() != nullptr;
++}
++
+ bool OmpStructureChecker::IsVariableListItem(const Symbol &sym) {
+   return evaluate::IsVariable(sym) || sym.attrs().test(Attr::POINTER);
+ }
+@@ -2883,6 +2911,8 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Destroy &x) {
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_reduction);
++  auto &objects{std::get<parser::OmpObjectList>(x.v.t)};
++
+   if (OmpVerifyModifiers(x.v, llvm::omp::OMPC_reduction,
+           GetContext().clauseSource, context_)) {
+     if (CheckReductionOperators(x)) {
+@@ -2895,6 +2925,13 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+       CheckReductionModifier(*maybeModifier);
+     }
+   }
++  CheckReductionObjects(objects, llvm::omp::Clause::OMPC_reduction);
++
++  // If this is a worksharing construct then ensure the reduction variable
++  // is not private in the parallel region that it binds to.
++  if (llvm::omp::nestedReduceWorkshareAllowedSet.test(GetContext().directive)) {
++    CheckSharedBindingInOuterContext(objects);
++  }
+ }
+ 
+ bool OmpStructureChecker::CheckReductionOperators(
+@@ -2963,6 +3000,69 @@ bool OmpStructureChecker::CheckIntrinsicOperator(
+   return false;
+ }
+ 
++/// Check restrictions on objects that are common to all reduction clauses.
++void OmpStructureChecker::CheckReductionObjects(
++    const parser::OmpObjectList &objects, llvm::omp::Clause clauseId) {
++  unsigned version{context_.langOptions().OpenMPVersion};
++  SymbolSourceMap symbols;
++  GetSymbolsInObjectList(objects, symbols);
++
++  // Array sections must be a contiguous storage, have non-zero length.
++  for (const parser::OmpObject &object : objects.v) {
++    CheckIfContiguous(object);
++  }
++  CheckReductionArraySection(objects);
++  // An object must be definable.
++  CheckDefinableObjects(symbols, clauseId);
++  // Procedure pointers are not allowed.
++  CheckProcedurePointer(symbols, clauseId);
++  // Pointers must not have INTENT(IN).
++  CheckIntentInPointer(symbols, clauseId);
++
++  // Disallow common blocks.
++  // Iterate on objects because `GetSymbolsInObjectList` expands common block
++  // names into the lists of their members.
++  for (const parser::OmpObject &object : objects.v) {
++    auto *symbol{GetObjectSymbol(object)};
++    assert(symbol && "Expecting a symbol for object");
++    if (IsCommonBlock(*symbol)) {
++      auto source{GetObjectSource(object)};
++      context_.Say(source ? *source : GetContext().clauseSource,
++          "Common block names are not allowed in %s clause"_err_en_US,
++          parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++    }
++  }
++
++  if (version >= 50) {
++    // Object cannot be a part of another object (except array elements)
++    CheckStructureComponent(objects, clauseId);
++    // If object is an array section or element, the base expression must be
++    // a language identifier.
++    for (const parser::OmpObject &object : objects.v) {
++      if (auto *elem{GetArrayElementFromObj(object)}) {
++        const parser::DataRef &base = elem->base;
++        if (!std::holds_alternative<parser::Name>(base.u)) {
++          auto source{GetObjectSource(object)};
++          context_.Say(source ? *source : GetContext().clauseSource,
++              "The base expression of an array element or section in %s clause must be an identifier"_err_en_US,
++              parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++        }
++      }
++    }
++    // Type parameter inquiries are not allowed.
++    for (const parser::OmpObject &object : objects.v) {
++      if (auto *dataRef{GetDataRefFromObj(object)}) {
++        if (IsDataRefTypeParamInquiry(dataRef)) {
++          auto source{GetObjectSource(object)};
++          context_.Say(source ? *source : GetContext().clauseSource,
++              "Type parameter inquiry is not permitted in %s clause"_err_en_US,
++              parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++        }
++      }
++    }
++  }
++}
++
+ static bool IsReductionAllowedForType(
+     const parser::OmpClause::Reduction &x, const DeclTypeSpec &type) {
+   auto &modifiers{OmpGetModifiers(x.v)};
+@@ -3052,26 +3152,18 @@ static bool IsReductionAllowedForType(
+ void OmpStructureChecker::CheckReductionTypeList(
+     const parser::OmpClause::Reduction &x) {
+   const auto &ompObjectList{std::get<parser::OmpObjectList>(x.v.t)};
+-  CheckIntentInPointerAndDefinable(
+-      ompObjectList, llvm::omp::Clause::OMPC_reduction);
+-  CheckReductionArraySection(ompObjectList);
+-  // If this is a worksharing construct then ensure the reduction variable
+-  // is not private in the parallel region that it binds to.
+-  if (llvm::omp::nestedReduceWorkshareAllowedSet.test(GetContext().directive)) {
+-    CheckSharedBindingInOuterContext(ompObjectList);
+-  }
+-
+   SymbolSourceMap symbols;
+   GetSymbolsInObjectList(ompObjectList, symbols);
++
+   for (auto &[symbol, source] : symbols) {
+-    if (IsProcedurePointer(*symbol)) {
+-      context_.Say(source,
+-          "A procedure pointer '%s' must not appear in a REDUCTION clause."_err_en_US,
+-          symbol->name());
+-    } else if (!IsReductionAllowedForType(x, DEREF(symbol->GetType()))) {
+-      context_.Say(source,
+-          "The type of '%s' is incompatible with the reduction operator."_err_en_US,
+-          symbol->name());
++    if (auto *type{symbol->GetType()}) {
++      if (!IsReductionAllowedForType(x, *type)) {
++        context_.Say(source,
++            "The type of '%s' is incompatible with the reduction operator."_err_en_US,
++            symbol->name());
++      }
++    } else {
++      assert(IsProcedurePointer(*symbol) && "Unexpected symbol properties");
+     }
+   }
+ }
+@@ -3127,43 +3219,14 @@ void OmpStructureChecker::CheckReductionModifier(
+   }
+ }
+ 
+-void OmpStructureChecker::CheckIntentInPointerAndDefinable(
+-    const parser::OmpObjectList &objectList, const llvm::omp::Clause clause) {
+-  for (const auto &ompObject : objectList.v) {
+-    if (const auto *name{parser::Unwrap<parser::Name>(ompObject)}) {
+-      if (const auto *symbol{name->symbol}) {
+-        if (IsPointer(symbol->GetUltimate()) &&
+-            IsIntentIn(symbol->GetUltimate())) {
+-          context_.Say(GetContext().clauseSource,
+-              "Pointer '%s' with the INTENT(IN) attribute may not appear "
+-              "in a %s clause"_err_en_US,
+-              symbol->name(),
+-              parser::ToUpperCaseLetters(getClauseName(clause).str()));
+-        } else if (auto msg{WhyNotDefinable(name->source,
+-                       context_.FindScope(name->source), DefinabilityFlags{},
+-                       *symbol)}) {
+-          context_
+-              .Say(GetContext().clauseSource,
+-                  "Variable '%s' on the %s clause is not definable"_err_en_US,
+-                  symbol->name(),
+-                  parser::ToUpperCaseLetters(getClauseName(clause).str()))
+-              .Attach(std::move(msg->set_severity(parser::Severity::Because)));
+-        }
+-      }
+-    }
+-  }
+-}
+-
+ void OmpStructureChecker::CheckReductionArraySection(
+     const parser::OmpObjectList &ompObjectList) {
+   for (const auto &ompObject : ompObjectList.v) {
+     if (const auto *dataRef{parser::Unwrap<parser::DataRef>(ompObject)}) {
+       if (const auto *arrayElement{
+               parser::Unwrap<parser::ArrayElement>(ompObject)}) {
+-        if (arrayElement) {
+-          CheckArraySection(*arrayElement, GetLastName(*dataRef),
+-              llvm::omp::Clause::OMPC_reduction);
+-        }
++        CheckArraySection(*arrayElement, GetLastName(*dataRef),
++            llvm::omp::Clause::OMPC_reduction);
+       }
+     }
+   }
+@@ -3232,9 +3295,11 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Shared &x) {
+   CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "SHARED");
+ }
+ void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
++  SymbolSourceMap symbols;
++  GetSymbolsInObjectList(x.v, symbols);
+   CheckAllowedClause(llvm::omp::Clause::OMPC_private);
+   CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "PRIVATE");
+-  CheckIntentInPointer(x.v, llvm::omp::Clause::OMPC_private);
++  CheckIntentInPointer(symbols, llvm::omp::Clause::OMPC_private);
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Nowait &x) {
+@@ -3891,11 +3956,11 @@ void OmpStructureChecker::CheckCopyingPolymorphicAllocatable(
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Copyprivate &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_copyprivate);
+-  CheckIntentInPointer(x.v, llvm::omp::Clause::OMPC_copyprivate);
+-  SymbolSourceMap currSymbols;
+-  GetSymbolsInObjectList(x.v, currSymbols);
++  SymbolSourceMap symbols;
++  GetSymbolsInObjectList(x.v, symbols);
++  CheckIntentInPointer(symbols, llvm::omp::Clause::OMPC_copyprivate);
+   CheckCopyingPolymorphicAllocatable(
+-      currSymbols, llvm::omp::Clause::OMPC_copyprivate);
++      symbols, llvm::omp::Clause::OMPC_copyprivate);
+   if (GetContext().directive == llvm::omp::Directive::OMPD_single) {
+     context_.Say(GetContext().clauseSource,
+         "%s clause is not allowed on the OMP %s directive,"
+@@ -3945,29 +4010,28 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Copyin &x) {
+       currSymbols, llvm::omp::Clause::OMPC_copyin);
+ }
+ 
+-void OmpStructureChecker::CheckStructureElement(
+-    const parser::OmpObjectList &ompObjectList,
+-    const llvm::omp::Clause clause) {
+-  for (const auto &ompObject : ompObjectList.v) {
++void OmpStructureChecker::CheckStructureComponent(
++    const parser::OmpObjectList &objects, llvm::omp::Clause clauseId) {
++  auto CheckComponent{[&](const parser::Designator &designator) {
++    if (auto *dataRef{std::get_if<parser::DataRef>(&designator.u)}) {
++      if (!IsDataRefTypeParamInquiry(dataRef)) {
++        if (auto *comp{parser::Unwrap<parser::StructureComponent>(*dataRef)}) {
++          context_.Say(comp->component.source,
++              "A variable that is part of another variable cannot appear on the %s clause"_err_en_US,
++              parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++        }
++      }
++    }
++  }};
++
++  for (const auto &object : objects.v) {
+     common::visit(
+         common::visitors{
+-            [&](const parser::Designator &designator) {
+-              if (std::get_if<parser::DataRef>(&designator.u)) {
+-                if (parser::Unwrap<parser::StructureComponent>(ompObject)) {
+-                  context_.Say(GetContext().clauseSource,
+-                      "A variable that is part of another variable "
+-                      "(structure element) cannot appear on the %s "
+-                      "%s clause"_err_en_US,
+-                      ContextDirectiveAsFortran(),
+-                      parser::ToUpperCaseLetters(getClauseName(clause).str()));
+-                }
+-              }
+-            },
++            CheckComponent,
+             [&](const parser::Name &name) {},
+         },
+-        ompObject.u);
++        object.u);
+   }
+-  return;
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Update &x) {
+@@ -4009,7 +4073,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Update &x) {
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::UseDevicePtr &x) {
+-  CheckStructureElement(x.v, llvm::omp::Clause::OMPC_use_device_ptr);
++  CheckStructureComponent(x.v, llvm::omp::Clause::OMPC_use_device_ptr);
+   CheckAllowedClause(llvm::omp::Clause::OMPC_use_device_ptr);
+   SymbolSourceMap currSymbols;
+   GetSymbolsInObjectList(x.v, currSymbols);
+@@ -4038,7 +4102,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::UseDevicePtr &x) {
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::UseDeviceAddr &x) {
+-  CheckStructureElement(x.v, llvm::omp::Clause::OMPC_use_device_addr);
++  CheckStructureComponent(x.v, llvm::omp::Clause::OMPC_use_device_addr);
+   CheckAllowedClause(llvm::omp::Clause::OMPC_use_device_addr);
+   SymbolSourceMap currSymbols;
+   GetSymbolsInObjectList(x.v, currSymbols);
+@@ -4214,6 +4278,26 @@ llvm::StringRef OmpStructureChecker::getDirectiveName(
+   return llvm::omp::getOpenMPDirectiveName(directive);
+ }
+ 
++const Symbol *OmpStructureChecker::GetObjectSymbol(
++    const parser::OmpObject &object) {
++  if (auto *name{std::get_if<parser::Name>(&object.u)}) {
++    return &name->symbol->GetUltimate();
++  } else if (auto *desg{std::get_if<parser::Designator>(&object.u)}) {
++    return &GetLastName(*desg).symbol->GetUltimate();
++  }
++  return nullptr;
++}
++
++std::optional<parser::CharBlock> OmpStructureChecker::GetObjectSource(
++    const parser::OmpObject &object) {
++  if (auto *name{std::get_if<parser::Name>(&object.u)}) {
++    return name->source;
++  } else if (auto *desg{std::get_if<parser::Designator>(&object.u)}) {
++    return GetLastName(*desg).source;
++  }
++  return std::nullopt;
++}
++
+ void OmpStructureChecker::CheckDependList(const parser::DataRef &d) {
+   common::visit(
+       common::visitors{
+@@ -4267,15 +4351,6 @@ void OmpStructureChecker::CheckArraySection(
+                       "DEPEND "
+                       "clause"_err_en_US);
+                 }
+-                const auto stride{GetIntValue(strideExpr)};
+-                if ((stride && stride != 1)) {
+-                  context_.Say(GetContext().clauseSource,
+-                      "A list item that appears in a REDUCTION clause"
+-                      " should have a contiguous storage array "
+-                      "section."_err_en_US,
+-                      ContextDirectiveAsFortran());
+-                  break;
+-                }
+               }
+             }
+           }
+@@ -4286,14 +4361,23 @@ void OmpStructureChecker::CheckArraySection(
+ }
+ 
+ void OmpStructureChecker::CheckIntentInPointer(
+-    const parser::OmpObjectList &objectList, const llvm::omp::Clause clause) {
+-  SymbolSourceMap symbols;
+-  GetSymbolsInObjectList(objectList, symbols);
++    SymbolSourceMap &symbols, llvm::omp::Clause clauseId) {
+   for (auto &[symbol, source] : symbols) {
+     if (IsPointer(*symbol) && IsIntentIn(*symbol)) {
+       context_.Say(source,
+-          "Pointer '%s' with the INTENT(IN) attribute may not appear "
+-          "in a %s clause"_err_en_US,
++          "Pointer '%s' with the INTENT(IN) attribute may not appear in a %s clause"_err_en_US,
++          symbol->name(),
++          parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++    }
++  }
++}
++
++void OmpStructureChecker::CheckProcedurePointer(
++    SymbolSourceMap &symbols, llvm::omp::Clause clause) {
++  for (const auto &[symbol, source] : symbols) {
++    if (IsProcedurePointer(*symbol)) {
++      context_.Say(source,
++          "Procedure pointer '%s' may not appear in a %s clause"_err_en_US,
+           symbol->name(),
+           parser::ToUpperCaseLetters(getClauseName(clause).str()));
+     }
+@@ -4468,7 +4552,7 @@ void OmpStructureChecker::CheckIfContiguous(const parser::OmpObject &object) {
+     const parser::Name *name{GetObjectName(object)};
+     assert(name && "Expecting name component");
+     context_.Say(name->source,
+-        "Reference to %s must be a contiguous object"_err_en_US,
++        "Reference to '%s' must be a contiguous object"_err_en_US,
+         name->ToString());
+   }
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 1411a9271d466..89af46d9171ad 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -146,13 +146,14 @@ class OmpStructureChecker
+   bool CheckAllowedClause(llvmOmpClause clause);
+   bool IsVariableListItem(const Symbol &sym);
+   bool IsExtendedListItem(const Symbol &sym);
++  bool IsCommonBlock(const Symbol &sym);
+   std::optional<bool> IsContiguous(const parser::OmpObject &object);
+   void CheckMultipleOccurrence(semantics::UnorderedSymbolSet &listVars,
+       const std::list<parser::Name> &nameList, const parser::CharBlock &item,
+       const std::string &clauseName);
+   void CheckMultListItems();
+-  void CheckStructureElement(const parser::OmpObjectList &ompObjectList,
+-      const llvm::omp::Clause clause);
++  void CheckStructureComponent(
++      const parser::OmpObjectList &objects, llvm::omp::Clause clauseId);
+   bool HasInvalidWorksharingNesting(
+       const parser::CharBlock &, const OmpDirectiveSet &);
+   bool IsCloselyNestedRegion(const OmpDirectiveSet &set);
+@@ -171,6 +172,9 @@ class OmpStructureChecker
+       typename IterTy = decltype(std::declval<RangeTy>().begin())>
+   std::optional<IterTy> FindDuplicate(RangeTy &&);
+ 
++  const Symbol *GetObjectSymbol(const parser::OmpObject &object);
++  std::optional<parser::CharBlock> GetObjectSource(
++      const parser::OmpObject &object);
+   void CheckDependList(const parser::DataRef &);
+   void CheckDependArraySection(
+       const common::Indirection<parser::ArrayElement> &, const parser::Name &);
+@@ -182,8 +186,8 @@ class OmpStructureChecker
+       const parser::OmpObjectList &objList);
+   void CheckSymbolNames(
+       const parser::CharBlock &source, const parser::OmpObjectList &objList);
+-  void CheckIntentInPointer(
+-      const parser::OmpObjectList &, const llvm::omp::Clause);
++  void CheckIntentInPointer(SymbolSourceMap &, const llvm::omp::Clause);
++  void CheckProcedurePointer(SymbolSourceMap &, const llvm::omp::Clause);
+   void GetSymbolsInObjectList(const parser::OmpObjectList &, SymbolSourceMap &);
+   void CheckDefinableObjects(SymbolSourceMap &, const llvm::omp::Clause);
+   void CheckCopyingPolymorphicAllocatable(
+@@ -220,6 +224,8 @@ class OmpStructureChecker
+   void CheckCancellationNest(
+       const parser::CharBlock &source, const parser::OmpCancelType::Type &type);
+   std::int64_t GetOrdCollapseLevel(const parser::OpenMPLoopConstruct &x);
++  void CheckReductionObjects(
++      const parser::OmpObjectList &objects, llvm::omp::Clause clauseId);
+   bool CheckReductionOperators(const parser::OmpClause::Reduction &);
+   bool CheckIntrinsicOperator(
+       const parser::DefinedOperator::IntrinsicOperator &);
+@@ -232,8 +238,6 @@ class OmpStructureChecker
+   void ChecksOnOrderedAsStandalone();
+   void CheckOrderedDependClause(std::optional<std::int64_t> orderedValue);
+   void CheckReductionArraySection(const parser::OmpObjectList &ompObjectList);
+-  void CheckIntentInPointerAndDefinable(
+-      const parser::OmpObjectList &, const llvm::omp::Clause);
+   void CheckArraySection(const parser::ArrayElement &arrayElement,
+       const parser::Name &name, const llvm::omp::Clause clause);
+   void CheckSharedBindingInOuterContext(
+diff --git a/flang/test/Semantics/OpenMP/from-clause-v45.f90 b/flang/test/Semantics/OpenMP/from-clause-v45.f90
+index 98dff295c879d..201128fc3031c 100644
+--- a/flang/test/Semantics/OpenMP/from-clause-v45.f90
++++ b/flang/test/Semantics/OpenMP/from-clause-v45.f90
+@@ -2,7 +2,7 @@
+ 
+ subroutine f00(x)
+   integer :: x(10)
+-!ERROR: Reference to x must be a contiguous object
++!ERROR: Reference to 'x' must be a contiguous object
+   !$omp target update from(x(1:10:2))
+ end
+ 
+diff --git a/flang/test/Semantics/OpenMP/reduction04.f90 b/flang/test/Semantics/OpenMP/reduction04.f90
+index 319ed9f245abe..e86b67b6efa96 100644
+--- a/flang/test/Semantics/OpenMP/reduction04.f90
++++ b/flang/test/Semantics/OpenMP/reduction04.f90
+@@ -14,8 +14,7 @@ program omp_Reduction
+   end do
+   !$omp end parallel do
+ 
+-  !ERROR: Variable 'c' on the REDUCTION clause is not definable
+-  !BECAUSE: 'c' is not a variable
++  !ERROR: Common block names are not allowed in REDUCTION clause
+   !$omp parallel do reduction(*:/c/)
+   do i = 1, 10
+     l = k + 1
+diff --git a/flang/test/Semantics/OpenMP/reduction06.f90 b/flang/test/Semantics/OpenMP/reduction06.f90
+index 58290c61cae86..66aa9fc62c1bf 100644
+--- a/flang/test/Semantics/OpenMP/reduction06.f90
++++ b/flang/test/Semantics/OpenMP/reduction06.f90
+@@ -8,21 +8,21 @@ program omp_reduction
+   integer :: k = 10
+   integer :: a(10), b(10,10,10)
+ 
+-  !ERROR: A list item that appears in a REDUCTION clause should have a contiguous storage array section.
++  !ERROR: Reference to 'a' must be a contiguous object
+   !$omp parallel do reduction(+:a(1:10:3))
+   do i = 1, 10
+     k = k + 1
+   end do
+   !$omp end parallel do
+ 
+-  !ERROR: A list item that appears in a REDUCTION clause should have a contiguous storage array section.
++  !ERROR: Reference to 'b' must be a contiguous object
+   !$omp parallel do reduction(+:b(1:10:3,1:8:1,1:5:1))
+   do i = 1, 10
+     k = k + 1
+   end do
+   !$omp end parallel do
+ 
+-  !ERROR: A list item that appears in a REDUCTION clause should have a contiguous storage array section.
++  !ERROR: Reference to 'b' must be a contiguous object
+   !$omp parallel do reduction(+:b(1:10:1,1:8:2,1:5:1))
+   do i = 1, 10
+     k = k + 1
+diff --git a/flang/test/Semantics/OpenMP/reduction12.f90 b/flang/test/Semantics/OpenMP/reduction12.f90
+index f896ca4aa60b6..f7e3baf046562 100644
+--- a/flang/test/Semantics/OpenMP/reduction12.f90
++++ b/flang/test/Semantics/OpenMP/reduction12.f90
+@@ -6,7 +6,7 @@
+   procedure(foo), pointer :: ptr
+   integer :: i
+   ptr => foo
+-!ERROR: A procedure pointer 'ptr' must not appear in a REDUCTION clause.
++!ERROR: Procedure pointer 'ptr' may not appear in a REDUCTION clause
+ !$omp do reduction (+ : ptr)
+   do i = 1, 10
+   end do
+diff --git a/flang/test/Semantics/OpenMP/reduction15.f90 b/flang/test/Semantics/OpenMP/reduction15.f90
+new file mode 100644
+index 0000000000000..1d4de6ff702bb
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/reduction15.f90
+@@ -0,0 +1,32 @@
++!RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=50
++
++!Ref: [5.0:297:28-29]
++! If a list item is an array section or an array element, its base expression
++! must be a base language identifier.
++
++module m
++  type t
++    integer :: a(10)
++  end type
++
++contains
++
++  subroutine f00
++    type(t) :: x
++  !ERROR: The base expression of an array element or section in REDUCTION clause must be an identifier
++  !$omp do reduction (+ : x%a(2))
++    do i = 1, 10
++    end do
++  !$omp end do
++  end subroutine
++
++  subroutine f01
++    type(t) :: x
++  !ERROR: The base expression of an array element or section in REDUCTION clause must be an identifier
++  !$omp do reduction (+ : x%a(1:10))
++    do i = 1, 10
++    end do
++  !$omp end do
++  end subroutine
++end
++
+diff --git a/flang/test/Semantics/OpenMP/reduction16.f90 b/flang/test/Semantics/OpenMP/reduction16.f90
+new file mode 100644
+index 0000000000000..6bb218e306128
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/reduction16.f90
+@@ -0,0 +1,14 @@
++!RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=50
++
++!Ref: [5.0:298:19]
++! A type parameter inquiry cannot appear in a reduction clause.
++
++subroutine f00
++  integer :: x
++!ERROR: Type parameter inquiry is not permitted in REDUCTION clause
++!$omp do reduction (+ : x%kind)
++  do i = 1, 10
++  end do
++!$omp end do
++end subroutine
++
+diff --git a/flang/test/Semantics/OpenMP/to-clause-v45.f90 b/flang/test/Semantics/OpenMP/to-clause-v45.f90
+index e4d8967ca14df..9797c06cdeddf 100644
+--- a/flang/test/Semantics/OpenMP/to-clause-v45.f90
++++ b/flang/test/Semantics/OpenMP/to-clause-v45.f90
+@@ -2,7 +2,7 @@
+ 
+ subroutine f00(x)
+   integer :: x(10)
+-!ERROR: Reference to x must be a contiguous object
++!ERROR: Reference to 'x' must be a contiguous object
+   !$omp target update to(x(1:10:2))
+ end
+ 
+diff --git a/flang/test/Semantics/OpenMP/use_device_addr1.f90 b/flang/test/Semantics/OpenMP/use_device_addr1.f90
+index e6a3e6e5b2a2d..350d236e00598 100644
+--- a/flang/test/Semantics/OpenMP/use_device_addr1.f90
++++ b/flang/test/Semantics/OpenMP/use_device_addr1.f90
+@@ -15,7 +15,7 @@ subroutine omp_target_data
+    type(my_type) :: my_var
+    a = 1
+ 
+-   !ERROR: A variable that is part of another variable (structure element) cannot appear on the TARGET DATA USE_DEVICE_ADDR clause
++   !ERROR: A variable that is part of another variable cannot appear on the USE_DEVICE_ADDR clause
+    !$omp target data map(tofrom: a) use_device_addr(my_var%my_b)
+       my_var%my_b = a
+    !$omp end target data
+diff --git a/flang/test/Semantics/OpenMP/use_device_ptr1.f90 b/flang/test/Semantics/OpenMP/use_device_ptr1.f90
+index 41dbadc59ce7c..5a5437e618450 100644
+--- a/flang/test/Semantics/OpenMP/use_device_ptr1.f90
++++ b/flang/test/Semantics/OpenMP/use_device_ptr1.f90
+@@ -20,7 +20,7 @@ subroutine omp_target_data
+    type(my_type) :: my_var
+    a = 1
+ 
+-   !ERROR: A variable that is part of another variable (structure element) cannot appear on the TARGET DATA USE_DEVICE_PTR clause
++   !ERROR: A variable that is part of another variable cannot appear on the USE_DEVICE_PTR clause
+    !$omp target data map(tofrom: a, arrayB) use_device_ptr(my_var%my_cptr)
+       allocate(arrayB)
+       call c_f_pointer(my_var%my_cptr, arrayB)

@@ -1,0 +1,247 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index d289f2fdfab26..1fe095dfd4083 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -16,6 +16,7 @@
+ #include "flang/Lower/PFTBuilder.h"
+ #include "flang/Parser/tools.h"
+ #include "flang/Semantics/tools.h"
++#include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
+ 
+ namespace Fortran {
+ namespace lower {
+@@ -500,6 +501,65 @@ bool ClauseProcessor::processUntied(mlir::omp::UntiedClauseOps &result) const {
+ //===----------------------------------------------------------------------===//
+ // ClauseProcessor repeatable clauses
+ //===----------------------------------------------------------------------===//
++static llvm::StringMap<bool> getTargetFeatures(mlir::ModuleOp module) {
++  llvm::StringMap<bool> featuresMap;
++  llvm::SmallVector<llvm::StringRef> targetFeaturesVec;
++  if (mlir::LLVM::TargetFeaturesAttr features =
++          fir::getTargetFeatures(module)) {
++    llvm::ArrayRef<mlir::StringAttr> featureAttrs = features.getFeatures();
++    for (auto &featureAttr : featureAttrs) {
++      llvm::StringRef featureKeyString = featureAttr.strref();
++      featuresMap[featureKeyString.substr(1)] = (featureKeyString[0] == '+');
++    }
++  }
++  return featuresMap;
++}
++
++static void
++addAlignedClause(lower::AbstractConverter &converter,
++                 const omp::clause::Aligned &clause,
++                 llvm::SmallVectorImpl<mlir::Value> &alignedVars,
++                 llvm::SmallVectorImpl<mlir::Attribute> &alignmentAttrs) {
++  using Aligned = omp::clause::Aligned;
++  lower::StatementContext stmtCtx;
++  mlir::IntegerAttr alignmentValueAttr;
++  int64_t alignment = 0;
++  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
++
++  if (auto &alignmentValueParserExpr =
++          std::get<std::optional<Aligned::Alignment>>(clause.t)) {
++    mlir::Value operand = fir::getBase(
++        converter.genExprValue(*alignmentValueParserExpr, stmtCtx));
++    alignment = *fir::getIntIfConstant(operand);
++  } else {
++    llvm::StringMap<bool> featuresMap = getTargetFeatures(builder.getModule());
++    llvm::Triple triple = fir::getTargetTriple(builder.getModule());
++    alignment =
++        llvm::OpenMPIRBuilder::getOpenMPDefaultSimdAlign(triple, featuresMap);
++  }
++
++  // The default alignment for some targets is equal to 0.
++  // Do not generate alignment assumption if alignment is less than or equal to
++  // 0.
++  if (alignment > 0) {
++    auto &objects = std::get<omp::ObjectList>(clause.t);
++    if (!objects.empty())
++      genObjectList(objects, converter, alignedVars);
++    alignmentValueAttr = builder.getI64IntegerAttr(alignment);
++    // All the list items in a aligned clause will have same alignment
++    for (std::size_t i = 0; i < objects.size(); i++)
++      alignmentAttrs.push_back(alignmentValueAttr);
++  }
++}
++
++bool ClauseProcessor::processAligned(
++    mlir::omp::AlignedClauseOps &result) const {
++  return findRepeatableClause<omp::clause::Aligned>(
++      [&](const omp::clause::Aligned &clause, const parser::CharBlock &) {
++        addAlignedClause(converter, clause, result.alignedVars,
++                         result.alignmentAttrs);
++      });
++}
+ 
+ bool ClauseProcessor::processAllocate(
+     mlir::omp::AllocateClauseOps &result) const {
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index 28f26697c1f50..b012d2d3ffc65 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -88,6 +88,7 @@ class ClauseProcessor {
+   bool processUntied(mlir::omp::UntiedClauseOps &result) const;
+ 
+   // 'Repeatable' clauses: They can appear multiple times in the clause list.
++  bool processAligned(mlir::omp::AlignedClauseOps &result) const;
+   bool processAllocate(mlir::omp::AllocateClauseOps &result) const;
+   bool processCopyin() const;
+   bool processCopyprivate(mlir::Location currentLocation,
+@@ -138,7 +139,6 @@ class ClauseProcessor {
+   template <typename T>
+   bool processMotionClauses(lower::StatementContext &stmtCtx,
+                             mlir::omp::MapClauseOps &result);
+-
+   // Call this method for these clauses that should be supported but are not
+   // implemented yet. It triggers a compilation error if any of the given
+   // clauses is found.
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 6b391e11beb48..d4d7324ba4daf 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1058,15 +1058,15 @@ static void genSimdClauses(lower::AbstractConverter &converter,
+                            const List<Clause> &clauses, mlir::Location loc,
+                            mlir::omp::SimdClauseOps &clauseOps) {
+   ClauseProcessor cp(converter, semaCtx, clauses);
++  cp.processAligned(clauseOps);
+   cp.processIf(llvm::omp::Directive::OMPD_simd, clauseOps);
+   cp.processReduction(loc, clauseOps);
+   cp.processSafelen(clauseOps);
+   cp.processSimdlen(clauseOps);
+-  // TODO Support delayed privatization.
+ 
+-  cp.processTODO<clause::Aligned, clause::Allocate, clause::Linear,
+-                 clause::Nontemporal, clause::Order>(
+-      loc, llvm::omp::Directive::OMPD_simd);
++  // TODO Support delayed privatization.
++  cp.processTODO<clause::Allocate, clause::Linear, clause::Nontemporal,
++                 clause::Order>(loc, llvm::omp::Directive::OMPD_simd);
+ }
+ 
+ static void genSingleClauses(lower::AbstractConverter &converter,
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index 223b248b79348..e98136dd57b0a 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -182,3 +182,44 @@ subroutine simd_with_collapse_clause(n)
+   end do
+   !$OMP END SIMD
+ end subroutine
++
++
++!CHECK: func.func @_QPsimdloop_aligned_cptr(%[[ARG_A:.*]]: !fir.ref
++!CHECK-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr
++!CHECK-SAME: {__address:i64}>> {fir.bindc_name = "a"}) {
++!CHECK: %[[A_DECL:.*]]:2 = hlfir.declare %[[ARG_A]] dummy_scope %0
++!CHECK-SAME: {uniq_name = "_QFsimdloop_aligned_cptrEa"} :
++!CHECK-SAME: (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.dscope) ->
++!CHECK-SAME: (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>,
++!CHECK-SAME: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>)
++subroutine simdloop_aligned_cptr( A)
++  use iso_c_binding
++  integer :: i
++  type (c_ptr) :: A
++!CHECK: omp.simd aligned(%[[A_DECL]]#1 : !fir.ref
++!CHECK-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>
++!CHECK-SAME: -> 256 : i64)
++  !$OMP SIMD ALIGNED(A:256)
++  do i = 1, 10
++    call c_test_call(A)
++  end do
++  !$OMP END SIMD
++end subroutine
++
++!CHECK-LABEL: func @_QPsimdloop_aligned_allocatable
++subroutine simdloop_aligned_allocatable()
++  integer :: i
++  integer, allocatable :: A(:)
++  allocate(A(10))
++!CHECK: %[[A_PTR:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>> {bindc_name = "a",
++!CHECK-SAME: uniq_name = "_QFsimdloop_aligned_allocatableEa"}
++!CHECK: %[[A_DECL:.*]]:2 = hlfir.declare %[[A_PTR]] {fortran_attrs = #fir.var_attrs<allocatable>,
++!CHECK-SAME: uniq_name = "_QFsimdloop_aligned_allocatableEa"} :
++!CHECK-SAME: (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
++!CHECK-SAME: (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++!CHECK: omp.simd aligned(%[[A_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> -> 256 : i64)
++  !$OMP SIMD ALIGNED(A:256)
++  do i = 1, 10
++    A(i) = i
++  end do
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/simd_aarch64.f90 b/flang/test/Lower/OpenMP/simd_aarch64.f90
+new file mode 100644
+index 0000000000000..735237223bcb5
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/simd_aarch64.f90
+@@ -0,0 +1,16 @@
++! Tests for 2.9.3.1 Simd and target dependent defult alignment for AArch64
++! The default alignment for AARCH64 is 0 so we do not emit aligned clause
++! REQUIRES: aarch64-registered-target
++! RUN: %flang_fc1 -triple aarch64-unknown-linux-gnu -emit-hlfir -fopenmp %s -o - | FileCheck  %s
++subroutine simdloop_aligned_cptr(A)
++    use iso_c_binding
++    integer :: i
++    type (c_ptr) :: A
++  !CHECK: omp.simd
++  !CHECK-NOT: aligned(
++    !$OMP SIMD ALIGNED(A)
++    do i = 1, 10
++      call c_test_call(A)
++    end do
++    !$OMP END SIMD
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/simd_x86_64.f90 b/flang/test/Lower/OpenMP/simd_x86_64.f90
+new file mode 100644
+index 0000000000000..c8cb7970c3222
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/simd_x86_64.f90
+@@ -0,0 +1,48 @@
++! Tests for 2.9.3.1 Simd and target dependent defult alignment for x86
++! REQUIRES: x86-registered-target
++! RUN: %flang_fc1 -triple x86_64-unknown-linux-gnu -emit-hlfir -fopenmp -target-cpu x86-64  %s -o - | FileCheck --check-prefixes=DEFAULT %s
++! RUN: %flang_fc1 -triple x86_64-unknown-linux-gnu -emit-hlfir -fopenmp -target-cpu x86-64 -target-feature +avx %s -o - | FileCheck --check-prefixes=AVX %s
++! RUN: %flang_fc1 -triple x86_64-unknown-linux-gnu -emit-hlfir -fopenmp -target-cpu x86-64  -target-feature +avx512f  %s -o - | FileCheck --check-prefixes=AVX512F %s
++!DEFAULT: func.func @_QPsimdloop_aligned_cptr(%[[ARG_A:.*]]: !fir.ref
++!DEFAULT-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr
++!DEFAULT-SAME: {__address:i64}>> {fir.bindc_name = "a"}) {
++!DEFAULT:  %[[A_DECL:.*]]:2 = hlfir.declare %[[ARG_A]] dummy_scope %0
++!DEFAULT-SAME:  {uniq_name = "_QFsimdloop_aligned_cptrEa"} :
++!DEFAULT-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.dscope) ->
++!DEFAULT-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>,
++!DEFAULT-SAME:  !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>)
++!AVX: func.func @_QPsimdloop_aligned_cptr(%[[ARG_A:.*]]: !fir.ref
++!AVX-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr
++!AVX-SAME: {__address:i64}>> {fir.bindc_name = "a"}) {
++!AVX:  %[[A_DECL:.*]]:2 = hlfir.declare %[[ARG_A]] dummy_scope %0
++!AVX-SAME:  {uniq_name = "_QFsimdloop_aligned_cptrEa"} :
++!AVX-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.dscope) ->
++!AVX-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>,
++!AVX-SAME:  !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>)
++!AVX512F: func.func @_QPsimdloop_aligned_cptr(%[[ARG_A:.*]]: !fir.ref
++!AVX512F-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr
++!AVX512F-SAME: {__address:i64}>> {fir.bindc_name = "a"}) {
++!AVX512F:  %[[A_DECL:.*]]:2 = hlfir.declare %[[ARG_A]] dummy_scope %0
++!AVX512F-SAME:  {uniq_name = "_QFsimdloop_aligned_cptrEa"} :
++!AVX512F-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.dscope) ->
++!AVX512F-SAME:  (!fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>,
++!AVX512F-SAME:  !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>)
++subroutine simdloop_aligned_cptr(A)
++    use iso_c_binding
++    integer :: i
++    type (c_ptr) :: A
++    !DEFAULT: omp.simd aligned(%[[A_DECL]]#1 : !fir.ref
++    !DEFAULT-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>
++    !DEFAULT-SAME: -> 128 : i64)
++    !AVX: omp.simd aligned(%[[A_DECL]]#1 : !fir.ref
++    !AVX-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>
++    !AVX-SAME: -> 256 : i64)
++    !AVX512F: omp.simd aligned(%[[A_DECL]]#1 : !fir.ref
++    !AVX512F-SAME: <!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>
++    !AVX512F-SAME: -> 512 : i64)
++    !$OMP SIMD ALIGNED(A)
++    do i = 1, 10
++        call c_test_call(A)
++    end do
++    !$OMP END SIMD
++end subroutine

@@ -1,0 +1,217 @@
+diff --git a/clang/test/Tooling/clang-linker-wrapper-spirv-elf.cpp b/clang/test/Tooling/clang-linker-wrapper-spirv-elf.cpp
+new file mode 100644
+index 0000000000000..4f8658064e857
+--- /dev/null
++++ b/clang/test/Tooling/clang-linker-wrapper-spirv-elf.cpp
+@@ -0,0 +1,18 @@
++// Verify the ELF packaging of OpenMP SPIR-V device images.
++// REQUIRES: system-linux
++// REQUIRES: spirv-tools
++// RUN: mkdir -p %t_tmp
++// RUN: cd %t_tmp
++// RUN: %clangxx -fopenmp -fopenmp-targets=spirv64-intel -nogpulib -c -o %t_clang-linker-wrapper-spirv-elf.o %s
++// RUN: not clang-linker-wrapper -o a.out %t_clang-linker-wrapper-spirv-elf.o --save-temps --linker-path=ld
++// RUN: clang-offload-packager --image=triple=spirv64-intel,kind=openmp,file=%t.elf  %t_tmp/a.out.openmp.image.wrapper.o
++// RUN: llvm-readelf -t %t.elf | FileCheck -check-prefix=CHECK-SECTION %s
++// RUN: llvm-readelf -n %t.elf | FileCheck -check-prefix=CHECK-NOTES %s
++
++// CHECK-SECTION: .note.inteloneompoffload
++// CHECK-SECTION: __openmp_offload_spirv_0
++
++// CHECK-NOTES-COUNT-3: INTELONEOMPOFFLOAD
++int main(int argc, char** argv) {
++  return 0;
++}
+diff --git a/clang/test/Tooling/lit.local.cfg b/clang/test/Tooling/lit.local.cfg
+index 4cd8ba72fa767..bc2a096c8f64f 100644
+--- a/clang/test/Tooling/lit.local.cfg
++++ b/clang/test/Tooling/lit.local.cfg
+@@ -1,2 +1,8 @@
+ if not config.root.clang_staticanalyzer:
+     config.unsupported = True
++
++if config.spirv_tools_tests:
++    config.available_features.add("spirv-tools")
++    config.substitutions.append(("spirv-dis", os.path.join(config.llvm_tools_dir, "spirv-dis")))
++    config.substitutions.append(("spirv-val", os.path.join(config.llvm_tools_dir, "spirv-val")))
++    config.substitutions.append(("spirv-as", os.path.join(config.llvm_tools_dir, "spirv-as")))
+diff --git a/clang/test/lit.site.cfg.py.in b/clang/test/lit.site.cfg.py.in
+index ae8b927624e23..ce10e9128a1df 100644
+--- a/clang/test/lit.site.cfg.py.in
++++ b/clang/test/lit.site.cfg.py.in
+@@ -43,6 +43,7 @@ config.llvm_external_lit = path(r"@LLVM_EXTERNAL_LIT@")
+ config.standalone_build = @CLANG_BUILT_STANDALONE@
+ config.ppc_linux_default_ieeelongdouble = @PPC_LINUX_DEFAULT_IEEELONGDOUBLE@
+ config.have_llvm_driver = @LLVM_TOOL_LLVM_DRIVER_BUILD@
++config.spirv_tools_tests = "@LLVM_INCLUDE_SPIRV_TOOLS_TESTS@"
+ config.substitutions.append(("%llvm-version-major", "@LLVM_VERSION_MAJOR@"))
+ 
+ import lit.llvm
+diff --git a/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp b/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
+index c92590581a645..f4771f14af55c 100644
+--- a/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
++++ b/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
+@@ -605,6 +605,15 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
+   }
+ }
+ 
++Error containerizeRawImage(std::unique_ptr<MemoryBuffer> &Img, OffloadKind Kind,
++                           const ArgList &Args) {
++  llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
++  if (Kind != OFK_OpenMP || !Triple.isSPIRV() ||
++      Triple.getVendor() != llvm::Triple::Intel)
++    return Error::success();
++  return offloading::intel::containerizeOpenMPSPIRVImage(Img);
++}
++
+ Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
+   const OffloadBinary &Binary = *File.getBinary();
+ 
+@@ -960,6 +969,10 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
+           return createFileError(*OutputOrErr, EC);
+       }
+ 
++      // Manually containerize offloading images not in ELF format.
++      if (Error E = containerizeRawImage(*FileOrErr, Kind, LinkerArgs))
++        return E;
++
+       std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
+       OffloadingImage TheImage{};
+       TheImage.TheImageKind =
+diff --git a/llvm/include/llvm/Frontend/Offloading/Utility.h b/llvm/include/llvm/Frontend/Offloading/Utility.h
+index 7932fd5acbe1e..600621f34b470 100644
+--- a/llvm/include/llvm/Frontend/Offloading/Utility.h
++++ b/llvm/include/llvm/Frontend/Offloading/Utility.h
+@@ -10,6 +10,7 @@
+ #define LLVM_FRONTEND_OFFLOADING_UTILITY_H
+ 
+ #include <cstdint>
++#include <memory>
+ 
+ #include "llvm/ADT/StringMap.h"
+ #include "llvm/ADT/StringRef.h"
+@@ -152,6 +153,12 @@ Error getAMDGPUMetaDataFromImage(MemoryBufferRef MemBuffer,
+                                  StringMap<AMDGPUKernelMetaData> &KernelInfoMap,
+                                  uint16_t &ELFABIVersion);
+ } // namespace amdgpu
++
++namespace intel {
++/// Containerizes an offloading binary into the ELF binary format expected by
++/// the Intel runtime offload plugin.
++Error containerizeOpenMPSPIRVImage(std::unique_ptr<MemoryBuffer> &Binary);
++} // namespace intel
+ } // namespace offloading
+ } // namespace llvm
+ 
+diff --git a/llvm/lib/Frontend/Offloading/CMakeLists.txt b/llvm/lib/Frontend/Offloading/CMakeLists.txt
+index ce445ad9cc4cb..8e1ede9c72b39 100644
+--- a/llvm/lib/Frontend/Offloading/CMakeLists.txt
++++ b/llvm/lib/Frontend/Offloading/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_llvm_component_library(LLVMFrontendOffloading
+   Core
+   BinaryFormat
+   Object
++  ObjectYAML
+   Support
+   TransformUtils
+   TargetParser
+diff --git a/llvm/lib/Frontend/Offloading/Utility.cpp b/llvm/lib/Frontend/Offloading/Utility.cpp
+index 8117a42b8a45c..1c731291e6b66 100644
+--- a/llvm/lib/Frontend/Offloading/Utility.cpp
++++ b/llvm/lib/Frontend/Offloading/Utility.cpp
+@@ -15,6 +15,8 @@
+ #include "llvm/IR/GlobalVariable.h"
+ #include "llvm/IR/Value.h"
+ #include "llvm/Object/ELFObjectFile.h"
++#include "llvm/ObjectYAML/ELFYAML.h"
++#include "llvm/ObjectYAML/yaml2obj.h"
+ #include "llvm/Support/MemoryBufferRef.h"
+ #include "llvm/Transforms/Utils/ModuleUtils.h"
+ 
+@@ -373,3 +375,86 @@ Error llvm::offloading::amdgpu::getAMDGPUMetaDataFromImage(
+   }
+   return Error::success();
+ }
++Error offloading::intel::containerizeOpenMPSPIRVImage(
++    std::unique_ptr<MemoryBuffer> &Img) {
++  constexpr char INTEL_ONEOMP_OFFLOAD_VERSION[] = "1.0";
++  constexpr int NT_INTEL_ONEOMP_OFFLOAD_VERSION = 1;
++  constexpr int NT_INTEL_ONEOMP_OFFLOAD_IMAGE_COUNT = 2;
++  constexpr int NT_INTEL_ONEOMP_OFFLOAD_IMAGE_AUX = 3;
++
++  // Start creating notes for the ELF container.
++  std::vector<ELFYAML::NoteEntry> Notes;
++  std::string Version = toHex(INTEL_ONEOMP_OFFLOAD_VERSION);
++  Notes.emplace_back(ELFYAML::NoteEntry{"INTELONEOMPOFFLOAD",
++                                        yaml::BinaryRef(Version),
++                                        NT_INTEL_ONEOMP_OFFLOAD_VERSION});
++
++  // The AuxInfo string will hold auxiliary information for the image.
++  // ELFYAML::NoteEntry structures will hold references to the
++  // string, so we have to make sure the string is valid.
++  std::string AuxInfo;
++
++  // TODO: Pass compile/link opts
++  StringRef CompileOpts = "";
++  StringRef LinkOpts = "";
++
++  unsigned ImageFmt = 1; // SPIR-V format
++
++  AuxInfo = toHex((Twine(0) + Twine('\0') + Twine(ImageFmt) + Twine('\0') +
++                   CompileOpts + Twine('\0') + LinkOpts)
++                      .str());
++  Notes.emplace_back(ELFYAML::NoteEntry{"INTELONEOMPOFFLOAD",
++                                        yaml::BinaryRef(AuxInfo),
++                                        NT_INTEL_ONEOMP_OFFLOAD_IMAGE_AUX});
++
++  std::string ImgCount = toHex(Twine(1).str()); // always one image per ELF
++  Notes.emplace_back(ELFYAML::NoteEntry{"INTELONEOMPOFFLOAD",
++                                        yaml::BinaryRef(ImgCount),
++                                        NT_INTEL_ONEOMP_OFFLOAD_IMAGE_COUNT});
++
++  std::string YamlFile;
++  llvm::raw_string_ostream YamlFileStream(YamlFile);
++
++  // Write the YAML template file.
++
++  // We use 64-bit little-endian ELF currently.
++  ELFYAML::FileHeader Header{};
++  Header.Class = ELF::ELFCLASS64;
++  Header.Data = ELF::ELFDATA2LSB;
++  Header.Type = ELF::ET_DYN;
++  // Use an existing Intel machine type as there is not one specifically for
++  // Intel GPUs.
++  Header.Machine = ELF::EM_IA_64;
++
++  // Create a section with notes.
++  ELFYAML::NoteSection Section{};
++  Section.Type = ELF::SHT_NOTE;
++  Section.AddressAlign = 0;
++  Section.Name = ".note.inteloneompoffload";
++  Section.Notes.emplace(std::move(Notes));
++
++  ELFYAML::Object Object{};
++  Object.Header = Header;
++  Object.Chunks.push_back(
++      std::make_unique<ELFYAML::NoteSection>(std::move(Section)));
++
++  // Create the section that will hold the image
++  ELFYAML::RawContentSection ImageSection{};
++  ImageSection.Type = ELF::SHT_PROGBITS;
++  ImageSection.AddressAlign = 0;
++  std::string Name = "__openmp_offload_spirv_0";
++  ImageSection.Name = Name;
++  ImageSection.Content =
++      llvm::yaml::BinaryRef(arrayRefFromStringRef(Img->getBuffer()));
++  Object.Chunks.push_back(
++      std::make_unique<ELFYAML::RawContentSection>(std::move(ImageSection)));
++  Error Err = Error::success();
++  llvm::yaml::yaml2elf(
++      Object, YamlFileStream,
++      [&Err](const Twine &Msg) { Err = createStringError(Msg); }, UINT64_MAX);
++  if (Err)
++    return Err;
++
++  Img = MemoryBuffer::getMemBufferCopy(YamlFile);
++  return Error::success();
++}

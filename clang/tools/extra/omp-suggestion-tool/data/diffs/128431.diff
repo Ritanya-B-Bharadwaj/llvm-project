@@ -1,0 +1,118 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index ef7204dcd9196..471cefbe4875d 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -3369,13 +3369,18 @@ void OmpStructureChecker::CheckReductionModifier(
+     return;
+   }
+   const DirectiveContext &dirCtx{GetContext()};
+-  if (dirCtx.directive == llvm::omp::Directive::OMPD_loop) {
++  if (dirCtx.directive == llvm::omp::Directive::OMPD_loop ||
++      dirCtx.directive == llvm::omp::Directive::OMPD_taskloop) {
+     // [5.2:257:33-34]
+     // If a reduction-modifier is specified in a reduction clause that
+     // appears on the directive, then the reduction modifier must be
+     // default.
++    // [5.2:268:16]
++    // The reduction-modifier must be default.
+     context_.Say(GetContext().clauseSource,
+-        "REDUCTION modifier on LOOP directive must be DEFAULT"_err_en_US);
++        "REDUCTION modifier on %s directive must be DEFAULT"_err_en_US,
++        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()));
++    return;
+   }
+   if (modifier.v == ReductionModifier::Value::Task) {
+     // "Task" is only allowed on worksharing or "parallel" directive.
+@@ -4274,8 +4279,30 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
+   CheckPrivateSymbolsInOuterCxt(
+       currSymbols, dirClauseTriple, llvm::omp::Clause::OMPC_lastprivate);
+ 
+-  OmpVerifyModifiers(
+-      x.v, llvm::omp::OMPC_lastprivate, GetContext().clauseSource, context_);
++  if (OmpVerifyModifiers(x.v, llvm::omp::OMPC_lastprivate,
++          GetContext().clauseSource, context_)) {
++    auto &modifiers{OmpGetModifiers(x.v)};
++    using LastprivateModifier = parser::OmpLastprivateModifier;
++    if (auto *modifier{OmpGetUniqueModifier<LastprivateModifier>(modifiers)}) {
++      CheckLastprivateModifier(*modifier);
++    }
++  }
++}
++
++// Add any restrictions related to Modifiers/Directives with
++// Lastprivate clause here:
++void OmpStructureChecker::CheckLastprivateModifier(
++    const parser::OmpLastprivateModifier &modifier) {
++  using LastprivateModifier = parser::OmpLastprivateModifier;
++  const DirectiveContext &dirCtx{GetContext()};
++  if (modifier.v == LastprivateModifier::Value::Conditional &&
++      dirCtx.directive == llvm::omp::Directive::OMPD_taskloop) {
++    // [5.2:268:17]
++    // The conditional lastprivate-modifier must not be specified.
++    context_.Say(GetContext().clauseSource,
++        "'CONDITIONAL' modifier on lastprivate clause with TASKLOOP "
++        "directive is not allowed"_err_en_US);
++  }
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Copyin &x) {
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index a9ac93a9149d4..fa74c67e51186 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -279,6 +279,7 @@ class OmpStructureChecker
+   void CheckReductionObjectTypes(const parser::OmpObjectList &objects,
+       const parser::OmpReductionIdentifier &ident);
+   void CheckReductionModifier(const parser::OmpReductionModifier &);
++  void CheckLastprivateModifier(const parser::OmpLastprivateModifier &);
+   void CheckMasterNesting(const parser::OpenMPBlockConstruct &x);
+   void ChecksOnOrderedAsBlock();
+   void CheckBarrierNesting(const parser::OpenMPSimpleStandaloneConstruct &x);
+diff --git a/flang/test/Semantics/OpenMP/test_taskloop_lastprivate_semantic_restrictions.f90 b/flang/test/Semantics/OpenMP/test_taskloop_lastprivate_semantic_restrictions.f90
+new file mode 100644
+index 0000000000000..521a9cd031fcf
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/test_taskloop_lastprivate_semantic_restrictions.f90
+@@ -0,0 +1,12 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++subroutine foo()
++  integer :: x, i
++  x = 1
++!ERROR: 'CONDITIONAL' modifier on lastprivate clause with TASKLOOP directive is not allowed
++  !$omp taskloop lastprivate(conditional: x)
++  do i = 1, 100
++    x = x + 1
++  enddo
++  !$omp end taskloop
++end
+diff --git a/flang/test/Semantics/OpenMP/test_taskloop_reduction_semantic_restrictions.f90 b/flang/test/Semantics/OpenMP/test_taskloop_reduction_semantic_restrictions.f90
+new file mode 100644
+index 0000000000000..81c1fed7a910a
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/test_taskloop_reduction_semantic_restrictions.f90
+@@ -0,0 +1,24 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++subroutine bar()
++  integer :: x, i
++  x = 1
++!ERROR: REDUCTION modifier on TASKLOOP directive must be DEFAULT
++!ERROR: List item x must appear in EXCLUSIVE or INCLUSIVE clause of an enclosed SCAN directive
++!$omp taskloop reduction(inscan, +:x)
++  do i = 1, 100
++    x = x + 1
++  enddo
++!$omp end taskloop
++end
++
++subroutine baz()
++  integer :: x, i
++  x = 1
++!ERROR: REDUCTION modifier on TASKLOOP directive must be DEFAULT
++!$omp taskloop reduction(task, +:x)
++  do i = 1, 100
++    x = x + 1
++  enddo
++!$omp end taskloop
++end

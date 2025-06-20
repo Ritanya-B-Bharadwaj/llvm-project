@@ -1,0 +1,139 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 401c4c11d8986..4529e63e603a2 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -1347,7 +1347,11 @@ def TargetOp : OpenMP_Op<"target", traits = [
+ 
+     /// Infers the kernel type (Generic, SPMD or Generic-SPMD) based on the
+     /// contents of the target region.
+-    llvm::omp::OMPTgtExecModeFlags getKernelExecFlags();
++    ///
++    /// \param capturedOp result of a still valid (no modifications made to any
++    /// nested operations) previous call to `getInnermostCapturedOmpOp()`.
++    static llvm::omp::OMPTgtExecModeFlags
++    getKernelExecFlags(Operation *capturedOp);
+   }] # clausesExtraClassDeclaration;
+ 
+   let assemblyFormat = clausesAssemblyFormat # [{
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 84b4d30076646..c72e3b22b1bfb 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1905,7 +1905,8 @@ LogicalResult TargetOp::verifyRegions() {
+     return emitError("target containing multiple 'omp.teams' nested ops");
+ 
+   // Check that host_eval values are only used in legal ways.
+-  llvm::omp::OMPTgtExecModeFlags execFlags = getKernelExecFlags();
++  llvm::omp::OMPTgtExecModeFlags execFlags =
++      getKernelExecFlags(getInnermostCapturedOmpOp());
+   for (Value hostEvalArg :
+        cast<BlockArgOpenMPOpInterface>(getOperation()).getHostEvalBlockArgs()) {
+     for (Operation *user : hostEvalArg.getUsers()) {
+@@ -2025,12 +2026,20 @@ Operation *TargetOp::getInnermostCapturedOmpOp() {
+   return capturedOp;
+ }
+ 
+-llvm::omp::OMPTgtExecModeFlags TargetOp::getKernelExecFlags() {
++llvm::omp::OMPTgtExecModeFlags
++TargetOp::getKernelExecFlags(Operation *capturedOp) {
+   using namespace llvm::omp;
+ 
++  // A non-null captured op is only valid if it resides inside of a TargetOp
++  // and is the result of calling getInnermostCapturedOmpOp() on it.
++  TargetOp targetOp =
++      capturedOp ? capturedOp->getParentOfType<TargetOp>() : nullptr;
++  assert((!capturedOp ||
++          (targetOp && targetOp.getInnermostCapturedOmpOp() == capturedOp)) &&
++         "unexpected captured op");
++
+   // Make sure this region is capturing a loop. Otherwise, it's a generic
+   // kernel.
+-  Operation *capturedOp = getInnermostCapturedOmpOp();
+   if (!isa_and_present<LoopNestOp>(capturedOp))
+     return OMP_TGT_EXEC_MODE_GENERIC;
+ 
+@@ -2054,7 +2063,7 @@ llvm::omp::OMPTgtExecModeFlags TargetOp::getKernelExecFlags() {
+     if (!isa_and_present<TeamsOp>(teamsOp))
+       return OMP_TGT_EXEC_MODE_GENERIC;
+ 
+-    if (teamsOp->getParentOp() == *this)
++    if (teamsOp->getParentOp() == targetOp.getOperation())
+       return OMP_TGT_EXEC_MODE_GENERIC_SPMD;
+   }
+ 
+@@ -2075,7 +2084,7 @@ llvm::omp::OMPTgtExecModeFlags TargetOp::getKernelExecFlags() {
+     if (!isa_and_present<TeamsOp>(teamsOp))
+       return OMP_TGT_EXEC_MODE_GENERIC;
+ 
+-    if (teamsOp->getParentOp() == *this)
++    if (teamsOp->getParentOp() == targetOp.getOperation())
+       return OMP_TGT_EXEC_MODE_SPMD;
+   }
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 3373f19a006ba..6de5492edc60b 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -4558,11 +4558,10 @@ static std::optional<int64_t> extractConstInteger(Value value) {
+ /// function for the target region, so that they can be used to initialize the
+ /// corresponding global `ConfigurationEnvironmentTy` structure.
+ static void
+-initTargetDefaultAttrs(omp::TargetOp targetOp,
++initTargetDefaultAttrs(omp::TargetOp targetOp, Operation *capturedOp,
+                        llvm::OpenMPIRBuilder::TargetKernelDefaultAttrs &attrs,
+                        bool isTargetDevice) {
+   // TODO: Handle constant 'if' clauses.
+-  Operation *capturedOp = targetOp.getInnermostCapturedOmpOp();
+ 
+   Value numThreads, numTeamsLower, numTeamsUpper, threadLimit;
+   if (!isTargetDevice) {
+@@ -4644,7 +4643,7 @@ initTargetDefaultAttrs(omp::TargetOp targetOp,
+     combinedMaxThreadsVal = maxThreadsVal;
+ 
+   // Update kernel bounds structure for the `OpenMPIRBuilder` to use.
+-  attrs.ExecFlags = targetOp.getKernelExecFlags();
++  attrs.ExecFlags = targetOp.getKernelExecFlags(capturedOp);
+   attrs.MinTeams = minTeamsVal;
+   attrs.MaxTeams.front() = maxTeamsVal;
+   attrs.MinThreads = 1;
+@@ -4660,10 +4659,9 @@ initTargetDefaultAttrs(omp::TargetOp targetOp,
+ static void
+ initTargetRuntimeAttrs(llvm::IRBuilderBase &builder,
+                        LLVM::ModuleTranslation &moduleTranslation,
+-                       omp::TargetOp targetOp,
++                       omp::TargetOp targetOp, Operation *capturedOp,
+                        llvm::OpenMPIRBuilder::TargetKernelRuntimeAttrs &attrs) {
+-  omp::LoopNestOp loopOp = castOrGetParentOfType<omp::LoopNestOp>(
+-      targetOp.getInnermostCapturedOmpOp());
++  omp::LoopNestOp loopOp = castOrGetParentOfType<omp::LoopNestOp>(capturedOp);
+   unsigned numLoops = loopOp ? loopOp.getNumLoops() : 0;
+ 
+   Value numThreads, numTeamsLower, numTeamsUpper, teamsThreadLimit;
+@@ -4690,7 +4688,8 @@ initTargetRuntimeAttrs(llvm::IRBuilderBase &builder,
+   if (numThreads)
+     attrs.MaxThreads = moduleTranslation.lookupValue(numThreads);
+ 
+-  if (targetOp.getKernelExecFlags() != llvm::omp::OMP_TGT_EXEC_MODE_GENERIC) {
++  if (targetOp.getKernelExecFlags(capturedOp) !=
++      llvm::omp::OMP_TGT_EXEC_MODE_GENERIC) {
+     llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
+     attrs.LoopTripCount = nullptr;
+ 
+@@ -4940,12 +4939,15 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   llvm::OpenMPIRBuilder::TargetKernelRuntimeAttrs runtimeAttrs;
+   llvm::OpenMPIRBuilder::TargetKernelDefaultAttrs defaultAttrs;
+-  initTargetDefaultAttrs(targetOp, defaultAttrs, isTargetDevice);
++  Operation *targetCapturedOp = targetOp.getInnermostCapturedOmpOp();
++  initTargetDefaultAttrs(targetOp, targetCapturedOp, defaultAttrs,
++                         isTargetDevice);
+ 
+   // Collect host-evaluated values needed to properly launch the kernel from the
+   // host.
+   if (!isTargetDevice)
+-    initTargetRuntimeAttrs(builder, moduleTranslation, targetOp, runtimeAttrs);
++    initTargetRuntimeAttrs(builder, moduleTranslation, targetOp,
++                           targetCapturedOp, runtimeAttrs);
+ 
+   // Pass host-evaluated values as parameters to the kernel / host fallback,
+   // except if they are constants. In any case, map the MLIR block argument to

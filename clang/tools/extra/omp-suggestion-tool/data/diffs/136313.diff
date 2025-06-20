@@ -1,0 +1,220 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 9061130202b08..ca8473c6f9674 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4242,9 +4242,8 @@ struct OmpDeviceTypeClause {
+ // OMP 5.2 15.8.3 extended-atomic, fail-clause ->
+ //    FAIL(memory-order)
+ struct OmpFailClause {
+-  WRAPPER_CLASS_BOILERPLATE(
+-      OmpFailClause, common::Indirection<OmpMemoryOrderClause>);
+-  CharBlock source;
++  using MemoryOrder = common::OmpMemoryOrderType;
++  WRAPPER_CLASS_BOILERPLATE(OmpFailClause, MemoryOrder);
+ };
+ 
+ // Ref: [4.5:107-109], [5.0:176-180], [5.1:205-210], [5.2:167-168]
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 57c2870f8d293..f1330b8d1909f 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -785,8 +785,19 @@ Exclusive make(const parser::OmpClause::Exclusive &inp,
+ 
+ Fail make(const parser::OmpClause::Fail &inp,
+           semantics::SemanticsContext &semaCtx) {
+-  // inp -> empty
+-  llvm_unreachable("Empty: fail");
++  // inp.v -> parser::OmpFalClause
++  CLAUSET_ENUM_CONVERT( //
++      convert, common::OmpMemoryOrderType, Fail::MemoryOrder,
++      // clang-format off
++      MS(Acq_Rel,  AcqRel)
++      MS(Acquire,  Acquire)
++      MS(Relaxed,  Relaxed)
++      MS(Release,  Release)
++      MS(Seq_Cst,  SeqCst)
++      // clang-format on
++  );
++
++  return Fail{/*MemoryOrder=*/convert(inp.v.v)};
+ }
+ 
+ Filter make(const parser::OmpClause::Filter &inp,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 0d20cce1b0371..e631922a354c4 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -666,6 +666,13 @@ TYPE_PARSER(construct<OmpDefaultClause>(
+         Parser<OmpDefaultClause::DataSharingAttribute>{}) ||
+     construct<OmpDefaultClause>(indirect(Parser<OmpDirectiveSpecification>{}))))
+ 
++TYPE_PARSER(construct<OmpFailClause>(
++    "ACQ_REL" >> pure(common::OmpMemoryOrderType::Acq_Rel) ||
++    "ACQUIRE" >> pure(common::OmpMemoryOrderType::Acquire) ||
++    "RELAXED" >> pure(common::OmpMemoryOrderType::Relaxed) ||
++    "RELEASE" >> pure(common::OmpMemoryOrderType::Release) ||
++    "SEQ_CST" >> pure(common::OmpMemoryOrderType::Seq_Cst)))
++
+ // 2.5 PROC_BIND (MASTER | CLOSE | PRIMARY | SPREAD)
+ TYPE_PARSER(construct<OmpProcBindClause>(
+     "CLOSE" >> pure(OmpProcBindClause::AffinityPolicy::Close) ||
+@@ -943,6 +950,8 @@ TYPE_PARSER( //
+                    parenthesized(Parser<OmpObjectList>{}))) ||
+     "EXCLUSIVE" >> construct<OmpClause>(construct<OmpClause::Exclusive>(
+                        parenthesized(Parser<OmpObjectList>{}))) ||
++    "FAIL" >> construct<OmpClause>(construct<OmpClause::Fail>(
++                  parenthesized(Parser<OmpFailClause>{}))) ||
+     "FILTER" >> construct<OmpClause>(construct<OmpClause::Filter>(
+                     parenthesized(scalarIntExpr))) ||
+     "FINAL" >> construct<OmpClause>(construct<OmpClause::Final>(
+@@ -1201,9 +1210,6 @@ TYPE_PARSER(sourced(construct<OmpLoopDirective>(first(
+ TYPE_PARSER(sourced(construct<OmpBeginLoopDirective>(
+     sourced(Parser<OmpLoopDirective>{}), Parser<OmpClauseList>{})))
+ 
+-TYPE_PARSER(sourced(construct<OmpFailClause>(
+-    parenthesized(indirect(Parser<OmpMemoryOrderClause>{})))))
+-
+ // 2.17.7 Atomic construct/2.17.8 Flush construct [OpenMP 5.0]
+ //        memory-order-clause ->
+ //                               acq_rel
+@@ -1222,7 +1228,8 @@ TYPE_PARSER(sourced(construct<OmpMemoryOrderClause>(
+ //        atomic-clause -> memory-order-clause | HINT(hint-expression)
+ TYPE_PARSER(sourced(construct<OmpAtomicClause>(
+     construct<OmpAtomicClause>(Parser<OmpMemoryOrderClause>{}) ||
+-    construct<OmpAtomicClause>("FAIL" >> Parser<OmpFailClause>{}) ||
++    construct<OmpAtomicClause>(
++        "FAIL" >> parenthesized(Parser<OmpFailClause>{})) ||
+     construct<OmpAtomicClause>(
+         "HINT" >> parenthesized(Parser<OmpHintClause>{})))))
+ 
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 35576d332a189..5ac598265ec87 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2889,22 +2889,20 @@ class UnparseVisitor {
+     Put("\n");
+     EndOpenMP();
+   }
+-  void Unparse(const OmpFailClause &x) {
+-    Word("FAIL(");
+-    Walk(x.v);
+-    Put(")");
+-  }
+-  void Unparse(const OmpHintClause &x) {
+-    Word("HINT(");
+-    Walk(x.v);
+-    Put(")");
+-  }
+   void Unparse(const OmpMemoryOrderClause &x) { Walk(x.v); }
+   void Unparse(const OmpAtomicClause &x) {
+     common::visit(common::visitors{
+                       [&](const OmpMemoryOrderClause &y) { Walk(y); },
+-                      [&](const OmpFailClause &y) { Walk(y); },
+-                      [&](const OmpHintClause &y) { Walk(y); },
++                      [&](const OmpFailClause &y) {
++                        Word("FAIL(");
++                        Walk(y.v);
++                        Put(")");
++                      },
++                      [&](const OmpHintClause &y) {
++                        Word("HINT(");
++                        Walk(y.v);
++                        Put(")");
++                      },
+                   },
+         x.u);
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index c8a905451cd03..ee7959be0322c 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -3262,6 +3262,12 @@ CHECK_SIMPLE_CLAUSE(Align, OMPC_align)
+ CHECK_SIMPLE_CLAUSE(Compare, OMPC_compare)
+ CHECK_SIMPLE_CLAUSE(OmpxAttribute, OMPC_ompx_attribute)
+ CHECK_SIMPLE_CLAUSE(Weak, OMPC_weak)
++CHECK_SIMPLE_CLAUSE(AcqRel, OMPC_acq_rel)
++CHECK_SIMPLE_CLAUSE(Acquire, OMPC_acquire)
++CHECK_SIMPLE_CLAUSE(Relaxed, OMPC_relaxed)
++CHECK_SIMPLE_CLAUSE(Release, OMPC_release)
++CHECK_SIMPLE_CLAUSE(SeqCst, OMPC_seq_cst)
++CHECK_SIMPLE_CLAUSE(Fail, OMPC_fail)
+ 
+ CHECK_REQ_SCALAR_INT_CLAUSE(NumTeams, OMPC_num_teams)
+ CHECK_REQ_SCALAR_INT_CLAUSE(NumThreads, OMPC_num_threads)
+@@ -3273,53 +3279,6 @@ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Collapse, OMPC_collapse)
+ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Safelen, OMPC_safelen)
+ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Simdlen, OMPC_simdlen)
+ 
+-void OmpStructureChecker::Enter(const parser::OmpClause::AcqRel &) {
+-  if (!isFailClause)
+-    CheckAllowedClause(llvm::omp::Clause::OMPC_acq_rel);
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpClause::Acquire &) {
+-  if (!isFailClause)
+-    CheckAllowedClause(llvm::omp::Clause::OMPC_acquire);
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpClause::Release &) {
+-  if (!isFailClause)
+-    CheckAllowedClause(llvm::omp::Clause::OMPC_release);
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpClause::Relaxed &) {
+-  if (!isFailClause)
+-    CheckAllowedClause(llvm::omp::Clause::OMPC_relaxed);
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpClause::SeqCst &) {
+-  if (!isFailClause)
+-    CheckAllowedClause(llvm::omp::Clause::OMPC_seq_cst);
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpClause::Fail &) {
+-  assert(!isFailClause && "Unexpected FAIL clause inside a FAIL clause?");
+-  isFailClause = true;
+-  CheckAllowedClause(llvm::omp::Clause::OMPC_fail);
+-}
+-
+-void OmpStructureChecker::Leave(const parser::OmpClause::Fail &) {
+-  assert(isFailClause && "Expected to be inside a FAIL clause here");
+-  isFailClause = false;
+-}
+-
+-void OmpStructureChecker::Enter(const parser::OmpFailClause &) {
+-  assert(!isFailClause && "Unexpected FAIL clause inside a FAIL clause?");
+-  isFailClause = true;
+-  CheckAllowedClause(llvm::omp::Clause::OMPC_fail);
+-}
+-
+-void OmpStructureChecker::Leave(const parser::OmpFailClause &) {
+-  assert(isFailClause && "Expected to be inside a FAIL clause here");
+-  isFailClause = false;
+-}
+-
+ // Restrictions specific to each clause are implemented apart from the
+ // generalized restrictions.
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 87130f51b85f6..5ea2039a83c3f 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -166,10 +166,6 @@ class OmpStructureChecker
+ #define GEN_FLANG_CLAUSE_CHECK_ENTER
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+ 
+-  void Leave(const parser::OmpClause::Fail &);
+-  void Enter(const parser::OmpFailClause &);
+-  void Leave(const parser::OmpFailClause &);
+-
+ private:
+   bool CheckAllowedClause(llvmOmpClause clause);
+   bool IsVariableListItem(const Symbol &sym);
+@@ -345,7 +341,6 @@ class OmpStructureChecker
+   using LoopConstruct = std::variant<const parser::DoConstruct *,
+       const parser::OpenMPLoopConstruct *>;
+   std::vector<LoopConstruct> loopStack_;
+-  bool isFailClause{false};
+ };
+ 
+ /// Find a duplicate entry in the range, and return an iterator to it.

@@ -1,0 +1,122 @@
+diff --git a/clang/include/clang/Basic/DiagnosticParseKinds.td b/clang/include/clang/Basic/DiagnosticParseKinds.td
+index c513dab810d1f..4b8449e9ee9b6 100644
+--- a/clang/include/clang/Basic/DiagnosticParseKinds.td
++++ b/clang/include/clang/Basic/DiagnosticParseKinds.td
+@@ -1657,6 +1657,10 @@ def err_omp_expected_colon : Error<"missing ':' in %0">;
+ def err_omp_missing_comma : Error< "missing ',' after %0">;
+ def err_omp_expected_context_selector
+     : Error<"expected valid context selector in %0">;
++def err_omp_unknown_clause
++    : Error<"unknown clause '%0' in %1">;
++def warn_omp_default_deprecated : Warning<"'default' clause for"
++  " 'metadirective' is deprecated; use 'otherwise' instead">, InGroup<Deprecated>;
+ def err_omp_requires_out_inout_depend_type : Error<
+   "reserved locator 'omp_all_memory' requires 'out' or 'inout' "
+   "dependency types">;
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 42e6aac681c1c..3b86847e937a2 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -2759,6 +2759,19 @@ StmtResult Parser::ParseOpenMPDeclarativeOrExecutableDirective(
+       OpenMPClauseKind CKind = Tok.isAnnotation()
+                                    ? OMPC_unknown
+                                    : getOpenMPClauseKind(PP.getSpelling(Tok));
++      // Check if the clause is unrecognized.
++      if (getLangOpts().OpenMP < 52 &&
++          (CKind == OMPC_unknown || CKind == OMPC_otherwise)) {
++        Diag(Tok, diag::err_omp_unknown_clause)
++            << PP.getSpelling(Tok) << "metadirective";
++      }
++      if (getLangOpts().OpenMP >= 52 && CKind == OMPC_unknown) {
++        Diag(Tok, diag::err_omp_unknown_clause)
++            << PP.getSpelling(Tok) << "metadirective";
++      }
++      if (CKind == OMPC_default && getLangOpts().OpenMP >= 52) {
++        Diag(Tok, diag::warn_omp_default_deprecated);
++      }
+       SourceLocation Loc = ConsumeToken();
+ 
+       // Parse '('.
+@@ -2785,6 +2798,13 @@ StmtResult Parser::ParseOpenMPDeclarativeOrExecutableDirective(
+           return Directive;
+         }
+       }
++      if (CKind == OMPC_otherwise) {
++        // Check for 'otherwise' keyword.
++        if (Tok.is(tok::identifier) &&
++            Tok.getIdentifierInfo()->getName() == "otherwise") {
++          ConsumeToken(); // Consume 'otherwise'
++        }
++      }
+       // Skip Directive for now. We will parse directive in the second iteration
+       int paren = 0;
+       while (Tok.isNot(tok::r_paren) || paren != 0) {
+diff --git a/clang/test/OpenMP/metadirective_messages.cpp b/clang/test/OpenMP/metadirective_messages.cpp
+index 7fce9fa446058..8e90bcc014b60 100644
+--- a/clang/test/OpenMP/metadirective_messages.cpp
++++ b/clang/test/OpenMP/metadirective_messages.cpp
+@@ -2,21 +2,48 @@
+ 
+ // RUN: %clang_cc1 -triple=x86_64-pc-linux-gnu -verify -fopenmp-simd -x c++ -std=c++14 -fexceptions -fcxx-exceptions %s
+ 
++// RUN: %clang_cc1 -verify=expected,omp52 -fopenmp -fopenmp-version=52 -ferror-limit 100 -o - %s -Wuninitialized
++
+ void foo() {
+-#pragma omp metadirective // expected-error {{expected expression}}
+-  ;
+-#pragma omp metadirective when() // expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-  ;
+-#pragma omp metadirective when(device{}) // expected-warning {{expected '=' after the context set name "device"; '=' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'kind' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}} expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}}
+-  ;
+-#pragma omp metadirective when(device{arch(nvptx)}) // expected-error {{missing ':' in when clause}} expected-error {{expected expression}} expected-warning {{expected '=' after the context set name "device"; '=' assumed}}
+-  ;
+-#pragma omp metadirective when(device{arch(nvptx)}: ) default() // expected-warning {{expected '=' after the context set name "device"; '=' assumed}}
+-  ;
+-#pragma omp metadirective when(device = {arch(nvptx)} : ) default(xyz) // expected-error {{expected an OpenMP directive}} expected-error {{use of undeclared identifier 'xyz'}}
+-  ;
+-#pragma omp metadirective when(device = {arch(nvptx)} : parallel default() // expected-error {{expected ',' or ')' in 'when' clause}} expected-error {{expected expression}}
+-  ;
+-#pragma omp metadirective when(device = {isa("some-unsupported-feature")} : parallel) default(single) // expected-warning {{isa trait 'some-unsupported-feature' is not known to the current target; verify the spelling or consider restricting the context selector with the 'arch' selector further}}
+-  ;
++#if _OPENMP >= 202111
++  #pragma omp metadirective // omp52-error {{expected expression}}
++    ;
++  #pragma omp metadirective when() // omp52-error {{expected valid context selector in when clause}} expected-error {{expected expression}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++    ;
++  #pragma omp metadirective when(device{}) // omp52-warning {{expected '=' after the context set name "device"; '=' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'kind' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}} expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}}
++    ;
++  #pragma omp metadirective when(device{arch(nvptx)}) // omp52-error {{missing ':' in when clause}} expected-error {{expected expression}} expected-warning {{expected '=' after the context set name "device"; '=' assumed}}
++    ;
++  #pragma omp metadirective when(device{arch(nvptx)}: ) otherwise() // omp52-warning {{expected '=' after the context set name "device"; '=' assumed}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : ) otherwise(xyz) // omp52-error {{expected an OpenMP directive}} expected-error {{use of undeclared identifier 'xyz'}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : parallel otherwise() // omp52-error {{expected ',' or ')' in 'when' clause}} expected-error {{expected expression}}
++    ;
++  #pragma omp metadirective when(device = {isa("some-unsupported-feature")} : parallel) otherwise(single) // omp52-warning {{isa trait 'some-unsupported-feature' is not known to the current target; verify the spelling or consider restricting the context selector with the 'arch' selector further}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : parallel) default() // omp52-warning {{'default' clause for 'metadirective' is deprecated; use 'otherwise' instead}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : parallel) xyz() //omp52-error {{unknown clause 'xyz' in metadirective}} 
++    ;
++#else
++  #pragma omp metadirective // expected-error {{expected expression}}
++    ;
++  #pragma omp metadirective when() // expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++    ;
++  #pragma omp metadirective when(device{}) // expected-warning {{expected '=' after the context set name "device"; '=' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'kind' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}} expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}}
++    ;
++  #pragma omp metadirective when(device{arch(nvptx)}) // expected-error {{missing ':' in when clause}} expected-error {{expected expression}} expected-warning {{expected '=' after the context set name "device"; '=' assumed}}
++    ;
++  #pragma omp metadirective when(device{arch(nvptx)}: ) default() // expected-warning {{expected '=' after the context set name "device"; '=' assumed}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : ) default(xyz) // expected-error {{expected an OpenMP directive}} expected-error {{use of undeclared identifier 'xyz'}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : parallel default() // expected-error {{expected ',' or ')' in 'when' clause}} expected-error {{expected expression}}
++    ;
++  #pragma omp metadirective when(device = {isa("some-unsupported-feature")} : parallel) default(single) // expected-warning {{isa trait 'some-unsupported-feature' is not known to the current target; verify the spelling or consider restricting the context selector with the 'arch' selector further}}
++    ;
++  #pragma omp metadirective when(device = {arch(nvptx)} : parallel) xyz() //expected-error {{unknown clause 'xyz' in metadirective}} 
++    ;
++#endif
+ }

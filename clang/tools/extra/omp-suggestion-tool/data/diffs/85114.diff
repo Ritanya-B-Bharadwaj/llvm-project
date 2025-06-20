@@ -1,0 +1,123 @@
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 215a3c9060a24..6d58013b87d29 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -487,6 +487,9 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+       const auto namePair{
+           currScope().try_emplace(name->source, Attrs{}, ProcEntityDetails{})};
+       auto &newSymbol{*namePair.first->second};
++      if (context_.intrinsics().IsIntrinsic(name->ToString())) {
++        newSymbol.attrs().set(Attr::INTRINSIC);
++      }
+       name->symbol = &newSymbol;
+     };
+     if (const auto *procD{parser::Unwrap<parser::ProcedureDesignator>(opr.u)}) {
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-rename.f90 b/flang/test/Lower/OpenMP/parallel-reduction-rename.f90
+new file mode 100644
+index 0000000000000..86db2ffbcfeba
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/parallel-reduction-rename.f90
+@@ -0,0 +1,36 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s | FileCheck %s
++
++module m1
++  intrinsic max
++end module m1
++program main
++  use m1, ren=>max
++  n=0
++  !$omp parallel reduction(ren:n)
++  print *, "par"
++  !$omp end parallel
++end program main
++
++! test that we understood that this should be a max reduction
++
++! CHECK-LABEL:   omp.reduction.declare @max_i_32 : i32 init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
++! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
++! CHECK:           omp.yield(%[[VAL_1]] : i32)
++
++! CHECK-LABEL:   } combiner {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: i32, %[[VAL_1:.*]]: i32):
++! CHECK:           %[[VAL_2:.*]] = arith.maxsi %[[VAL_0]], %[[VAL_1]] : i32
++! CHECK:           omp.yield(%[[VAL_2]] : i32)
++! CHECK:         }
++
++! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "main"} {
++! CHECK:           %[[VAL_0:.*]] = fir.alloca i32 {bindc_name = "n", uniq_name = "_QFEn"}
++! CHECK:           %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
++! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_1]]#0 : i32, !fir.ref<i32>
++! CHECK:           omp.parallel reduction(@max_i_32 %[[VAL_1]]#0 -> %[[VAL_3:.*]] : !fir.ref<i32>) {
++! ...
++! CHECK:             omp.terminator
++
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+index 9289973bae202..86fb067fc48eb 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+@@ -17,8 +17,16 @@ program reduce
+ 
+ end program
+ 
+-! TODO: the reduction is not curently lowered correctly. This test is checking
+-! that we do not crash and we still produce the same broken IR as before.
++! CHECK-LABEL:   omp.reduction.declare @min_i_32 : i32 init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 2147483647 : i32
++! CHECK:           omp.yield(%[[VAL_1]] : i32)
++
++! CHECK-LABEL:   } combiner {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: i32, %[[VAL_1:.*]]: i32):
++! CHECK:           %[[VAL_2:.*]] = arith.minsi %[[VAL_0]], %[[VAL_1]] : i32
++! CHECK:           omp.yield(%[[VAL_2]] : i32)
++! CHECK:         }
+ 
+ ! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "reduce"} {
+ ! CHECK:           %[[VAL_0:.*]] = fir.address_of(@_QFEi) : !fir.ref<i32>
+@@ -31,10 +39,11 @@ program reduce
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 0 : i32
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop  for  (%[[VAL_9:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
+-! CHECK:               fir.store %[[VAL_9]] to %[[VAL_5]]#1 : !fir.ref<i32>
+-! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+-! CHECK:               hlfir.assign %[[VAL_10]] to %[[VAL_3]]#0 : i32, !fir.ref<i32>
++! CHECK:             omp.wsloop reduction(@min_i_32 %[[VAL_3]]#0 -> %[[VAL_9:.*]] : !fir.ref<i32>)  for  (%[[VAL_10:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
++! CHECK:               fir.store %[[VAL_10]] to %[[VAL_5]]#1 : !fir.ref<i32>
++! CHECK:               %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_9]] {uniq_name = "_QFEr"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:               %[[VAL_12:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
++! CHECK:               hlfir.assign %[[VAL_12]] to %[[VAL_11]]#0 : i32, !fir.ref<i32>
+ ! CHECK:               omp.yield
+ ! CHECK:             }
+ ! CHECK:             omp.terminator
+diff --git a/flang/test/Semantics/OpenMP/reduction11.f90 b/flang/test/Semantics/OpenMP/reduction11.f90
+new file mode 100644
+index 0000000000000..3893fe70b407f
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/reduction11.f90
+@@ -0,0 +1,22 @@
++! RUN: %flang_fc1 -fopenmp -fdebug-dump-symbols -o - %s 2>&1 | FileCheck %s
++! Check intrinsic reduction symbols (in this case "max" are marked as INTRINSIC
++
++! CHECK: MainProgram scope: omp_reduction
++program omp_reduction
++  ! CHECK: i size=4 offset=0: ObjectEntity type: INTEGER(4)
++  integer i
++  ! CHECK: k size=4 offset=4: ObjectEntity type: INTEGER(4) init:10_4
++  integer :: k = 10
++  ! CHECK: m size=4 offset=8: ObjectEntity type: INTEGER(4) init:12_4
++  integer :: m = 12
++
++  ! CHECK: OtherConstruct scope
++  ! CHECK: i (OmpPrivate, OmpPreDetermined): HostAssoc
++  ! CHECK: k (OmpReduction): HostAssoc
++  ! CHECK: max, INTRINSIC: ProcEntity
++  !$omp parallel do  reduction(max:k)
++  do i=1,10
++    k = i
++  end do
++  !$omp end parallel do
++end program omp_reduction

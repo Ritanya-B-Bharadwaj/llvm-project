@@ -1,0 +1,432 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 3dac44ac63691..b1bb4c11f86dd 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1986,19 +1986,44 @@ static void genCompositeDoSimd(lower::AbstractConverter &converter,
+                                const ConstructQueue &queue,
+                                ConstructQueue::iterator item,
+                                DataSharingProcessor &dsp) {
+-  ClauseProcessor cp(converter, semaCtx, item->clauses);
+-  cp.processTODO<clause::Aligned, clause::Allocate, clause::Linear,
+-                 clause::Safelen, clause::Simdlen>(loc,
+-                                                   llvm::omp::OMPD_do_simd);
+-  // TODO: Add support for vectorization - add vectorization hints inside loop
+-  // body.
+-  // OpenMP standard does not specify the length of vector instructions.
+-  // Currently we safely assume that for !$omp do simd pragma the SIMD length
+-  // is equal to 1 (i.e. we generate standard workshare loop).
+-  // When support for vectorization is enabled, then we need to add handling of
+-  // if clause. Currently if clause can be skipped because we always assume
+-  // SIMD length = 1.
+-  genStandaloneDo(converter, symTable, semaCtx, eval, loc, queue, item, dsp);
++  lower::StatementContext stmtCtx;
++
++  // Clause processing.
++  mlir::omp::WsloopClauseOps wsloopClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> wsloopReductionSyms;
++  llvm::SmallVector<mlir::Type> wsloopReductionTypes;
++  genWsloopClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
++                   wsloopClauseOps, wsloopReductionTypes, wsloopReductionSyms);
++
++  mlir::omp::SimdClauseOps simdClauseOps;
++  genSimdClauses(converter, semaCtx, item->clauses, loc, simdClauseOps);
++
++  mlir::omp::LoopNestClauseOps loopNestClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> iv;
++  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
++                     loopNestClauseOps, iv);
++
++  // Operation creation.
++  // TODO: Add private variables to entry block arguments.
++  auto wsloopOp = genWrapperOp<mlir::omp::WsloopOp>(
++      converter, loc, wsloopClauseOps, wsloopReductionTypes);
++
++  // TODO: Populate entry block arguments with reduction and private variables.
++  auto simdOp = genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps,
++                                                /*blockArgTypes=*/{});
++
++  // Construct wrapper entry block list and associated symbols. It is important
++  // that the symbol and block argument order match, so that the symbol-value
++  // bindings created are correct.
++  // TODO: Add omp.wsloop private and omp.simd private and reduction args.
++  auto wrapperArgs = llvm::to_vector(llvm::concat<mlir::BlockArgument>(
++      wsloopOp.getRegion().getArguments(), simdOp.getRegion().getArguments()));
++
++  assert(wsloopReductionSyms.size() == wrapperArgs.size() &&
++         "Number of symbols and wrapper block arguments must match");
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
++                loopNestClauseOps, iv, wsloopReductionSyms, wrapperArgs,
++                llvm::omp::Directive::OMPD_do_simd, dsp);
+ }
+ 
+ static void genCompositeTaskloopSimd(
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-do-simd-aligned.f90 b/flang/test/Lower/OpenMP/Todo/omp-do-simd-aligned.f90
+deleted file mode 100644
+index b62c54182442a..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/omp-do-simd-aligned.f90
++++ /dev/null
+@@ -1,16 +0,0 @@
+-! This test checks lowering of OpenMP do simd aligned() pragma
+-
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-subroutine testDoSimdAligned(int_array)
+-        use iso_c_binding
+-        type(c_ptr) :: int_array
+-!CHECK: not yet implemented: Unhandled clause ALIGNED in DO SIMD construct
+-!$omp do simd aligned(int_array)
+-        do index_ = 1, 10
+-          call c_test_call(int_array)
+-        end do
+-!$omp end do simd
+-
+-end subroutine testDoSimdAligned
+-
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-do-simd-linear.f90 b/flang/test/Lower/OpenMP/Todo/omp-do-simd-linear.f90
+index a9e0446ec8c34..2f5366c2a5b36 100644
+--- a/flang/test/Lower/OpenMP/Todo/omp-do-simd-linear.f90
++++ b/flang/test/Lower/OpenMP/Todo/omp-do-simd-linear.f90
+@@ -4,7 +4,7 @@
+ ! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+ subroutine testDoSimdLinear(int_array)
+         integer :: int_array(*)
+-!CHECK: not yet implemented: Unhandled clause LINEAR in DO SIMD construct
++!CHECK: not yet implemented: Unhandled clause LINEAR in DO construct
+ !$omp do simd linear(int_array)
+         do index_ = 1, 10
+         end do
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-do-simd-safelen.f90 b/flang/test/Lower/OpenMP/Todo/omp-do-simd-safelen.f90
+deleted file mode 100644
+index 054eb52ea170a..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/omp-do-simd-safelen.f90
++++ /dev/null
+@@ -1,14 +0,0 @@
+-! This test checks lowering of OpenMP do simd safelen() pragma
+-
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-subroutine testDoSimdSafelen(int_array)
+-        integer :: int_array(*)
+-!CHECK: not yet implemented: Unhandled clause SAFELEN in DO SIMD construct
+-!$omp do simd safelen(4)
+-        do index_ = 1, 10
+-        end do
+-!$omp end do simd
+-
+-end subroutine testDoSimdSafelen
+-
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-do-simd-simdlen.f90 b/flang/test/Lower/OpenMP/Todo/omp-do-simd-simdlen.f90
+deleted file mode 100644
+index bd00b6f336c93..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/omp-do-simd-simdlen.f90
++++ /dev/null
+@@ -1,14 +0,0 @@
+-! This test checks lowering of OpenMP do simd simdlen() pragma
+-
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-subroutine testDoSimdSimdlen(int_array)
+-        integer :: int_array(*)
+-!CHECK: not yet implemented: Unhandled clause SIMDLEN in DO SIMD construct
+-!$omp do simd simdlen(4)
+-        do index_ = 1, 10
+-        end do
+-!$omp end do simd
+-
+-end subroutine testDoSimdSimdlen
+-
+diff --git a/flang/test/Lower/OpenMP/if-clause.f90 b/flang/test/Lower/OpenMP/if-clause.f90
+index 2c9a66e7bc11e..ea730b5f1d9db 100644
+--- a/flang/test/Lower/OpenMP/if-clause.f90
++++ b/flang/test/Lower/OpenMP/if-clause.f90
+@@ -30,6 +30,9 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp do simd
+   do i = 1, 10
+@@ -39,6 +42,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp do simd if(.true.)
+   do i = 1, 10
+@@ -48,6 +53,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp do simd if(simd: .true.)
+   do i = 1, 10
+@@ -122,6 +129,9 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd
+   do i = 1, 10
+@@ -133,6 +143,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd if(.true.)
+   do i = 1, 10
+@@ -144,6 +156,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd if(parallel: .true.) if(simd: .false.)
+   do i = 1, 10
+@@ -155,6 +169,9 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd if(parallel: .true.)
+   do i = 1, 10
+@@ -167,6 +184,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd if(simd: .true.)
+   do i = 1, 10
+@@ -355,6 +374,9 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd
+   do i = 1, 10
+@@ -368,6 +390,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd if(.true.)
+   do i = 1, 10
+@@ -381,6 +405,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd if(target: .true.) if(parallel: .false.) &
+   !$omp&                        if(simd: .true.)
+@@ -396,6 +422,9 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd if(target: .true.)
+   do i = 1, 10
+@@ -410,6 +439,8 @@ program main
+   ! CHECK:      omp.wsloop
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd if(parallel: .true.) if(simd: .false.)
+   do i = 1, 10
+diff --git a/flang/test/Lower/OpenMP/loop-compound.f90 b/flang/test/Lower/OpenMP/loop-compound.f90
+index 5012008b07671..383a3716a9439 100644
+--- a/flang/test/Lower/OpenMP/loop-compound.f90
++++ b/flang/test/Lower/OpenMP/loop-compound.f90
+@@ -23,6 +23,7 @@ program main
+   ! DO SIMD
+   ! ----------------------------------------------------------------------------
+   ! CHECK: omp.wsloop
++  ! CHECK-NEXT: omp.simd
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp do simd
+   do i = 1, 10
+@@ -34,6 +35,7 @@ program main
+   ! ----------------------------------------------------------------------------
+   ! CHECK: omp.parallel
+   ! CHECK: omp.wsloop
++  ! CHECK-NEXT: omp.simd
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp parallel do simd
+   do i = 1, 10
+@@ -57,6 +59,7 @@ program main
+   ! CHECK: omp.target
+   ! CHECK: omp.parallel
+   ! CHECK: omp.wsloop
++  ! CHECK-NEXT: omp.simd
+   ! CHECK-NEXT: omp.loop_nest
+   !$omp target parallel do simd
+   do i = 1, 10
+diff --git a/flang/test/Lower/OpenMP/wsloop-schedule.f90 b/flang/test/Lower/OpenMP/wsloop-schedule.f90
+new file mode 100644
+index 0000000000000..1df67474d65e3
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/wsloop-schedule.f90
+@@ -0,0 +1,37 @@
++! This test checks lowering of OpenMP DO Directive(Worksharing) with
++! simd schedule modifier.
++
++! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck %s
++
++program wsloop_dynamic
++  integer :: i
++!CHECK-LABEL: func @_QQmain()
++
++!$OMP PARALLEL
++!CHECK:  omp.parallel {
++
++!$OMP DO SCHEDULE(simd: runtime)
++!CHECK:      %[[WS_LB:.*]] = arith.constant 1 : i32
++!CHECK:      %[[WS_UB:.*]] = arith.constant 9 : i32
++!CHECK:      %[[WS_STEP:.*]] = arith.constant 1 : i32
++!CHECK:      omp.wsloop schedule(runtime, simd) nowait {
++!CHECK-NEXT:   omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
++!CHECK:          fir.store %[[I]] to %[[STORE:.*]]#1 : !fir.ref<i32>
++
++  do i=1, 9
++    print*, i
++!CHECK:          %[[RTBEGIN:.*]] = fir.call @_FortranAioBeginExternalListOutput
++!CHECK:          %[[LOAD:.*]] = fir.load %[[STORE]]#0 : !fir.ref<i32>
++!CHECK:          fir.call @_FortranAioOutputInteger32(%[[RTBEGIN]], %[[LOAD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
++!CHECK:          fir.call @_FortranAioEndIoStatement(%[[RTBEGIN]]) {{.*}}: (!fir.ref<i8>) -> i32
++  end do
++!CHECK:          omp.yield
++!CHECK:        }
++!CHECK:        omp.terminator
++!CHECK:      }
++!CHECK:      omp.terminator
++!CHECK:    }
++
++!$OMP END DO NOWAIT
++!$OMP END PARALLEL
++end
+diff --git a/flang/test/Lower/OpenMP/wsloop-simd.f90 b/flang/test/Lower/OpenMP/wsloop-simd.f90
+index 1df67474d65e3..e331f1ba15f0e 100644
+--- a/flang/test/Lower/OpenMP/wsloop-simd.f90
++++ b/flang/test/Lower/OpenMP/wsloop-simd.f90
+@@ -1,37 +1,47 @@
+-! This test checks lowering of OpenMP DO Directive(Worksharing) with
+-! simd schedule modifier.
++! This test checks lowering of OpenMP DO SIMD composite constructs.
+ 
+ ! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck %s
++! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - | FileCheck %s
+ 
+-program wsloop_dynamic
+-  integer :: i
+-!CHECK-LABEL: func @_QQmain()
++! CHECK-LABEL: func.func @_QPdo_simd_aligned(
++subroutine do_simd_aligned(A)
++  use iso_c_binding
++  type(c_ptr) :: A
++  
++  ! CHECK:      omp.wsloop
++  ! CHECK-NOT:  aligned({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: aligned({{.*}})
++  !$omp do simd aligned(A)
++    do index_ = 1, 10
++      call c_test_call(A)
++    end do
++  !$omp end do simd
++end subroutine do_simd_aligned
+ 
+-!$OMP PARALLEL
+-!CHECK:  omp.parallel {
++! CHECK-LABEL: func.func @_QPdo_simd_safelen(
++subroutine do_simd_safelen()
++  ! CHECK:      omp.wsloop
++  ! CHECK-NOT:  safelen({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: safelen({{.*}})
++  !$omp do simd safelen(4)
++    do index_ = 1, 10
++    end do
++  !$omp end do simd
++end subroutine do_simd_safelen
+ 
+-!$OMP DO SCHEDULE(simd: runtime)
+-!CHECK:      %[[WS_LB:.*]] = arith.constant 1 : i32
+-!CHECK:      %[[WS_UB:.*]] = arith.constant 9 : i32
+-!CHECK:      %[[WS_STEP:.*]] = arith.constant 1 : i32
+-!CHECK:      omp.wsloop schedule(runtime, simd) nowait {
+-!CHECK-NEXT:   omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+-!CHECK:          fir.store %[[I]] to %[[STORE:.*]]#1 : !fir.ref<i32>
+-
+-  do i=1, 9
+-    print*, i
+-!CHECK:          %[[RTBEGIN:.*]] = fir.call @_FortranAioBeginExternalListOutput
+-!CHECK:          %[[LOAD:.*]] = fir.load %[[STORE]]#0 : !fir.ref<i32>
+-!CHECK:          fir.call @_FortranAioOutputInteger32(%[[RTBEGIN]], %[[LOAD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+-!CHECK:          fir.call @_FortranAioEndIoStatement(%[[RTBEGIN]]) {{.*}}: (!fir.ref<i8>) -> i32
+-  end do
+-!CHECK:          omp.yield
+-!CHECK:        }
+-!CHECK:        omp.terminator
+-!CHECK:      }
+-!CHECK:      omp.terminator
+-!CHECK:    }
+-
+-!$OMP END DO NOWAIT
+-!$OMP END PARALLEL
+-end
++! CHECK-LABEL: func.func @_QPdo_simd_simdlen(
++subroutine do_simd_simdlen()
++  ! CHECK:      omp.wsloop
++  ! CHECK-NOT:  simdlen({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: simdlen({{.*}})
++  !$omp do simd simdlen(4)
++    do index_ = 1, 10
++    end do
++  !$omp end do simd
++end subroutine do_simd_simdlen
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 35971fbacbf91..0c9c699a1f390 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -899,6 +899,9 @@ static LogicalResult
+ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+                  LLVM::ModuleTranslation &moduleTranslation) {
+   auto wsloopOp = cast<omp::WsloopOp>(opInst);
++  // FIXME: Here any other nested wrappers (e.g. omp.simd) are skipped, so
++  // codegen for composite constructs like 'DO/FOR SIMD' will be the same as for
++  // 'DO/FOR'.
+   auto loopOp = cast<omp::LoopNestOp>(wsloopOp.getWrappedLoop());
+ 
+   llvm::ArrayRef<bool> isByRef = getIsByRef(wsloopOp.getReductionVarsByref());

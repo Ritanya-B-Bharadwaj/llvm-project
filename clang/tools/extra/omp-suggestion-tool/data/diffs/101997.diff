@@ -1,0 +1,118 @@
+diff --git a/mlir/include/mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h b/mlir/include/mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h
+index 5ae484eadf49f..4822d6836ded1 100644
+--- a/mlir/include/mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h
++++ b/mlir/include/mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h
+@@ -11,6 +11,7 @@
+ #include <memory>
+ 
+ namespace mlir {
++class DialectRegistry;
+ class LLVMTypeConverter;
+ class ConversionTarget;
+ class MLIRContext;
+@@ -28,6 +29,10 @@ void configureOpenMPToLLVMConversionLegality(
+ /// Populate the given list with patterns that convert from OpenMP to LLVM.
+ void populateOpenMPToLLVMConversionPatterns(LLVMTypeConverter &converter,
+                                             RewritePatternSet &patterns);
++
++/// Registers the `ConvertToLLVMPatternInterface` interface in the `OpenMP`
++/// dialect.
++void registerConvertOpenMPToLLVMInterface(DialectRegistry &registry);
+ } // namespace mlir
+ 
+ #endif // MLIR_CONVERSION_OPENMPTOLLVM_CONVERTOPENMPTOLLVM_H
+diff --git a/mlir/include/mlir/InitAllExtensions.h b/mlir/include/mlir/InitAllExtensions.h
+index dc5d4fbea04f4..2a241fa4b192f 100644
+--- a/mlir/include/mlir/InitAllExtensions.h
++++ b/mlir/include/mlir/InitAllExtensions.h
+@@ -22,6 +22,7 @@
+ #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+ #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+ #include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
++#include "mlir/Conversion/OpenMPToLLVM/ConvertOpenMPToLLVM.h"
+ #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+ #include "mlir/Dialect/Affine/TransformOps/AffineTransformOps.h"
+ #include "mlir/Dialect/Bufferization/TransformOps/BufferizationTransformOps.h"
+@@ -67,6 +68,7 @@ inline void registerAllExtensions(DialectRegistry &registry) {
+   registerConvertMathToLLVMInterface(registry);
+   registerConvertMemRefToLLVMInterface(registry);
+   registerConvertNVVMToLLVMInterface(registry);
++  registerConvertOpenMPToLLVMInterface(registry);
+   ub::registerConvertUBToLLVMInterface(registry);
+ 
+   // Register all transform dialect extensions.
+diff --git a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+index bf1b59a9913f4..aa824a95b1574 100644
+--- a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
++++ b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+ #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
++#include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
+ #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+ #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+ #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+@@ -314,3 +315,31 @@ void ConvertOpenMPToLLVMPass::runOnOperation() {
+   if (failed(applyPartialConversion(module, target, std::move(patterns))))
+     signalPassFailure();
+ }
++
++//===----------------------------------------------------------------------===//
++// ConvertToLLVMPatternInterface implementation
++//===----------------------------------------------------------------------===//
++namespace {
++/// Implement the interface to convert OpenMP to LLVM.
++struct OpenMPToLLVMDialectInterface : public ConvertToLLVMPatternInterface {
++  using ConvertToLLVMPatternInterface::ConvertToLLVMPatternInterface;
++  void loadDependentDialects(MLIRContext *context) const final {
++    context->loadDialect<LLVM::LLVMDialect>();
++  }
++
++  /// Hook for derived dialect interface to provide conversion patterns
++  /// and mark dialect legal for the conversion target.
++  void populateConvertToLLVMConversionPatterns(
++      ConversionTarget &target, LLVMTypeConverter &typeConverter,
++      RewritePatternSet &patterns) const final {
++    configureOpenMPToLLVMConversionLegality(target, typeConverter);
++    populateOpenMPToLLVMConversionPatterns(typeConverter, patterns);
++  }
++};
++} // namespace
++
++void mlir::registerConvertOpenMPToLLVMInterface(DialectRegistry &registry) {
++  registry.addExtension(+[](MLIRContext *ctx, omp::OpenMPDialect *dialect) {
++    dialect->addInterfaces<OpenMPToLLVMDialectInterface>();
++  });
++}
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index d516c8d9e0be6..f552221bbdcaf 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -11,6 +11,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+ #include "mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.h"
+@@ -83,6 +84,8 @@ void OpenMPDialect::initialize() {
+ #include "mlir/Dialect/OpenMP/OpenMPOpsTypes.cpp.inc"
+       >();
+ 
++  declarePromisedInterface<ConvertToLLVMPatternInterface, OpenMPDialect>();
++
+   MemRefType::attachInterface<MemRefPointerLikeModel>(*getContext());
+   LLVM::LLVMPointerType::attachInterface<LLVMPointerPointerLikeModel>(
+       *getContext());
+diff --git a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+index 5ab6802c75700..d914eb940e791 100644
+--- a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
++++ b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+@@ -1,4 +1,5 @@
+ // RUN: mlir-opt -convert-openmp-to-llvm -split-input-file %s | FileCheck %s
++// RUN: mlir-opt -convert-to-llvm -split-input-file %s | FileCheck %s
+ 
+ // CHECK-LABEL: llvm.func @foo(i64, i64)
+ func.func private @foo(index, index)

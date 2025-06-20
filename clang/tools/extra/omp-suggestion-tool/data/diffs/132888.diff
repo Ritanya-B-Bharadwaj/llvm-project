@@ -1,0 +1,252 @@
+diff --git a/flang/test/Integration/OpenMP/atomic-capture-complex.f90 b/flang/test/Integration/OpenMP/atomic-capture-complex.f90
+index 4ffd18097d79e..69390427ff1ff 100644
+--- a/flang/test/Integration/OpenMP/atomic-capture-complex.f90
++++ b/flang/test/Integration/OpenMP/atomic-capture-complex.f90
+@@ -9,6 +9,7 @@
+ !RUN: %if x86-registered-target %{ %flang_fc1 -triple x86_64-unknown-linux-gnu -emit-llvm -fopenmp %s -o - | FileCheck --check-prefixes=CHECK,X86 %s %}
+ !RUN: %if aarch64-registerd-target %{ %flang_fc1 -triple aarch64-unknown-linux-gnu -emit-llvm -fopenmp %s -o - | FileCheck --check-prefixes=CHECK,AARCH64 %s %}
+ 
++!CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ !CHECK: %[[X_NEW_VAL:.*]] = alloca { float, float }, align 8
+ !CHECK: %[[VAL_1:.*]] = alloca { float, float }, i64 1, align 8
+ !CHECK: %[[ORIG_VAL:.*]] = alloca { float, float }, i64 1, align 8
+@@ -16,7 +17,6 @@
+ !CHECK: br label %entry
+ 
+ !CHECK: entry:
+-!CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ !CHECK: call void @__atomic_load(i64 8, ptr %[[ORIG_VAL]], ptr %[[ATOMIC_TEMP_LOAD]], i32 0)
+ !CHECK: %[[PHI_NODE_ENTRY_1:.*]] = load { float, float }, ptr %[[ATOMIC_TEMP_LOAD]], align 8
+ !CHECK: br label %.atomic.cont
+diff --git a/llvm/include/llvm/Frontend/Atomic/Atomic.h b/llvm/include/llvm/Frontend/Atomic/Atomic.h
+index 9f46fde6292a9..fb85a3b580b13 100644
+--- a/llvm/include/llvm/Frontend/Atomic/Atomic.h
++++ b/llvm/include/llvm/Frontend/Atomic/Atomic.h
+@@ -22,14 +22,15 @@ class AtomicInfo {
+   Align AtomicAlign;
+   Align ValueAlign;
+   bool UseLibcall;
++  IRBuilderBase::InsertPoint AllocaIP;
+ 
+ public:
+   AtomicInfo(IRBuilderBase *Builder, Type *Ty, uint64_t AtomicSizeInBits,
+              uint64_t ValueSizeInBits, Align AtomicAlign, Align ValueAlign,
+-             bool UseLibcall)
++             bool UseLibcall, IRBuilderBase::InsertPoint AllocaIP)
+       : Builder(Builder), Ty(Ty), AtomicSizeInBits(AtomicSizeInBits),
+         ValueSizeInBits(ValueSizeInBits), AtomicAlign(AtomicAlign),
+-        ValueAlign(ValueAlign), UseLibcall(UseLibcall) {}
++        ValueAlign(ValueAlign), UseLibcall(UseLibcall), AllocaIP(AllocaIP) {}
+ 
+   virtual ~AtomicInfo() = default;
+ 
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index ec013d1822439..8e9739cce3e2f 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -489,9 +489,10 @@ class OpenMPIRBuilder {
+   public:
+     AtomicInfo(IRBuilder<> *Builder, llvm::Type *Ty, uint64_t AtomicSizeInBits,
+                uint64_t ValueSizeInBits, llvm::Align AtomicAlign,
+-               llvm::Align ValueAlign, bool UseLibcall, llvm::Value *AtomicVar)
++               llvm::Align ValueAlign, bool UseLibcall,
++               IRBuilderBase::InsertPoint AllocaIP, llvm::Value *AtomicVar)
+         : llvm::AtomicInfo(Builder, Ty, AtomicSizeInBits, ValueSizeInBits,
+-                           AtomicAlign, ValueAlign, UseLibcall),
++                           AtomicAlign, ValueAlign, UseLibcall, AllocaIP),
+           AtomicVar(AtomicVar) {}
+ 
+     llvm::Value *getAtomicPointer() const override { return AtomicVar; }
+@@ -3268,11 +3269,12 @@ class OpenMPIRBuilder {
+   /// 					    value
+   /// \param AO			Atomic ordering of the generated atomic
+   /// 					    instructions.
+-  ///
++  /// \param AllocaIP           Insert point for allocas
++  //
+   /// \return Insertion point after generated atomic read IR.
+   InsertPointTy createAtomicRead(const LocationDescription &Loc,
+                                  AtomicOpValue &X, AtomicOpValue &V,
+-                                 AtomicOrdering AO);
++                                 AtomicOrdering AO, InsertPointTy AllocaIP);
+ 
+   /// Emit atomic write for : X = Expr --- Only Scalar data types.
+   ///
+diff --git a/llvm/lib/Frontend/Atomic/Atomic.cpp b/llvm/lib/Frontend/Atomic/Atomic.cpp
+index c9f9a9dcfb702..37db8fe350053 100644
+--- a/llvm/lib/Frontend/Atomic/Atomic.cpp
++++ b/llvm/lib/Frontend/Atomic/Atomic.cpp
+@@ -118,8 +118,12 @@ AtomicInfo::EmitAtomicLoadLibcall(AtomicOrdering AO) {
+   Value *PtrVal = getAtomicPointer();
+   PtrVal = Builder->CreateAddrSpaceCast(PtrVal, PointerType::getUnqual(Ctx));
+   Args.push_back(PtrVal);
++
++  auto CurrentIP = Builder->saveIP();
++  Builder->restoreIP(AllocaIP);
+   AllocaInst *AllocaResult =
+       CreateAlloca(Ty, getAtomicPointer()->getName() + "atomic.temp.load");
++  Builder->restoreIP(CurrentIP);
+   const Align AllocaAlignment = DL.getPrefTypeAlign(SizedIntTy);
+   AllocaResult->setAlignment(AllocaAlignment);
+   Args.push_back(AllocaResult);
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 68b1fa42934ad..28e109e1a8ad3 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -8565,7 +8565,7 @@ bool OpenMPIRBuilder::checkAndEmitFlushAfterAtomic(
+ OpenMPIRBuilder::InsertPointTy
+ OpenMPIRBuilder::createAtomicRead(const LocationDescription &Loc,
+                                   AtomicOpValue &X, AtomicOpValue &V,
+-                                  AtomicOrdering AO) {
++                                  AtomicOrdering AO, InsertPointTy AllocaIP) {
+   if (!updateToLocation(Loc))
+     return Loc.IP;
+ 
+@@ -8593,7 +8593,7 @@ OpenMPIRBuilder::createAtomicRead(const LocationDescription &Loc,
+         LoadDL.getTypeStoreSize(OldVal->getPointerOperand()->getType());
+     OpenMPIRBuilder::AtomicInfo atomicInfo(
+         &Builder, XElemTy, LoadSize * 8, LoadSize * 8, OldVal->getAlign(),
+-        OldVal->getAlign(), true /* UseLibcall */, X.Var);
++        OldVal->getAlign(), true /* UseLibcall */, AllocaIP, X.Var);
+     auto AtomicLoadRes = atomicInfo.EmitAtomicLoadLibcall(AO);
+     XRead = AtomicLoadRes.first;
+     OldVal->eraseFromParent();
+@@ -8758,7 +8758,7 @@ Expected<std::pair<Value *, Value *>> OpenMPIRBuilder::emitAtomicUpdate(
+ 
+     OpenMPIRBuilder::AtomicInfo atomicInfo(
+         &Builder, XElemTy, LoadSize * 8, LoadSize * 8, OldVal->getAlign(),
+-        OldVal->getAlign(), true /* UseLibcall */, X);
++        OldVal->getAlign(), true /* UseLibcall */, AllocaIP, X);
+     auto AtomicLoadRes = atomicInfo.EmitAtomicLoadLibcall(AO);
+     BasicBlock *CurBB = Builder.GetInsertBlock();
+     Instruction *CurBBTI = CurBB->getTerminator();
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index 27c0e0bf80255..5fa5dca050c5f 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -3780,6 +3780,9 @@ TEST_F(OpenMPIRBuilderTest, OMPAtomicReadFlt) {
+   IRBuilder<> Builder(BB);
+ 
+   OpenMPIRBuilder::LocationDescription Loc({Builder.saveIP(), DL});
++  BasicBlock *EntryBB = BB;
++  OpenMPIRBuilder::InsertPointTy AllocaIP(EntryBB,
++                                          EntryBB->getFirstInsertionPt());
+ 
+   Type *Float32 = Type::getFloatTy(M->getContext());
+   AllocaInst *XVal = Builder.CreateAlloca(Float32);
+@@ -3790,7 +3793,7 @@ TEST_F(OpenMPIRBuilderTest, OMPAtomicReadFlt) {
+   OpenMPIRBuilder::AtomicOpValue X = {XVal, Float32, false, false};
+   OpenMPIRBuilder::AtomicOpValue V = {VVal, Float32, false, false};
+ 
+-  Builder.restoreIP(OMPBuilder.createAtomicRead(Loc, X, V, AO));
++  Builder.restoreIP(OMPBuilder.createAtomicRead(Loc, X, V, AO, AllocaIP));
+ 
+   IntegerType *IntCastTy =
+       IntegerType::get(M->getContext(), Float32->getScalarSizeInBits());
+@@ -3820,6 +3823,9 @@ TEST_F(OpenMPIRBuilderTest, OMPAtomicReadInt) {
+   IRBuilder<> Builder(BB);
+ 
+   OpenMPIRBuilder::LocationDescription Loc({Builder.saveIP(), DL});
++  BasicBlock *EntryBB = BB;
++  OpenMPIRBuilder::InsertPointTy AllocaIP(EntryBB,
++                                          EntryBB->getFirstInsertionPt());
+ 
+   IntegerType *Int32 = Type::getInt32Ty(M->getContext());
+   AllocaInst *XVal = Builder.CreateAlloca(Int32);
+@@ -3830,9 +3836,8 @@ TEST_F(OpenMPIRBuilderTest, OMPAtomicReadInt) {
+   OpenMPIRBuilder::AtomicOpValue X = {XVal, Int32, false, false};
+   OpenMPIRBuilder::AtomicOpValue V = {VVal, Int32, false, false};
+ 
+-  BasicBlock *EntryBB = BB;
++  Builder.restoreIP(OMPBuilder.createAtomicRead(Loc, X, V, AO, AllocaIP));
+ 
+-  Builder.restoreIP(OMPBuilder.createAtomicRead(Loc, X, V, AO));
+   LoadInst *AtomicLoad = nullptr;
+   StoreInst *StoreofAtomic = nullptr;
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 4d610d6e2656d..2dd2185dae31b 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -2675,6 +2675,8 @@ convertOmpAtomicRead(Operation &opInst, llvm::IRBuilderBase &builder,
+     return failure();
+ 
+   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
++  llvm::OpenMPIRBuilder::InsertPointTy allocaIP =
++      findAllocaInsertPoint(builder, moduleTranslation);
+ 
+   llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+ 
+@@ -2687,7 +2689,7 @@ convertOmpAtomicRead(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   llvm::OpenMPIRBuilder::AtomicOpValue V = {v, elementType, false, false};
+   llvm::OpenMPIRBuilder::AtomicOpValue X = {x, elementType, false, false};
+-  builder.restoreIP(ompBuilder->createAtomicRead(ompLoc, X, V, AO));
++  builder.restoreIP(ompBuilder->createAtomicRead(ompLoc, X, V, AO, allocaIP));
+   return success();
+ }
+ 
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index d7f4d0a65b24c..15cd429c7cf9a 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -1368,6 +1368,7 @@ llvm.func @omp_atomic_read(%arg0 : !llvm.ptr, %arg1 : !llvm.ptr) -> () {
+ 
+ // CHECK-LABEL: @omp_atomic_read_implicit_cast
+ llvm.func @omp_atomic_read_implicit_cast () {
++//CHECK: %[[ATOMIC_LOAD_TEMP:.*]] = alloca { float, float }, align 8
+ //CHECK: %[[Z:.*]] = alloca float, i64 1, align 4
+ //CHECK: %[[Y:.*]] = alloca double, i64 1, align 8
+ //CHECK: %[[X:.*]] = alloca [2 x { float, float }], i64 1, align 8
+@@ -1392,7 +1393,7 @@ llvm.func @omp_atomic_read_implicit_cast () {
+   %16 = llvm.mul %10, %9 overflow<nsw> : i64
+   %17 = llvm.getelementptr %5[%15] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(f32, f32)>
+ 
+-//CHECK: %[[ATOMIC_LOAD_TEMP:.*]] = alloca { float, float }, align 8
++
+ //CHECK: call void @__atomic_load(i64 8, ptr %[[X_ELEMENT]], ptr %[[ATOMIC_LOAD_TEMP]], i32 0)
+ //CHECK: %[[LOAD:.*]] = load { float, float }, ptr %[[ATOMIC_LOAD_TEMP]], align 8
+ //CHECK: %[[EXT:.*]] = extractvalue { float, float } %[[LOAD]], 0
+@@ -1480,6 +1481,7 @@ llvm.func @omp_atomic_update(%x:!llvm.ptr, %expr: i32, %xbool: !llvm.ptr, %exprb
+ 
+ // -----
+ 
++//CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ //CHECK: %[[X_NEW_VAL:.*]] = alloca { float, float }, align 8
+ //CHECK: {{.*}} = alloca { float, float }, i64 1, align 8
+ //CHECK: %[[ORIG_VAL:.*]] = alloca { float, float }, i64 1, align 8
+@@ -1487,7 +1489,6 @@ llvm.func @omp_atomic_update(%x:!llvm.ptr, %expr: i32, %xbool: !llvm.ptr, %exprb
+ //CHECK: br label %entry
+ 
+ //CHECK: entry:
+-//CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ //CHECK: call void @__atomic_load(i64 8, ptr %[[ORIG_VAL]], ptr %[[ATOMIC_TEMP_LOAD]], i32 0)
+ //CHECK: %[[PHI_NODE_ENTRY_1:.*]] = load { float, float }, ptr %[[ATOMIC_TEMP_LOAD]], align 8
+ //CHECK: br label %.atomic.cont
+@@ -1532,6 +1533,7 @@ llvm.func @_QPomp_atomic_update_complex() {
+ 
+ // -----
+ 
++//CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ //CHECK: %[[X_NEW_VAL:.*]] = alloca { float, float }, align 8
+ //CHECK: %[[VAL_1:.*]] = alloca { float, float }, i64 1, align 8
+ //CHECK: %[[ORIG_VAL:.*]] = alloca { float, float }, i64 1, align 8
+@@ -1539,7 +1541,6 @@ llvm.func @_QPomp_atomic_update_complex() {
+ //CHECK: br label %entry
+ 
+ //CHECK: entry:							; preds = %0
+-//CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ //CHECK: call void @__atomic_load(i64 8, ptr %[[ORIG_VAL]], ptr %[[ATOMIC_TEMP_LOAD]], i32 0)
+ //CHECK: %[[PHI_NODE_ENTRY_1:.*]] = load { float, float }, ptr %[[ATOMIC_TEMP_LOAD]], align 8
+ //CHECK: br label %.atomic.cont
+@@ -1597,9 +1598,9 @@ llvm.func @_QPomp_atomic_capture_complex() {
+ // CHECK-LABEL: define void @omp_atomic_read_complex() {
+ llvm.func @omp_atomic_read_complex(){
+ 
++// CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ // CHECK: %[[a:.*]] = alloca { float, float }, i64 1, align 8
+ // CHECK: %[[b:.*]] = alloca { float, float }, i64 1, align 8
+-// CHECK: %[[ATOMIC_TEMP_LOAD:.*]] = alloca { float, float }, align 8
+ // CHECK: call void @__atomic_load(i64 8, ptr %[[b]], ptr %[[ATOMIC_TEMP_LOAD]], i32 0)
+ // CHECK: %[[LOADED_VAL:.*]] = load { float, float }, ptr %[[ATOMIC_TEMP_LOAD]], align 8
+ // CHECK: store { float, float } %[[LOADED_VAL]], ptr %[[a]], align 4

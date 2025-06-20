@@ -1,0 +1,637 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 8aab9a790f24a..78c88db143ce1 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -4982,10 +4982,13 @@ OpenMPIRBuilder::getOrCreateInternalVariable(Type *Ty, const StringRef &Name,
+     // variable for possibly changing that to internal or private, or maybe
+     // create different versions of the function for different OMP internal
+     // variables.
+-    auto *GV = new GlobalVariable(
+-        M, Ty, /*IsConstant=*/false, GlobalValue::CommonLinkage,
+-        Constant::getNullValue(Ty), Elem.first(),
+-        /*InsertBefore=*/nullptr, GlobalValue::NotThreadLocal, AddressSpace);
++    auto Linkage = this->M.getTargetTriple().rfind("wasm32") == 0
++                       ? GlobalValue::ExternalLinkage
++                       : GlobalValue::CommonLinkage;
++    auto *GV = new GlobalVariable(M, Ty, /*IsConstant=*/false, Linkage,
++                                  Constant::getNullValue(Ty), Elem.first(),
++                                  /*InsertBefore=*/nullptr,
++                                  GlobalValue::NotThreadLocal, AddressSpace);
+     const DataLayout &DL = M.getDataLayout();
+     const llvm::Align TypeAlign = DL.getABITypeAlign(Ty);
+     const llvm::Align PtrAlign = DL.getPointerABIAlignment(AddressSpace);
+diff --git a/openmp/CMakeLists.txt b/openmp/CMakeLists.txt
+index 13e65bf70b5bb..307c8dbbc0c3b 100644
+--- a/openmp/CMakeLists.txt
++++ b/openmp/CMakeLists.txt
+@@ -94,7 +94,7 @@ set(ENABLE_LIBOMPTARGET ON)
+ # Since the device plugins are only supported on Linux anyway,
+ # there is no point in trying to compile libomptarget on other OSes.
+ # 32-bit systems are not supported either.
+-if (APPLE OR WIN32 OR NOT "cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
++if (APPLE OR WIN32 OR WASM OR NOT "cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+   set(ENABLE_LIBOMPTARGET OFF)
+ endif()
+ 
+diff --git a/openmp/runtime/CMakeLists.txt b/openmp/runtime/CMakeLists.txt
+index 8a913989272c4..80064170db193 100644
+--- a/openmp/runtime/CMakeLists.txt
++++ b/openmp/runtime/CMakeLists.txt
+@@ -30,7 +30,7 @@ if(${OPENMP_STANDALONE_BUILD})
+   # If adding a new architecture, take a look at cmake/LibompGetArchitecture.cmake
+   libomp_get_architecture(LIBOMP_DETECTED_ARCH)
+   set(LIBOMP_ARCH ${LIBOMP_DETECTED_ARCH} CACHE STRING
+-    "The architecture to build for (x86_64/i386/arm/ppc64/ppc64le/aarch64/mic/mips/mips64/riscv64/loongarch64/ve/s390x).")
++    "The architecture to build for (x86_64/i386/arm/ppc64/ppc64le/aarch64/mic/mips/mips64/riscv64/loongarch64/ve/s390x/wasm32).")
+   # Should assertions be enabled?  They are on by default.
+   set(LIBOMP_ENABLE_ASSERTIONS TRUE CACHE BOOL
+     "enable assertions?")
+@@ -67,6 +67,8 @@ else() # Part of LLVM build
+     set(LIBOMP_ARCH ve)
+   elseif(LIBOMP_NATIVE_ARCH MATCHES "s390x")
+     set(LIBOMP_ARCH s390x)
++  elseif(LIBOMP_NATIVE_ARCH MATCHES "wasm")
++    set(LIBOMP_ARCH wasm32)
+   else()
+     # last ditch effort
+     libomp_get_architecture(LIBOMP_ARCH)
+@@ -87,7 +89,7 @@ if(LIBOMP_ARCH STREQUAL "aarch64")
+   endif()
+ endif()
+ 
+-libomp_check_variable(LIBOMP_ARCH 32e x86_64 32 i386 arm ppc64 ppc64le aarch64 aarch64_a64fx mic mips mips64 riscv64 loongarch64 ve s390x)
++libomp_check_variable(LIBOMP_ARCH 32e x86_64 32 i386 arm ppc64 ppc64le aarch64 aarch64_a64fx mic mips mips64 riscv64 loongarch64 ve s390x wasm32)
+ 
+ set(LIBOMP_LIB_TYPE normal CACHE STRING
+   "Performance,Profiling,Stubs library (normal/profile/stubs)")
+@@ -168,6 +170,7 @@ set(RISCV64 FALSE)
+ set(LOONGARCH64 FALSE)
+ set(VE FALSE)
+ set(S390X FALSE)
++set(WASM FALSE)
+ if("${LIBOMP_ARCH}" STREQUAL "i386" OR "${LIBOMP_ARCH}" STREQUAL "32")    # IA-32 architecture
+   set(IA32 TRUE)
+ elseif("${LIBOMP_ARCH}" STREQUAL "x86_64" OR "${LIBOMP_ARCH}" STREQUAL "32e") # Intel(R) 64 architecture
+@@ -198,6 +201,8 @@ elseif("${LIBOMP_ARCH}" STREQUAL "ve") # VE architecture
+     set(VE TRUE)
+ elseif("${LIBOMP_ARCH}" STREQUAL "s390x") # S390x (Z) architecture
+     set(S390X TRUE)
++elseif("${LIBOMP_ARCH}" STREQUAL "wasm32") # WebAssembly architecture
++    set(WASM TRUE)
+ endif()
+ 
+ # Set some flags based on build_type
+@@ -306,6 +311,11 @@ endif()
+ set(LIBOMP_ENABLE_SHARED TRUE CACHE BOOL
+   "Shared library instead of static library?")
+ 
++if(WASM)
++  libomp_warning_say("The WebAssembly build currently only supports static libraries; forcing LIBOMP_ENABLE_SHARED to false")
++  set(LIBOMP_ENABLE_SHARED FALSE)
++endif()
++
+ if(WIN32 AND NOT LIBOMP_ENABLE_SHARED)
+   libomp_error_say("Static libraries requested but not available on Windows")
+ endif()
+diff --git a/openmp/runtime/cmake/LibompGetArchitecture.cmake b/openmp/runtime/cmake/LibompGetArchitecture.cmake
+index 9d4f08b92de50..cd85267020bd6 100644
+--- a/openmp/runtime/cmake/LibompGetArchitecture.cmake
++++ b/openmp/runtime/cmake/LibompGetArchitecture.cmake
+@@ -53,6 +53,8 @@ function(libomp_get_architecture return_arch)
+       #error ARCHITECTURE=ve
+     #elif defined(__s390x__)
+       #error ARCHITECTURE=s390x
++    #elif defined(__wasm32__)
++      #error ARCHITECTURE=wasm32
+     #else
+       #error ARCHITECTURE=UnknownArchitecture
+     #endif
+diff --git a/openmp/runtime/cmake/config-ix.cmake b/openmp/runtime/cmake/config-ix.cmake
+index d54d350816926..90b9af4cd3829 100644
+--- a/openmp/runtime/cmake/config-ix.cmake
++++ b/openmp/runtime/cmake/config-ix.cmake
+@@ -150,15 +150,20 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Intel" OR CMAKE_C_COMPILER_ID STREQUAL "IntelLL
+   check_library_exists(irc_pic _intel_fast_memcpy "" LIBOMP_HAVE_IRC_PIC_LIBRARY)
+ endif()
+ 
+-# Checking Threading requirements
+-find_package(Threads REQUIRED)
+-if(WIN32)
+-  if(NOT CMAKE_USE_WIN32_THREADS_INIT)
+-    libomp_error_say("Need Win32 thread interface on Windows.")
+-  endif()
+-else()
+-  if(NOT CMAKE_USE_PTHREADS_INIT)
+-    libomp_error_say("Need pthread interface on Unix-like systems.")
++# Checking threading requirements. Note that compiling to WebAssembly threads
++# with either the Emscripten or wasi-threads flavor ends up using the pthreads
++# interface in a WebAssembly-compiled libc; CMake does not yet know how to
++# detect this.
++if (NOT WASM)
++  find_package(Threads REQUIRED)
++  if(WIN32)
++    if(NOT CMAKE_USE_WIN32_THREADS_INIT)
++      libomp_error_say("Need Win32 thread interface on Windows.")
++    endif()
++  else()
++    if(NOT CMAKE_USE_PTHREADS_INIT)
++      libomp_error_say("Need pthread interface on Unix-like systems.")
++    endif()
+   endif()
+ endif()
+ 
+diff --git a/openmp/runtime/src/kmp.h b/openmp/runtime/src/kmp.h
+index d34adf7cbf8af..3dbf8c71c48d3 100644
+--- a/openmp/runtime/src/kmp.h
++++ b/openmp/runtime/src/kmp.h
+@@ -63,7 +63,15 @@
+ #undef KMP_CANCEL_THREADS
+ #endif
+ 
++// Some WASI targets (e.g., wasm32-wasi-threads) do not support thread
++// cancellation.
++#if KMP_OS_WASI
++#undef KMP_CANCEL_THREADS
++#endif
++
++#if !KMP_OS_WASI
+ #include <signal.h>
++#endif
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdio.h>
+@@ -124,7 +132,7 @@ class kmp_stats_list;
+ #endif
+ #include "kmp_i18n.h"
+ 
+-#define KMP_HANDLE_SIGNALS (KMP_OS_UNIX || KMP_OS_WINDOWS)
++#define KMP_HANDLE_SIGNALS ((KMP_OS_UNIX && !KMP_OS_WASI) || KMP_OS_WINDOWS)
+ 
+ #include "kmp_wrapper_malloc.h"
+ #if KMP_OS_UNIX
+@@ -601,7 +609,9 @@ typedef int PACKED_REDUCTION_METHOD_T;
+ #endif
+ 
+ #if KMP_OS_UNIX
++#if !KMP_OS_WASI
+ #include <dlfcn.h>
++#endif
+ #include <pthread.h>
+ #endif
+ 
+@@ -1340,6 +1350,10 @@ extern kmp_uint64 __kmp_now_nsec();
+ /* TODO: tune for KMP_OS_SOLARIS */
+ #define KMP_INIT_WAIT 1024U /* initial number of spin-tests   */
+ #define KMP_NEXT_WAIT 512U /* susequent number of spin-tests */
++#elif KMP_OS_WASI
++/* TODO: tune for KMP_OS_WASI */
++#define KMP_INIT_WAIT 1024U /* initial number of spin-tests   */
++#define KMP_NEXT_WAIT 512U /* susequent number of spin-tests */
+ #endif
+ 
+ #if KMP_ARCH_X86 || KMP_ARCH_X86_64
+diff --git a/openmp/runtime/src/kmp_ftn_entry.h b/openmp/runtime/src/kmp_ftn_entry.h
+index ad19079cb6509..d54c5bfd10fe9 100644
+--- a/openmp/runtime/src/kmp_ftn_entry.h
++++ b/openmp/runtime/src/kmp_ftn_entry.h
+@@ -593,7 +593,7 @@ int FTN_STDCALL KMP_EXPAND_NAME(FTN_GET_THREAD_NUM)(void) {
+     return 0;
+   }
+   --gtid; // We keep (gtid+1) in TLS
+-#elif KMP_OS_LINUX
++#elif KMP_OS_LINUX || KMP_OS_WASI
+ #ifdef KMP_TDATA_GTID
+   if (__kmp_gtid_mode >= 3) {
+     if ((gtid = __kmp_gtid) == KMP_GTID_DNE) {
+@@ -1043,7 +1043,7 @@ void FTN_STDCALL KMP_EXPAND_NAME(FTN_SET_DEFAULT_DEVICE)(int KMP_DEREF arg) {
+ int FTN_STDCALL KMP_EXPAND_NAME(FTN_GET_NUM_DEVICES)(void)
+     KMP_WEAK_ATTRIBUTE_EXTERNAL;
+ int FTN_STDCALL KMP_EXPAND_NAME(FTN_GET_NUM_DEVICES)(void) {
+-#if KMP_MIC || KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_MIC || KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return 0;
+ #else
+   int (*fptr)();
+@@ -1558,7 +1558,7 @@ typedef void *omp_interop_t;
+ 
+ // libomptarget, if loaded, provides this function
+ int FTN_STDCALL FTN_GET_NUM_INTEROP_PROPERTIES(const omp_interop_t interop) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return 0;
+ #else
+   int (*fptr)(const omp_interop_t);
+@@ -1573,7 +1573,7 @@ int FTN_STDCALL FTN_GET_NUM_INTEROP_PROPERTIES(const omp_interop_t interop) {
+ intptr_t FTN_STDCALL FTN_GET_INTEROP_INT(const omp_interop_t interop,
+                                          omp_interop_property_t property_id,
+                                          int *err) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return 0;
+ #else
+   intptr_t (*fptr)(const omp_interop_t, omp_interop_property_t, int *);
+@@ -1587,7 +1587,7 @@ intptr_t FTN_STDCALL FTN_GET_INTEROP_INT(const omp_interop_t interop,
+ void *FTN_STDCALL FTN_GET_INTEROP_PTR(const omp_interop_t interop,
+                                       omp_interop_property_t property_id,
+                                       int *err) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return nullptr;
+ #else
+   void *(*fptr)(const omp_interop_t, omp_interop_property_t, int *);
+@@ -1601,7 +1601,7 @@ void *FTN_STDCALL FTN_GET_INTEROP_PTR(const omp_interop_t interop,
+ const char *FTN_STDCALL FTN_GET_INTEROP_STR(const omp_interop_t interop,
+                                             omp_interop_property_t property_id,
+                                             int *err) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return nullptr;
+ #else
+   const char *(*fptr)(const omp_interop_t, omp_interop_property_t, int *);
+@@ -1614,7 +1614,7 @@ const char *FTN_STDCALL FTN_GET_INTEROP_STR(const omp_interop_t interop,
+ // libomptarget, if loaded, provides this function
+ const char *FTN_STDCALL FTN_GET_INTEROP_NAME(
+     const omp_interop_t interop, omp_interop_property_t property_id) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return nullptr;
+ #else
+   const char *(*fptr)(const omp_interop_t, omp_interop_property_t);
+@@ -1627,7 +1627,7 @@ const char *FTN_STDCALL FTN_GET_INTEROP_NAME(
+ // libomptarget, if loaded, provides this function
+ const char *FTN_STDCALL FTN_GET_INTEROP_TYPE_DESC(
+     const omp_interop_t interop, omp_interop_property_t property_id) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return nullptr;
+ #else
+   const char *(*fptr)(const omp_interop_t, omp_interop_property_t);
+@@ -1640,7 +1640,7 @@ const char *FTN_STDCALL FTN_GET_INTEROP_TYPE_DESC(
+ // libomptarget, if loaded, provides this function
+ const char *FTN_STDCALL FTN_GET_INTEROP_RC_DESC(
+     const omp_interop_t interop, omp_interop_property_t property_id) {
+-#if KMP_OS_DARWIN || defined(KMP_STUB)
++#if KMP_OS_DARWIN || KMP_OS_WASI || defined(KMP_STUB)
+   return nullptr;
+ #else
+   const char *(*fptr)(const omp_interop_t, omp_interop_property_t);
+diff --git a/openmp/runtime/src/kmp_gsupport.cpp b/openmp/runtime/src/kmp_gsupport.cpp
+index d77d4809a7e95..dc843f78dc697 100644
+--- a/openmp/runtime/src/kmp_gsupport.cpp
++++ b/openmp/runtime/src/kmp_gsupport.cpp
+@@ -356,7 +356,7 @@ void KMP_EXPAND_NAME(KMP_API_NAME_GOMP_ORDERED_END)(void) {
+ // They come in two flavors: 64-bit unsigned, and either 32-bit signed
+ // (IA-32 architecture) or 64-bit signed (Intel(R) 64).
+ 
+-#if KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS
++#if KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS || KMP_ARCH_WASM
+ #define KMP_DISPATCH_INIT __kmp_aux_dispatch_init_4
+ #define KMP_DISPATCH_FINI_CHUNK __kmp_aux_dispatch_fini_chunk_4
+ #define KMP_DISPATCH_NEXT __kmpc_dispatch_next_4
+diff --git a/openmp/runtime/src/kmp_os.h b/openmp/runtime/src/kmp_os.h
+index beb8d0197ddf5..4ffe9f2d8c953 100644
+--- a/openmp/runtime/src/kmp_os.h
++++ b/openmp/runtime/src/kmp_os.h
+@@ -75,7 +75,7 @@
+ #error Unknown compiler
+ #endif
+ 
+-#if (KMP_OS_LINUX || KMP_OS_WINDOWS || KMP_OS_FREEBSD)
++#if (KMP_OS_LINUX || KMP_OS_WINDOWS || KMP_OS_FREEBSD) && !KMP_OS_WASI
+ #define KMP_AFFINITY_SUPPORTED 1
+ #if KMP_OS_WINDOWS && KMP_ARCH_X86_64
+ #define KMP_GROUP_AFFINITY 1
+@@ -176,7 +176,7 @@ typedef unsigned long long kmp_uint64;
+ #define KMP_UINT64_SPEC "llu"
+ #endif /* KMP_OS_UNIX */
+ 
+-#if KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS
++#if KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS || KMP_ARCH_WASM
+ #define KMP_SIZE_T_SPEC KMP_UINT32_SPEC
+ #elif KMP_ARCH_X86_64 || KMP_ARCH_PPC64 || KMP_ARCH_AARCH64 ||                 \
+     KMP_ARCH_MIPS64 || KMP_ARCH_RISCV64 || KMP_ARCH_LOONGARCH64 ||             \
+@@ -186,7 +186,7 @@ typedef unsigned long long kmp_uint64;
+ #error "Can't determine size_t printf format specifier."
+ #endif
+ 
+-#if KMP_ARCH_X86 || KMP_ARCH_ARM
++#if KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_WASM
+ #define KMP_SIZE_T_MAX (0xFFFFFFFF)
+ #else
+ #define KMP_SIZE_T_MAX (0xFFFFFFFFFFFFFFFF)
+@@ -215,8 +215,8 @@ typedef kmp_uint32 kmp_uint;
+ #define KMP_INT_MIN ((kmp_int32)0x80000000)
+ 
+ // stdarg handling
+-#if (KMP_ARCH_ARM || KMP_ARCH_X86_64 || KMP_ARCH_AARCH64) &&                   \
+-    (KMP_OS_FREEBSD || KMP_OS_LINUX)
++#if (KMP_ARCH_ARM || KMP_ARCH_X86_64 || KMP_ARCH_AARCH64 || KMP_ARCH_WASM) &&  \
++    (KMP_OS_FREEBSD || KMP_OS_LINUX || KMP_OS_WASI)
+ typedef va_list *kmp_va_list;
+ #define kmp_va_deref(ap) (*(ap))
+ #define kmp_va_addr_of(ap) (&(ap))
+@@ -1146,7 +1146,7 @@ extern kmp_real64 __kmp_xchg_real64(volatile kmp_real64 *p, kmp_real64 v);
+   KMP_COMPARE_AND_STORE_REL64((volatile kmp_int64 *)(volatile void *)&(a),     \
+                               (kmp_int64)(b), (kmp_int64)(c))
+ 
+-#if KMP_ARCH_X86 || KMP_ARCH_MIPS
++#if KMP_ARCH_X86 || KMP_ARCH_MIPS || KMP_ARCH_WASM
+ // What about ARM?
+ #define TCR_PTR(a) ((void *)TCR_4(a))
+ #define TCW_PTR(a, b) TCW_4((a), (b))
+@@ -1288,6 +1288,9 @@ bool __kmp_atomic_compare_store_rel(std::atomic<T> *p, T expected, T desired) {
+ extern void *__kmp_lookup_symbol(const char *name, bool next = false);
+ #define KMP_DLSYM(name) __kmp_lookup_symbol(name)
+ #define KMP_DLSYM_NEXT(name) __kmp_lookup_symbol(name, true)
++#elif KMP_OS_WASI
++#define KMP_DLSYM(name) nullptr
++#define KMP_DLSYM_NEXT(name) nullptr
+ #else
+ #define KMP_DLSYM(name) dlsym(RTLD_DEFAULT, name)
+ #define KMP_DLSYM_NEXT(name) dlsym(RTLD_NEXT, name)
+diff --git a/openmp/runtime/src/kmp_platform.h b/openmp/runtime/src/kmp_platform.h
+index b7972c7248dd5..45f411b9c2194 100644
+--- a/openmp/runtime/src/kmp_platform.h
++++ b/openmp/runtime/src/kmp_platform.h
+@@ -24,6 +24,7 @@
+ #define KMP_OS_WINDOWS 0
+ #define KMP_OS_HURD 0
+ #define KMP_OS_SOLARIS 0
++#define KMP_OS_WASI 0
+ #define KMP_OS_UNIX 0 /* disjunction of KMP_OS_LINUX, KMP_OS_DARWIN etc. */
+ 
+ #ifdef _WIN32
+@@ -76,14 +77,20 @@
+ #define KMP_OS_SOLARIS 1
+ #endif
+ 
++#if (defined __wasi__) || (defined __EMSCRIPTEN__)
++#undef KMP_OS_WASI
++#define KMP_OS_WASI 1
++#endif
++
+ #if (1 != KMP_OS_LINUX + KMP_OS_DRAGONFLY + KMP_OS_FREEBSD + KMP_OS_NETBSD +   \
+               KMP_OS_OPENBSD + KMP_OS_DARWIN + KMP_OS_WINDOWS + KMP_OS_HURD +  \
+-              KMP_OS_SOLARIS)
++              KMP_OS_SOLARIS + KMP_OS_WASI)
+ #error Unknown OS
+ #endif
+ 
+ #if KMP_OS_LINUX || KMP_OS_DRAGONFLY || KMP_OS_FREEBSD || KMP_OS_NETBSD ||     \
+-    KMP_OS_OPENBSD || KMP_OS_DARWIN || KMP_OS_HURD || KMP_OS_SOLARIS
++    KMP_OS_OPENBSD || KMP_OS_DARWIN || KMP_OS_HURD || KMP_OS_SOLARIS ||        \
++    KMP_OS_WASI
+ #undef KMP_OS_UNIX
+ #define KMP_OS_UNIX 1
+ #endif
+@@ -196,6 +203,10 @@
+ #define KMP_ARCH_ARM 1
+ #endif
+ 
++#if defined(__wasm32__)
++#define KMP_ARCH_WASM 1
++#endif
++
+ #if defined(__MIC__) || defined(__MIC2__)
+ #define KMP_MIC 1
+ #if __MIC2__ || __KNC__
+@@ -212,7 +223,8 @@
+ #endif
+ 
+ /* Specify 32 bit architectures here */
+-#define KMP_32_BIT_ARCH (KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS)
++#define KMP_32_BIT_ARCH                                                        \
++  (KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_MIPS || KMP_ARCH_WASM)
+ 
+ // Platforms which support Intel(R) Many Integrated Core Architecture
+ #define KMP_MIC_SUPPORTED                                                      \
+@@ -222,7 +234,7 @@
+ #if (1 != KMP_ARCH_X86 + KMP_ARCH_X86_64 + KMP_ARCH_ARM + KMP_ARCH_PPC64 +     \
+               KMP_ARCH_AARCH64 + KMP_ARCH_MIPS + KMP_ARCH_MIPS64 +             \
+               KMP_ARCH_RISCV64 + KMP_ARCH_LOONGARCH64 + KMP_ARCH_VE +          \
+-              KMP_ARCH_S390X)
++              KMP_ARCH_S390X + KMP_ARCH_WASM)
+ #error Unknown or unsupported architecture
+ #endif
+ 
+diff --git a/openmp/runtime/src/kmp_runtime.cpp b/openmp/runtime/src/kmp_runtime.cpp
+index 25136691bc72d..7d2e7a99ade43 100644
+--- a/openmp/runtime/src/kmp_runtime.cpp
++++ b/openmp/runtime/src/kmp_runtime.cpp
+@@ -47,8 +47,9 @@ static char *ProfileTraceFile = nullptr;
+ #include <process.h>
+ #endif
+ 
+-#if KMP_OS_WINDOWS
+-// windows does not need include files as it doesn't use shared memory
++#ifndef KMP_USE_SHM
++// Windows and WASI do not need these include files as they don't use shared
++// memory.
+ #else
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -446,26 +447,26 @@ void __kmp_abort_process() {
+     __kmp_dump_debug_buffer();
+   }
+ 
+-  if (KMP_OS_WINDOWS) {
+-    // Let other threads know of abnormal termination and prevent deadlock
+-    // if abort happened during library initialization or shutdown
+-    __kmp_global.g.g_abort = SIGABRT;
+-
+-    /* On Windows* OS by default abort() causes pop-up error box, which stalls
+-       nightly testing. Unfortunately, we cannot reliably suppress pop-up error
+-       boxes. _set_abort_behavior() works well, but this function is not
+-       available in VS7 (this is not problem for DLL, but it is a problem for
+-       static OpenMP RTL). SetErrorMode (and so, timelimit utility) does not
+-       help, at least in some versions of MS C RTL.
+-
+-       It seems following sequence is the only way to simulate abort() and
+-       avoid pop-up error box. */
+-    raise(SIGABRT);
+-    _exit(3); // Just in case, if signal ignored, exit anyway.
+-  } else {
+-    __kmp_unregister_library();
+-    abort();
+-  }
++#if KMP_OS_WINDOWS
++  // Let other threads know of abnormal termination and prevent deadlock
++  // if abort happened during library initialization or shutdown
++  __kmp_global.g.g_abort = SIGABRT;
++
++  /* On Windows* OS by default abort() causes pop-up error box, which stalls
++     nightly testing. Unfortunately, we cannot reliably suppress pop-up error
++     boxes. _set_abort_behavior() works well, but this function is not
++     available in VS7 (this is not problem for DLL, but it is a problem for
++     static OpenMP RTL). SetErrorMode (and so, timelimit utility) does not
++     help, at least in some versions of MS C RTL.
++
++     It seems following sequence is the only way to simulate abort() and
++     avoid pop-up error box. */
++  raise(SIGABRT);
++  _exit(3); // Just in case, if signal ignored, exit anyway.
++#else
++  __kmp_unregister_library();
++  abort();
++#endif
+ 
+   __kmp_infinite_loop();
+   __kmp_release_bootstrap_lock(&__kmp_exit_lock);
+@@ -8895,11 +8896,11 @@ __kmp_determine_reduction_method(
+ 
+ #if KMP_ARCH_X86_64 || KMP_ARCH_PPC64 || KMP_ARCH_AARCH64 ||                   \
+     KMP_ARCH_MIPS64 || KMP_ARCH_RISCV64 || KMP_ARCH_LOONGARCH64 ||             \
+-    KMP_ARCH_VE || KMP_ARCH_S390X
++    KMP_ARCH_VE || KMP_ARCH_S390X || KMP_ARCH_WASM
+ 
+ #if KMP_OS_LINUX || KMP_OS_DRAGONFLY || KMP_OS_FREEBSD || KMP_OS_NETBSD ||     \
+     KMP_OS_OPENBSD || KMP_OS_WINDOWS || KMP_OS_DARWIN || KMP_OS_HURD ||        \
+-    KMP_OS_SOLARIS
++    KMP_OS_SOLARIS || KMP_OS_WASI
+ 
+     int teamsize_cutoff = 4;
+ 
+@@ -8924,12 +8925,14 @@ __kmp_determine_reduction_method(
+ #error "Unknown or unsupported OS"
+ #endif // KMP_OS_LINUX || KMP_OS_DRAGONFLY || KMP_OS_FREEBSD || KMP_OS_NETBSD ||
+        // KMP_OS_OPENBSD || KMP_OS_WINDOWS || KMP_OS_DARWIN || KMP_OS_HURD ||
+-       // KMP_OS_SOLARIS
++       // KMP_OS_SOLARIS || KMP_OS_WASI
+ 
+-#elif KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_AARCH || KMP_ARCH_MIPS
++#elif KMP_ARCH_X86 || KMP_ARCH_ARM || KMP_ARCH_AARCH || KMP_ARCH_MIPS ||       \
++    KMP_ARCH_WASM
+ 
+ #if KMP_OS_LINUX || KMP_OS_DRAGONFLY || KMP_OS_FREEBSD || KMP_OS_NETBSD ||     \
+-    KMP_OS_OPENBSD || KMP_OS_WINDOWS || KMP_OS_HURD || KMP_OS_SOLARIS
++    KMP_OS_OPENBSD || KMP_OS_WINDOWS || KMP_OS_HURD || KMP_OS_SOLARIS ||       \
++    KMP_OS_WASI
+ 
+     // basic tuning
+ 
+diff --git a/openmp/runtime/src/kmp_utility.cpp b/openmp/runtime/src/kmp_utility.cpp
+index 3174bbb7a5b75..f901eaca92f4d 100644
+--- a/openmp/runtime/src/kmp_utility.cpp
++++ b/openmp/runtime/src/kmp_utility.cpp
+@@ -294,6 +294,8 @@ void __kmp_expand_host_name(char *buffer, size_t size) {
+     if (!GetComputerNameA(buffer, &s))
+       KMP_STRCPY_S(buffer, size, unknown);
+   }
++#elif KMP_OS_WASI
++  KMP_STRCPY_S(buffer, size, unknown);
+ #else
+   buffer[size - 2] = 0;
+   if (gethostname(buffer, size) || buffer[size - 2] != 0)
+diff --git a/openmp/runtime/src/z_Linux_asm.S b/openmp/runtime/src/z_Linux_asm.S
+index a72705528d416..14987c298fa5f 100644
+--- a/openmp/runtime/src/z_Linux_asm.S
++++ b/openmp/runtime/src/z_Linux_asm.S
+@@ -2441,7 +2441,27 @@ KMP_PREFIX_UNDERSCORE(__kmp_unnamed_critical_addr):
+ #if KMP_OS_LINUX
+ # if KMP_ARCH_ARM || KMP_ARCH_AARCH64
+ .section .note.GNU-stack,"",%progbits
+-# else
++# elif !KMP_ARCH_WASM
+ .section .note.GNU-stack,"",@progbits
+ # endif
+ #endif
++
++#if KMP_ARCH_WASM
++.data
++.global .gomp_critical_user_
++.global .gomp_critical_user_.var
++.global .gomp_critical_user_.reduction.var
++.global __kmp_unnamed_critical_addr
++.gomp_critical_user_:
++.zero 4
++.size .gomp_critical_user_, 4
++.gomp_critical_user_.var:
++.zero 4
++.size .gomp_critical_user_.var, 4
++.gomp_critical_user_.reduction.var:
++.zero 4
++.size .gomp_critical_user_.reduction.var, 4
++__kmp_unnamed_critical_addr:
++    .4byte .gomp_critical_user_
++    .size __kmp_unnamed_critical_addr, 4
++#endif
+diff --git a/openmp/runtime/src/z_Linux_util.cpp b/openmp/runtime/src/z_Linux_util.cpp
+index 72da0f79865df..a1f64b067b1f5 100644
+--- a/openmp/runtime/src/z_Linux_util.cpp
++++ b/openmp/runtime/src/z_Linux_util.cpp
+@@ -277,7 +277,7 @@ int __kmp_futex_determine_capable() {
+ 
+ #endif // KMP_USE_FUTEX
+ 
+-#if (KMP_ARCH_X86 || KMP_ARCH_X86_64) && (!KMP_ASM_INTRINS)
++#if (KMP_ARCH_X86 || KMP_ARCH_X86_64 || KMP_ARCH_WASM) && (!KMP_ASM_INTRINS)
+ /* Only 32-bit "add-exchange" instruction on IA-32 architecture causes us to
+    use compare_and_store for these routines */
+ 
+@@ -337,7 +337,7 @@ kmp_uint32 __kmp_test_then_and32(volatile kmp_uint32 *p, kmp_uint32 d) {
+   return old_value;
+ }
+ 
+-#if KMP_ARCH_X86
++#if KMP_ARCH_X86 || KMP_ARCH_WASM
+ kmp_int8 __kmp_test_then_add8(volatile kmp_int8 *p, kmp_int8 d) {
+   kmp_int8 old_value, new_value;
+ 
+@@ -985,7 +985,11 @@ void __kmp_create_monitor(kmp_info_t *th) {
+ #endif // KMP_USE_MONITOR
+ 
+ void __kmp_exit_thread(int exit_status) {
++#if KMP_OS_WASI
++// TODO: the wasm32-wasi-threads target does not yet support pthread_exit.
++#else
+   pthread_exit((void *)(intptr_t)exit_status);
++#endif
+ } // __kmp_exit_thread
+ 
+ #if KMP_USE_MONITOR
+@@ -1330,9 +1334,11 @@ static void __kmp_atfork_child(void) {
+ 
+ void __kmp_register_atfork(void) {
+   if (__kmp_need_register_atfork) {
++#if !KMP_OS_WASI
+     int status = pthread_atfork(__kmp_atfork_prepare, __kmp_atfork_parent,
+                                 __kmp_atfork_child);
+     KMP_CHECK_SYSFAIL("pthread_atfork", status);
++#endif
+     __kmp_need_register_atfork = FALSE;
+   }
+ }
+@@ -1774,6 +1780,7 @@ int __kmp_read_system_info(struct kmp_sys_info *info) {
+   status = getrusage(RUSAGE_SELF, &r_usage);
+   KMP_CHECK_SYSFAIL_ERRNO("getrusage", status);
+ 
++#if !KMP_OS_WASI
+   // The maximum resident set size utilized (in kilobytes)
+   info->maxrss = r_usage.ru_maxrss;
+   // The number of page faults serviced without any I/O
+@@ -1790,6 +1797,7 @@ int __kmp_read_system_info(struct kmp_sys_info *info) {
+   info->nvcsw = r_usage.ru_nvcsw;
+   // The number of times a context switch was forced
+   info->nivcsw = r_usage.ru_nivcsw;
++#endif
+ 
+   return (status != 0);
+ }
+@@ -1824,7 +1832,7 @@ static int __kmp_get_xproc(void) {
+   __kmp_type_convert(sysconf(_SC_NPROCESSORS_CONF), &(r));
+ 
+ #elif KMP_OS_DRAGONFLY || KMP_OS_FREEBSD || KMP_OS_NETBSD || KMP_OS_OPENBSD || \
+-    KMP_OS_HURD || KMP_OS_SOLARIS
++    KMP_OS_HURD || KMP_OS_SOLARIS || KMP_OS_WASI
+ 
+   __kmp_type_convert(sysconf(_SC_NPROCESSORS_ONLN), &(r));
+ 
+@@ -2200,6 +2208,8 @@ int __kmp_is_address_mapped(void *addr) {
+     }
+     kiv.kve_start += 1;
+   }
++#elif KMP_OS_WASI
++  found = (int)addr < (__builtin_wasm_memory_size(0) * PAGESIZE);
+ #elif KMP_OS_DRAGONFLY || KMP_OS_SOLARIS
+ 
+   // FIXME(DragonFly, Solaris): Implement this

@@ -1,0 +1,240 @@
+diff --git a/flang/include/flang/Lower/AbstractConverter.h b/flang/include/flang/Lower/AbstractConverter.h
+index d5dab9040d22b..1cb6bcb1f5d25 100644
+--- a/flang/include/flang/Lower/AbstractConverter.h
++++ b/flang/include/flang/Lower/AbstractConverter.h
+@@ -134,9 +134,12 @@ class AbstractConverter {
+   virtual bool isPresentShallowLookup(Fortran::semantics::Symbol &sym) = 0;
+ 
+   /// Collect the set of symbols with \p flag in \p eval
+-  /// region if \p collectSymbols is true. Likewise, collect the
++  /// region if \p collectSymbols is true. Otherwise, collect the
+   /// set of the host symbols with \p flag of the associated symbols in \p eval
+-  /// region if collectHostAssociatedSymbols is true.
++  /// region if collectHostAssociatedSymbols is true. This allows gathering
++  /// host association details of symbols particularly in nested directives
++  /// irrespective of \p flag \p, and can be useful where host
++  /// association details are needed in flag-agnostic manner.
+   virtual void collectSymbolSet(
+       pft::Evaluation &eval,
+       llvm::SetVector<const Fortran::semantics::Symbol *> &symbolSet,
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index fb01789d3f8ae..121d5f6d4c184 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -810,7 +810,7 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+                               bool collectSymbol) {
+             if (collectSymbol && oriSymbol.test(flag))
+               symbolSet.insert(&oriSymbol);
+-            if (checkHostAssociatedSymbols)
++            else if (checkHostAssociatedSymbols)
+               if (const auto *details{
+                       oriSymbol
+                           .detailsIf<Fortran::semantics::HostAssocDetails>()})
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index f63a774fa44b9..2a418396cdafc 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -302,21 +302,38 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+   }
+ }
+ 
++void DataSharingProcessor::collectSymbolsInNestedRegions(
++    Fortran::lower::pft::Evaluation &eval,
++    Fortran::semantics::Symbol::Flag flag,
++    llvm::SetVector<const Fortran::semantics::Symbol *>
++        &symbolsInNestedRegions) {
++  for (Fortran::lower::pft::Evaluation &nestedEval :
++       eval.getNestedEvaluations()) {
++    if (nestedEval.hasNestedEvaluations()) {
++      if (nestedEval.isConstruct())
++        // Recursively look for OpenMP constructs within `nestedEval`'s region
++        collectSymbolsInNestedRegions(nestedEval, flag, symbolsInNestedRegions);
++      else
++        converter.collectSymbolSet(nestedEval, symbolsInNestedRegions, flag,
++                                   /*collectSymbols=*/true,
++                                   /*collectHostAssociatedSymbols=*/false);
++    }
++  }
++}
++
++// Collect symbols to be default privatized in two steps.
++// In step 1, collect all symbols in `eval` that match `flag` into
++// `defaultSymbols`. In step 2, for nested constructs (if any), if and only if
++// the nested construct is an OpenMP construct, collect those nested
++// symbols skipping host associated symbols into `symbolsInNestedRegions`.
++// Later, in current context, all symbols in the set
++// `defaultSymbols` - `symbolsInNestedRegions` will be privatized.
+ void DataSharingProcessor::collectSymbols(
+     Fortran::semantics::Symbol::Flag flag) {
+   converter.collectSymbolSet(eval, defaultSymbols, flag,
+                              /*collectSymbols=*/true,
+                              /*collectHostAssociatedSymbols=*/true);
+-  for (Fortran::lower::pft::Evaluation &e : eval.getNestedEvaluations()) {
+-    if (e.hasNestedEvaluations())
+-      converter.collectSymbolSet(e, symbolsInNestedRegions, flag,
+-                                 /*collectSymbols=*/true,
+-                                 /*collectHostAssociatedSymbols=*/false);
+-    else
+-      converter.collectSymbolSet(e, symbolsInParentRegions, flag,
+-                                 /*collectSymbols=*/false,
+-                                 /*collectHostAssociatedSymbols=*/true);
+-  }
++  collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
+ }
+ 
+ void DataSharingProcessor::collectDefaultSymbols() {
+@@ -367,7 +384,6 @@ void DataSharingProcessor::defaultPrivatize(
+         !sym->GetUltimate().has<Fortran::semantics::NamelistDetails>() &&
+         !Fortran::semantics::IsImpliedDoIndex(sym->GetUltimate()) &&
+         !symbolsInNestedRegions.contains(sym) &&
+-        !symbolsInParentRegions.contains(sym) &&
+         !privatizedSymbols.contains(sym))
+       doPrivatize(sym, clauseOps, privateSyms);
+   }
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.h b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+index f709a64211a84..5d1bce4f5036a 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.h
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+@@ -40,7 +40,6 @@ class DataSharingProcessor {
+   llvm::SetVector<const Fortran::semantics::Symbol *> privatizedSymbols;
+   llvm::SetVector<const Fortran::semantics::Symbol *> defaultSymbols;
+   llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInNestedRegions;
+-  llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInParentRegions;
+   llvm::DenseMap<const Fortran::semantics::Symbol *, mlir::omp::PrivateClauseOp>
+       symToPrivatizer;
+   Fortran::lower::AbstractConverter &converter;
+@@ -52,6 +51,11 @@ class DataSharingProcessor {
+ 
+   bool needBarrier();
+   void collectSymbols(Fortran::semantics::Symbol::Flag flag);
++  void collectSymbolsInNestedRegions(
++      Fortran::lower::pft::Evaluation &eval,
++      Fortran::semantics::Symbol::Flag flag,
++      llvm::SetVector<const Fortran::semantics::Symbol *>
++          &symbolsInNestedRegions);
+   void collectOmpObjectListSymbol(
+       const omp::ObjectList &objects,
+       llvm::SetVector<const Fortran::semantics::Symbol *> &symbolSet);
+diff --git a/flang/test/Lower/OpenMP/default-clause-byref.f90 b/flang/test/Lower/OpenMP/default-clause-byref.f90
+index 6a91927ab02db..ec8bfbc397d2e 100644
+--- a/flang/test/Lower/OpenMP/default-clause-byref.f90
++++ b/flang/test/Lower/OpenMP/default-clause-byref.f90
+@@ -226,8 +226,6 @@ subroutine nested_default_clause_tests
+ !CHECK: %[[PRIVATE_Y_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_Y]] {uniq_name = "_QFnested_default_clause_testsEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_testsEz"}
+ !CHECK: %[[PRIVATE_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_Z]] {uniq_name = "_QFnested_default_clause_testsEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: %[[PRIVATE_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_testsEw"}
+-!CHECK: %[[PRIVATE_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_W]] {uniq_name = "_QFnested_default_clause_testsEw"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: omp.parallel {
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -242,12 +240,14 @@ subroutine nested_default_clause_tests
+ !CHECK: omp.terminator
+ !CHECK: }
+ !CHECK: omp.parallel {
++!CHECK: %[[PRIVATE_INNER_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_testsEz"}
++!CHECK: %[[PRIVATE_INNER_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_Z]] {uniq_name = "_QFnested_default_clause_testsEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_testsEw"}
+ !CHECK: %[[PRIVATE_INNER_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_W]] {uniq_name = "_QFnested_default_clause_testsEw"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP_1:.*]] = fir.load %[[PRIVATE_INNER_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_INNER_Z_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_INNER_W_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+diff --git a/flang/test/Lower/OpenMP/default-clause.f90 b/flang/test/Lower/OpenMP/default-clause.f90
+index d3c6550821f0d..88adb7993fd07 100644
+--- a/flang/test/Lower/OpenMP/default-clause.f90
++++ b/flang/test/Lower/OpenMP/default-clause.f90
+@@ -149,7 +149,7 @@ program default_clause_lowering
+ end program default_clause_lowering
+ 
+ subroutine nested_default_clause_tests
+-    integer :: x, y, z, w, k, a
++    integer :: x, y, z, w, k
+ !CHECK: %[[K:.*]] = fir.alloca i32 {bindc_name = "k", uniq_name = "_QFnested_default_clause_testsEk"}
+ !CHECK: %[[K_DECL:.*]]:2 = hlfir.declare %[[K]] {uniq_name = "_QFnested_default_clause_testsEk"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[W:.*]] = fir.alloca i32 {bindc_name = "w", uniq_name = "_QFnested_default_clause_testsEw"}
+@@ -221,13 +221,12 @@ subroutine nested_default_clause_tests
+     
+     
+ !CHECK: omp.parallel {
++!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFnested_default_clause_testsEy"}
+ !CHECK: %[[PRIVATE_Y_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_Y]] {uniq_name = "_QFnested_default_clause_testsEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_testsEz"}
+ !CHECK: %[[PRIVATE_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_Z]] {uniq_name = "_QFnested_default_clause_testsEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: %[[PRIVATE_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_testsEw"}
+-!CHECK: %[[PRIVATE_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_W]] {uniq_name = "_QFnested_default_clause_testsEw"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: omp.parallel {
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -242,12 +241,14 @@ subroutine nested_default_clause_tests
+ !CHECK: omp.terminator
+ !CHECK: }
+ !CHECK: omp.parallel {
++!CHECK: %[[PRIVATE_INNER_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_testsEz"}
++!CHECK: %[[PRIVATE_INNER_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_Z]] {uniq_name = "_QFnested_default_clause_testsEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_testsEw"}
+ !CHECK: %[[PRIVATE_INNER_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_W]] {uniq_name = "_QFnested_default_clause_testsEw"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP_1:.*]] = fir.load %[[PRIVATE_INNER_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_INNER_Z_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_INNER_W_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+@@ -415,3 +416,49 @@ subroutine threadprivate_with_default
+            end do
+         !$omp end parallel do
+ end subroutine
++
++subroutine nested_constructs
++!CHECK: %[[I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFnested_constructsEi"}
++!CHECK: %[[I_DECL:.*]]:2 = hlfir.declare %[[I]] {{.*}}
++!CHECK: %[[J:.*]] = fir.alloca i32 {bindc_name = "j", uniq_name = "_QFnested_constructsEj"}
++!CHECK: %[[J_DECL:.*]]:2 = hlfir.declare %[[J]] {{.*}}
++!CHECK: %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFnested_constructsEy"}
++!CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {{.*}}
++!CHECK: %[[Z:.*]] = fir.alloca i32 {bindc_name = "z", uniq_name = "_QFnested_constructsEz"}
++!CHECK: %[[Z_DECL:.*]]:2 = hlfir.declare %[[Z]] {{.*}}
++
++    integer :: y, z
++!CHECK: omp.parallel {
++!CHECK: %[[INNER_J:.*]] = fir.alloca i32 {bindc_name = "j", pinned}
++!CHECK: %[[INNER_J_DECL:.*]]:2 = hlfir.declare %[[INNER_J]] {{.*}}
++!CHECK: %[[INNER_I:.*]] = fir.alloca i32 {bindc_name = "i", pinned}
++!CHECK: %[[INNER_I_DECL:.*]]:2 = hlfir.declare %[[INNER_I]] {{.*}}
++!CHECK: %[[INNER_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFnested_constructsEy"}
++!CHECK: %[[INNER_Y_DECL:.*]]:2 = hlfir.declare %[[INNER_Y]] {{.*}}
++!CHECK: %[[TEMP:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[INNER_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: %[[INNER_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_constructsEz"}
++!CHECK: %[[INNER_Z_DECL:.*]]:2 = hlfir.declare %[[INNER_Z]] {{.*}}
++    !$omp parallel default(private) firstprivate(y)
++!CHECK: {{.*}} = fir.do_loop {{.*}} {
++      do i = 1, 10
++!CHECK: %[[CONST_1:.*]] = arith.constant 1 : i32
++!CHECK: hlfir.assign %[[CONST_1]] to %[[INNER_Y_DECL]]#0 : i32, !fir.ref<i32>
++        y = 1
++!CHECK: {{.*}} = fir.do_loop {{.*}} {
++        do j = 1, 10
++!CHECK: %[[CONST_20:.*]] = arith.constant 20 : i32
++!CHECK: hlfir.assign %[[CONST_20]] to %[[INNER_Z_DECL]]#0 : i32, !fir.ref<i32>
++          z = 20
++!CHECK: omp.parallel {
++!CHECK: %[[NESTED_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFnested_constructsEy"}
++!CHECK: %[[NESTED_Y_DECL:.*]]:2 = hlfir.declare %[[NESTED_Y]] {{.*}}
++!CHECK: %[[CONST_2:.*]] = arith.constant 2 : i32
++!CHECK: hlfir.assign %[[CONST_2]] to %[[NESTED_Y_DECL]]#0 : i32, !fir.ref<i32>
++          !$omp parallel default(private)
++             y = 2
++          !$omp end parallel
++        end do
++      end do
++    !$omp end parallel
++end subroutine

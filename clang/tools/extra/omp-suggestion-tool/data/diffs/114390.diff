@@ -1,0 +1,1633 @@
+diff --git a/flang/lib/Lower/DirectivesCommon.h b/flang/lib/Lower/DirectivesCommon.h
+index 421a44b128c01..88514b1674327 100644
+--- a/flang/lib/Lower/DirectivesCommon.h
++++ b/flang/lib/Lower/DirectivesCommon.h
+@@ -179,7 +179,11 @@ static inline void genOmpAccAtomicWriteStatement(
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+ 
+   mlir::Type varType = fir::unwrapRefType(lhsAddr.getType());
++  // Create a conversion outside the capture block.
++  auto insertionPoint = firOpBuilder.saveInsertionPoint();
++  firOpBuilder.setInsertionPointAfter(rhsExpr.getDefiningOp());
+   rhsExpr = firOpBuilder.createConvert(loc, varType, rhsExpr);
++  firOpBuilder.restoreInsertionPoint(insertionPoint);
+ 
+   processOmpAtomicTODO<AtomicListT>(varType, loc);
+ 
+@@ -410,10 +414,6 @@ void genOmpAccAtomicRead(Fortran::lower::AbstractConverter &converter,
+       fir::getBase(converter.genExprAddr(fromExpr, stmtCtx));
+   mlir::Value toAddress = fir::getBase(converter.genExprAddr(
+       *Fortran::semantics::GetExpr(assignmentStmtVariable), stmtCtx));
+-  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+-  if (fromAddress.getType() != toAddress.getType())
+-    fromAddress =
+-        builder.create<fir::ConvertOp>(loc, toAddress.getType(), fromAddress);
+   genOmpAccAtomicCaptureStatement(converter, fromAddress, toAddress,
+                                   leftHandClauseList, rightHandClauseList,
+                                   elementType, loc);
+@@ -497,23 +497,12 @@ void genOmpAccAtomicCapture(Fortran::lower::AbstractConverter &converter,
+   // a `atomic.read`, `atomic.write`, or `atomic.update` operation
+   // inside `atomic.capture`
+   Fortran::lower::StatementContext stmtCtx;
+-  mlir::Value stmt1LHSArg, stmt1RHSArg, stmt2LHSArg, stmt2RHSArg;
+-  mlir::Type elementType;
+   // LHS evaluations are common to all combinations of `atomic.capture`
+-  stmt1LHSArg = fir::getBase(converter.genExprAddr(assign1.lhs, stmtCtx));
+-  stmt2LHSArg = fir::getBase(converter.genExprAddr(assign2.lhs, stmtCtx));
++  mlir::Value stmt1LHSArg =
++      fir::getBase(converter.genExprAddr(assign1.lhs, stmtCtx));
++  mlir::Value stmt2LHSArg =
++      fir::getBase(converter.genExprAddr(assign2.lhs, stmtCtx));
+ 
+-  // Operation specific RHS evaluations
+-  if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
+-    // Atomic capture construct is of the form [capture-stmt, update-stmt] or
+-    // of the form [capture-stmt, write-stmt]
+-    stmt1RHSArg = fir::getBase(converter.genExprAddr(assign1.rhs, stmtCtx));
+-    stmt2RHSArg = fir::getBase(converter.genExprValue(assign2.rhs, stmtCtx));
+-  } else {
+-    // Atomic capture construct is of the form [update-stmt, capture-stmt]
+-    stmt1RHSArg = fir::getBase(converter.genExprValue(assign1.rhs, stmtCtx));
+-    stmt2RHSArg = fir::getBase(converter.genExprAddr(assign2.lhs, stmtCtx));
+-  }
+   // Type information used in generation of `atomic.update` operation
+   mlir::Type stmt1VarType =
+       fir::getBase(converter.genExprValue(assign1.lhs, stmtCtx)).getType();
+@@ -545,44 +534,46 @@ void genOmpAccAtomicCapture(Fortran::lower::AbstractConverter &converter,
+       // Atomic capture construct is of the form [capture-stmt, update-stmt]
+       const Fortran::semantics::SomeExpr &fromExpr =
+           *Fortran::semantics::GetExpr(stmt1Expr);
+-      elementType = converter.genType(fromExpr);
++      mlir::Type elementType = converter.genType(fromExpr);
+       genOmpAccAtomicCaptureStatement<AtomicListT>(
+-          converter, stmt1RHSArg, stmt1LHSArg,
++          converter, stmt2LHSArg, stmt1LHSArg,
+           /*leftHandClauseList=*/nullptr,
+           /*rightHandClauseList=*/nullptr, elementType, loc);
+       genOmpAccAtomicUpdateStatement<AtomicListT>(
+-          converter, stmt1RHSArg, stmt2VarType, stmt2Var, stmt2Expr,
++          converter, stmt2LHSArg, stmt2VarType, stmt2Var, stmt2Expr,
+           /*leftHandClauseList=*/nullptr,
+           /*rightHandClauseList=*/nullptr, loc, atomicCaptureOp);
+     } else {
+       // Atomic capture construct is of the form [capture-stmt, write-stmt]
++      firOpBuilder.setInsertionPoint(atomicCaptureOp);
++      mlir::Value stmt2RHSArg =
++          fir::getBase(converter.genExprValue(assign2.rhs, stmtCtx));
++      firOpBuilder.setInsertionPointToStart(&block);
+       const Fortran::semantics::SomeExpr &fromExpr =
+           *Fortran::semantics::GetExpr(stmt1Expr);
+-      elementType = converter.genType(fromExpr);
++      mlir::Type elementType = converter.genType(fromExpr);
+       genOmpAccAtomicCaptureStatement<AtomicListT>(
+-          converter, stmt1RHSArg, stmt1LHSArg,
++          converter, stmt2LHSArg, stmt1LHSArg,
+           /*leftHandClauseList=*/nullptr,
+           /*rightHandClauseList=*/nullptr, elementType, loc);
+       genOmpAccAtomicWriteStatement<AtomicListT>(
+-          converter, stmt1RHSArg, stmt2RHSArg,
++          converter, stmt2LHSArg, stmt2RHSArg,
+           /*leftHandClauseList=*/nullptr,
+           /*rightHandClauseList=*/nullptr, loc);
+     }
+   } else {
+     // Atomic capture construct is of the form [update-stmt, capture-stmt]
+-    firOpBuilder.setInsertionPointToEnd(&block);
+     const Fortran::semantics::SomeExpr &fromExpr =
+         *Fortran::semantics::GetExpr(stmt2Expr);
+-    elementType = converter.genType(fromExpr);
+-    genOmpAccAtomicCaptureStatement<AtomicListT>(
+-        converter, stmt1LHSArg, stmt2LHSArg,
+-        /*leftHandClauseList=*/nullptr,
+-        /*rightHandClauseList=*/nullptr, elementType, loc);
+-    firOpBuilder.setInsertionPointToStart(&block);
++    mlir::Type elementType = converter.genType(fromExpr);
+     genOmpAccAtomicUpdateStatement<AtomicListT>(
+         converter, stmt1LHSArg, stmt1VarType, stmt1Var, stmt1Expr,
+         /*leftHandClauseList=*/nullptr,
+         /*rightHandClauseList=*/nullptr, loc, atomicCaptureOp);
++    genOmpAccAtomicCaptureStatement<AtomicListT>(
++        converter, stmt1LHSArg, stmt2LHSArg,
++        /*leftHandClauseList=*/nullptr,
++        /*rightHandClauseList=*/nullptr, elementType, loc);
+   }
+   firOpBuilder.setInsertionPointToEnd(&block);
+   if constexpr (std::is_same<AtomicListT,
+diff --git a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+index 168526518865b..184abe24fe967 100644
+--- a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
++++ b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+@@ -781,11 +781,11 @@ func.func @_QPsimple_reduction(%arg0: !fir.ref<!fir.array<100x!fir.logical<4>>>
+ // -----
+ 
+ // CHECK: llvm.func @_QPs
+-// CHECK: omp.atomic.read %{{.*}} = %{{.*}}   : !llvm.ptr, !llvm.struct<(f32, f32)>
++// CHECK: omp.atomic.read %{{.*}} = %{{.*}}   : !llvm.ptr, !llvm.ptr, !llvm.struct<(f32, f32)>
+ 
+ func.func @_QPs(%arg0: !fir.ref<complex<f32>> {fir.bindc_name = "x"}) {
+   %0 = fir.alloca complex<f32> {bindc_name = "v", uniq_name = "_QFsEv"}
+-  omp.atomic.read %0 = %arg0   : !fir.ref<complex<f32>>, complex<f32>
++  omp.atomic.read %0 = %arg0   : !fir.ref<complex<f32>>, !fir.ref<complex<f32>>, complex<f32>
+   return
+ }
+ 
+diff --git a/flang/test/Lower/OpenACC/acc-atomic-capture.f90 b/flang/test/Lower/OpenACC/acc-atomic-capture.f90
+index 373683386fda9..797d322ca7ef1 100644
+--- a/flang/test/Lower/OpenACC/acc-atomic-capture.f90
++++ b/flang/test/Lower/OpenACC/acc-atomic-capture.f90
+@@ -11,7 +11,7 @@ program acc_atomic_capture_test
+ !CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %2 {uniq_name = "_QFEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[temp:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: acc.atomic.capture {
+-!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>
++!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ !CHECK: acc.atomic.update %[[Y_DECL]]#1 : !fir.ref<i32> {
+ !CHECK: ^bb0(%[[ARG:.*]]: i32):
+ !CHECK: %[[result:.*]] = arith.addi %[[temp]], %[[ARG]] : i32
+@@ -32,7 +32,7 @@ program acc_atomic_capture_test
+ !CHECK: %[[result:.*]] = arith.muli %[[temp]], %[[ARG]] : i32
+ !CHECK: acc.yield %[[result]] : i32
+ !CHECK: }
+-!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>
++!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ !CHECK: }
+ 
+     !$acc atomic capture
+@@ -47,7 +47,7 @@ program acc_atomic_capture_test
+ !CHECK: %[[result_noreassoc:.*]] = hlfir.no_reassoc %[[result]] : i32
+ !CHECK: %[[result:.*]] = arith.addi %[[constant_20]], %[[result_noreassoc]] : i32
+ !CHECK: acc.atomic.capture {
+-!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>
++!CHECK: acc.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ !CHECK: acc.atomic.write %[[Y_DECL]]#1 = %[[result]] : !fir.ref<i32>, i32
+ !CHECK: }
+ 
+@@ -82,7 +82,7 @@ subroutine pointers_in_atomic_capture()
+ !CHECK: %[[result:.*]] = arith.addi %[[ARG]], %[[loaded_value]] : i32
+ !CHECK: acc.yield %[[result]] : i32
+ !CHECK: }
+-!CHECK: acc.atomic.read %[[loaded_B_addr]] = %[[loaded_A_addr]] : !fir.ptr<i32>, i32
++!CHECK: acc.atomic.read %[[loaded_B_addr]] = %[[loaded_A_addr]] : !fir.ptr<i32>, !fir.ptr<i32>, i32
+ !CHECK: }
+     integer, pointer :: a, b
+     integer, target :: c, d
+@@ -118,10 +118,99 @@ subroutine capture_with_convert_f32_to_i32()
+ ! CHECK: %[[MUL:.*]] = arith.mulf %{{.*}}, %[[CST]] fastmath<contract> : f32
+ ! CHECK: %[[CONV:.*]] = fir.convert %[[MUL]] : (f32) -> i32
+ ! CHECK: acc.atomic.capture {
+-! CHECK:   acc.atomic.read %[[V_DECL]]#1 = %[[K_DECL]]#1 : !fir.ref<i32>, i32
++! CHECK:   acc.atomic.read %[[V_DECL]]#1 = %[[K_DECL]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ ! CHECK:   acc.atomic.write %[[K_DECL]]#1 = %[[CONV]] : !fir.ref<i32>, i32
+ ! CHECK: }
+ 
++subroutine capture_with_convert_i32_to_f64()
++  real(8) :: x
++  integer :: v
++  x = 1.0
++  v = 0
++  !$acc atomic capture
++  v = x
++  x = v
++  !$acc end atomic
++end subroutine capture_with_convert_i32_to_f64
++
++! CHECK-LABEL: func.func @_QPcapture_with_convert_i32_to_f64()
++! CHECK: %[[V:.*]] = fir.alloca i32 {bindc_name = "v", uniq_name = "_QFcapture_with_convert_i32_to_f64Ev"}
++! CHECK: %[[V_DECL:.*]]:2 = hlfir.declare %[[V]] {uniq_name = "_QFcapture_with_convert_i32_to_f64Ev"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK: %[[X:.*]] = fir.alloca f64 {bindc_name = "x", uniq_name = "_QFcapture_with_convert_i32_to_f64Ex"}
++! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFcapture_with_convert_i32_to_f64Ex"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
++! CHECK: %[[CST:.*]] = arith.constant 1.000000e+00 : f64
++! CHECK: hlfir.assign %[[CST]] to %[[X_DECL]]#0 : f64, !fir.ref<f64>
++! CHECK: %c0_i32 = arith.constant 0 : i32
++! CHECK: hlfir.assign %c0_i32 to %[[V_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK: %[[LOAD:.*]] = fir.load %[[V_DECL]]#0 : !fir.ref<i32>
++! CHECK: %[[CONV:.*]] = fir.convert %[[LOAD]] : (i32) -> f64
++! CHECK: acc.atomic.capture {
++! CHECK:   acc.atomic.read %[[V_DECL]]#1 = %[[X_DECL]]#1 : !fir.ref<i32>, !fir.ref<f64>, f64
++! CHECK:   acc.atomic.write %[[X_DECL]]#1 = %[[CONV]] : !fir.ref<f64>, f64
++! CHECK: }
++
++subroutine capture_with_convert_f64_to_i32()
++  integer :: x
++  real(8) :: v
++  x = 1
++  v = 0
++  !$acc atomic capture
++  x = v * v
++  v = x
++  !$acc end atomic
++end subroutine capture_with_convert_f64_to_i32
++
++! CHECK-LABEL: func.func @_QPcapture_with_convert_f64_to_i32()
++! CHECK: %[[V:.*]] = fir.alloca f64 {bindc_name = "v", uniq_name = "_QFcapture_with_convert_f64_to_i32Ev"}
++! CHECK: %[[V_DECL:.*]]:2 = hlfir.declare %[[V]] {uniq_name = "_QFcapture_with_convert_f64_to_i32Ev"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
++! CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFcapture_with_convert_f64_to_i32Ex"}
++! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFcapture_with_convert_f64_to_i32Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK: %c1_i32 = arith.constant 1 : i32
++! CHECK: hlfir.assign %c1_i32 to %[[X_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK: %[[CST:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK: hlfir.assign %[[CST]] to %[[V_DECL]]#0 : f64, !fir.ref<f64>
++! CHECK: %[[LOAD:.*]] = fir.load %[[V_DECL]]#0 : !fir.ref<f64>
++! CHECK: acc.atomic.capture {
++! CHECK:   acc.atomic.update %[[X_DECL]]#1 : !fir.ref<i32> {
++! CHECK:   ^bb0(%arg0: i32):
++! CHECK:     %[[MUL:.*]] = arith.mulf %[[LOAD]], %[[LOAD]] fastmath<contract> : f64
++! CHECK:     %[[CONV:.*]] = fir.convert %[[MUL]] : (f64) -> i32
++! CHECK:     acc.yield %[[CONV]] : i32
++! CHECK:   }
++! CHECK:   acc.atomic.read %[[V_DECL]]#1 = %[[X_DECL]]#1 : !fir.ref<f64>, !fir.ref<i32>, i32
++! CHECK: }
++
++subroutine capture_with_convert_i32_to_f32()
++  real(4) :: x
++  integer :: v
++  x = 1.0
++  v = 0
++  !$acc atomic capture
++  v = x
++  x = x + v
++  !$acc end atomic
++end subroutine capture_with_convert_i32_to_f32
++
++! CHECK-LABEL: func.func @_QPcapture_with_convert_i32_to_f32()
++! CHECK: %[[V:.*]] = fir.alloca i32 {bindc_name = "v", uniq_name = "_QFcapture_with_convert_i32_to_f32Ev"}
++! CHECK: %[[V_DECL:.*]]:2 = hlfir.declare %[[V]] {uniq_name = "_QFcapture_with_convert_i32_to_f32Ev"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK: %[[X:.*]] = fir.alloca f32 {bindc_name = "x", uniq_name = "_QFcapture_with_convert_i32_to_f32Ex"}
++! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFcapture_with_convert_i32_to_f32Ex"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
++! CHECK: %[[CST:.*]] = arith.constant 1.000000e+00 : f32
++! CHECK: hlfir.assign %[[CST]] to %[[X_DECL]]#0 : f32, !fir.ref<f32>
++! CHECK: %c0_i32 = arith.constant 0 : i32
++! CHECK: hlfir.assign %c0_i32 to %[[V_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK: %[[LOAD:.*]] = fir.load %[[V_DECL]]#0 : !fir.ref<i32>
++! CHECK: acc.atomic.capture {
++! CHECK:   acc.atomic.read %[[V_DECL]]#1 = %[[X_DECL]]#1 : !fir.ref<i32>, !fir.ref<f32>, f32
++! CHECK:   acc.atomic.update %[[X_DECL]]#1 : !fir.ref<f32> {
++! CHECK:   ^bb0(%arg0: f32):
++! CHECK:     %[[CONV:.*]] = fir.convert %[[LOAD]] : (i32) -> f32
++! CHECK:     %[[ADD:.*]] = arith.addf %arg0, %[[CONV]] fastmath<contract> : f32
++! CHECK:     acc.yield %[[ADD]] : f32
++! CHECK:   }
++! CHECK: }
++
+ subroutine array_ref_in_atomic_capture1
+   integer :: x(10), v
+   !$acc atomic capture
+@@ -136,7 +225,7 @@ end subroutine array_ref_in_atomic_capture1
+ ! CHECK:           %[[X_DECL:.*]]:2 = hlfir.declare %[[X]](%{{.*}}) {uniq_name = "_QFarray_ref_in_atomic_capture1Ex"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
+ ! CHECK:           %[[X_REF:.*]] = hlfir.designate %[[X_DECL]]#0 (%{{.*}})  : (!fir.ref<!fir.array<10xi32>>, index) -> !fir.ref<i32>
+ ! CHECK:           acc.atomic.capture {
+-! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[X_REF]] : !fir.ref<i32>, i32
++! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[X_REF]] : !fir.ref<i32>, !fir.ref<i32>, i32
+ ! CHECK:             acc.atomic.update %[[X_REF]] : !fir.ref<i32> {
+ ! CHECK:             ^bb0(%[[VAL_7:.*]]: i32):
+ ! CHECK:               %[[VAL_8:.*]] = arith.addi %[[VAL_7]], %{{.*}} : i32
+@@ -163,7 +252,7 @@ end subroutine array_ref_in_atomic_capture2
+ ! CHECK:               %[[VAL_8:.*]] = arith.addi %[[VAL_7]], %{{.*}} : i32
+ ! CHECK:               acc.yield %[[VAL_8]] : i32
+ ! CHECK:             }
+-! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[X_REF]] : !fir.ref<i32>, i32
++! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[X_REF]] : !fir.ref<i32>, !fir.ref<i32>, i32
+ ! CHECK:           }
+ 
+ subroutine comp_ref_in_atomic_capture1
+@@ -184,7 +273,7 @@ end subroutine comp_ref_in_atomic_capture1
+ ! CHECK:           %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFcomp_ref_in_atomic_capture1Ex"} : (!fir.ref<!fir.type<_QFcomp_ref_in_atomic_capture1Tt1{c:i32}>>) -> (!fir.ref<!fir.type<_QFcomp_ref_in_atomic_capture1Tt1{c:i32}>>, !fir.ref<!fir.type<_QFcomp_ref_in_atomic_capture1Tt1{c:i32}>>)
+ ! CHECK:           %[[C:.*]] = hlfir.designate %[[X_DECL]]#0{"c"}   : (!fir.ref<!fir.type<_QFcomp_ref_in_atomic_capture1Tt1{c:i32}>>) -> !fir.ref<i32>
+ ! CHECK:           acc.atomic.capture {
+-! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[C]] : !fir.ref<i32>, i32
++! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[C]] : !fir.ref<i32>, !fir.ref<i32>, i32
+ ! CHECK:             acc.atomic.update %[[C]] : !fir.ref<i32> {
+ ! CHECK:             ^bb0(%[[VAL_5:.*]]: i32):
+ ! CHECK:               %[[VAL_6:.*]] = arith.addi %[[VAL_5]], %{{.*}} : i32
+@@ -215,5 +304,5 @@ end subroutine comp_ref_in_atomic_capture2
+ ! CHECK:               %[[VAL_6:.*]] = arith.addi %[[VAL_5]], %{{.*}} : i32
+ ! CHECK:               acc.yield %[[VAL_6]] : i32
+ ! CHECK:             }
+-! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[C]] : !fir.ref<i32>, i32
++! CHECK:             acc.atomic.read %[[V_DECL]]#1 = %[[C]] : !fir.ref<i32>, !fir.ref<i32>, i32
+ ! CHECK:           }
+diff --git a/flang/test/Lower/OpenACC/acc-atomic-read.f90 b/flang/test/Lower/OpenACC/acc-atomic-read.f90
+index c1a97a9e5f74f..f2cbe6e45596a 100644
+--- a/flang/test/Lower/OpenACC/acc-atomic-read.f90
++++ b/flang/test/Lower/OpenACC/acc-atomic-read.f90
+@@ -13,7 +13,7 @@ end program acc_atomic_test
+ ! CHECK: %[[G_DECL:.*]]:2 = hlfir.declare %[[VAR_G]] {uniq_name = "_QFEg"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK: %[[VAR_H:.*]] = fir.alloca f32 {bindc_name = "h", uniq_name = "_QFEh"}
+ ! CHECK: %[[H_DECL:.*]]:2 = hlfir.declare %[[VAR_H]] {uniq_name = "_QFEh"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK: acc.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1 : !fir.ref<f32>, f32
++! CHECK: acc.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1 : !fir.ref<f32>, !fir.ref<f32>, f32
+ ! CHECK: return
+ ! CHECK: }
+ 
+@@ -39,10 +39,10 @@ subroutine atomic_read_pointer()
+ ! CHECK:   %[[BOX_ADDR_X:.*]] = fir.box_addr %[[LOAD_X]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+ ! CHECK:   %[[LOAD_Y:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+ ! CHECK:   %[[BOX_ADDR_Y:.*]] = fir.box_addr %[[LOAD_Y]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+-! CHECK:   acc.atomic.read %[[BOX_ADDR_Y]] = %[[BOX_ADDR_X]] : !fir.ptr<i32>, i32
++! CHECK:   acc.atomic.read %[[BOX_ADDR_Y]] = %[[BOX_ADDR_X]] : !fir.ptr<i32>, !fir.ptr<i32>, i32
+ ! CHECK: }
+ 
+-subroutine atomic_read_with_convert()
++subroutine atomic_read_with_cast()
+   integer(4) :: x
+   integer(8) :: y
+ 
+@@ -50,10 +50,9 @@ subroutine atomic_read_with_convert()
+   y = x
+ end
+ 
+-! CHECK-LABEL: func.func @_QPatomic_read_with_convert() {
+-! CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFatomic_read_with_convertEx"}
+-! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFatomic_read_with_convertEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK: %[[Y:.*]] = fir.alloca i64 {bindc_name = "y", uniq_name = "_QFatomic_read_with_convertEy"}
+-! CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFatomic_read_with_convertEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+-! CHECK: %[[CONV:.*]] = fir.convert %[[X_DECL]]#1 : (!fir.ref<i32>) -> !fir.ref<i64>
+-! CHECK: acc.atomic.read %[[Y_DECL]]#1 = %[[CONV]] : !fir.ref<i64>, i32
++! CHECK-LABEL: func.func @_QPatomic_read_with_cast() {
++! CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFatomic_read_with_castEx"}
++! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFatomic_read_with_castEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK: %[[Y:.*]] = fir.alloca i64 {bindc_name = "y", uniq_name = "_QFatomic_read_with_castEy"}
++! CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFatomic_read_with_castEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
++! CHECK: acc.atomic.read %[[Y_DECL]]#1 = %[[X_DECL]]#1 : !fir.ref<i64>, !fir.ref<i32>, i32
+diff --git a/flang/test/Lower/OpenACC/acc-atomic-update-array.f90 b/flang/test/Lower/OpenACC/acc-atomic-update-array.f90
+index eeb7ea2994086..f89a9ab457d49 100644
+--- a/flang/test/Lower/OpenACC/acc-atomic-update-array.f90
++++ b/flang/test/Lower/OpenACC/acc-atomic-update-array.f90
+@@ -45,7 +45,7 @@ subroutine atomic_read_array1(r, n, x)
+ ! CHECK: %[[DECL_X:.*]]:2 = hlfir.declare %[[ARG2]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFatomic_read_array1Ex"} : (!fir.ref<f32>, !fir.dscope) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK: %[[DECL_R:.*]]:2 = hlfir.declare %[[ARG0]](%{{.*}}) dummy_scope %{{[0-9]+}} {uniq_name = "_QFatomic_read_array1Er"} : (!fir.ref<!fir.array<?xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.box<!fir.array<?xf32>>, !fir.ref<!fir.array<?xf32>>)
+ ! CHECK: %[[DES:.*]] = hlfir.designate %[[DECL_R]]#0 (%{{.*}})  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+-! CHECK: acc.atomic.read %[[DECL_X]]#1 = %[[DES]] : !fir.ref<f32>, f32
++! CHECK: acc.atomic.read %[[DECL_X]]#1 = %[[DES]] : !fir.ref<f32>, !fir.ref<f32>, f32
+ 
+ subroutine atomic_write_array1(r, n, x)
+   implicit none
+@@ -88,5 +88,5 @@ subroutine atomic_capture_array1(r, n, x, y)
+ ! CHECK:     %[[ADD:.*]] = arith.addf %[[ARG]], %[[LOAD]] fastmath<contract> : f32
+ ! CHECK:     acc.yield %[[ADD]] : f32
+ ! CHECK:   }
+-! CHECK:   acc.atomic.read %[[DECL_Y]]#1 = %[[R_I]] : !fir.ref<f32>, f32
++! CHECK:   acc.atomic.read %[[DECL_Y]]#1 = %[[R_I]] : !fir.ref<f32>, !fir.ref<f32>, f32
+ ! CHECK: }
+diff --git a/flang/test/Lower/OpenMP/atomic-capture.f90 b/flang/test/Lower/OpenMP/atomic-capture.f90
+index af82e4b2a20eb..679d22d3d7063 100644
+--- a/flang/test/Lower/OpenMP/atomic-capture.f90
++++ b/flang/test/Lower/OpenMP/atomic-capture.f90
+@@ -22,7 +22,7 @@ program OmpAtomicCapture
+ !CHECK: %[[TEMP:.*]] = arith.muli %[[VAL_Y_LOADED]], %[[ARG]] : i32
+ !CHECK: omp.yield(%[[TEMP]] : i32)
+ !CHECK: }
+-!CHECK: omp.atomic.read %[[VAL_X_DECLARE]]#1 = %[[VAL_Y_DECLARE]]#1 : !fir.ref<i32>, i32
++!CHECK: omp.atomic.read %[[VAL_X_DECLARE]]#1 = %[[VAL_Y_DECLARE]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ !CHECK: }
+     !$omp atomic hint(omp_sync_hint_uncontended) capture
+         y = x * y 
+@@ -36,7 +36,7 @@ program OmpAtomicCapture
+ !CHECK: %[[NO_REASSOC:.*]] = hlfir.no_reassoc %[[SUB]] : i32
+ !CHECK: %[[ADD:.*]] = arith.addi  %[[VAL_20]], %[[NO_REASSOC]] : i32
+ !CHECK: omp.atomic.capture hint(nonspeculative) memory_order(acquire) {
+-!CHECK:   omp.atomic.read %[[VAL_X_DECLARE]]#1 = %[[VAL_Y_DECLARE]]#1 : !fir.ref<i32>, i32
++!CHECK:   omp.atomic.read %[[VAL_X_DECLARE]]#1 = %[[VAL_Y_DECLARE]]#1 : !fir.ref<i32>, !fir.ref<i32>, i32
+ !CHECK:   omp.atomic.write %[[VAL_Y_DECLARE]]#1 = %[[ADD]] : !fir.ref<i32>, i32
+ !CHECK: }
+ !CHECK: return
+@@ -88,7 +88,7 @@ subroutine pointers_in_atomic_capture()
+ !CHECK: %[[TEMP:.*]] = arith.addi %[[ARG]], %[[VAL_B]] : i32
+ !CHECK: omp.yield(%[[TEMP]] : i32)
+ !CHECK: }
+-!CHECK: omp.atomic.read %[[VAL_B_BOX_ADDR]] = %[[VAL_A_BOX_ADDR]] : !fir.ptr<i32>, i32
++!CHECK: omp.atomic.read %[[VAL_B_BOX_ADDR]] = %[[VAL_A_BOX_ADDR]] : !fir.ptr<i32>, !fir.ptr<i32>, i32
+ !CHECK: }
+ !CHECK: return
+ !CHECK: }
+diff --git a/flang/test/Lower/OpenMP/atomic-read.f90 b/flang/test/Lower/OpenMP/atomic-read.f90
+index c3270dd6c1d67..e9bea42252faa 100644
+--- a/flang/test/Lower/OpenMP/atomic-read.f90
++++ b/flang/test/Lower/OpenMP/atomic-read.f90
+@@ -25,12 +25,12 @@
+ !CHECK:    %[[X_DECL:.*]]:2 = hlfir.declare %[[X_REF]] {uniq_name = "_QFEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:    %[[Y_REF:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFEy"}
+ !CHECK:    %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y_REF]] {uniq_name = "_QFEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK:    omp.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1   hint(uncontended) memory_order(acquire) : !fir.ref<i32>, i32
+-!CHECK:    omp.atomic.read %[[A_DECL]]#1 = %[[B_DECL]]#1   memory_order(relaxed) : !fir.ref<i32>, i32
+-!CHECK:    omp.atomic.read %[[C_DECL]]#1 = %[[D_DECL]]#1   hint(contended) memory_order(seq_cst) : !fir.ref<!fir.logical<4>>, !fir.logical<4>
+-!CHECK:    omp.atomic.read %[[E_DECL]]#1 = %[[F_DECL]]#1   hint(speculative) : !fir.ref<i32>, i32
+-!CHECK:    omp.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1   hint(nonspeculative) : !fir.ref<f32>, f32
+-!CHECK:    omp.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1   : !fir.ref<f32>, f32
++!CHECK:    omp.atomic.read %[[X_DECL]]#1 = %[[Y_DECL]]#1   hint(uncontended) memory_order(acquire) : !fir.ref<i32>, !fir.ref<i32>, i32
++!CHECK:    omp.atomic.read %[[A_DECL]]#1 = %[[B_DECL]]#1   memory_order(relaxed) : !fir.ref<i32>, !fir.ref<i32>, i32
++!CHECK:    omp.atomic.read %[[C_DECL]]#1 = %[[D_DECL]]#1   hint(contended) memory_order(seq_cst) : !fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>, !fir.logical<4>
++!CHECK:    omp.atomic.read %[[E_DECL]]#1 = %[[F_DECL]]#1   hint(speculative) : !fir.ref<i32>, !fir.ref<i32>, i32
++!CHECK:    omp.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1   hint(nonspeculative) : !fir.ref<f32>, !fir.ref<f32>, f32
++!CHECK:    omp.atomic.read %[[G_DECL]]#1 = %[[H_DECL]]#1   : !fir.ref<f32>, !fir.ref<f32>, f32
+ 
+ program OmpAtomic
+ 
+@@ -68,7 +68,7 @@ end program OmpAtomic
+ !CHECK:    %[[X_POINTEE_ADDR:.*]] = fir.box_addr %[[X_ADDR]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+ !CHECK:    %[[Y_ADDR:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+ !CHECK:    %[[Y_POINTEE_ADDR:.*]] = fir.box_addr %[[Y_ADDR]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+-!CHECK:    omp.atomic.read %[[Y_POINTEE_ADDR]] = %[[X_POINTEE_ADDR]]   : !fir.ptr<i32>, i32
++!CHECK:    omp.atomic.read %[[Y_POINTEE_ADDR]] = %[[X_POINTEE_ADDR]]   : !fir.ptr<i32>, !fir.ptr<i32>, i32
+ !CHECK:    %[[Y_ADDR:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+ !CHECK:    %[[Y_POINTEE_ADDR:.*]] = fir.box_addr %[[Y_ADDR]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+ !CHECK:    %[[Y_POINTEE_VAL:.*]] = fir.load %[[Y_POINTEE_ADDR]] : !fir.ptr<i32>
+diff --git a/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td b/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
+index e305e2fbde5b1..1d179c74a970e 100644
+--- a/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
++++ b/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
+@@ -1958,8 +1958,7 @@ def OpenACC_YieldOp : OpenACC_Op<"yield", [Pure, ReturnLike, Terminator,
+ // 2.12 atomic construct
+ //===----------------------------------------------------------------------===//
+ 
+-def AtomicReadOp : OpenACC_Op<"atomic.read", [AllTypesMatch<["x", "v"]>,
+-                                              AtomicReadOpInterface]> {
++def AtomicReadOp : OpenACC_Op<"atomic.read", [AtomicReadOpInterface]> {
+ 
+   let summary = "performs an atomic read";
+ 
+@@ -1975,7 +1974,7 @@ def AtomicReadOp : OpenACC_Op<"atomic.read", [AllTypesMatch<["x", "v"]>,
+                        TypeAttr:$element_type);
+   let assemblyFormat = [{
+     $v `=` $x
+-    `:` type($x) `,` $element_type attr-dict
++    `:` type($v) `,` type($x) `,` $element_type attr-dict
+   }];
+   let hasVerifier = 1;
+ }
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 626539cb7bde4..5fd8184fe0e0f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -1286,7 +1286,7 @@ def TaskwaitOp : OpenMP_Op<"taskwait", clauses = [
+ // two-step process.
+ 
+ def AtomicReadOp : OpenMP_Op<"atomic.read", traits = [
+-    AllTypesMatch<["x", "v"]>, AtomicReadOpInterface
++    AtomicReadOpInterface
+   ], clauses = [
+     OpenMP_HintClause, OpenMP_MemoryOrderClause
+   ]> {
+@@ -1304,7 +1304,8 @@ def AtomicReadOp : OpenMP_Op<"atomic.read", traits = [
+ 
+   // Override clause-based assemblyFormat.
+   let assemblyFormat = "$v `=` $x" # clausesReqAssemblyFormat # " oilist(" #
+-    clausesOptAssemblyFormat # ") `:` type($x) `,` $element_type attr-dict";
++    clausesOptAssemblyFormat #
++    ") `:` type($v) `,` type($x) `,` $element_type attr-dict";
+ 
+   let extraClassDeclaration = [{
+     /// The number of variable operands.
+diff --git a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+index e496c66f86522..4f37dd16b44dd 100644
+--- a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
++++ b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+@@ -120,7 +120,7 @@ func.func @atomic_write(%a: !llvm.ptr) -> () {
+ // CHECK: (%[[ARG0:.*]]: !llvm.ptr, %[[ARG1:.*]]: !llvm.ptr)
+ // CHECK: omp.atomic.read %[[ARG1]] = %[[ARG0]] hint(contended) memory_order(acquire) : !llvm.ptr
+ func.func @atomic_read(%a: !llvm.ptr, %b: !llvm.ptr) -> () {
+-  omp.atomic.read %b = %a memory_order(acquire) hint(contended) : !llvm.ptr, i32
++  omp.atomic.read %b = %a memory_order(acquire) hint(contended) : !llvm.ptr, !llvm.ptr, i32
+   return
+ }
+ 
+diff --git a/mlir/test/Dialect/OpenACC/invalid.mlir b/mlir/test/Dialect/OpenACC/invalid.mlir
+index 96edb585ae21a..0cc65f7b30d98 100644
+--- a/mlir/test/Dialect/OpenACC/invalid.mlir
++++ b/mlir/test/Dialect/OpenACC/invalid.mlir
+@@ -611,7 +611,7 @@ func.func @acc_atomic_update(%x: memref<i32>, %expr: i32) {
+ func.func @acc_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   // expected-error @below {{expected three operations in atomic.capture region}}
+   acc.atomic.capture {
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.terminator
+   }
+   return
+@@ -622,8 +622,8 @@ func.func @acc_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+ func.func @acc_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   acc.atomic.capture {
+     // expected-error @below {{invalid sequence of operations in the capture region}}
+-    acc.atomic.read %v = %x : memref<i32>, i32
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.terminator
+   }
+   return
+@@ -699,7 +699,7 @@ func.func @acc_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   acc.atomic.capture {
+     // expected-error @below {{invalid sequence of operations in the capture region}}
+     acc.atomic.write %x = %expr : memref<i32>, i32
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.terminator
+   }
+   return
+@@ -715,7 +715,7 @@ func.func @acc_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+       %newval = llvm.add %xval, %expr : i32
+       acc.yield %newval : i32
+     }
+-    acc.atomic.read %v = %y : memref<i32>, i32
++    acc.atomic.read %v = %y : memref<i32>, memref<i32>, i32
+     acc.terminator
+   }
+ }
+@@ -725,7 +725,7 @@ func.func @acc_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+ func.func @acc_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>, %expr: i32) {
+   acc.atomic.capture {
+     // expected-error @below {{captured variable in atomic.read must be updated in second operation}}
+-    acc.atomic.read %v = %y : memref<i32>, i32
++    acc.atomic.read %v = %y : memref<i32>, memref<i32>, i32
+     acc.atomic.update %x : memref<i32> {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -740,7 +740,7 @@ func.func @acc_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+ func.func @acc_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>, %expr: i32) {
+   acc.atomic.capture {
+     // expected-error @below {{captured variable in atomic.read must be updated in second operation}}
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.atomic.write %y = %expr : memref<i32>, i32
+     acc.terminator
+   }
+diff --git a/mlir/test/Dialect/OpenACC/ops.mlir b/mlir/test/Dialect/OpenACC/ops.mlir
+index 2ef2178cb2b63..3ed81b5117f22 100644
+--- a/mlir/test/Dialect/OpenACC/ops.mlir
++++ b/mlir/test/Dialect/OpenACC/ops.mlir
+@@ -1703,8 +1703,8 @@ acc.set default_async(%i32Value : i32)
+ // CHECK-LABEL: func.func @acc_atomic_read
+ // CHECK-SAME: (%[[v:.*]]: memref<i32>, %[[x:.*]]: memref<i32>)
+ func.func @acc_atomic_read(%v: memref<i32>, %x: memref<i32>) {
+-  // CHECK: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
+-  acc.atomic.read %v = %x : memref<i32>, i32
++  // CHECK: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
++  acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -1806,7 +1806,7 @@ func.func @acc_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   acc.yield %[[newval]] : i32
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   acc.atomic.capture {
+     acc.atomic.update %x : memref<i32> {
+@@ -1814,10 +1814,10 @@ func.func @acc_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       acc.yield %newval : i32
+     }
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   // CHECK: acc.atomic.capture {
+-  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: acc.atomic.update %[[x]] : memref<i32>
+   // CHECK-NEXT: (%[[xval:.*]]: i32):
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+@@ -1825,7 +1825,7 @@ func.func @acc_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT: }
+   // CHECK-NEXT: }
+   acc.atomic.capture {
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.atomic.update %x : memref<i32> {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -1833,11 +1833,11 @@ func.func @acc_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+     }
+   }
+   // CHECK: acc.atomic.capture {
+-  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: acc.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: acc.atomic.write %[[x]] = %[[expr]] : memref<i32>, i32
+   // CHECK-NEXT: }
+   acc.atomic.capture {
+-    acc.atomic.read %v = %x : memref<i32>, i32
++    acc.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     acc.atomic.write %x = %expr : memref<i32>, i32
+   }
+ 
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index fd89ec31c64a6..db941d401d52d 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -891,7 +891,7 @@ func.func @omp_ordered5(%arg1 : i32, %arg2 : i32, %arg3 : i32, %vec0 : i64, %vec
+ 
+ func.func @omp_atomic_read1(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{the hints omp_sync_hint_nonspeculative and omp_sync_hint_speculative cannot be combined.}}
+-  omp.atomic.read %v = %x hint(speculative, nonspeculative) : memref<i32>, i32
++  omp.atomic.read %v = %x hint(speculative, nonspeculative) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -899,7 +899,7 @@ func.func @omp_atomic_read1(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read2(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{invalid clause value: 'xyz'}}
+-  omp.atomic.read %v = %x memory_order(xyz) : memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(xyz) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -907,7 +907,7 @@ func.func @omp_atomic_read2(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read3(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{memory-order must not be acq_rel or release for atomic reads}}
+-  omp.atomic.read %v = %x memory_order(acq_rel) : memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(acq_rel) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -915,7 +915,7 @@ func.func @omp_atomic_read3(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read4(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{memory-order must not be acq_rel or release for atomic reads}}
+-  omp.atomic.read %v = %x memory_order(release) : memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(release) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -923,7 +923,7 @@ func.func @omp_atomic_read4(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read5(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{`memory_order` clause can appear at most once in the expansion of the oilist directive}}
+-  omp.atomic.read %v = %x memory_order(acquire) memory_order(relaxed) : memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(acquire) memory_order(relaxed) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -931,7 +931,7 @@ func.func @omp_atomic_read5(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read6(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{`hint` clause can appear at most once in the expansion of the oilist directive}}
+-  omp.atomic.read %v =  %x hint(speculative) hint(contended) : memref<i32>, i32
++  omp.atomic.read %v =  %x hint(speculative) hint(contended) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -939,7 +939,7 @@ func.func @omp_atomic_read6(%x: memref<i32>, %v: memref<i32>) {
+ 
+ func.func @omp_atomic_read6(%x: memref<i32>, %v: memref<i32>) {
+   // expected-error @below {{read and write must not be to the same location for atomic reads}}
+-  omp.atomic.read %x =  %x hint(speculative) : memref<i32>, i32
++  omp.atomic.read %x =  %x hint(speculative) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -1137,7 +1137,7 @@ func.func @omp_atomic_update(%x: memref<i32>, %expr: i32) {
+ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   // expected-error @below {{expected three operations in atomic.capture region}}
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.terminator
+   }
+   return
+@@ -1148,8 +1148,8 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   omp.atomic.capture {
+     // expected-error @below {{invalid sequence of operations in the capture region}}
+-    omp.atomic.read %v = %x : memref<i32>, i32
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.terminator
+   }
+   return
+@@ -1225,7 +1225,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+   omp.atomic.capture {
+     // expected-error @below {{invalid sequence of operations in the capture region}}
+     omp.atomic.write %x = %expr : memref<i32>, i32
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.terminator
+   }
+   return
+@@ -1241,7 +1241,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield (%newval : i32)
+     }
+-    omp.atomic.read %v = %y : memref<i32>, i32
++    omp.atomic.read %v = %y : memref<i32>, memref<i32>, i32
+     omp.terminator
+   }
+ }
+@@ -1251,7 +1251,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+ func.func @omp_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>, %expr: i32) {
+   omp.atomic.capture {
+     // expected-error @below {{captured variable in atomic.read must be updated in second operation}}
+-    omp.atomic.read %v = %y : memref<i32>, i32
++    omp.atomic.read %v = %y : memref<i32>, memref<i32>, i32
+     omp.atomic.update %x : memref<i32> {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -1266,7 +1266,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>,
+ func.func @omp_atomic_capture(%x: memref<i32>, %y: memref<i32>, %v: memref<i32>, %expr: i32) {
+   omp.atomic.capture {
+     // expected-error @below {{captured variable in atomic.read must be updated in second operation}}
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.atomic.write %y = %expr : memref<i32>, i32
+     omp.terminator
+   }
+@@ -1282,7 +1282,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+@@ -1297,7 +1297,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+@@ -1312,7 +1312,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+@@ -1327,7 +1327,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+@@ -1342,7 +1342,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+@@ -1357,7 +1357,7 @@ func.func @omp_atomic_capture(%x: memref<i32>, %v: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x memory_order(seq_cst) : memref<i32>, i32
++    omp.atomic.read %v = %x memory_order(seq_cst) : memref<i32>, memref<i32>, i32
+   }
+   return
+ }
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 6f11b451fa00a..b606f9eb708cf 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -1282,20 +1282,20 @@ func.func @omp_ordered(%arg1 : i32, %arg2 : i32, %arg3 : i32,
+ // CHECK-LABEL: omp_atomic_read
+ // CHECK-SAME: (%[[v:.*]]: memref<i32>, %[[x:.*]]: memref<i32>)
+ func.func @omp_atomic_read(%v: memref<i32>, %x: memref<i32>) {
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
+-  omp.atomic.read %v = %x : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(seq_cst) : memref<i32>, i32
+-  omp.atomic.read %v = %x memory_order(seq_cst) : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(acquire) : memref<i32>, i32
+-  omp.atomic.read %v = %x memory_order(acquire) : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(relaxed) : memref<i32>, i32
+-  omp.atomic.read %v = %x memory_order(relaxed) : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] hint(contended, nonspeculative) : memref<i32>, i32
+-  omp.atomic.read %v = %x hint(nonspeculative, contended) : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] hint(contended, speculative) memory_order(seq_cst) : memref<i32>, i32
+-  omp.atomic.read %v = %x hint(speculative, contended) memory_order(seq_cst) : memref<i32>, i32
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(seq_cst) : memref<i32>, i32
+-  omp.atomic.read %v = %x hint(none) memory_order(seq_cst) : memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(seq_cst) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(seq_cst) : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(acquire) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(acquire) : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(relaxed) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x memory_order(relaxed) : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] hint(contended, nonspeculative) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x hint(nonspeculative, contended) : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] hint(contended, speculative) memory_order(seq_cst) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x hint(speculative, contended) memory_order(seq_cst) : memref<i32>, memref<i32>, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] memory_order(seq_cst) : memref<i32>, memref<i32>, i32
++  omp.atomic.read %v = %x hint(none) memory_order(seq_cst) : memref<i32>, memref<i32>, i32
+   return
+ }
+ 
+@@ -1531,7 +1531,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture{
+     omp.atomic.update %x : memref<i32> {
+@@ -1539,10 +1539,10 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+   // CHECK: omp.atomic.capture {
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: omp.atomic.update %[[x]] : memref<i32>
+   // CHECK-NEXT: (%[[xval:.*]]: i32):
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+@@ -1550,7 +1550,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT: }
+   // CHECK-NEXT: }
+   omp.atomic.capture{
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.atomic.update %x : memref<i32> {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -1558,11 +1558,11 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+     }
+   }
+   // CHECK: omp.atomic.capture {
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: omp.atomic.write %[[x]] = %[[expr]] : memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture{
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+     omp.atomic.write %x = %expr : memref<i32>, i32
+   }
+ 
+@@ -1572,7 +1572,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(none) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1580,7 +1580,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(uncontended) {
+@@ -1589,7 +1589,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(uncontended) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1597,7 +1597,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(contended) {
+@@ -1606,7 +1606,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(contended) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1614,7 +1614,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(nonspeculative) {
+@@ -1623,7 +1623,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(nonspeculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1631,7 +1631,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(speculative) {
+@@ -1640,7 +1640,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(speculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1648,7 +1648,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(uncontended, nonspeculative) {
+@@ -1657,7 +1657,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(uncontended, nonspeculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1665,7 +1665,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(contended, nonspeculative) {
+@@ -1674,7 +1674,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(contended, nonspeculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1682,7 +1682,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(uncontended, speculative) {
+@@ -1691,7 +1691,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(uncontended, speculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1699,7 +1699,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(contended, speculative) {
+@@ -1708,7 +1708,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(contended, speculative) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1716,7 +1716,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture memory_order(seq_cst) {
+@@ -1725,7 +1725,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture memory_order(seq_cst) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1733,7 +1733,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture memory_order(acq_rel) {
+@@ -1742,7 +1742,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture memory_order(acq_rel) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1750,7 +1750,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture memory_order(acquire) {
+@@ -1759,7 +1759,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture memory_order(acquire) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1767,7 +1767,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture memory_order(release) {
+@@ -1776,7 +1776,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture memory_order(release) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1784,7 +1784,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture memory_order(relaxed) {
+@@ -1793,7 +1793,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture memory_order(relaxed) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1801,7 +1801,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   // CHECK: omp.atomic.capture hint(contended, speculative) memory_order(seq_cst) {
+@@ -1810,7 +1810,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+   // CHECK-NEXT:   %[[newval:.*]] = llvm.add %[[xval]], %[[expr]] : i32
+   // CHECK-NEXT:   omp.yield(%[[newval]] : i32)
+   // CHECK-NEXT: }
+-  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, i32
++  // CHECK-NEXT: omp.atomic.read %[[v]] = %[[x]] : memref<i32>, memref<i32>, i32
+   // CHECK-NEXT: }
+   omp.atomic.capture hint(contended, speculative) memory_order(seq_cst) {
+     omp.atomic.update %x : memref<i32> {
+@@ -1818,7 +1818,7 @@ func.func @omp_atomic_capture(%v: memref<i32>, %x: memref<i32>, %expr: i32) {
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : memref<i32>, i32
++    omp.atomic.read %v = %x : memref<i32>, memref<i32>, i32
+   }
+ 
+   return
+@@ -2420,14 +2420,14 @@ func.func @omp_requires_multiple() -> ()
+ // CHECK-LABEL: @opaque_pointers_atomic_rwu
+ // CHECK-SAME: (%[[v:.*]]: !llvm.ptr, %[[x:.*]]: !llvm.ptr)
+ func.func @opaque_pointers_atomic_rwu(%v: !llvm.ptr, %x: !llvm.ptr) {
+-  // CHECK: omp.atomic.read %[[v]] = %[[x]] : !llvm.ptr, i32
++  // CHECK: omp.atomic.read %[[v]] = %[[x]] : !llvm.ptr, !llvm.ptr, i32
+   // CHECK: %[[VAL:.*]] = llvm.load %[[x]] : !llvm.ptr -> i32
+   // CHECK: omp.atomic.write %[[v]] = %[[VAL]] : !llvm.ptr, i32
+   // CHECK: omp.atomic.update %[[x]] : !llvm.ptr {
+   // CHECK-NEXT: ^{{[[:alnum:]]+}}(%[[XVAL:.*]]: i32):
+   // CHECK-NEXT:   omp.yield(%[[XVAL]] : i32)
+   // CHECK-NEXT: }
+-  omp.atomic.read %v = %x : !llvm.ptr, i32
++  omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   %val = llvm.load %x : !llvm.ptr -> i32
+   omp.atomic.write %v = %val : !llvm.ptr, i32
+   omp.atomic.update %x : !llvm.ptr {
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm-invalid.mlir b/mlir/test/Target/LLVMIR/openmp-llvm-invalid.mlir
+index 3c6ca1ef0c6bf..41bc5c4ba525f 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm-invalid.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm-invalid.mlir
+@@ -35,7 +35,7 @@ llvm.func @omp_atomic_update_multiple_step_update(%x: !llvm.ptr, %expr: i32) {
+ llvm.func @omp_atomic_update_multiple_step_update(%x: !llvm.ptr, %v: !llvm.ptr, %expr: i32) {
+   // expected-error @+1 {{LLVM Translation failed for operation: omp.atomic.capture}}
+   omp.atomic.capture memory_order(seq_cst) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     // expected-error @+1 {{no atomic update operation with region argument as operand found inside atomic.update region}}
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+@@ -52,7 +52,7 @@ llvm.func @omp_atomic_update_multiple_step_update(%x: !llvm.ptr, %v: !llvm.ptr,
+ // update operation
+ llvm.func @omp_atomic_update_multiple_step_update(%x: !llvm.ptr, %v: !llvm.ptr, %expr: i32) {
+   omp.atomic.capture memory_order(seq_cst) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %t1 = llvm.mul %xval, %expr : i32
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index 49f9f3562c78b..e68102ecc8d47 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -1348,21 +1348,21 @@ llvm.func @omp_atomic_read(%arg0 : !llvm.ptr, %arg1 : !llvm.ptr) -> () {
+ 
+   // CHECK: %[[X1:.*]] = load atomic i32, ptr %[[ARG0]] monotonic, align 4
+   // CHECK: store i32 %[[X1]], ptr %[[ARG1]], align 4
+-  omp.atomic.read %arg1 = %arg0 : !llvm.ptr, i32
++  omp.atomic.read %arg1 = %arg0 : !llvm.ptr, !llvm.ptr, i32
+ 
+   // CHECK: %[[X2:.*]] = load atomic i32, ptr %[[ARG0]] seq_cst, align 4
+   // CHECK: call void @__kmpc_flush(ptr @{{.*}})
+   // CHECK: store i32 %[[X2]], ptr %[[ARG1]], align 4
+-  omp.atomic.read %arg1 = %arg0 memory_order(seq_cst) : !llvm.ptr, i32
++  omp.atomic.read %arg1 = %arg0 memory_order(seq_cst) : !llvm.ptr, !llvm.ptr, i32
+ 
+   // CHECK: %[[X3:.*]] = load atomic i32, ptr %[[ARG0]] acquire, align 4
+   // CHECK: call void @__kmpc_flush(ptr @{{.*}})
+   // CHECK: store i32 %[[X3]], ptr %[[ARG1]], align 4
+-  omp.atomic.read %arg1 = %arg0 memory_order(acquire) : !llvm.ptr, i32
++  omp.atomic.read %arg1 = %arg0 memory_order(acquire) : !llvm.ptr, !llvm.ptr, i32
+ 
+   // CHECK: %[[X4:.*]] = load atomic i32, ptr %[[ARG0]] monotonic, align 4
+   // CHECK: store i32 %[[X4]], ptr %[[ARG1]], align 4
+-  omp.atomic.read %arg1 = %arg0 memory_order(relaxed) : !llvm.ptr, i32
++  omp.atomic.read %arg1 = %arg0 memory_order(relaxed) : !llvm.ptr, !llvm.ptr, i32
+   llvm.return
+ }
+ 
+@@ -1518,7 +1518,7 @@ llvm.func @_QPomp_atomic_capture_complex() {
+         %20 = llvm.insertvalue %17, %19[1] : !llvm.struct<(f32, f32)>
+         omp.yield(%20 : !llvm.struct<(f32, f32)>)
+       }
+-      omp.atomic.read %1 = %3 : !llvm.ptr, !llvm.struct<(f32, f32)>
++      omp.atomic.read %1 = %3 : !llvm.ptr, !llvm.ptr, !llvm.struct<(f32, f32)>
+     }
+     llvm.return
+ }
+@@ -1541,7 +1541,7 @@ llvm.func @omp_atomic_read_complex(){
+     %1 = llvm.alloca %0 x !llvm.struct<(f32, f32)> {bindc_name = "ib"} : (i64) -> !llvm.ptr
+     %2 = llvm.mlir.constant(1 : i64) : i64
+     %3 = llvm.alloca %2 x !llvm.struct<(f32, f32)> {bindc_name = "ia"} : (i64) -> !llvm.ptr
+-    omp.atomic.read %1 = %3 : !llvm.ptr, !llvm.struct<(f32, f32)>
++    omp.atomic.read %1 = %3 : !llvm.ptr, !llvm.ptr, !llvm.struct<(f32, f32)>
+     llvm.return
+ }
+ 
+@@ -1646,7 +1646,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.add %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[res:.*]] = atomicrmw sub ptr %[[x]], i32 %[[expr]] monotonic
+@@ -1658,7 +1658,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.sub %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[res:.*]] = atomicrmw and ptr %[[x]], i32 %[[expr]] monotonic
+@@ -1670,7 +1670,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.and %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[res:.*]] = atomicrmw or ptr %[[x]], i32 %[[expr]] monotonic
+@@ -1682,7 +1682,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.or %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[res:.*]] = atomicrmw xor ptr %[[x]], i32 %[[expr]] monotonic
+@@ -1694,7 +1694,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.xor %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1709,7 +1709,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.mul %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1724,7 +1724,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.sdiv %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1739,7 +1739,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.udiv %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1754,7 +1754,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.shl %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1769,7 +1769,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.lshr %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1784,7 +1784,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.ashr %xval, %expr : i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1799,7 +1799,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = "llvm.intr.smax"(%xval, %expr) : (i32, i32) -> i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1814,7 +1814,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = "llvm.intr.smin"(%xval, %expr) : (i32, i32) -> i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1829,7 +1829,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = "llvm.intr.umax"(%xval, %expr) : (i32, i32) -> i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1844,7 +1844,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = "llvm.intr.umin"(%xval, %expr) : (i32, i32) -> i32
+       omp.yield(%newval : i32)
+     }
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1859,7 +1859,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.fadd %xval, %exprf : f32
+       omp.yield(%newval : f32)
+     }
+-    omp.atomic.read %vf = %xf : !llvm.ptr, f32
++    omp.atomic.read %vf = %xf : !llvm.ptr, !llvm.ptr, f32
+   }
+ 
+   // CHECK: %[[xval:.*]] = phi i32
+@@ -1874,7 +1874,7 @@ llvm.func @omp_atomic_capture_prefix_update(
+       %newval = llvm.fsub %xval, %exprf : f32
+       omp.yield(%newval : f32)
+     }
+-    omp.atomic.read %vf = %xf : !llvm.ptr, f32
++    omp.atomic.read %vf = %xf : !llvm.ptr, !llvm.ptr, f32
+   }
+ 
+   llvm.return
+@@ -1890,7 +1890,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -1901,7 +1901,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %[[res:.*]] = atomicrmw sub ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.sub %xval, %expr : i32
+@@ -1912,7 +1912,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %[[res:.*]] = atomicrmw and ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.and %xval, %expr : i32
+@@ -1923,7 +1923,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %[[res:.*]] = atomicrmw or ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.or %xval, %expr : i32
+@@ -1934,7 +1934,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %[[res:.*]] = atomicrmw xor ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.xor %xval, %expr : i32
+@@ -1949,7 +1949,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.mul %xval, %expr : i32
+@@ -1964,7 +1964,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.sdiv %xval, %expr : i32
+@@ -1979,7 +1979,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.udiv %xval, %expr : i32
+@@ -1994,7 +1994,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.shl %xval, %expr : i32
+@@ -2009,7 +2009,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.lshr %xval, %expr : i32
+@@ -2024,7 +2024,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.ashr %xval, %expr : i32
+@@ -2039,7 +2039,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = "llvm.intr.smax"(%xval, %expr) : (i32, i32) -> i32
+@@ -2054,7 +2054,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = "llvm.intr.smin"(%xval, %expr) : (i32, i32) -> i32
+@@ -2069,7 +2069,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = "llvm.intr.umax"(%xval, %expr) : (i32, i32) -> i32
+@@ -2084,7 +2084,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK-NEXT: %{{.*}} = cmpxchg ptr %[[x]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = "llvm.intr.umin"(%xval, %expr) : (i32, i32) -> i32
+@@ -2100,7 +2100,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %{{.*}} = cmpxchg ptr %[[xf]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store float %[[xvalf]], ptr %[[vf]]
+   omp.atomic.capture {
+-    omp.atomic.read %vf = %xf : !llvm.ptr, f32
++    omp.atomic.read %vf = %xf : !llvm.ptr, !llvm.ptr, f32
+     omp.atomic.update %xf : !llvm.ptr {
+     ^bb0(%xval: f32):
+       %newval = llvm.fadd %xval, %exprf : f32
+@@ -2116,7 +2116,7 @@ llvm.func @omp_atomic_capture_postfix_update(
+   // CHECK: %{{.*}} = cmpxchg ptr %[[xf]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store float %[[xvalf]], ptr %[[vf]]
+   omp.atomic.capture {
+-    omp.atomic.read %vf = %xf : !llvm.ptr, f32
++    omp.atomic.read %vf = %xf : !llvm.ptr, !llvm.ptr, f32
+     omp.atomic.update %xf : !llvm.ptr {
+     ^bb0(%xval: f32):
+       %newval = llvm.fsub %xval, %exprf : f32
+@@ -2136,7 +2136,7 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %[[xval:.*]] = atomicrmw xchg ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[xval]], ptr %[[v]]
+   omp.atomic.capture{
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.write %x = %expr : !llvm.ptr, i32
+   }
+ 
+@@ -2147,14 +2147,14 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %{{.*}} = cmpxchg ptr %[[xf]], i32 %[[xval]], i32 %[[newval_]] monotonic monotonic
+   // CHECK: store float %[[xvalf]], ptr %[[vf]]
+   omp.atomic.capture{
+-    omp.atomic.read %vf = %xf : !llvm.ptr, f32
++    omp.atomic.read %vf = %xf : !llvm.ptr, !llvm.ptr, f32
+     omp.atomic.write %xf = %exprf : !llvm.ptr, f32
+   }
+ 
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] seq_cst
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture memory_order(seq_cst) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -2165,7 +2165,7 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] acquire
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture memory_order(acquire) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -2176,7 +2176,7 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] release
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture memory_order(release) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -2187,7 +2187,7 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] monotonic
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture memory_order(relaxed) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -2198,7 +2198,7 @@ llvm.func @omp_atomic_capture_misc(
+   // CHECK: %[[res:.*]] = atomicrmw add ptr %[[x]], i32 %[[expr]] acq_rel
+   // CHECK: store i32 %[[res]], ptr %[[v]]
+   omp.atomic.capture memory_order(acq_rel) {
+-    omp.atomic.read %v = %x : !llvm.ptr, i32
++    omp.atomic.read %v = %x : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %x : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+@@ -2771,12 +2771,12 @@ llvm.func @omp_taskgroup_task(%x: i32, %y: i32, %zaddr: !llvm.ptr) {
+ llvm.func @omp_opaque_pointers(%arg0 : !llvm.ptr, %arg1: !llvm.ptr, %expr: i32) -> () {
+   // CHECK: %[[X1:.*]] = load atomic i32, ptr %[[ARG0]] monotonic, align 4
+   // CHECK: store i32 %[[X1]], ptr %[[ARG1]], align 4
+-  omp.atomic.read %arg1 = %arg0 : !llvm.ptr, i32
++  omp.atomic.read %arg1 = %arg0 : !llvm.ptr, !llvm.ptr, i32
+ 
+   // CHECK: %[[RES:.*]] = atomicrmw add ptr %[[ARG1]], i32 %[[EXPR]] acq_rel
+   // CHECK: store i32 %[[RES]], ptr %[[ARG0]]
+   omp.atomic.capture memory_order(acq_rel) {
+-    omp.atomic.read %arg0 = %arg1 : !llvm.ptr, i32
++    omp.atomic.read %arg0 = %arg1 : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.update %arg1 : !llvm.ptr {
+     ^bb0(%xval: i32):
+       %newval = llvm.add %xval, %expr : i32
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index 3c9bd9031c3e8..ee70c55d2215b 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -4,12 +4,12 @@
+ llvm.func @atomic_hint(%v : !llvm.ptr, %x : !llvm.ptr, %expr : i32) {
+   // expected-warning@below {{hint clause discarded}}
+   omp.atomic.capture hint(uncontended) {
+-    omp.atomic.read %x = %v : !llvm.ptr, i32
++    omp.atomic.read %x = %v : !llvm.ptr, !llvm.ptr, i32
+     omp.atomic.write %v = %expr : !llvm.ptr, i32
+   }
+ 
+   // expected-warning@below {{hint clause discarded}}
+-  omp.atomic.read %x = %v hint(contended) : !llvm.ptr, i32
++  omp.atomic.read %x = %v hint(contended) : !llvm.ptr, !llvm.ptr, i32
+ 
+   // expected-warning@below {{hint clause discarded}}
+   omp.atomic.write %v = %expr hint(nonspeculative) : !llvm.ptr, i32

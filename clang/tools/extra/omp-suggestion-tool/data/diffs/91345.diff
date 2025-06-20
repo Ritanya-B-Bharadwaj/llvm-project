@@ -1,0 +1,1074 @@
+diff --git a/clang/include/clang/Parse/Parser.h b/clang/include/clang/Parse/Parser.h
+index 60d59732269bc..61589fb7766f4 100644
+--- a/clang/include/clang/Parse/Parser.h
++++ b/clang/include/clang/Parse/Parser.h
+@@ -3553,6 +3553,23 @@ class Parser : public CodeCompletionHandler {
+   OMPClause *ParseOpenMPVarListClause(OpenMPDirectiveKind DKind,
+                                       OpenMPClauseKind Kind, bool ParseOnly);
+ 
++  /// Parses a clause consisting of a list of expressions.
++  ///
++  /// \param Kind          The clause to parse.
++  /// \param ClauseNameLoc [out] The location of the clause name.
++  /// \param OpenLoc       [out] The location of '('.
++  /// \param CloseLoc      [out] The location of ')'.
++  /// \param Exprs         [out] The parsed expressions.
++  /// \param ReqIntConst   If true, each expression must be an integer constant.
++  ///
++  /// \return Whether the clause was parsed successfully.
++  bool ParseOpenMPExprListClause(OpenMPClauseKind Kind,
++                                 SourceLocation &ClauseNameLoc,
++                                 SourceLocation &OpenLoc,
++                                 SourceLocation &CloseLoc,
++                                 SmallVectorImpl<Expr *> &Exprs,
++                                 bool ReqIntConst = false);
++
+   /// Parses and creates OpenMP 5.0 iterators expression:
+   /// <iterators> = 'iterator' '(' { [ <iterator-type> ] identifier =
+   /// <range-specification> }+ ')'
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 53eabe0c662e5..03a64600bc2a2 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -3107,34 +3107,14 @@ bool Parser::ParseOpenMPSimpleVarList(
+ }
+ 
+ OMPClause *Parser::ParseOpenMPSizesClause() {
+-  SourceLocation ClauseNameLoc = ConsumeToken();
++  SourceLocation ClauseNameLoc, OpenLoc, CloseLoc;
+   SmallVector<Expr *, 4> ValExprs;
+-
+-  BalancedDelimiterTracker T(*this, tok::l_paren, tok::annot_pragma_openmp_end);
+-  if (T.consumeOpen()) {
+-    Diag(Tok, diag::err_expected) << tok::l_paren;
++  if (ParseOpenMPExprListClause(OMPC_sizes, ClauseNameLoc, OpenLoc, CloseLoc,
++                                ValExprs))
+     return nullptr;
+-  }
+-
+-  while (true) {
+-    ExprResult Val = ParseConstantExpression();
+-    if (!Val.isUsable()) {
+-      T.skipToEnd();
+-      return nullptr;
+-    }
+-
+-    ValExprs.push_back(Val.get());
+-
+-    if (Tok.is(tok::r_paren) || Tok.is(tok::annot_pragma_openmp_end))
+-      break;
+-
+-    ExpectAndConsume(tok::comma);
+-  }
+-
+-  T.consumeClose();
+ 
+-  return Actions.OpenMP().ActOnOpenMPSizesClause(
+-      ValExprs, ClauseNameLoc, T.getOpenLocation(), T.getCloseLocation());
++  return Actions.OpenMP().ActOnOpenMPSizesClause(ValExprs, ClauseNameLoc,
++                                                 OpenLoc, CloseLoc);
+ }
+ 
+ OMPClause *Parser::ParseOpenMPUsesAllocatorClause(OpenMPDirectiveKind DKind) {
+@@ -4991,3 +4971,38 @@ OMPClause *Parser::ParseOpenMPVarListClause(OpenMPDirectiveKind DKind,
+   OMPVarListLocTy Locs(Loc, LOpen, Data.RLoc);
+   return Actions.OpenMP().ActOnOpenMPVarListClause(Kind, Vars, Locs, Data);
+ }
++
++bool Parser::ParseOpenMPExprListClause(OpenMPClauseKind Kind,
++                                       SourceLocation &ClauseNameLoc,
++                                       SourceLocation &OpenLoc,
++                                       SourceLocation &CloseLoc,
++                                       SmallVectorImpl<Expr *> &Exprs,
++                                       bool ReqIntConst) {
++  assert(getOpenMPClauseName(Kind) == PP.getSpelling(Tok) &&
++         "Expected parsing to start at clause name");
++  ClauseNameLoc = ConsumeToken();
++
++  // Parse inside of '(' and ')'.
++  BalancedDelimiterTracker T(*this, tok::l_paren, tok::annot_pragma_openmp_end);
++  if (T.consumeOpen()) {
++    Diag(Tok, diag::err_expected) << tok::l_paren;
++    return true;
++  }
++
++  // Parse the list with interleaved commas.
++  do {
++    ExprResult Val =
++        ReqIntConst ? ParseConstantExpression() : ParseAssignmentExpression();
++    if (!Val.isUsable()) {
++      // Encountered something other than an expression; abort to ')'.
++      T.skipToEnd();
++      return true;
++    }
++    Exprs.push_back(Val.get());
++  } while (TryConsumeToken(tok::comma));
++
++  bool Result = T.consumeClose();
++  OpenLoc = T.getOpenLocation();
++  CloseLoc = T.getCloseLocation();
++  return Result;
++}
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 2475f962fd0df..7d00cf6fb5b6a 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -15111,13 +15111,11 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+   ASTContext &Context = getASTContext();
+   Scope *CurScope = SemaRef.getCurScope();
+ 
+-  auto SizesClauses =
+-      OMPExecutableDirective::getClausesOfKind<OMPSizesClause>(Clauses);
+-  if (SizesClauses.empty()) {
+-    // A missing 'sizes' clause is already reported by the parser.
++  const auto *SizesClause =
++      OMPExecutableDirective::getSingleClause<OMPSizesClause>(Clauses);
++  if (!SizesClause ||
++      llvm::any_of(SizesClause->getSizesRefs(), [](Expr *E) { return !E; }))
+     return StmtError();
+-  }
+-  const OMPSizesClause *SizesClause = *SizesClauses.begin();
+   unsigned NumLoops = SizesClause->getNumSizes();
+ 
+   // Empty statement should only be possible if there already was an error.
+@@ -15138,6 +15136,13 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     return OMPTileDirective::Create(Context, StartLoc, EndLoc, Clauses,
+                                     NumLoops, AStmt, nullptr, nullptr);
+ 
++  assert(LoopHelpers.size() == NumLoops &&
++         "Expecting loop iteration space dimensionality to match number of "
++         "affected loops");
++  assert(OriginalInits.size() == NumLoops &&
++         "Expecting loop iteration space dimensionality to match number of "
++         "affected loops");
++
+   SmallVector<Decl *, 4> PreInits;
+   CaptureVars CopyTransformer(SemaRef);
+ 
+@@ -15197,6 +15202,44 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+   // Once the original iteration values are set, append the innermost body.
+   Stmt *Inner = Body;
+ 
++  auto MakeDimTileSize = [&SemaRef = this->SemaRef, &CopyTransformer, &Context,
++                          SizesClause, CurScope](int I) -> Expr * {
++    Expr *DimTileSizeExpr = SizesClause->getSizesRefs()[I];
++    if (isa<ConstantExpr>(DimTileSizeExpr))
++      return AssertSuccess(CopyTransformer.TransformExpr(DimTileSizeExpr));
++
++    // When the tile size is not a constant but a variable, it is possible to
++    // pass non-positive numbers. For instance:
++    // \code{c}
++    //   int a = 0;
++    //   #pragma omp tile sizes(a)
++    //   for (int i = 0; i < 42; ++i)
++    //     body(i);
++    // \endcode
++    // Although there is no meaningful interpretation of the tile size, the body
++    // should still be executed 42 times to avoid surprises. To preserve the
++    // invariant that every loop iteration is executed exactly once and not
++    // cause an infinite loop, apply a minimum tile size of one.
++    // Build expr:
++    // \code{c}
++    //   (TS <= 0) ? 1 : TS
++    // \endcode
++    QualType DimTy = DimTileSizeExpr->getType();
++    uint64_t DimWidth = Context.getTypeSize(DimTy);
++    IntegerLiteral *Zero = IntegerLiteral::Create(
++        Context, llvm::APInt::getZero(DimWidth), DimTy, {});
++    IntegerLiteral *One =
++        IntegerLiteral::Create(Context, llvm::APInt(DimWidth, 1), DimTy, {});
++    Expr *Cond = AssertSuccess(SemaRef.BuildBinOp(
++        CurScope, {}, BO_LE,
++        AssertSuccess(CopyTransformer.TransformExpr(DimTileSizeExpr)), Zero));
++    Expr *MinOne = new (Context) ConditionalOperator(
++        Cond, {}, One, {},
++        AssertSuccess(CopyTransformer.TransformExpr(DimTileSizeExpr)), DimTy,
++        VK_PRValue, OK_Ordinary);
++    return MinOne;
++  };
++
+   // Create tile loops from the inside to the outside.
+   for (int I = NumLoops - 1; I >= 0; --I) {
+     OMPLoopBasedDirective::HelperExprs &LoopHelper = LoopHelpers[I];
+@@ -15207,10 +15250,6 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     // Commonly used variables. One of the constraints of an AST is that every
+     // node object must appear at most once, hence we define lamdas that create
+     // a new AST node at every use.
+-    auto MakeDimTileSize = [&CopyTransformer, I, SizesClause]() -> Expr * {
+-      Expr *DimTileSize = SizesClause->getSizesRefs()[I];
+-      return AssertSuccess(CopyTransformer.TransformExpr(DimTileSize));
+-    };
+     auto MakeTileIVRef = [&SemaRef = this->SemaRef, &TileIndVars, I, CntTy,
+                           OrigCntVar]() {
+       return buildDeclRefExpr(SemaRef, TileIndVars[I], CntTy,
+@@ -15237,7 +15276,7 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     //   .tile.iv < min(.floor.iv + DimTileSize, NumIterations)
+     ExprResult EndOfTile =
+         SemaRef.BuildBinOp(CurScope, LoopHelper.Cond->getExprLoc(), BO_Add,
+-                           MakeFloorIVRef(), MakeDimTileSize());
++                           MakeFloorIVRef(), MakeDimTileSize(I));
+     if (!EndOfTile.isUsable())
+       return StmtError();
+     ExprResult IsPartialTile =
+@@ -15297,10 +15336,6 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     QualType CntTy = OrigCntVar->getType();
+ 
+     // Commonly used variables.
+-    auto MakeDimTileSize = [&CopyTransformer, I, SizesClause]() -> Expr * {
+-      Expr *DimTileSize = SizesClause->getSizesRefs()[I];
+-      return AssertSuccess(CopyTransformer.TransformExpr(DimTileSize));
+-    };
+     auto MakeFloorIVRef = [&SemaRef = this->SemaRef, &FloorIndVars, I, CntTy,
+                            OrigCntVar]() {
+       return buildDeclRefExpr(SemaRef, FloorIndVars[I], CntTy,
+@@ -15329,7 +15364,7 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     // For incr-statement: .floor.iv += DimTileSize
+     ExprResult IncrStmt =
+         SemaRef.BuildBinOp(CurScope, LoopHelper.Inc->getExprLoc(), BO_AddAssign,
+-                           MakeFloorIVRef(), MakeDimTileSize());
++                           MakeFloorIVRef(), MakeDimTileSize(I));
+     if (!IncrStmt.isUsable())
+       return StmtError();
+ 
+@@ -17430,16 +17465,53 @@ OMPClause *SemaOpenMP::ActOnOpenMPSizesClause(ArrayRef<Expr *> SizeExprs,
+                                               SourceLocation StartLoc,
+                                               SourceLocation LParenLoc,
+                                               SourceLocation EndLoc) {
+-  for (Expr *SizeExpr : SizeExprs) {
+-    ExprResult NumForLoopsResult = VerifyPositiveIntegerConstantInClause(
+-        SizeExpr, OMPC_sizes, /*StrictlyPositive=*/true);
+-    if (!NumForLoopsResult.isUsable())
+-      return nullptr;
++  SmallVector<Expr *> SanitizedSizeExprs(SizeExprs);
++
++  for (Expr *&SizeExpr : SanitizedSizeExprs) {
++    // Skip if already sanitized, e.g. during a partial template instantiation.
++    if (!SizeExpr)
++      continue;
++
++    bool IsValid = isNonNegativeIntegerValue(SizeExpr, SemaRef, OMPC_sizes,
++                                             /*StrictlyPositive=*/true);
++
++    // isNonNegativeIntegerValue returns true for non-integral types (but still
++    // emits error diagnostic), so check for the expected type explicitly.
++    QualType SizeTy = SizeExpr->getType();
++    if (!SizeTy->isIntegerType())
++      IsValid = false;
++
++    // Handling in templates is tricky. There are four possibilities to
++    // consider:
++    //
++    // 1a. The expression is valid and we are in a instantiated template or not
++    //     in a template:
++    //       Pass valid expression to be further analysed later in Sema.
++    // 1b. The expression is valid and we are in a template (including partial
++    //     instantiation):
++    //       isNonNegativeIntegerValue skipped any checks so there is no
++    //       guarantee it will be correct after instantiation.
++    //       ActOnOpenMPSizesClause will be called again at instantiation when
++    //       it is not in a dependent context anymore. This may cause warnings
++    //       to be emitted multiple times.
++    // 2a. The expression is invalid and we are in an instantiated template or
++    //     not in a template:
++    //       Invalidate the expression with a clearly wrong value (nullptr) so
++    //       later in Sema we do not have to do the same validity analysis again
++    //       or crash from unexpected data. Error diagnostics have already been
++    //       emitted.
++    // 2b. The expression is invalid and we are in a template (including partial
++    //     instantiation):
++    //       Pass the invalid expression as-is, template instantiation may
++    //       replace unexpected types/values with valid ones. The directives
++    //       with this clause must not try to use these expressions in dependent
++    //       contexts, but delay analysis until full instantiation.
++    if (!SizeExpr->isInstantiationDependent() && !IsValid)
++      SizeExpr = nullptr;
+   }
+ 
+-  DSAStack->setAssociatedLoops(SizeExprs.size());
+   return OMPSizesClause::Create(getASTContext(), StartLoc, LParenLoc, EndLoc,
+-                                SizeExprs);
++                                SanitizedSizeExprs);
+ }
+ 
+ OMPClause *SemaOpenMP::ActOnOpenMPFullClause(SourceLocation StartLoc,
+diff --git a/clang/test/OpenMP/tile_ast_print.cpp b/clang/test/OpenMP/tile_ast_print.cpp
+index afc8b34911e3b..c4dff2c4be448 100644
+--- a/clang/test/OpenMP/tile_ast_print.cpp
++++ b/clang/test/OpenMP/tile_ast_print.cpp
+@@ -183,4 +183,21 @@ void tfoo7() {
+ }
+ 
+ 
++// PRINT-LABEL: void foo8(
++// DUMP-LABEL:  FunctionDecl {{.*}} foo8
++void foo8(int a) {
++  // PRINT:     #pragma omp tile sizes(a)
++  // DUMP:      OMPTileDirective
++  // DUMP-NEXT:   OMPSizesClause
++  // DUMP-NEXT:     ImplicitCastExpr
++  // DUMP-NEXT:       DeclRefExpr {{.*}} 'a'
++  #pragma omp tile sizes(a)
++  // PRINT-NEXT: for (int i = 7; i < 19; i += 3)
++  // DUMP-NEXT: ForStmt
++  for (int i = 7; i < 19; i += 3)
++    // PRINT: body(i);
++    // DUMP:  CallExpr
++    body(i);
++}
++
+ #endif
+diff --git a/clang/test/OpenMP/tile_codegen.cpp b/clang/test/OpenMP/tile_codegen.cpp
+index 76cf2d8f1992d..93a3a14133ab5 100644
+--- a/clang/test/OpenMP/tile_codegen.cpp
++++ b/clang/test/OpenMP/tile_codegen.cpp
+@@ -83,6 +83,14 @@ extern "C" void tfoo7() {
+   foo7<int,3,5>(0, 42);
+ }
+ 
++
++extern "C" void foo8(int a) {
++#pragma omp tile sizes(a)
++  for (int i = 7; i < 17; i += 3)
++    body(i);
++}
++
++
+ #endif /* HEADER */
+ // CHECK1-LABEL: define {{[^@]+}}@body
+ // CHECK1-SAME: (...) #[[ATTR0:[0-9]+]] {
+@@ -98,7 +106,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK1-LABEL: define {{[^@]+}}@_ZN1SC1Ev
+-// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR2:[0-9]+]] comdat align 2 {
++// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    store ptr [[THIS]], ptr [[THIS_ADDR]], align 8
+@@ -108,7 +116,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK1-LABEL: define {{[^@]+}}@_ZN1SC2Ev
+-// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR2]] comdat align 2 {
++// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    [[I:%.*]] = alloca ptr, align 8
+@@ -885,7 +893,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK1-LABEL: define {{[^@]+}}@foo6.omp_outlined
+-// CHECK1-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR5:[0-9]+]] {
++// CHECK1-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[DOTGLOBAL_TID__ADDR:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    [[DOTBOUND_TID__ADDR:%.*]] = alloca ptr, align 8
+@@ -1071,6 +1079,95 @@ extern "C" void tfoo7() {
+ // CHECK1-NEXT:    ret void
+ //
+ //
++// CHECK1-LABEL: define {{[^@]+}}@foo8
++// CHECK1-SAME: (i32 noundef [[A:%.*]]) #[[ATTR0]] {
++// CHECK1-NEXT:  entry:
++// CHECK1-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
++// CHECK1-NEXT:    [[I:%.*]] = alloca i32, align 4
++// CHECK1-NEXT:    [[DOTFLOOR_0_IV_I:%.*]] = alloca i32, align 4
++// CHECK1-NEXT:    [[DOTTILE_0_IV_I:%.*]] = alloca i32, align 4
++// CHECK1-NEXT:    store i32 [[A]], ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    store i32 7, ptr [[I]], align 4
++// CHECK1-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK1:       for.cond:
++// CHECK1-NEXT:    [[TMP0:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[CMP:%.*]] = icmp slt i32 [[TMP0]], 4
++// CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END24:%.*]]
++// CHECK1:       for.body:
++// CHECK1-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    store i32 [[TMP1]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    br label [[FOR_COND1:%.*]]
++// CHECK1:       for.cond1:
++// CHECK1-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP4:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    [[CMP2:%.*]] = icmp sle i32 [[TMP4]], 0
++// CHECK1-NEXT:    br i1 [[CMP2]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK1:       cond.true:
++// CHECK1-NEXT:    br label [[COND_END:%.*]]
++// CHECK1:       cond.false:
++// CHECK1-NEXT:    [[TMP5:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    br label [[COND_END]]
++// CHECK1:       cond.end:
++// CHECK1-NEXT:    [[COND:%.*]] = phi i32 [ 1, [[COND_TRUE]] ], [ [[TMP5]], [[COND_FALSE]] ]
++// CHECK1-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP3]], [[COND]]
++// CHECK1-NEXT:    [[CMP3:%.*]] = icmp slt i32 4, [[ADD]]
++// CHECK1-NEXT:    br i1 [[CMP3]], label [[COND_TRUE4:%.*]], label [[COND_FALSE5:%.*]]
++// CHECK1:       cond.true4:
++// CHECK1-NEXT:    br label [[COND_END12:%.*]]
++// CHECK1:       cond.false5:
++// CHECK1-NEXT:    [[TMP6:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP7:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    [[CMP6:%.*]] = icmp sle i32 [[TMP7]], 0
++// CHECK1-NEXT:    br i1 [[CMP6]], label [[COND_TRUE7:%.*]], label [[COND_FALSE8:%.*]]
++// CHECK1:       cond.true7:
++// CHECK1-NEXT:    br label [[COND_END9:%.*]]
++// CHECK1:       cond.false8:
++// CHECK1-NEXT:    [[TMP8:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    br label [[COND_END9]]
++// CHECK1:       cond.end9:
++// CHECK1-NEXT:    [[COND10:%.*]] = phi i32 [ 1, [[COND_TRUE7]] ], [ [[TMP8]], [[COND_FALSE8]] ]
++// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP6]], [[COND10]]
++// CHECK1-NEXT:    br label [[COND_END12]]
++// CHECK1:       cond.end12:
++// CHECK1-NEXT:    [[COND13:%.*]] = phi i32 [ 4, [[COND_TRUE4]] ], [ [[ADD11]], [[COND_END9]] ]
++// CHECK1-NEXT:    [[CMP14:%.*]] = icmp slt i32 [[TMP2]], [[COND13]]
++// CHECK1-NEXT:    br i1 [[CMP14]], label [[FOR_BODY15:%.*]], label [[FOR_END:%.*]]
++// CHECK1:       for.body15:
++// CHECK1-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP9]], 3
++// CHECK1-NEXT:    [[ADD16:%.*]] = add nsw i32 7, [[MUL]]
++// CHECK1-NEXT:    store i32 [[ADD16]], ptr [[I]], align 4
++// CHECK1-NEXT:    [[TMP10:%.*]] = load i32, ptr [[I]], align 4
++// CHECK1-NEXT:    call void (...) @body(i32 noundef [[TMP10]])
++// CHECK1-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK1:       for.inc:
++// CHECK1-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP11]], 1
++// CHECK1-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP23:![0-9]+]]
++// CHECK1:       for.end:
++// CHECK1-NEXT:    br label [[FOR_INC17:%.*]]
++// CHECK1:       for.inc17:
++// CHECK1-NEXT:    [[TMP12:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    [[CMP18:%.*]] = icmp sle i32 [[TMP12]], 0
++// CHECK1-NEXT:    br i1 [[CMP18]], label [[COND_TRUE19:%.*]], label [[COND_FALSE20:%.*]]
++// CHECK1:       cond.true19:
++// CHECK1-NEXT:    br label [[COND_END21:%.*]]
++// CHECK1:       cond.false20:
++// CHECK1-NEXT:    [[TMP13:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK1-NEXT:    br label [[COND_END21]]
++// CHECK1:       cond.end21:
++// CHECK1-NEXT:    [[COND22:%.*]] = phi i32 [ 1, [[COND_TRUE19]] ], [ [[TMP13]], [[COND_FALSE20]] ]
++// CHECK1-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[ADD23:%.*]] = add nsw i32 [[TMP14]], [[COND22]]
++// CHECK1-NEXT:    store i32 [[ADD23]], ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP24:![0-9]+]]
++// CHECK1:       for.end24:
++// CHECK1-NEXT:    ret void
++//
++//
+ // CHECK1-LABEL: define {{[^@]+}}@_GLOBAL__sub_I_tile_codegen.cpp
+ // CHECK1-SAME: () #[[ATTR1]] section ".text.startup" {
+ // CHECK1-NEXT:  entry:
+@@ -1159,13 +1256,13 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@body
+-// CHECK2-SAME: (...) #[[ATTR2:[0-9]+]] {
++// CHECK2-SAME: (...) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo1
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR2]] {
++// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -1255,7 +1352,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo2
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR2]] {
++// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -1368,7 +1465,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo3
+-// CHECK2-SAME: () #[[ATTR2]] {
++// CHECK2-SAME: () #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1510,7 +1607,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo4
+-// CHECK2-SAME: () #[[ATTR2]] {
++// CHECK2-SAME: () #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1663,7 +1760,7 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo5
+-// CHECK2-SAME: () #[[ATTR2]] {
++// CHECK2-SAME: () #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i64, align 8
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1872,14 +1969,14 @@ extern "C" void tfoo7() {
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo6
+-// CHECK2-SAME: () #[[ATTR2]] {
++// CHECK2-SAME: () #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void (ptr, i32, ptr, ...) @__kmpc_fork_call(ptr @[[GLOB2]], i32 0, ptr @foo6.omp_outlined)
+ // CHECK2-NEXT:    ret void
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@foo6.omp_outlined
+-// CHECK2-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR5:[0-9]+]] {
++// CHECK2-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTGLOBAL_TID__ADDR:%.*]] = alloca ptr, align 8
+ // CHECK2-NEXT:    [[DOTBOUND_TID__ADDR:%.*]] = alloca ptr, align 8
+@@ -1974,15 +2071,104 @@ extern "C" void tfoo7() {
+ // CHECK2-NEXT:    ret void
+ //
+ //
++// CHECK2-LABEL: define {{[^@]+}}@foo8
++// CHECK2-SAME: (i32 noundef [[A:%.*]]) #[[ATTR1]] {
++// CHECK2-NEXT:  entry:
++// CHECK2-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
++// CHECK2-NEXT:    [[I:%.*]] = alloca i32, align 4
++// CHECK2-NEXT:    [[DOTFLOOR_0_IV_I:%.*]] = alloca i32, align 4
++// CHECK2-NEXT:    [[DOTTILE_0_IV_I:%.*]] = alloca i32, align 4
++// CHECK2-NEXT:    store i32 [[A]], ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    store i32 7, ptr [[I]], align 4
++// CHECK2-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK2:       for.cond:
++// CHECK2-NEXT:    [[TMP0:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[CMP:%.*]] = icmp slt i32 [[TMP0]], 4
++// CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END24:%.*]]
++// CHECK2:       for.body:
++// CHECK2-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    store i32 [[TMP1]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    br label [[FOR_COND1:%.*]]
++// CHECK2:       for.cond1:
++// CHECK2-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP4:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    [[CMP2:%.*]] = icmp sle i32 [[TMP4]], 0
++// CHECK2-NEXT:    br i1 [[CMP2]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK2:       cond.true:
++// CHECK2-NEXT:    br label [[COND_END:%.*]]
++// CHECK2:       cond.false:
++// CHECK2-NEXT:    [[TMP5:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    br label [[COND_END]]
++// CHECK2:       cond.end:
++// CHECK2-NEXT:    [[COND:%.*]] = phi i32 [ 1, [[COND_TRUE]] ], [ [[TMP5]], [[COND_FALSE]] ]
++// CHECK2-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP3]], [[COND]]
++// CHECK2-NEXT:    [[CMP3:%.*]] = icmp slt i32 4, [[ADD]]
++// CHECK2-NEXT:    br i1 [[CMP3]], label [[COND_TRUE4:%.*]], label [[COND_FALSE5:%.*]]
++// CHECK2:       cond.true4:
++// CHECK2-NEXT:    br label [[COND_END12:%.*]]
++// CHECK2:       cond.false5:
++// CHECK2-NEXT:    [[TMP6:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP7:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    [[CMP6:%.*]] = icmp sle i32 [[TMP7]], 0
++// CHECK2-NEXT:    br i1 [[CMP6]], label [[COND_TRUE7:%.*]], label [[COND_FALSE8:%.*]]
++// CHECK2:       cond.true7:
++// CHECK2-NEXT:    br label [[COND_END9:%.*]]
++// CHECK2:       cond.false8:
++// CHECK2-NEXT:    [[TMP8:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    br label [[COND_END9]]
++// CHECK2:       cond.end9:
++// CHECK2-NEXT:    [[COND10:%.*]] = phi i32 [ 1, [[COND_TRUE7]] ], [ [[TMP8]], [[COND_FALSE8]] ]
++// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP6]], [[COND10]]
++// CHECK2-NEXT:    br label [[COND_END12]]
++// CHECK2:       cond.end12:
++// CHECK2-NEXT:    [[COND13:%.*]] = phi i32 [ 4, [[COND_TRUE4]] ], [ [[ADD11]], [[COND_END9]] ]
++// CHECK2-NEXT:    [[CMP14:%.*]] = icmp slt i32 [[TMP2]], [[COND13]]
++// CHECK2-NEXT:    br i1 [[CMP14]], label [[FOR_BODY15:%.*]], label [[FOR_END:%.*]]
++// CHECK2:       for.body15:
++// CHECK2-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP9]], 3
++// CHECK2-NEXT:    [[ADD16:%.*]] = add nsw i32 7, [[MUL]]
++// CHECK2-NEXT:    store i32 [[ADD16]], ptr [[I]], align 4
++// CHECK2-NEXT:    [[TMP10:%.*]] = load i32, ptr [[I]], align 4
++// CHECK2-NEXT:    call void (...) @body(i32 noundef [[TMP10]])
++// CHECK2-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK2:       for.inc:
++// CHECK2-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP11]], 1
++// CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP21:![0-9]+]]
++// CHECK2:       for.end:
++// CHECK2-NEXT:    br label [[FOR_INC17:%.*]]
++// CHECK2:       for.inc17:
++// CHECK2-NEXT:    [[TMP12:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    [[CMP18:%.*]] = icmp sle i32 [[TMP12]], 0
++// CHECK2-NEXT:    br i1 [[CMP18]], label [[COND_TRUE19:%.*]], label [[COND_FALSE20:%.*]]
++// CHECK2:       cond.true19:
++// CHECK2-NEXT:    br label [[COND_END21:%.*]]
++// CHECK2:       cond.false20:
++// CHECK2-NEXT:    [[TMP13:%.*]] = load i32, ptr [[A_ADDR]], align 4
++// CHECK2-NEXT:    br label [[COND_END21]]
++// CHECK2:       cond.end21:
++// CHECK2-NEXT:    [[COND22:%.*]] = phi i32 [ 1, [[COND_TRUE19]] ], [ [[TMP13]], [[COND_FALSE20]] ]
++// CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[ADD23:%.*]] = add nsw i32 [[TMP14]], [[COND22]]
++// CHECK2-NEXT:    store i32 [[ADD23]], ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP22:![0-9]+]]
++// CHECK2:       for.end24:
++// CHECK2-NEXT:    ret void
++//
++//
+ // CHECK2-LABEL: define {{[^@]+}}@tfoo7
+-// CHECK2-SAME: () #[[ATTR2]] {
++// CHECK2-SAME: () #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void @_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_(i32 noundef 0, i32 noundef 42)
+ // CHECK2-NEXT:    ret void
+ //
+ //
+ // CHECK2-LABEL: define {{[^@]+}}@_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR2]] comdat {
++// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR1]] comdat {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -2053,14 +2239,14 @@ extern "C" void tfoo7() {
+ // CHECK2-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP16]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP21:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP23:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC15:%.*]]
+ // CHECK2:       for.inc15:
+ // CHECK2-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[ADD16:%.*]] = add nsw i32 [[TMP17]], 5
+ // CHECK2-NEXT:    store i32 [[ADD16]], ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP22:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP24:![0-9]+]]
+ // CHECK2:       for.end17:
+ // CHECK2-NEXT:    ret void
+ //
+diff --git a/clang/test/OpenMP/tile_messages.cpp b/clang/test/OpenMP/tile_messages.cpp
+index adeef617b75c0..5268dfe97e0c8 100644
+--- a/clang/test/OpenMP/tile_messages.cpp
++++ b/clang/test/OpenMP/tile_messages.cpp
+@@ -43,13 +43,7 @@ void func() {
+ 
+   // expected-error@+1 {{argument to 'sizes' clause must be a strictly positive integer value}}
+   #pragma omp tile sizes(0)
+-    ;
+-
+-  // expected-error@+4 {{expression is not an integral constant expression}}
+-  // expected-note@+3 {{read of non-const variable 'a' is not allowed in a constant expression}}
+-  // expected-note@+1 {{declared here}}
+-  int a;
+-  #pragma omp tile sizes(a)
++  for (int i = 0; i < 7; ++i)
+     ;
+ 
+   // expected-warning@+2 {{extra tokens at the end of '#pragma omp tile' are ignored}}
+@@ -124,4 +118,46 @@ void func() {
+   #pragma omp tile sizes(5)
+   for (int i = 0; i/3<7; ++i)
+     ;
++
++  // expected-error@+2 {{expression must have integral or unscoped enumeration type, not 'struct S'}}
++  struct S{} s;
++  #pragma omp tile sizes(s)
++  for (int i = 0; i < 7; ++i)
++    ;
++}
++
++
++template <typename T>
++static void templated_func() {
++  // In a template context, but expression itself not instantiation-dependent
++
++  // expected-error@+1 {{argument to 'sizes' clause must be a strictly positive integer value}}
++  #pragma omp tile sizes(0)
++  for (int i = 0; i < 7; ++i)
++    ;
++}
++
++template <int S>
++static void templated_func_value_dependent() {
++  // expected-error@+1 {{argument to 'sizes' clause must be a strictly positive integer value}}
++  #pragma omp tile sizes(S)
++  for (int i = 0; i < 7; ++i)
++    ;
++}
++
++template <typename T>
++static void templated_func_type_dependent() {
++  constexpr T s = 0;
++  // expected-error@+1 {{argument to 'sizes' clause must be a strictly positive integer value}}
++  #pragma omp tile sizes(s)
++  for (int i = 0; i < 7; ++i)
++    ;
++}
++
++void template_inst() {
++  templated_func<int>();
++  // expected-note@+1 {{in instantiation of function template specialization 'templated_func_value_dependent<0>' requested here}}
++  templated_func_value_dependent<0>();
++  // expected-note@+1 {{in instantiation of function template specialization 'templated_func_type_dependent<int>' requested here}}
++  templated_func_type_dependent<int>();
+ }
+diff --git a/openmp/runtime/test/transform/tile/intfor.c b/openmp/runtime/test/transform/tile/intfor.c
+new file mode 100644
+index 0000000000000..4a930eab6730a
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/intfor.c
+@@ -0,0 +1,191 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++// TODO: The OpenMP specification explicitly does not define when and how often
++// expressions in the clause are evaluated. Currently Clang evaluates it again
++// whenever needed, but function calls in clauses are not common. A better
++// implementation would evaluate it just once and reuse the result.
++static int tilesize(int i) {
++  printf("tilesize(%d)\n", i);
++  return 3;
++}
++
++int main() {
++  printf("do\n");
++#pragma omp tile sizes(tilesize(1), tilesize(2))
++  for (int i = 7; i < 19; i += 3)
++    for (int j = 7; j < 20; j += 3)
++      printf("i=%d j=%d\n", i, j);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=7 j=7
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=7 j=10
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=7 j=13
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=10 j=7
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=10 j=10
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=10 j=13
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=13 j=7
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=13 j=10
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=13 j=13
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=7 j=16
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=7 j=19
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=10 j=16
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=10 j=19
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=13 j=16
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=13 j=19
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=16 j=7
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=16 j=10
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=16 j=13
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=16 j=16
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: i=16 j=19
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(2)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: tilesize(1)
++// CHECK-NEXT: done
+\ No newline at end of file
+diff --git a/openmp/runtime/test/transform/tile/negtile_intfor.c b/openmp/runtime/test/transform/tile/negtile_intfor.c
+new file mode 100644
+index 0000000000000..8784d9e9fa61c
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/negtile_intfor.c
+@@ -0,0 +1,44 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++int tilesize = -2;
++
++int main() {
++  printf("do\n");
++#pragma omp tile sizes(tilesize, tilesize)
++  for (int i = 7; i < 19; i += 3)
++    for (int j = 7; j < 20; j += 3)
++      printf("i=%d j=%d\n", i, j);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=7 j=7
++// CHECK-NEXT: i=7 j=10
++// CHECK-NEXT: i=7 j=13
++// CHECK-NEXT: i=7 j=16
++// CHECK-NEXT: i=7 j=19
++// CHECK-NEXT: i=10 j=7
++// CHECK-NEXT: i=10 j=10
++// CHECK-NEXT: i=10 j=13
++// CHECK-NEXT: i=10 j=16
++// CHECK-NEXT: i=10 j=19
++// CHECK-NEXT: i=13 j=7
++// CHECK-NEXT: i=13 j=10
++// CHECK-NEXT: i=13 j=13
++// CHECK-NEXT: i=13 j=16
++// CHECK-NEXT: i=13 j=19
++// CHECK-NEXT: i=16 j=7
++// CHECK-NEXT: i=16 j=10
++// CHECK-NEXT: i=16 j=13
++// CHECK-NEXT: i=16 j=16
++// CHECK-NEXT: i=16 j=19
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-intfor.cpp b/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-intfor.cpp
+new file mode 100644
+index 0000000000000..f4c2af6107680
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-intfor.cpp
+@@ -0,0 +1,100 @@
++// RUN: %libomp-cxx-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdio>
++
++int main() {
++  printf("do\n");
++#pragma omp parallel for collapse(3) num_threads(1)
++  for (int i = 0; i < 3; ++i)
++#pragma omp tile sizes(3, 3)
++    for (int j = 0; j < 4; ++j)
++      for (int k = 0; k < 5; ++k)
++        printf("i=%d j=%d k=%d\n", i, j, k);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++
++// Full tile
++// CHECK-NEXT: i=0 j=0 k=0
++// CHECK-NEXT: i=0 j=0 k=1
++// CHECK-NEXT: i=0 j=0 k=2
++// CHECK-NEXT: i=0 j=1 k=0
++// CHECK-NEXT: i=0 j=1 k=1
++// CHECK-NEXT: i=0 j=1 k=2
++// CHECK-NEXT: i=0 j=2 k=0
++// CHECK-NEXT: i=0 j=2 k=1
++// CHECK-NEXT: i=0 j=2 k=2
++
++// Partial tile
++// CHECK-NEXT: i=0 j=0 k=3
++// CHECK-NEXT: i=0 j=0 k=4
++// CHECK-NEXT: i=0 j=1 k=3
++// CHECK-NEXT: i=0 j=1 k=4
++// CHECK-NEXT: i=0 j=2 k=3
++// CHECK-NEXT: i=0 j=2 k=4
++
++// Partial tile
++// CHECK-NEXT: i=0 j=3 k=0
++// CHECK-NEXT: i=0 j=3 k=1
++// CHECK-NEXT: i=0 j=3 k=2
++
++// Partial tile
++// CHECK-NEXT: i=0 j=3 k=3
++// CHECK-NEXT: i=0 j=3 k=4
++
++// Full tile
++// CHECK-NEXT: i=1 j=0 k=0
++// CHECK-NEXT: i=1 j=0 k=1
++// CHECK-NEXT: i=1 j=0 k=2
++// CHECK-NEXT: i=1 j=1 k=0
++// CHECK-NEXT: i=1 j=1 k=1
++// CHECK-NEXT: i=1 j=1 k=2
++// CHECK-NEXT: i=1 j=2 k=0
++// CHECK-NEXT: i=1 j=2 k=1
++// CHECK-NEXT: i=1 j=2 k=2
++
++// Partial tiles
++// CHECK-NEXT: i=1 j=0 k=3
++// CHECK-NEXT: i=1 j=0 k=4
++// CHECK-NEXT: i=1 j=1 k=3
++// CHECK-NEXT: i=1 j=1 k=4
++// CHECK-NEXT: i=1 j=2 k=3
++// CHECK-NEXT: i=1 j=2 k=4
++// CHECK-NEXT: i=1 j=3 k=0
++// CHECK-NEXT: i=1 j=3 k=1
++// CHECK-NEXT: i=1 j=3 k=2
++// CHECK-NEXT: i=1 j=3 k=3
++// CHECK-NEXT: i=1 j=3 k=4
++
++// Full tile
++// CHECK-NEXT: i=2 j=0 k=0
++// CHECK-NEXT: i=2 j=0 k=1
++// CHECK-NEXT: i=2 j=0 k=2
++// CHECK-NEXT: i=2 j=1 k=0
++// CHECK-NEXT: i=2 j=1 k=1
++// CHECK-NEXT: i=2 j=1 k=2
++// CHECK-NEXT: i=2 j=2 k=0
++// CHECK-NEXT: i=2 j=2 k=1
++// CHECK-NEXT: i=2 j=2 k=2
++
++// Partial tiles
++// CHECK-NEXT: i=2 j=0 k=3
++// CHECK-NEXT: i=2 j=0 k=4
++// CHECK-NEXT: i=2 j=1 k=3
++// CHECK-NEXT: i=2 j=1 k=4
++// CHECK-NEXT: i=2 j=2 k=3
++// CHECK-NEXT: i=2 j=2 k=4
++// CHECK-NEXT: i=2 j=3 k=0
++// CHECK-NEXT: i=2 j=3 k=1
++// CHECK-NEXT: i=2 j=3 k=2
++// CHECK-NEXT: i=2 j=3 k=3
++// CHECK-NEXT: i=2 j=3 k=4
++// CHECK-NEXT: done

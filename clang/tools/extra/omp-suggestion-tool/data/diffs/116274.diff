@@ -1,0 +1,272 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 5886e384b986b..520b7ceeb1449 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -546,6 +546,7 @@ class ParseTreeDumper {
+   NODE_ENUM(OmpLinearModifier, Type)
+   NODE(parser, OmpLoopDirective)
+   NODE(parser, OmpMapClause)
++  NODE(parser, OmpMapperIdentifier)
+   NODE_ENUM(OmpMapClause, TypeModifier)
+   NODE_ENUM(OmpMapClause, Type)
+   static std::string GetNodeName(const llvm::omp::Clause &x) {
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 10d7840775e88..c7edaa2141969 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3703,8 +3703,11 @@ struct OmpLinearClause {
+   std::variant<WithModifier, WithoutModifier> u;
+ };
+ 
++WRAPPER_CLASS(OmpMapperIdentifier, std::optional<Name>);
++
+ // 2.15.5.1 map ->
+-//    MAP ([[map-type-modifier-list [,]] [iterator-modifier [,]] map-type : ]
++//    MAP ([MAPPER(mapper-identifier)] [[map-type-modifier-list [,]]
++//    [iterator-modifier [,]] map-type : ]
+ //         variable-name-list)
+ // map-type-modifier-list -> map-type-modifier [,] [...]
+ // map-type-modifier -> ALWAYS | CLOSE | PRESENT | OMPX_HOLD
+@@ -3718,7 +3721,8 @@ struct OmpMapClause {
+   // The checks for satisfying those constraints are deferred to semantics.
+   // In OpenMP 5.2 the non-comma syntax has been deprecated: keep the
+   // information about separator presence to emit a diagnostic if needed.
+-  std::tuple<std::optional<std::list<TypeModifier>>,
++  std::tuple<OmpMapperIdentifier, // Mapper name
++      std::optional<std::list<TypeModifier>>,
+       std::optional<std::list<OmpIteratorModifier>>, // unique
+       std::optional<std::list<Type>>, // unique
+       OmpObjectList,
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 3dedd4864bafc..a6f47f2db31ab 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "flang/Common/idioms.h"
+ #include "flang/Evaluate/expression.h"
++#include "flang/Optimizer/Builder/Todo.h"
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Semantics/expression.h"
+ #include "flang/Semantics/symbol.h"
+@@ -974,6 +975,10 @@ Map make(const parser::OmpClause::Map &inp,
+       std::get<std::optional<std::list<parser::OmpIteratorModifier>>>(inp.v.t);
+   auto &t2 = std::get<std::optional<std::list<wrapped::Type>>>(inp.v.t);
+   auto &t3 = std::get<parser::OmpObjectList>(inp.v.t);
++  auto &t4 = std::get<parser::OmpMapperIdentifier>(inp.v.t);
++
++  if (t4.v)
++    TODO_NOLOC("OmpMapClause(MAPPER(...)): user defined mapper not supported");
+ 
+   // These should have been diagnosed already.
+   assert((!t1 || t1->size() == 1) && "Only one iterator modifier is allowed");
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index c2c730edacc02..8259f501dca84 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -131,7 +131,6 @@ template <typename Separator> struct MotionModifiers {
+   constexpr MotionModifiers(const MotionModifiers &) = default;
+   constexpr MotionModifiers(MotionModifiers &&) = default;
+ 
+-  // Parsing of mappers if not implemented yet.
+   using ExpParser = Parser<OmpFromClause::Expectation>;
+   using IterParser = Parser<OmpIteratorModifier>;
+   using ModParser = ConcatSeparated<Separator, ExpParser, IterParser>;
+@@ -250,21 +249,26 @@ TYPE_PARSER(
+         "TOFROM" >> pure(OmpMapClause::Type::Tofrom)))
+ 
+ template <bool CommasEverywhere>
+-static inline OmpMapClause makeMapClause(
++static inline OmpMapClause makeMapClause(OmpMapperIdentifier &&mm,
+     std::tuple<std::optional<std::list<OmpMapClause::TypeModifier>>,
+         std::optional<std::list<OmpIteratorModifier>>,
+         std::optional<std::list<OmpMapClause::Type>>> &&mods,
+     OmpObjectList &&objs) {
+   auto &&[tm, it, ty] = std::move(mods);
+-  return OmpMapClause{std::move(tm), std::move(it), std::move(ty),
+-      std::move(objs), CommasEverywhere};
++  return OmpMapClause{std::move(mm), std::move(tm), std::move(it),
++      std::move(ty), std::move(objs), CommasEverywhere};
+ }
+ 
++TYPE_PARSER(construct<OmpMapperIdentifier>(
++    maybe("MAPPER"_tok >> parenthesized(name) / ","_tok)))
++
+ TYPE_PARSER(construct<OmpMapClause>(
+-    applyFunction<OmpMapClause>(
+-        makeMapClause<true>, MapModifiers(","_tok), Parser<OmpObjectList>{}) ||
++    applyFunction<OmpMapClause>(makeMapClause<true>,
++        Parser<OmpMapperIdentifier>{}, MapModifiers(","_tok),
++        Parser<OmpObjectList>{}) ||
+     applyFunction<OmpMapClause>(makeMapClause<false>,
+-        MapModifiers(maybe(","_tok)), Parser<OmpObjectList>{})))
++        Parser<OmpMapperIdentifier>{}, MapModifiers(maybe(","_tok)),
++        Parser<OmpObjectList>{})))
+ 
+ // [OpenMP 5.0]
+ // 2.19.7.2 defaultmap(implicit-behavior[:variable-category])
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 158d3a1f14e4f..a4de6d23f9f19 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2095,12 +2095,22 @@ class UnparseVisitor {
+         std::get<std::optional<std::list<OmpMapClause::TypeModifier>>>(x.t);
+     auto &iter = std::get<std::optional<std::list<OmpIteratorModifier>>>(x.t);
+     auto &type = std::get<std::optional<std::list<OmpMapClause::Type>>>(x.t);
++    auto &mapper = std::get<OmpMapperIdentifier>(x.t);
+ 
+     // For a given list of items, if the item has a value, then walk it.
+     // Print commas between items that have values.
+     // Return 'true' if something did get printed, otherwise 'false'.
+     bool needComma{false};
++    if (mapper.v) {
++      Word("MAPPER(");
++      Walk(*mapper.v);
++      Put(")");
++      needComma = true;
++    }
+     if (typeMod) {
++      if (needComma) {
++        Put(", ");
++      }
+       Walk(*typeMod);
+       needComma = true;
+     }
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 9b0e204ac4e91..7d1df884c5555 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1471,6 +1471,8 @@ class OmpVisitor : public virtual DeclarationVisitor {
+ 
+   bool Pre(const parser::OpenMPDeclareMapperConstruct &);
+ 
++  bool Pre(const parser::OmpMapClause &);
++
+   void Post(const parser::OmpBeginLoopDirective &) {
+     messageHandler().set_currStmtSource(std::nullopt);
+   }
+@@ -1639,6 +1641,33 @@ bool OmpVisitor::Pre(const parser::OpenMPDeclareMapperConstruct &x) {
+   return false;
+ }
+ 
++bool OmpVisitor::Pre(const parser::OmpMapClause &x) {
++  const auto &mid{std::get<parser::OmpMapperIdentifier>(x.t)};
++  if (const auto &mapperName{mid.v}) {
++    if (const auto symbol = FindSymbol(currScope(), *mapperName)) {
++      // TODO: Do we need a specific flag or type here, to distinghuish against
++      // other ConstructName things? Leaving this for the full implementation
++      // of mapper lowering.
++      auto *misc{symbol->detailsIf<MiscDetails>()};
++      if (!misc || misc->kind() != MiscDetails::Kind::ConstructName)
++        context().Say(mapperName->source,
++            "Name '%s' should be a mapper name"_err_en_US, mapperName->source);
++      else
++        mapperName->symbol = symbol;
++    } else {
++      mapperName->symbol = &MakeSymbol(
++          *mapperName, MiscDetails{MiscDetails::Kind::ConstructName});
++      // TODO: When completing the implementation, we probably want to error if
++      // the symbol is not declared, but right now, testing that the TODO for
++      // OmpMapclause happens is obscured by the TODO for declare mapper, so
++      // leaving this out. Remove the above line once the declare mapper is
++      // implemented. context().Say(mapperName->source, "'%s' not
++      // declared"_err_en_US, mapperName->source);
++    }
++  }
++  return true;
++}
++
+ // Walk the parse tree and resolve names to symbols.
+ class ResolveNamesVisitor : public virtual ScopeHandler,
+                             public ModuleVisitor,
+diff --git a/flang/test/Lower/OpenMP/Todo/map-mapper.f90 b/flang/test/Lower/OpenMP/Todo/map-mapper.f90
+new file mode 100644
+index 0000000000000..d83c20db29307
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/map-mapper.f90
+@@ -0,0 +1,16 @@
++! RUN: not %flang_fc1 -emit-fir -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++program p
++  integer, parameter :: n = 256
++  real(8) :: a(256)
++  !! TODO: Add declare mapper, when it works to lower this construct 
++  !!type t1
++  !!   integer :: x
++  !!end type t1
++  !!!$omp declare mapper(xx : t1 :: nn) map(nn, nn%x)
++  !$omp target map(mapper(xx), from:a)
++!CHECK: not yet implemented: OmpMapClause(MAPPER(...))
++  do i=1,n
++     a(i) = 4.2
++  end do
++  !$omp end target
++end program p
+diff --git a/flang/test/Parser/OpenMP/map-modifiers.f90 b/flang/test/Parser/OpenMP/map-modifiers.f90
+index 0c95f21c5e6a5..2b4073f2cafcd 100644
+--- a/flang/test/Parser/OpenMP/map-modifiers.f90
++++ b/flang/test/Parser/OpenMP/map-modifiers.f90
+@@ -316,3 +316,28 @@ subroutine f90(x, y)
+ !PARSE-TREE: | | | | Designator -> DataRef -> Name = 'k'
+ !PARSE-TREE: | | bool = 'true'
+ 
++subroutine f100(x, y)
++  integer :: x(10)
++  integer :: y
++  integer, parameter :: p = 23
++  !$omp target map(mapper(xx), from: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f100 (x, y)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE:  INTEGER y
++!UNPARSE:  INTEGER, PARAMETER :: p = 23_4
++!UNPARSE: !$OMP TARGET  MAP(MAPPER(XX), FROM: X)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | OmpMapperIdentifier -> Name = 'xx'
++!PARSE-TREE: | | Type = From
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
+diff --git a/flang/test/Semantics/OpenMP/map-clause-symbols.f90 b/flang/test/Semantics/OpenMP/map-clause-symbols.f90
+new file mode 100644
+index 0000000000000..8f984fcd2fa7e
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/map-clause-symbols.f90
+@@ -0,0 +1,14 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++program main
++!CHECK-LABEL:  MainProgram scope: main
++  integer, parameter :: n = 256
++  real(8) :: a(256)
++  !$omp target map(mapper(xx), from:a)
++  do i=1,n
++     a(i) = 4.2
++  end do
++  !$omp end target
++!CHECK:    OtherConstruct scope: size=0 alignment=1 sourceRange=74 bytes
++!CHECK:    OtherClause scope: size=0 alignment=1 sourceRange=0 bytes
++!CHECK:    xx: Misc ConstructName
++end program main
+diff --git a/flang/test/Semantics/OpenMP/map-clause.f90 b/flang/test/Semantics/OpenMP/map-clause.f90
+index a7430c3edeb94..efcef2571a04a 100644
+--- a/flang/test/Semantics/OpenMP/map-clause.f90
++++ b/flang/test/Semantics/OpenMP/map-clause.f90
+@@ -33,3 +33,11 @@ subroutine sb(arr)
+    c = 2
+  !$omp end target
+ end subroutine
++
++subroutine sb1
++  integer :: xx
++  integer :: a
++  !ERROR: Name 'xx' should be a mapper name
++  !$omp target map(mapper(xx), from:a)
++  !$omp end target
++end subroutine sb1

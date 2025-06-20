@@ -1,0 +1,93 @@
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 977c2fef34091..ce96eb9b7782e 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2404,6 +2404,24 @@ void OmpAttributeVisitor::ResolveOmpObjectList(
+   }
+ }
+ 
++/// True if either symbol is in a namelist or some other symbol in the same
++/// equivalence set as symbol is in a namelist.
++static bool SymbolOrEquivalentIsInNamelist(const Symbol &symbol) {
++  auto isInNamelist{[](const Symbol &sym) {
++    const Symbol &ultimate{sym.GetUltimate()};
++    return ultimate.test(Symbol::Flag::InNamelist);
++  }};
++
++  const EquivalenceSet *eqv{FindEquivalenceSet(symbol)};
++  if (!eqv) {
++    return isInNamelist(symbol);
++  }
++
++  return llvm::any_of(*eqv, [isInNamelist](const EquivalenceObject &obj) {
++    return isInNamelist(obj.symbol);
++  });
++}
++
+ void OmpAttributeVisitor::ResolveOmpObject(
+     const parser::OmpObject &ompObject, Symbol::Flag ompFlag) {
+   common::visit(
+@@ -2468,7 +2486,6 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                               .str()));
+                 }
+                 if (ompFlag == Symbol::Flag::OmpReduction) {
+-                  const Symbol &ultimateSymbol{symbol->GetUltimate()};
+                   // Using variables inside of a namelist in OpenMP reductions
+                   // is allowed by the standard, but is not allowed for
+                   // privatisation. This looks like an oversight. If the
+@@ -2476,7 +2493,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                   // mapping for the reduction variable: resulting in incorrect
+                   // results. Disabling this hoisting could make some real
+                   // production code go slower. See discussion in #109303
+-                  if (ultimateSymbol.test(Symbol::Flag::InNamelist)) {
++                  if (SymbolOrEquivalentIsInNamelist(*symbol)) {
+                     context_.Say(name->source,
+                         "Variable '%s' in NAMELIST cannot be in a REDUCTION clause"_err_en_US,
+                         name->ToString());
+@@ -2838,7 +2855,7 @@ void OmpAttributeVisitor::CheckObjectIsPrivatizable(
+     clauseName = "LASTPRIVATE";
+   }
+ 
+-  if (ultimateSymbol.test(Symbol::Flag::InNamelist)) {
++  if (SymbolOrEquivalentIsInNamelist(symbol)) {
+     context_.Say(name.source,
+         "Variable '%s' in NAMELIST cannot be in a %s clause"_err_en_US,
+         name.ToString(), clauseName.str());
+diff --git a/flang/test/Semantics/OpenMP/equivalence-namelist.f90 b/flang/test/Semantics/OpenMP/equivalence-namelist.f90
+new file mode 100644
+index 0000000000000..dc0a1712ed8f5
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/equivalence-namelist.f90
+@@ -0,0 +1,32 @@
++! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++
++! The openmp standard only dissallows namelist for privatization, but flang
++! also does not allow it for reduction as this would be difficult to support.
++!
++! Variables in equivalence with variables in the namelist pose the same
++! implementation problems.
++
++subroutine test01()
++  integer::va
++  equivalence (va,vva)
++  namelist /na1/vva
++  va=1
++
++!ERROR: Variable 'va' in NAMELIST cannot be in a REDUCTION clause
++!$omp parallel reduction(+:va)
++  write(*,na1)
++!$omp end parallel
++end subroutine test01
++
++
++subroutine test02()
++  integer::va
++  equivalence (va,vva)
++  namelist /na1/vva
++  va=1
++
++!ERROR: Variable 'va' in NAMELIST cannot be in a PRIVATE clause
++!$omp parallel private(va)
++  write(*,na1)
++!$omp end parallel
++end subroutine test02

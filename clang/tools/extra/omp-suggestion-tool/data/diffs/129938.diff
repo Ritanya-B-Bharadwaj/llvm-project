@@ -1,0 +1,782 @@
+diff --git a/clang/docs/OpenMPSupport.rst b/clang/docs/OpenMPSupport.rst
+index 88af120d06edb..25becfae0271d 100644
+--- a/clang/docs/OpenMPSupport.rst
++++ b/clang/docs/OpenMPSupport.rst
+@@ -405,8 +405,8 @@ implementation.
+ | Extensions to depobj construct                              | :none:`unclaimed`         | :none:`unclaimed`         |                                                                          |
+ +-------------------------------------------------------------+---------------------------+---------------------------+--------------------------------------------------------------------------+
+ | Extensions to atomic construct                              | :none:`unclaimed`         | :none:`unclaimed`         |                                                                          |
+-+-------------------------------------------------------------+---------------------------+---------------------------+--------------------------------------------------------------------------+
+-| Private reductions                                          | :none:`unclaimed`         | :none:`unclaimed`         |                                                                          |
+++-------------------------------------------------------------+---------------------------+---------------------------+--------------------------------------------------------------------------+ 
++| Private reductions                                          | :part:`partial`           | :none:`unclaimed`         | Parse/Sema:https://github.com/llvm/llvm-project/pull/129938              |
+ +-------------------------------------------------------------+---------------------------+---------------------------+--------------------------------------------------------------------------+
+ | Self maps                                                   | :none:`unclaimed`         | :none:`unclaimed`         |                                                                          |
+ +-------------------------------------------------------------+---------------------------+---------------------------+--------------------------------------------------------------------------+
+diff --git a/clang/include/clang/AST/OpenMPClause.h b/clang/include/clang/AST/OpenMPClause.h
+index 154ecfbaa4418..3a383a28f770f 100644
+--- a/clang/include/clang/AST/OpenMPClause.h
++++ b/clang/include/clang/AST/OpenMPClause.h
+@@ -3658,7 +3658,7 @@ class OMPSharedClause final
+ class OMPReductionClause final
+     : public OMPVarListClause<OMPReductionClause>,
+       public OMPClauseWithPostUpdate,
+-      private llvm::TrailingObjects<OMPReductionClause, Expr *> {
++      private llvm::TrailingObjects<OMPReductionClause, Expr *, bool> {
+   friend class OMPClauseReader;
+   friend OMPVarListClause;
+   friend TrailingObjects;
+@@ -3666,6 +3666,10 @@ class OMPReductionClause final
+   /// Reduction modifier.
+   OpenMPReductionClauseModifier Modifier = OMPC_REDUCTION_unknown;
+ 
++  /// Original Sharing  modifier.
++  OpenMPOriginalSharingModifier OriginalSharingModifier =
++      OMPC_ORIGINAL_SHARING_default;
++
+   /// Reduction modifier location.
+   SourceLocation ModifierLoc;
+ 
+@@ -3691,12 +3695,14 @@ class OMPReductionClause final
+   OMPReductionClause(SourceLocation StartLoc, SourceLocation LParenLoc,
+                      SourceLocation ModifierLoc, SourceLocation ColonLoc,
+                      SourceLocation EndLoc,
+-                     OpenMPReductionClauseModifier Modifier, unsigned N,
+-                     NestedNameSpecifierLoc QualifierLoc,
++                     OpenMPReductionClauseModifier Modifier,
++                     OpenMPOriginalSharingModifier OriginalSharingModifier,
++                     unsigned N, NestedNameSpecifierLoc QualifierLoc,
+                      const DeclarationNameInfo &NameInfo)
+       : OMPVarListClause<OMPReductionClause>(llvm::omp::OMPC_reduction,
+                                              StartLoc, LParenLoc, EndLoc, N),
+         OMPClauseWithPostUpdate(this), Modifier(Modifier),
++        OriginalSharingModifier(OriginalSharingModifier),
+         ModifierLoc(ModifierLoc), ColonLoc(ColonLoc),
+         QualifierLoc(QualifierLoc), NameInfo(NameInfo) {}
+ 
+@@ -3712,6 +3718,11 @@ class OMPReductionClause final
+   /// Sets reduction modifier.
+   void setModifier(OpenMPReductionClauseModifier M) { Modifier = M; }
+ 
++  /// Sets Original Sharing  modifier.
++  void setOriginalSharingModifier(OpenMPOriginalSharingModifier M) {
++    OriginalSharingModifier = M;
++  }
++
+   /// Sets location of the modifier.
+   void setModifierLoc(SourceLocation Loc) { ModifierLoc = Loc; }
+ 
+@@ -3757,6 +3768,31 @@ class OMPReductionClause final
+   /// reduction copies.
+   void setRHSExprs(ArrayRef<Expr *> RHSExprs);
+ 
++  /// Set the list private reduction flags
++  void setPrivateVariableReductionFlags(ArrayRef<bool> Flags) {
++    assert(Flags.size() == varlist_size() &&
++           "Number of private flags does not match vars");
++    llvm::copy(Flags, getTrailingObjects<bool>());
++  }
++
++  /// Get the list of help private variable reduction flags
++  MutableArrayRef<bool> getPrivateVariableReductionFlags() {
++    return MutableArrayRef(getTrailingObjects<bool>(), varlist_size());
++  }
++  ArrayRef<bool> getPrivateVariableReductionFlags() const {
++    return ArrayRef(getTrailingObjects<bool>(), varlist_size());
++  }
++
++  /// Returns the number of Expr* objects in trailing storage
++  size_t numTrailingObjects(OverloadToken<Expr *>) const {
++    return varlist_size() * (Modifier == OMPC_REDUCTION_inscan ? 8 : 5);
++  }
++
++  /// Returns the number of bool flags in trailing storage
++  size_t numTrailingObjects(OverloadToken<bool>) const {
++    return varlist_size();
++  }
++
+   /// Get the list of helper destination expressions.
+   MutableArrayRef<Expr *> getRHSExprs() {
+     return MutableArrayRef<Expr *>(getLHSExprs().end(), varlist_size());
+@@ -3854,6 +3890,7 @@ class OMPReductionClause final
+   /// region with this clause.
+   /// \param PostUpdate Expression that must be executed after exit from the
+   /// OpenMP region with this clause.
++  /// \param IsPrivateVarReduction array for private variable reduction flags
+   static OMPReductionClause *
+   Create(const ASTContext &C, SourceLocation StartLoc, SourceLocation LParenLoc,
+          SourceLocation ModifierLoc, SourceLocation ColonLoc,
+@@ -3863,7 +3900,8 @@ class OMPReductionClause final
+          ArrayRef<Expr *> LHSExprs, ArrayRef<Expr *> RHSExprs,
+          ArrayRef<Expr *> ReductionOps, ArrayRef<Expr *> CopyOps,
+          ArrayRef<Expr *> CopyArrayTemps, ArrayRef<Expr *> CopyArrayElems,
+-         Stmt *PreInit, Expr *PostUpdate);
++         Stmt *PreInit, Expr *PostUpdate, ArrayRef<bool> IsPrivateVarReduction,
++         OpenMPOriginalSharingModifier OriginalSharingModifier);
+ 
+   /// Creates an empty clause with the place for \a N variables.
+   ///
+@@ -3877,6 +3915,11 @@ class OMPReductionClause final
+   /// Returns modifier.
+   OpenMPReductionClauseModifier getModifier() const { return Modifier; }
+ 
++  /// Returns Original Sharing Modifier.
++  OpenMPOriginalSharingModifier getOriginalSharingModifier() const {
++    return OriginalSharingModifier;
++  }
++
+   /// Returns modifier location.
+   SourceLocation getModifierLoc() const { return ModifierLoc; }
+ 
+@@ -3894,6 +3937,11 @@ class OMPReductionClause final
+   using helper_expr_range = llvm::iterator_range<helper_expr_iterator>;
+   using helper_expr_const_range =
+       llvm::iterator_range<helper_expr_const_iterator>;
++  using helper_flag_iterator = MutableArrayRef<bool>::iterator;
++  using helper_flag_const_iterator = ArrayRef<bool>::iterator;
++  using helper_flag_range = llvm::iterator_range<helper_flag_iterator>;
++  using helper_flag_const_range =
++      llvm::iterator_range<helper_flag_const_iterator>;
+ 
+   helper_expr_const_range privates() const {
+     return helper_expr_const_range(getPrivates().begin(), getPrivates().end());
+@@ -3919,6 +3967,16 @@ class OMPReductionClause final
+     return helper_expr_range(getRHSExprs().begin(), getRHSExprs().end());
+   }
+ 
++  helper_flag_const_range private_var_reduction_flags() const {
++    return helper_flag_const_range(getPrivateVariableReductionFlags().begin(),
++                                   getPrivateVariableReductionFlags().end());
++  }
++
++  helper_flag_range private_var_reduction_flags() {
++    return helper_flag_range(getPrivateVariableReductionFlags().begin(),
++                             getPrivateVariableReductionFlags().end());
++  }
++
+   helper_expr_const_range reduction_ops() const {
+     return helper_expr_const_range(getReductionOps().begin(),
+                                    getReductionOps().end());
+diff --git a/clang/include/clang/Basic/OpenMPKinds.def b/clang/include/clang/Basic/OpenMPKinds.def
+index 76a861f416fd5..ea01fe6386ada 100644
+--- a/clang/include/clang/Basic/OpenMPKinds.def
++++ b/clang/include/clang/Basic/OpenMPKinds.def
+@@ -71,6 +71,9 @@
+ #ifndef OPENMP_REDUCTION_MODIFIER
+ #define OPENMP_REDUCTION_MODIFIER(Name)
+ #endif
++#ifndef OPENMP_ORIGINAL_SHARING_MODIFIER
++#define OPENMP_ORIGINAL_SHARING_MODIFIER(Name)
++#endif
+ #ifndef OPENMP_ADJUST_ARGS_KIND
+ #define OPENMP_ADJUST_ARGS_KIND(Name)
+ #endif
+@@ -202,6 +205,11 @@ OPENMP_REDUCTION_MODIFIER(default)
+ OPENMP_REDUCTION_MODIFIER(inscan)
+ OPENMP_REDUCTION_MODIFIER(task)
+ 
++// OpenMP 6.0 modifiers for 'reduction' clause.
++OPENMP_ORIGINAL_SHARING_MODIFIER(shared)
++OPENMP_ORIGINAL_SHARING_MODIFIER(private)
++OPENMP_ORIGINAL_SHARING_MODIFIER(default)
++
+ // Adjust-op kinds for the 'adjust_args' clause.
+ OPENMP_ADJUST_ARGS_KIND(nothing)
+ OPENMP_ADJUST_ARGS_KIND(need_device_ptr)
+@@ -233,6 +241,7 @@ OPENMP_DOACROSS_MODIFIER(source_omp_cur_iteration)
+ #undef OPENMP_ADJUST_ARGS_KIND
+ #undef OPENMP_REDUCTION_MODIFIER
+ #undef OPENMP_DEVICE_MODIFIER
++#undef OPENMP_ORIGINAL_SHARING_MODIFIER
+ #undef OPENMP_ORDER_KIND
+ #undef OPENMP_ORDER_MODIFIER
+ #undef OPENMP_LASTPRIVATE_KIND
+diff --git a/clang/include/clang/Basic/OpenMPKinds.h b/clang/include/clang/Basic/OpenMPKinds.h
+index e80bce34a97e0..6ca9f9c550285 100644
+--- a/clang/include/clang/Basic/OpenMPKinds.h
++++ b/clang/include/clang/Basic/OpenMPKinds.h
+@@ -190,6 +190,13 @@ enum OpenMPReductionClauseModifier {
+   OMPC_REDUCTION_unknown,
+ };
+ 
++/// OpenMP 6.0 original sharing modifiers
++enum OpenMPOriginalSharingModifier {
++#define OPENMP_ORIGINAL_SHARING_MODIFIER(Name) OMPC_ORIGINAL_SHARING_##Name,
++#include "clang/Basic/OpenMPKinds.def"
++  OMPC_ORIGINAL_SHARING_unknown,
++};
++
+ /// OpenMP adjust-op kinds for 'adjust_args' clause.
+ enum OpenMPAdjustArgsOpKind {
+ #define OPENMP_ADJUST_ARGS_KIND(Name) OMPC_ADJUST_ARGS_##Name,
+diff --git a/clang/include/clang/Sema/SemaOpenMP.h b/clang/include/clang/Sema/SemaOpenMP.h
+index 64f0cfa0676af..cd427bc104ba5 100644
+--- a/clang/include/clang/Sema/SemaOpenMP.h
++++ b/clang/include/clang/Sema/SemaOpenMP.h
+@@ -1142,6 +1142,7 @@ class SemaOpenMP : public SemaBase {
+     DeclarationNameInfo ReductionOrMapperId;
+     int ExtraModifier = -1; ///< Additional modifier for linear, map, depend or
+                             ///< lastprivate clause.
++    int OriginalSharingModifier = 0; // Default is shared
+     SmallVector<OpenMPMapModifierKind, NumberOfOMPMapClauseModifiers>
+         MapTypeModifiers;
+     SmallVector<SourceLocation, NumberOfOMPMapClauseModifiers>
+@@ -1151,6 +1152,7 @@ class SemaOpenMP : public SemaBase {
+     SmallVector<SourceLocation, NumberOfOMPMotionModifiers> MotionModifiersLoc;
+     bool IsMapTypeImplicit = false;
+     SourceLocation ExtraModifierLoc;
++    SourceLocation OriginalSharingModifierLoc;
+     SourceLocation OmpAllMemoryLoc;
+     SourceLocation
+         StepModifierLoc; /// 'step' modifier location for linear clause
+@@ -1160,6 +1162,12 @@ class SemaOpenMP : public SemaBase {
+     SmallVector<SourceLocation, NumberOfOMPAllocateClauseModifiers>
+         AllocClauseModifiersLoc;
+     Expr *AllocateAlignment = nullptr;
++    struct OpenMPReductionClauseModifiers {
++      int ExtraModifier;
++      int OriginalSharingModifier;
++      OpenMPReductionClauseModifiers(int Extra, int Original)
++          : ExtraModifier(Extra), OriginalSharingModifier(Original) {}
++    };
+   };
+ 
+   OMPClause *ActOnOpenMPVarListClause(OpenMPClauseKind Kind,
+@@ -1208,7 +1216,8 @@ class SemaOpenMP : public SemaBase {
+                                      SourceLocation EndLoc);
+   /// Called on well-formed 'reduction' clause.
+   OMPClause *ActOnOpenMPReductionClause(
+-      ArrayRef<Expr *> VarList, OpenMPReductionClauseModifier Modifier,
++      ArrayRef<Expr *> VarList,
++      OpenMPVarListDataTy::OpenMPReductionClauseModifiers Modifiers,
+       SourceLocation StartLoc, SourceLocation LParenLoc,
+       SourceLocation ModifierLoc, SourceLocation ColonLoc,
+       SourceLocation EndLoc, CXXScopeSpec &ReductionIdScopeSpec,
+diff --git a/clang/lib/AST/OpenMPClause.cpp b/clang/lib/AST/OpenMPClause.cpp
+index 424cab3a7de35..9041b39a1a14e 100644
+--- a/clang/lib/AST/OpenMPClause.cpp
++++ b/clang/lib/AST/OpenMPClause.cpp
+@@ -797,12 +797,14 @@ OMPReductionClause *OMPReductionClause::Create(
+     ArrayRef<Expr *> Privates, ArrayRef<Expr *> LHSExprs,
+     ArrayRef<Expr *> RHSExprs, ArrayRef<Expr *> ReductionOps,
+     ArrayRef<Expr *> CopyOps, ArrayRef<Expr *> CopyArrayTemps,
+-    ArrayRef<Expr *> CopyArrayElems, Stmt *PreInit, Expr *PostUpdate) {
+-  void *Mem = C.Allocate(totalSizeToAlloc<Expr *>(
+-      (Modifier == OMPC_REDUCTION_inscan ? 8 : 5) * VL.size()));
+-  auto *Clause = new (Mem)
+-      OMPReductionClause(StartLoc, LParenLoc, ModifierLoc, EndLoc, ColonLoc,
+-                         Modifier, VL.size(), QualifierLoc, NameInfo);
++    ArrayRef<Expr *> CopyArrayElems, Stmt *PreInit, Expr *PostUpdate,
++    ArrayRef<bool> IsPrivateVarReduction,
++    OpenMPOriginalSharingModifier OrignalSharingModifier) {
++  void *Mem = C.Allocate(totalSizeToAlloc<Expr *, bool>(
++      (Modifier == OMPC_REDUCTION_inscan ? 8 : 5) * VL.size(), VL.size()));
++  auto *Clause = new (Mem) OMPReductionClause(
++      StartLoc, LParenLoc, ModifierLoc, EndLoc, ColonLoc, Modifier,
++      OrignalSharingModifier, VL.size(), QualifierLoc, NameInfo);
+   Clause->setVarRefs(VL);
+   Clause->setPrivates(Privates);
+   Clause->setLHSExprs(LHSExprs);
+@@ -810,6 +812,7 @@ OMPReductionClause *OMPReductionClause::Create(
+   Clause->setReductionOps(ReductionOps);
+   Clause->setPreInitStmt(PreInit);
+   Clause->setPostUpdateExpr(PostUpdate);
++  Clause->setPrivateVariableReductionFlags(IsPrivateVarReduction);
+   if (Modifier == OMPC_REDUCTION_inscan) {
+     Clause->setInscanCopyOps(CopyOps);
+     Clause->setInscanCopyArrayTemps(CopyArrayTemps);
+@@ -828,8 +831,8 @@ OMPReductionClause *OMPReductionClause::Create(
+ OMPReductionClause *
+ OMPReductionClause::CreateEmpty(const ASTContext &C, unsigned N,
+                                 OpenMPReductionClauseModifier Modifier) {
+-  void *Mem = C.Allocate(totalSizeToAlloc<Expr *>(
+-      (Modifier == OMPC_REDUCTION_inscan ? 8 : 5) * N));
++  void *Mem = C.Allocate(totalSizeToAlloc<Expr *, bool>(
++      (Modifier == OMPC_REDUCTION_inscan ? 8 : 5) * N, N));
+   auto *Clause = new (Mem) OMPReductionClause(N);
+   Clause->setModifier(Modifier);
+   return Clause;
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 42e6aac681c1c..eec9ff9ebebbc 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -4668,6 +4668,37 @@ bool Parser::ParseOpenMPVarList(OpenMPDirectiveKind DKind,
+       assert(Tok.is(tok::comma) && "Expected comma.");
+       (void)ConsumeToken();
+     }
++    // Handle original(private / shared) Modifier
++    if (Kind == OMPC_reduction && getLangOpts().OpenMP >= 60 &&
++        Tok.is(tok::identifier) && PP.getSpelling(Tok) == "original" &&
++        NextToken().is(tok::l_paren)) {
++      // Parse original(private) modifier.
++      ConsumeToken();
++      BalancedDelimiterTracker ParenT(*this, tok::l_paren, tok::r_paren);
++      ParenT.consumeOpen();
++      if (Tok.is(tok::kw_private)) {
++        Data.OriginalSharingModifier = OMPC_ORIGINAL_SHARING_private;
++        Data.OriginalSharingModifierLoc = Tok.getLocation();
++        ConsumeToken();
++      } else if (Tok.is(tok::identifier) &&
++                 (PP.getSpelling(Tok) == "shared" ||
++                  PP.getSpelling(Tok) == "default")) {
++        Data.OriginalSharingModifier = OMPC_ORIGINAL_SHARING_shared;
++        Data.OriginalSharingModifierLoc = Tok.getLocation();
++        ConsumeToken();
++      } else {
++        Diag(Tok.getLocation(), diag::err_expected)
++            << "'private or shared or default'";
++        SkipUntil(tok::r_paren);
++        return false;
++      }
++      ParenT.consumeClose();
++      if (!Tok.is(tok::comma)) {
++        Diag(Tok.getLocation(), diag::err_expected) << "',' (comma)";
++        return false;
++      }
++      (void)ConsumeToken();
++    }
+     ColonProtectionRAIIObject ColonRAII(*this);
+     if (getLangOpts().CPlusPlus)
+       ParseOptionalCXXScopeSpecifier(Data.ReductionOrMapperIdScopeSpec,
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 616296027d811..834d198fc798c 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -17366,6 +17366,7 @@ OMPClause *SemaOpenMP::ActOnOpenMPVarListClause(OpenMPClauseKind Kind,
+   SourceLocation EndLoc = Locs.EndLoc;
+   OMPClause *Res = nullptr;
+   int ExtraModifier = Data.ExtraModifier;
++  int OriginalSharingModifier = Data.OriginalSharingModifier;
+   SourceLocation ExtraModifierLoc = Data.ExtraModifierLoc;
+   SourceLocation ColonLoc = Data.ColonLoc;
+   switch (Kind) {
+@@ -17389,7 +17390,9 @@ OMPClause *SemaOpenMP::ActOnOpenMPVarListClause(OpenMPClauseKind Kind,
+     assert(0 <= ExtraModifier && ExtraModifier <= OMPC_REDUCTION_unknown &&
+            "Unexpected lastprivate modifier.");
+     Res = ActOnOpenMPReductionClause(
+-        VarList, static_cast<OpenMPReductionClauseModifier>(ExtraModifier),
++        VarList,
++        OpenMPVarListDataTy::OpenMPReductionClauseModifiers(
++            ExtraModifier, OriginalSharingModifier),
+         StartLoc, LParenLoc, ExtraModifierLoc, ColonLoc, EndLoc,
+         Data.ReductionOrMapperIdScopeSpec, Data.ReductionOrMapperId);
+     break;
+@@ -18570,14 +18573,20 @@ struct ReductionData {
+   SmallVector<Expr *, 4> ExprPostUpdates;
+   /// Reduction modifier.
+   unsigned RedModifier = 0;
++  /// Original modifier.
++  unsigned OrigSharingModifier = 0;
++  /// Private Variable Reduction
++  SmallVector<bool, 8> IsPrivateVarReduction;
+   ReductionData() = delete;
+   /// Reserves required memory for the reduction data.
+-  ReductionData(unsigned Size, unsigned Modifier = 0) : RedModifier(Modifier) {
++  ReductionData(unsigned Size, unsigned Modifier = 0, unsigned OrgModifier = 0)
++      : RedModifier(Modifier), OrigSharingModifier(OrgModifier) {
+     Vars.reserve(Size);
+     Privates.reserve(Size);
+     LHSs.reserve(Size);
+     RHSs.reserve(Size);
+     ReductionOps.reserve(Size);
++    IsPrivateVarReduction.reserve(Size);
+     if (RedModifier == OMPC_REDUCTION_inscan) {
+       InscanCopyOps.reserve(Size);
+       InscanCopyArrayTemps.reserve(Size);
+@@ -18595,6 +18604,7 @@ struct ReductionData {
+     LHSs.emplace_back(nullptr);
+     RHSs.emplace_back(nullptr);
+     ReductionOps.emplace_back(ReductionOp);
++    IsPrivateVarReduction.emplace_back(false);
+     TaskgroupDescriptors.emplace_back(nullptr);
+     if (RedModifier == OMPC_REDUCTION_inscan) {
+       InscanCopyOps.push_back(nullptr);
+@@ -18605,7 +18615,7 @@ struct ReductionData {
+   /// Stores reduction data.
+   void push(Expr *Item, Expr *Private, Expr *LHS, Expr *RHS, Expr *ReductionOp,
+             Expr *TaskgroupDescriptor, Expr *CopyOp, Expr *CopyArrayTemp,
+-            Expr *CopyArrayElem) {
++            Expr *CopyArrayElem, bool IsPrivate) {
+     Vars.emplace_back(Item);
+     Privates.emplace_back(Private);
+     LHSs.emplace_back(LHS);
+@@ -18621,6 +18631,7 @@ struct ReductionData {
+              CopyArrayElem == nullptr &&
+              "Copy operation must be used for inscan reductions only.");
+     }
++    IsPrivateVarReduction.emplace_back(IsPrivate);
+   }
+ };
+ } // namespace
+@@ -18834,6 +18845,7 @@ static bool actOnOMPReductionKindClause(
+     FirstIter = false;
+     SourceLocation ELoc;
+     SourceRange ERange;
++    bool IsPrivate = false;
+     Expr *SimpleRefExpr = RefExpr;
+     auto Res = getPrivateItem(S, SimpleRefExpr, ELoc, ERange,
+                               /*AllowArraySection=*/true);
+@@ -18933,12 +18945,34 @@ static bool actOnOMPReductionKindClause(
+         reportOriginalDsa(S, Stack, D, DVar);
+         continue;
+       }
++      // OpenMP 6.0 [ 7.6.10 ]
++      // Support Reduction over private variables with reduction clause.
++      // A list item in a reduction clause can now be private in the enclosing
++      // context. For orphaned constructs it is assumed to be shared unless the
++      // original(private) modifier appears in the clause.
++      DVar = Stack->getImplicitDSA(D, true);
++      bool IsOrphaned = false;
++      OpenMPDirectiveKind CurrDir = Stack->getCurrentDirective();
++      OpenMPDirectiveKind ParentDir = Stack->getParentDirective();
++      // Check if the construct is orphaned (has no enclosing OpenMP context)
++      IsOrphaned = ParentDir == OMPD_unknown;
++      // OpenMP 6.0: Private DSA check
++      IsPrivate =
++          (S.getLangOpts().OpenMP > 52) &&
++          ((isOpenMPPrivate(DVar.CKind) && DVar.CKind != OMPC_reduction &&
++            isOpenMPWorksharingDirective(CurrDir) &&
++            !isOpenMPParallelDirective(CurrDir) &&
++            !isOpenMPTeamsDirective(CurrDir) &&
++            !isOpenMPSimdDirective(ParentDir)) ||
++           (IsOrphaned && DVar.CKind == OMPC_unknown) ||
++           RD.OrigSharingModifier != OMPC_ORIGINAL_SHARING_shared);
+ 
+       // OpenMP [2.14.3.6, Restrictions, p.1]
+       //  A list item that appears in a reduction clause of a worksharing
+       //  construct must be shared in the parallel regions to which any of the
+       //  worksharing regions arising from the worksharing construct bind.
+-      if (isOpenMPWorksharingDirective(CurrDir) &&
++
++      if (!IsPrivate && isOpenMPWorksharingDirective(CurrDir) &&
+           !isOpenMPParallelDirective(CurrDir) &&
+           !isOpenMPTeamsDirective(CurrDir)) {
+         DVar = Stack->getImplicitDSA(D, true);
+@@ -19434,17 +19468,23 @@ static bool actOnOMPReductionKindClause(
+     }
+     RD.push(VarsExpr, PrivateDRE, LHSDRE, RHSDRE, ReductionOp.get(),
+             TaskgroupDescriptor, CopyOpRes.get(), TempArrayRes.get(),
+-            TempArrayElem.get());
++            TempArrayElem.get(), IsPrivate);
+   }
+   return RD.Vars.empty();
+ }
+ 
+ OMPClause *SemaOpenMP::ActOnOpenMPReductionClause(
+-    ArrayRef<Expr *> VarList, OpenMPReductionClauseModifier Modifier,
++    ArrayRef<Expr *> VarList,
++    OpenMPVarListDataTy::OpenMPReductionClauseModifiers Modifiers,
+     SourceLocation StartLoc, SourceLocation LParenLoc,
+     SourceLocation ModifierLoc, SourceLocation ColonLoc, SourceLocation EndLoc,
+     CXXScopeSpec &ReductionIdScopeSpec, const DeclarationNameInfo &ReductionId,
+     ArrayRef<Expr *> UnresolvedReductions) {
++  OpenMPReductionClauseModifier Modifier =
++      static_cast<OpenMPReductionClauseModifier>(Modifiers.ExtraModifier);
++  OpenMPOriginalSharingModifier OriginalSharingModifier =
++      static_cast<OpenMPOriginalSharingModifier>(
++          Modifiers.OriginalSharingModifier);
+   if (ModifierLoc.isValid() && Modifier == OMPC_REDUCTION_unknown) {
+     Diag(LParenLoc, diag::err_omp_unexpected_clause_value)
+         << getListOfPossibleValues(OMPC_reduction, /*First=*/0,
+@@ -19466,8 +19506,7 @@ OMPClause *SemaOpenMP::ActOnOpenMPReductionClause(
+     Diag(ModifierLoc, diag::err_omp_wrong_inscan_reduction);
+     return nullptr;
+   }
+-
+-  ReductionData RD(VarList.size(), Modifier);
++  ReductionData RD(VarList.size(), Modifier, OriginalSharingModifier);
+   if (actOnOMPReductionKindClause(SemaRef, DSAStack, OMPC_reduction, VarList,
+                                   StartLoc, LParenLoc, ColonLoc, EndLoc,
+                                   ReductionIdScopeSpec, ReductionId,
+@@ -19481,7 +19520,8 @@ OMPClause *SemaOpenMP::ActOnOpenMPReductionClause(
+       RD.Privates, RD.LHSs, RD.RHSs, RD.ReductionOps, RD.InscanCopyOps,
+       RD.InscanCopyArrayTemps, RD.InscanCopyArrayElems,
+       buildPreInits(getASTContext(), RD.ExprCaptures),
+-      buildPostUpdate(SemaRef, RD.ExprPostUpdates));
++      buildPostUpdate(SemaRef, RD.ExprPostUpdates), RD.IsPrivateVarReduction,
++      OriginalSharingModifier);
+ }
+ 
+ OMPClause *SemaOpenMP::ActOnOpenMPTaskReductionClause(
+diff --git a/clang/lib/Sema/TreeTransform.h b/clang/lib/Sema/TreeTransform.h
+index eaabfae2409f4..8e134b41ec85c 100644
+--- a/clang/lib/Sema/TreeTransform.h
++++ b/clang/lib/Sema/TreeTransform.h
+@@ -1913,14 +1913,16 @@ class TreeTransform {
+   /// Subclasses may override this routine to provide different behavior.
+   OMPClause *RebuildOMPReductionClause(
+       ArrayRef<Expr *> VarList, OpenMPReductionClauseModifier Modifier,
++      OpenMPOriginalSharingModifier OriginalSharingModifier,
+       SourceLocation StartLoc, SourceLocation LParenLoc,
+       SourceLocation ModifierLoc, SourceLocation ColonLoc,
+       SourceLocation EndLoc, CXXScopeSpec &ReductionIdScopeSpec,
+       const DeclarationNameInfo &ReductionId,
+       ArrayRef<Expr *> UnresolvedReductions) {
+     return getSema().OpenMP().ActOnOpenMPReductionClause(
+-        VarList, Modifier, StartLoc, LParenLoc, ModifierLoc, ColonLoc, EndLoc,
+-        ReductionIdScopeSpec, ReductionId, UnresolvedReductions);
++        VarList, {Modifier, OriginalSharingModifier}, StartLoc, LParenLoc,
++        ModifierLoc, ColonLoc, EndLoc, ReductionIdScopeSpec, ReductionId,
++        UnresolvedReductions);
+   }
+ 
+   /// Build a new OpenMP 'task_reduction' clause.
+@@ -10946,8 +10948,8 @@ TreeTransform<Derived>::TransformOMPReductionClause(OMPReductionClause *C) {
+       UnresolvedReductions.push_back(nullptr);
+   }
+   return getDerived().RebuildOMPReductionClause(
+-      Vars, C->getModifier(), C->getBeginLoc(), C->getLParenLoc(),
+-      C->getModifierLoc(), C->getColonLoc(), C->getEndLoc(),
++      Vars, C->getModifier(), C->getOriginalSharingModifier(), C->getBeginLoc(),
++      C->getLParenLoc(), C->getModifierLoc(), C->getColonLoc(), C->getEndLoc(),
+       ReductionIdScopeSpec, NameInfo, UnresolvedReductions);
+ }
+ 
+diff --git a/clang/lib/Serialization/ASTReader.cpp b/clang/lib/Serialization/ASTReader.cpp
+index 4a40df6399f64..f876f1ab5d2f9 100644
+--- a/clang/lib/Serialization/ASTReader.cpp
++++ b/clang/lib/Serialization/ASTReader.cpp
+@@ -11721,6 +11721,12 @@ void OMPClauseReader::VisitOMPReductionClause(OMPReductionClause *C) {
+       Vars.push_back(Record.readSubExpr());
+     C->setInscanCopyArrayElems(Vars);
+   }
++  unsigned NumFlags = Record.readInt();
++  SmallVector<bool, 16> Flags;
++  Flags.reserve(NumFlags);
++  for (unsigned I : llvm::seq<unsigned>(NumFlags))
++    Flags.push_back(Record.readInt());
++  C->setPrivateVariableReductionFlags(Flags);
+ }
+ 
+ void OMPClauseReader::VisitOMPTaskReductionClause(OMPTaskReductionClause *C) {
+diff --git a/clang/lib/Serialization/ASTWriter.cpp b/clang/lib/Serialization/ASTWriter.cpp
+index 79b777cddd0b0..4aaa99b9c16f4 100644
+--- a/clang/lib/Serialization/ASTWriter.cpp
++++ b/clang/lib/Serialization/ASTWriter.cpp
+@@ -8020,6 +8020,10 @@ void OMPClauseWriter::VisitOMPReductionClause(OMPReductionClause *C) {
+     for (auto *E : C->copy_array_elems())
+       Record.AddStmt(E);
+   }
++  auto PrivateFlags = C->private_var_reduction_flags();
++  Record.push_back(std::distance(PrivateFlags.begin(), PrivateFlags.end()));
++  for (bool Flag : PrivateFlags)
++    Record.push_back(Flag);
+ }
+ 
+ void OMPClauseWriter::VisitOMPTaskReductionClause(OMPTaskReductionClause *C) {
+diff --git a/clang/test/OpenMP/for_reduction_messages.cpp b/clang/test/OpenMP/for_reduction_messages.cpp
+index 1ef9726205abb..de28ba2c3be02 100644
+--- a/clang/test/OpenMP/for_reduction_messages.cpp
++++ b/clang/test/OpenMP/for_reduction_messages.cpp
+@@ -237,6 +237,7 @@ T tmain(T argc) {
+ #pragma omp for reduction(max : j) // expected-error 2 {{argument of OpenMP clause 'reduction' must reference the same object in all threads}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)  // expected-note 2 {{defined as private}}
+ #pragma omp for reduction(+ : fl) // expected-error 2 {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+@@ -253,7 +254,7 @@ T tmain(T argc) {
+ #pragma omp for reduction(+ : fl)      // expected-error 2 {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+     foo();
+-
++#endif
+   return T();
+ }
+ 
+@@ -402,10 +403,12 @@ int main(int argc, char **argv) {
+ #pragma omp for reduction(max : j) // expected-error {{argument of OpenMP clause 'reduction' must reference the same object in all threads}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)  // expected-note {{defined as private}}
+ #pragma omp for reduction(+ : fl) // expected-error {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#endif
+ #pragma omp parallel private(argv)
+ #pragma omp for reduction(+ : argv[1], get()[0]) // expected-error {{expected variable name as a base of the array subscript}} expected-error {{invalid operands to binary expression ('char *' and 'char *')}}
+   for (int i = 0; i < 10; ++i)
+diff --git a/clang/test/OpenMP/for_simd_reduction_messages.cpp b/clang/test/OpenMP/for_simd_reduction_messages.cpp
+index 2550cf481265f..96b3805b10a86 100644
+--- a/clang/test/OpenMP/for_simd_reduction_messages.cpp
++++ b/clang/test/OpenMP/for_simd_reduction_messages.cpp
+@@ -236,6 +236,7 @@ T tmain(T argc) {
+ #pragma omp for simd reduction(max : j) // expected-error 2 {{argument of OpenMP clause 'reduction' must reference the same object in all threads}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)  // expected-note 2 {{defined as private}}
+ #pragma omp for simd reduction(+ : fl) // expected-error 2 {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+@@ -244,6 +245,7 @@ T tmain(T argc) {
+ #pragma omp for simd reduction(+ : fl)      // expected-error 2 {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#endif
+ 
+   return T();
+ }
+@@ -389,10 +391,12 @@ int main(int argc, char **argv) {
+ #pragma omp for simd reduction(max : j) // expected-error {{argument of OpenMP clause 'reduction' must reference the same object in all threads}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)  // expected-note {{defined as private}}
+ #pragma omp for simd reduction(+ : fl) // expected-error {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+     foo();
++#endif
+ #pragma omp parallel reduction(* : fl) // expected-note {{defined as reduction}}
+ #pragma omp for simd reduction(+ : fl)      // expected-error {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+diff --git a/clang/test/OpenMP/parallel_for_reduction_messages.cpp b/clang/test/OpenMP/parallel_for_reduction_messages.cpp
+index d4660ae43acf8..60742e5aa6b1d 100644
+--- a/clang/test/OpenMP/parallel_for_reduction_messages.cpp
++++ b/clang/test/OpenMP/parallel_for_reduction_messages.cpp
+@@ -89,10 +89,12 @@ class S5 {
+ public:
+   S5(int v) : a(v) {}
+   void foo() {
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(a) // expected-note {{defined as private}}
+ #pragma omp for reduction(+:a) // expected-error {{reduction variable must be shared}}
+   for (int i = 0; i < 10; ++i)
+     ::foo();
++#endif
+ #pragma omp parallel for reduction(inscan, +:a)
+   for (int i = 0; i < 10; ++i) {
+ #pragma omp scan inclusive(a)
+@@ -226,9 +228,96 @@ T tmain(T argc) {
+ #pragma omp parallel for reduction(+ : fl)
+   for (int i = 0; i < 10; ++i)
+     foo();
+-
++#if defined(_OPENMP) && (_OPENMP >= 202411)
++#pragma omp parallel private(fl)
++#pragma omp for reduction(original(abcxx),+:fl) // expected-error {{private or shared or default}} expected-warning {{extra tokens at the end of '#pragma omp for'}} 
++for (int i = 1; i <= 10; i++) 
++  foo();
++#endif
+   return T();
+ }
++namespace private_reduction_test{
++void test_original_modifier(){
++int fl;
++#if defined(_OPENMP) && (_OPENMP >= 202411)
++#pragma omp parallel private(fl)
++#pragma omp for reduction(original(privates),+:fl) // expected-error {{private or shared or default}} expected-warning {{extra tokens at the end of '#pragma omp for'}}
++for (int i = 1; i <= 10; i++)
++  ;
++
++#pragma omp parallel for reduction(original(private)+ : fl) // expected-error {{expected ',' (comma)}} expected-warning {{extra tokens at the end of '#pragma omp parallel for' }}
++for (int i = 0; i < 10; ++i)
++    ;
++
++#pragma omp parallel 
++#pragma omp for reduction(original(shared),+:fl) 
++for( int i = 0; i < 10; i++)
++;
++#pragma omp parallel for reduction(original(private),+: fl // expected-error {{expected ')'}} expected-note {{to match this '('}}
++for (int i = 0; i < 10; ++i)
++    ;
++#pragma omp parallel firstprivate(fl)
++#pragma omp for reduction(+:fl) 
++for( int i = 0; i < 10; i++)
++;
++
++#pragma omp parallel 
++#pragma omp for reduction(original(private),+:fl) 
++for( int i = 0; i < 10; i++)
++;
++
++#endif
++}
++void test_interaction(){
++int x;
++#if defined(_OPENMP) && (_OPENMP >= 202411)
++#pragma omp parallel private(x)
++#pragma omp for reduction(original(private),+:x) nowait 
++for (int i = 0; i < 10; ++i)
++  x += 1;
++#pragma omp parallel
++{
++#pragma omp for reduction(original(private),+:) // expected-error {{expected expression}}
++for( int i = 0; i < 10; ++i)
++;
++}
++#pragma omp parallel private(x)
++#pragma omp for reduction(original(private),+:x) ordered
++for (int i = 0; i < 10; ++i)
++  x += 1;
++#endif
++ }
++template<typename T>
++void test_template_reduction() {
++  T x = T();
++#if defined(_OPENMP) && (_OPENMP >= 202411)  
++  #pragma omp parallel private(x)
++  {
++    #pragma omp for reduction(original(private),+:x) 
++    for (int i = 0; i < 10; ++i) {
++      x += T(1);
++    }
++  }
++#endif
++}
++struct Custom {
++  int value;
++  Custom() : value(0) {}
++  Custom& operator+=(const Custom& other) {
++    value += other.value;
++    return *this;
++  }
++};
++void test_user_defined_type() {
++  Custom c;
++#if defined(_OPENMP) && (_OPENMP >= 202411)  
++  #pragma omp parallel private(c)
++  #pragma omp for reduction(original(private),+:c)
++    for (int i = 0; i < 10; ++i)
++      c.value += 1;
++#endif
++ }
++}
+ 
+ namespace A {
+ double x;
+diff --git a/clang/test/OpenMP/sections_reduction_messages.cpp b/clang/test/OpenMP/sections_reduction_messages.cpp
+index f93b4dd016308..42ec3ed6d58e8 100644
+--- a/clang/test/OpenMP/sections_reduction_messages.cpp
++++ b/clang/test/OpenMP/sections_reduction_messages.cpp
+@@ -268,6 +268,7 @@ T tmain(T argc) {
+   {
+     foo();
+   }
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)       // expected-note 2 {{defined as private}}
+ #pragma omp sections reduction(+ : fl) // expected-error 2 {{reduction variable must be shared}}
+   {
+@@ -278,6 +279,7 @@ T tmain(T argc) {
+   {
+     foo();
+   }
++#endif
+ 
+   return T();
+ }
+@@ -453,11 +455,13 @@ int main(int argc, char **argv) {
+   {
+     foo();
+   }
++#if defined(_OPENMP) && (_OPENMP <= 202111)
+ #pragma omp parallel private(fl)       // expected-note {{defined as private}}
+ #pragma omp sections reduction(+ : fl) // expected-error {{reduction variable must be shared}}
+   {
+     foo();
+   }
++#endif
+ #pragma omp parallel reduction(* : fl) // expected-note {{defined as reduction}}
+ #pragma omp sections reduction(+ : fl) // expected-error {{reduction variable must be shared}}
+   {

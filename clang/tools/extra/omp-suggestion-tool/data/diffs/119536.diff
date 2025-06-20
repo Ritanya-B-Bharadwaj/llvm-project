@@ -1,0 +1,222 @@
+diff --git a/clang/test/OpenMP/irbuilder_simd_aligned.cpp b/clang/test/OpenMP/irbuilder_simd_aligned.cpp
+index 1c3dc49b717ed..721fde6d95495 100644
+--- a/clang/test/OpenMP/irbuilder_simd_aligned.cpp
++++ b/clang/test/OpenMP/irbuilder_simd_aligned.cpp
+@@ -70,8 +70,11 @@ void simple(float *a, float *b, int *c) {
+ // CHECK-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP3:![0-9]+]]
+ // CHECK:       for.end:
+ // CHECK-NEXT:    [[TMP4:%.*]] = load ptr, ptr [[A_ADDR]], align 8
++// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[TMP4]], i64 128) ]
+ // CHECK-NEXT:    [[TMP5:%.*]] = load ptr, ptr [[P]], align 8
++// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[TMP5]], i64 64) ]
+ // CHECK-NEXT:    [[ARRAYDECAY:%.*]] = getelementptr inbounds [32 x i32], ptr [[D]], i64 0, i64 0
++// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[ARRAYDECAY]], i64 16) ]
+ // CHECK-NEXT:    store i32 3, ptr [[I1]], align 4
+ // CHECK-NEXT:    [[TMP6:%.*]] = getelementptr inbounds nuw [[STRUCT_ANON]], ptr [[AGG_CAPTURED]], i32 0, i32 0
+ // CHECK-NEXT:    store ptr [[I1]], ptr [[TMP6]], align 8
+@@ -82,9 +85,6 @@ void simple(float *a, float *b, int *c) {
+ // CHECK-NEXT:    [[DOTCOUNT:%.*]] = load i32, ptr [[DOTCOUNT_ADDR]], align 4
+ // CHECK-NEXT:    br label [[OMP_LOOP_PREHEADER:%.*]]
+ // CHECK:       omp_loop.preheader:
+-// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[TMP4]], i64 128) ]
+-// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[TMP5]], i64 64) ]
+-// CHECK-NEXT:    call void @llvm.assume(i1 true) [ "align"(ptr [[ARRAYDECAY]], i64 16) ]
+ // CHECK-NEXT:    br label [[OMP_LOOP_HEADER:%.*]]
+ // CHECK:       omp_loop.header:
+ // CHECK-NEXT:    [[OMP_LOOP_IV:%.*]] = phi i32 [ 0, [[OMP_LOOP_PREHEADER]] ], [ [[OMP_LOOP_NEXT:%.*]], [[OMP_LOOP_INC:%.*]] ]
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 48c559a78b9bc..1b226482a8c13 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -606,6 +606,8 @@ addAlignedClause(lower::AbstractConverter &converter,
+   // Do not generate alignment assumption if alignment is less than or equal to
+   // 0.
+   if (alignment > 0) {
++    // alignment value must be power of 2
++    assert((alignment & (alignment - 1)) == 0 && "alignment is not power of 2");
+     auto &objects = std::get<omp::ObjectList>(clause.t);
+     if (!objects.empty())
+       genObjectList(objects, converter, alignedVars);
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 21004e6a15d49..2fb53609e8439 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -5302,10 +5302,11 @@ void OpenMPIRBuilder::applySimd(CanonicalLoopInfo *CanonicalLoop,
+   Loop *L = LI.getLoopFor(CanonicalLoop->getHeader());
+   if (AlignedVars.size()) {
+     InsertPointTy IP = Builder.saveIP();
+-    Builder.SetInsertPoint(CanonicalLoop->getPreheader()->getTerminator());
+     for (auto &AlignedItem : AlignedVars) {
+       Value *AlignedPtr = AlignedItem.first;
+       Value *Alignment = AlignedItem.second;
++      Instruction *loadInst = dyn_cast<Instruction>(AlignedPtr);
++      Builder.SetInsertPoint(loadInst->getNextNode());
+       Builder.CreateAlignmentAssumption(F->getDataLayout(),
+                                         AlignedPtr, Alignment);
+     }
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index 630cd03c68801..4ec1b281d4d2d 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -1993,6 +1993,7 @@ TEST_F(OpenMPIRBuilderTest, ApplySimdCustomAligned) {
+   OpenMPIRBuilder OMPBuilder(*M);
+   IRBuilder<> Builder(BB);
+   const int AlignmentValue = 32;
++  llvm::BasicBlock *sourceBlock = Builder.GetInsertBlock();
+   AllocaInst *Alloc1 =
+       Builder.CreateAlloca(Builder.getPtrTy(), Builder.getInt64(1));
+   LoadInst *Load1 = Builder.CreateLoad(Alloc1->getAllocatedType(), Alloc1);
+@@ -2031,13 +2032,12 @@ TEST_F(OpenMPIRBuilderTest, ApplySimdCustomAligned) {
+ 
+   // Check if number of assumption instructions is equal to number of aligned
+   // variables
+-  BasicBlock *LoopPreheader = CLI->getPreheader();
+-  size_t NumAssummptionCallsInPreheader = count_if(
+-      *LoopPreheader, [](Instruction &I) { return isa<AssumeInst>(I); });
++  size_t NumAssummptionCallsInPreheader =
++      count_if(*sourceBlock, [](Instruction &I) { return isa<AssumeInst>(I); });
+   EXPECT_EQ(NumAssummptionCallsInPreheader, AlignedVars.size());
+ 
+   // Check if variables are correctly aligned
+-  for (Instruction &Instr : *LoopPreheader) {
++  for (Instruction &Instr : *sourceBlock) {
+     if (!isa<AssumeInst>(Instr))
+       continue;
+     AssumeInst *AssumeInstruction = cast<AssumeInst>(&Instr);
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 49fe509800491..b4ccb77f45a42 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -150,10 +150,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+                           << " operation";
+   };
+ 
+-  auto checkAligned = [&todo](auto op, LogicalResult &result) {
+-    if (!op.getAlignedVars().empty() || op.getAlignments())
+-      result = todo("aligned");
+-  };
+   auto checkAllocate = [&todo](auto op, LogicalResult &result) {
+     if (!op.getAllocateVars().empty() || !op.getAllocatorVars().empty())
+       result = todo("allocate");
+@@ -271,7 +267,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+       })
+       .Case([&](omp::ParallelOp op) { checkAllocate(op, result); })
+       .Case([&](omp::SimdOp op) {
+-        checkAligned(op, result);
+         checkLinear(op, result);
+         checkNontemporal(op, result);
+         checkPrivate(op, result);
+@@ -2257,6 +2252,24 @@ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   llvm::MapVector<llvm::Value *, llvm::Value *> alignedVars;
+   llvm::omp::OrderKind order = convertOrderKind(simdOp.getOrder());
++  llvm::BasicBlock *sourceBlock = builder.GetInsertBlock();
++  std::optional<ArrayAttr> alignmentValues = simdOp.getAlignments();
++  mlir::OperandRange operands = simdOp.getAlignedVars();
++  for (size_t i = 0; i < operands.size(); ++i) {
++    llvm::Value *alignment = nullptr;
++    llvm::Value *llvmVal = moduleTranslation.lookupValue(operands[i]);
++    llvm::Type *ty = llvmVal->getType();
++    if (auto intAttr = llvm::dyn_cast<IntegerAttr>((*alignmentValues)[i])) {
++      alignment = builder.getInt64(intAttr.getInt());
++      assert(ty->isPointerTy() && "Invalid type for aligned variable");
++      assert(alignment && "Invalid alignment value");
++      auto curInsert = builder.saveIP();
++      builder.SetInsertPoint(sourceBlock->getTerminator());
++      llvmVal = builder.CreateLoad(ty, llvmVal);
++      builder.restoreIP(curInsert);
++      alignedVars[llvmVal] = alignment;
++    }
++  }
+   ompBuilder->applySimd(loopInfo, alignedVars,
+                         simdOp.getIfExpr()
+                             ? moduleTranslation.lookupValue(simdOp.getIfExpr())
+diff --git a/mlir/test/Target/LLVMIR/openmp-simd-aligned.mlir b/mlir/test/Target/LLVMIR/openmp-simd-aligned.mlir
+new file mode 100644
+index 0000000000000..234604e4b664a
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-simd-aligned.mlir
+@@ -0,0 +1,60 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
++
++//CHECK-LABEL: define void @_QPsimd_aligned_pointer() {
++//CHECK:   %[[A_PTR:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1, align 8
++//CHECK:   %[[A_VAL:.*]] = load ptr, ptr %[[A_PTR]], align 8
++//CHECK:   call void @llvm.assume(i1 true) [ "align"(ptr %[[A_VAL]], i64 256) ]
++llvm.func @_QPsimd_aligned_pointer() {
++  %1 = llvm.mlir.constant(1 : i64) : i64
++  %2 = llvm.alloca %1 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {bindc_name = "x"} : (i64) -> !llvm.ptr
++  %3 = llvm.alloca %1 x i32 {bindc_name = "i", pinned} : (i64) -> !llvm.ptr
++  %4 = llvm.mlir.constant(1 : i32) : i32
++  %5 = llvm.mlir.constant(10 : i32) : i32
++  %6 = llvm.mlir.constant(1 : i32) : i32
++  omp.simd aligned(%2 : !llvm.ptr -> 256 : i64) {
++    omp.loop_nest (%arg0) : i32 = (%4) to (%5) inclusive step (%6) {
++      llvm.store %arg0, %3 : i32, !llvm.ptr
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++//CHECK-LABEL: define void @_QPsimd_aligned_cptr() {
++//CHECK:   %[[A_CPTR:.*]] = alloca %_QM__fortran_builtinsT__builtin_c_ptr, i64 1, align 8
++//CHECK:   %[[A_VAL:.*]] = load ptr, ptr %[[A_CPTR]], align 8
++//CHECK:   call void @llvm.assume(i1 true) [ "align"(ptr %[[A_VAL]], i64 256) ]
++llvm.func @_QPsimd_aligned_cptr() {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x !llvm.struct<"_QM__fortran_builtinsT__builtin_c_ptr", (i64)> {bindc_name = "a"} : (i64) -> !llvm.ptr
++  %2 = llvm.mlir.constant(1 : i64) : i64
++  %3 = llvm.alloca %2 x i32 {bindc_name = "i", pinned} : (i64) -> !llvm.ptr
++  %4 = llvm.mlir.constant(1 : i32) : i32
++  %5 = llvm.mlir.constant(10 : i32) : i32
++  %6 = llvm.mlir.constant(1 : i32) : i32
++  omp.simd aligned(%1 : !llvm.ptr -> 256 : i64) {
++    omp.loop_nest (%arg0) : i32 = (%4) to (%5) inclusive step (%6) {
++      llvm.store %arg0, %3 : i32, !llvm.ptr
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++//CHECK-LABEL: define void @_QPsimd_aligned_allocatable() {
++//CHECK:   %[[A_ADDR:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
++//CHECK:   %[[A_VAL:.*]] = load ptr, ptr %[[A_ADDR]], align 8
++//CHECK:   call void @llvm.assume(i1 true) [ "align"(ptr %[[A_VAL]], i64 256) ]
++llvm.func @_QPsimd_aligned_allocatable() {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {bindc_name = "a"} : (i64) -> !llvm.ptr
++  %2 = llvm.mlir.constant(1 : i32) : i32
++  %3 = llvm.mlir.constant(10 : i32) : i32
++  %4 = llvm.mlir.constant(1 : i32) : i32
++  omp.simd aligned(%1 : !llvm.ptr -> 256 : i64) {
++    omp.loop_nest (%arg0) : i32 = (%2) to (%3) inclusive step (%4) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index c1e0014d1f571..010f604870628 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -127,18 +127,6 @@ llvm.func @sections_private(%x : !llvm.ptr) {
+   llvm.return
+ }
+ 
+-// -----
+-
+-llvm.func @simd_aligned(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
+-  // expected-error@below {{not yet implemented: Unhandled clause aligned in omp.simd operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.simd}}
+-  omp.simd aligned(%x : !llvm.ptr -> 32) {
+-    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+-      omp.yield
+-    }
+-  }
+-  llvm.return
+-}
+ 
+ // -----
+ 

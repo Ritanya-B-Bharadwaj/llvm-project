@@ -1,0 +1,456 @@
+diff --git a/flang/include/flang/Optimizer/Builder/HLFIRTools.h b/flang/include/flang/Optimizer/Builder/HLFIRTools.h
+index 6c36f7e84db68..cf7df38b1cdfb 100644
+--- a/flang/include/flang/Optimizer/Builder/HLFIRTools.h
++++ b/flang/include/flang/Optimizer/Builder/HLFIRTools.h
+@@ -223,7 +223,7 @@ class EntityWithAttributes : public Entity {
+ using CleanupFunction = std::function<void()>;
+ std::pair<fir::ExtendedValue, std::optional<CleanupFunction>>
+ translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                         Entity entity);
++                         Entity entity, bool contiguousHint = false);
+ 
+ /// Function to translate FortranVariableOpInterface to fir::ExtendedValue.
+ /// It may generates IR to unbox fir.boxchar, but has otherwise no side effects
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 2a418396cdafc..3569a0f070beb 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -15,6 +15,7 @@
+ #include "Utils.h"
+ #include "flang/Lower/PFTBuilder.h"
+ #include "flang/Lower/SymbolMap.h"
++#include "flang/Optimizer/Builder/HLFIRTools.h"
+ #include "flang/Optimizer/Builder/Todo.h"
+ #include "flang/Semantics/tools.h"
+ 
+@@ -438,8 +439,16 @@ void DataSharingProcessor::doPrivatize(
+           &allocRegion, /*insertPt=*/{}, symType, symLoc);
+ 
+       firOpBuilder.setInsertionPointToEnd(allocEntryBlock);
+-      symTable->addSymbol(*sym,
+-                          fir::substBase(symExV, allocRegion.getArgument(0)));
++
++      fir::ExtendedValue localExV =
++          hlfir::translateToExtendedValue(
++              symLoc, firOpBuilder, hlfir::Entity{allocRegion.getArgument(0)},
++              /*contiguousHint=*/
++              Fortran::evaluate::IsSimplyContiguous(
++                  *sym, converter.getFoldingContext()))
++              .first;
++
++      symTable->addSymbol(*sym, localExV);
+       symTable->pushScope();
+       cloneSymbol(sym);
+       firOpBuilder.create<mlir::omp::YieldOp>(
+@@ -456,12 +465,23 @@ void DataSharingProcessor::doPrivatize(
+       mlir::Block *copyEntryBlock = firOpBuilder.createBlock(
+           &copyRegion, /*insertPt=*/{}, {symType, symType}, {symLoc, symLoc});
+       firOpBuilder.setInsertionPointToEnd(copyEntryBlock);
+-      symTable->addSymbol(*sym,
+-                          fir::substBase(symExV, copyRegion.getArgument(0)),
+-                          /*force=*/true);
++
++      auto addSymbol = [&](unsigned argIdx, bool force = false) {
++        symExV.match(
++            [&](const fir::MutableBoxValue &box) {
++              symTable->addSymbol(
++                  *sym, fir::substBase(box, copyRegion.getArgument(argIdx)),
++                  force);
++            },
++            [&](const auto &box) {
++              symTable->addSymbol(*sym, copyRegion.getArgument(argIdx), force);
++            });
++      };
++
++      addSymbol(0, true);
+       symTable->pushScope();
+-      symTable->addSymbol(*sym,
+-                          fir::substBase(symExV, copyRegion.getArgument(1)));
++      addSymbol(1);
++
+       auto ip = firOpBuilder.saveInsertionPoint();
+       copyFirstPrivateSymbol(sym, &ip);
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index c54f100b73da3..6758f980b8b27 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1439,13 +1439,18 @@ genParallelOp(Fortran::lower::AbstractConverter &converter,
+         reductionSyms;
+     allSymbols.append(privateSyms);
+     for (auto [arg, prv] : llvm::zip_equal(allSymbols, region.getArguments())) {
+-      converter.bindSymbol(*arg, prv);
++      fir::ExtendedValue hostExV = converter.getSymbolExtendedValue(*arg);
++      converter.bindSymbol(*arg, hlfir::translateToExtendedValue(
++                                     loc, firOpBuilder, hlfir::Entity{prv},
++                                     /*contiguousHint=*/
++                                     Fortran::evaluate::IsSimplyContiguous(
++                                         *arg, converter.getFoldingContext()))
++                                     .first);
+     }
+ 
+     return allSymbols;
+   };
+ 
+-  // TODO Merge with the reduction CB.
+   genInfo.setGenRegionEntryCb(genRegionEntryCB).setDataSharingProcessor(&dsp);
+   return genOpWithBody<mlir::omp::ParallelOp>(genInfo, clauseOps);
+ }
+diff --git a/flang/lib/Optimizer/Builder/HLFIRTools.cpp b/flang/lib/Optimizer/Builder/HLFIRTools.cpp
+index 44779427ab557..b32c3e50647e2 100644
+--- a/flang/lib/Optimizer/Builder/HLFIRTools.cpp
++++ b/flang/lib/Optimizer/Builder/HLFIRTools.cpp
+@@ -844,10 +844,9 @@ hlfir::LoopNest hlfir::genLoopNest(mlir::Location loc,
+   return loopNest;
+ }
+ 
+-static fir::ExtendedValue
+-translateVariableToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                                 hlfir::Entity variable,
+-                                 bool forceHlfirBase = false) {
++static fir::ExtendedValue translateVariableToExtendedValue(
++    mlir::Location loc, fir::FirOpBuilder &builder, hlfir::Entity variable,
++    bool forceHlfirBase = false, bool contiguousHint = false) {
+   assert(variable.isVariable() && "must be a variable");
+   /// When going towards FIR, use the original base value to avoid
+   /// introducing descriptors at runtime when they are not required.
+@@ -858,7 +857,8 @@ translateVariableToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+                                 fir::MutableProperties{});
+ 
+   if (mlir::isa<fir::BaseBoxType>(base.getType())) {
+-    if (!variable.isSimplyContiguous() || variable.isPolymorphic() ||
++    bool contiguous = variable.isSimplyContiguous() || contiguousHint;
++    if (!contiguous || variable.isPolymorphic() ||
+         variable.isDerivedWithLengthParameters() || variable.isOptional()) {
+       llvm::SmallVector<mlir::Value> nonDefaultLbounds =
+           getNonDefaultLowerBounds(loc, builder, variable);
+@@ -907,9 +907,10 @@ hlfir::translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+ 
+ std::pair<fir::ExtendedValue, std::optional<hlfir::CleanupFunction>>
+ hlfir::translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                                hlfir::Entity entity) {
++                                hlfir::Entity entity, bool contiguousHint) {
+   if (entity.isVariable())
+-    return {translateVariableToExtendedValue(loc, builder, entity),
++    return {translateVariableToExtendedValue(loc, builder, entity, false,
++                                             contiguousHint),
+             std::nullopt};
+ 
+   if (entity.isProcedure()) {
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90 b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90
+new file mode 100644
+index 0000000000000..47e163014fe86
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90
+@@ -0,0 +1,67 @@
++! Test delayed privatization for allocatable arrays.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %s 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %s 2>&1 |\
++! RUN:   FileCheck %s
++
++subroutine delayed_privatization_private(var1, l1)
++  implicit none
++  integer(8):: l1
++  integer, allocatable, dimension(:) :: var1
++
++!$omp parallel firstprivate(var1)
++  var1(l1 + 1) = 10
++!$omp end parallel
++end subroutine
++
++! CHECK-LABEL: omp.private {type = firstprivate}
++! CHECK-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.ref<!fir.box<!fir.heap<!fir.array<\?xi32>>>>]] alloc {
++
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! CHECK-NEXT:   %[[PRIV_ALLOC:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<{{\?}}xi32>>> {bindc_name = "var1", pinned, uniq_name = "_QFdelayed_privatization_privateEvar1"}
++
++! CHECK-NEXT:   %[[PRIV_ARG_VAL:.*]] = fir.load %[[PRIV_ARG]]
++! CHECK-NEXT:   %[[PRIV_ARG_BOX:.*]] = fir.box_addr %[[PRIV_ARG_VAL]]
++! CHECK-NEXT:   %[[PRIV_ARG_ADDR:.*]] = fir.convert %[[PRIV_ARG_BOX]]
++! CHECK-NEXT:   %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:   %[[ALLOC_COND:.*]] = arith.cmpi ne, %[[PRIV_ARG_ADDR]], %[[C0]] : i64
++
++! CHECK-NEXT:   fir.if %[[ALLOC_COND]] {
++! CHECK-NEXT:     %[[PRIV_ARG_VAL:.*]] = fir.load %[[PRIV_ARG]] : [[TYPE]]
++! CHECK-NEXT:     %[[C0:.*]] = arith.constant 0 : index
++! CHECK-NEXT:     %[[DIMS:.*]]:3 = fir.box_dims %[[PRIV_ARG_VAL]], %[[C0]]
++! CHECK-NEXT:     fir.box_addr %[[PRIV_ARG_VAL]]
++! CHECK-NEXT:     %[[C0_2:.*]] = arith.constant 0 : index 
++! CHECK-NEXT:     %[[CMP:.*]] = arith.cmpi sgt, %[[DIMS]]#1, %[[C0_2]] : index
++! CHECK-NEXT:     %[[SELECT:.*]] = arith.select %[[CMP]], %[[DIMS]]#1, %[[C0_2]] : index
++! CHECK-NEXT:     %[[MEM:.*]] = fir.allocmem !fir.array<?xi32>, %[[SELECT]]
++! CHECK-NEXT:     %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[SELECT]] : (index, index) -> !fir.shapeshift<1>
++! CHECK-NEXT:     %[[EMBOX:.*]] = fir.embox %[[MEM]](%[[SHAPE_SHIFT]])
++! CHECK-NEXT:     fir.store %[[EMBOX]] to %[[PRIV_ALLOC]]
++! CHECK-NEXT:   } else {
++! CHECK-NEXT:     %[[ZEROS:.*]] = fir.zero_bits
++! CHECK-NEXT:     %[[C0_3:.*]] = arith.constant 0 : index
++! CHECK-NEXT:     %[[SHAPE:.*]] = fir.shape %[[C0_3]] : (index) -> !fir.shape<1>
++! CHECK-NEXT:     %[[EMBOX_2:.*]] = fir.embox %[[ZEROS]](%[[SHAPE]])
++! CHECK-NEXT:     fir.store %[[EMBOX_2]] to %[[PRIV_ALLOC]]
++! CHECK-NEXT:   }
++
++! CHECK-NEXT:   hlfir.declare
++! CHECK-NEXT:   omp.yield
++
++! CHECK-NEXT: } copy {
++! CHECK-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
++! CHECK-NEXT:  %[[PRIV_BASE_VAL:.*]] = fir.load %[[PRIV_PRIV_ARG]]
++! CHECK-NEXT:  %[[PRIV_BASE_BOX:.*]] = fir.box_addr %[[PRIV_BASE_VAL]]
++! CHECK-NEXT:  %[[PRIV_BASE_ADDR:.*]] = fir.convert %[[PRIV_BASE_BOX]]
++! CHECK-NEXT:  %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:  %[[COPY_COND:.*]] = arith.cmpi ne, %[[PRIV_BASE_ADDR]], %[[C0]] : i64
++
++
++! CHECK-NEXT:  fir.if %[[COPY_COND]] {
++! CHECK-NEXT:    %[[PRIV_ORIG_ARG_VAL:.*]] = fir.load %[[PRIV_ORIG_ARG]]
++! CHECK-NEXT:    hlfir.assign %[[PRIV_ORIG_ARG_VAL]] to %[[PRIV_BASE_VAL]] temporary_lhs
++! CHECK-NEXT:   }
++! CHECK-NEXT:   omp.yield
++! CHECK-NEXT: }
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-array.f90 b/flang/test/Lower/OpenMP/delayed-privatization-array.f90
+new file mode 100644
+index 0000000000000..1d291b2ac0feb
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/delayed-privatization-array.f90
+@@ -0,0 +1,100 @@
++! Test delayed privatization for arrays.
++
++! RUN: split-file %s %t
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/one_dim_array.f90 2>&1 | FileCheck %s --check-prefix=ONE_DIM
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - \
++! RUN:   %t/one_dim_array.f90 2>&1 | FileCheck %s --check-prefix=ONE_DIM
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/two_dim_array.f90 2>&1 | FileCheck %s --check-prefix=TWO_DIM
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - \
++! RUN:   %t/two_dim_array.f90 2>&1 | FileCheck %s --check-prefix=TWO_DIM
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/one_dim_array_default_lb.f90 2>&1 | FileCheck %s --check-prefix=ONE_DIM_DEFAULT_LB
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - \
++! RUN:   %t/one_dim_array_default_lb.f90 2>&1 | FileCheck %s --check-prefix=ONE_DIM_DEFAULT_LB
++
++!--- one_dim_array.f90
++subroutine delayed_privatization_private_1d(var1, l1, u1)
++  implicit none
++  integer(8):: l1, u1
++  integer, dimension(l1:u1) :: var1
++
++!$omp parallel firstprivate(var1)
++  var1(l1 + 1) = 10
++!$omp end parallel
++end subroutine
++
++! ONE_DIM-LABEL: omp.private {type = firstprivate}
++! ONE_DIM-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.box<!fir.array<\?xi32>>]] alloc {
++
++! ONE_DIM-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++
++! ONE_DIM:   %[[C0:.*]] = arith.constant 0 : index
++! ONE_DIM-NEXT:   %[[DIMS:.*]]:3 = fir.box_dims %[[PRIV_ARG]], %[[C0]] : ([[TYPE]], index) -> (index, index, index)
++! ONE_DIM:   %[[PRIV_ALLOCA:.*]] = fir.alloca !fir.array<{{\?}}xi32>
++! ONE_DIM-NEXT:   %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! ONE_DIM-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOCA]](%[[SHAPE_SHIFT]]) {uniq_name = "_QFdelayed_privatization_private_1dEvar1"}
++! ONE_DIM-NEXT:  omp.yield(%[[PRIV_DECL]]#0 : [[TYPE]])
++
++! ONE_DIM-NEXT: } copy {
++! ONE_DIM-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
++! ONE_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]] temporary_lhs
++! ONE_DIM-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]] : [[TYPE]])
++! ONE_DIM-NEXT: }
++
++!--- two_dim_array.f90
++subroutine delayed_privatization_private_2d(var1, l1, u1, l2, u2)
++  implicit none
++  integer(8):: l1, u1, l2, u2
++  integer, dimension(l1:u1, l2:u2) :: var1
++
++!$omp parallel firstprivate(var1)
++  var1(l1 + 1, u2) = 10
++!$omp end parallel
++end subroutine
++
++! TWO_DIM-LABEL: omp.private {type = firstprivate}
++! TWO_DIM-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.box<!fir.array<\?x\?xi32>>]] alloc {
++
++! TWO_DIM-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! TWO_DIM:        %[[C0:.*]] = arith.constant 0 : index
++! TWO_DIM-NEXT:   %[[DIMS0:.*]]:3 = fir.box_dims %[[PRIV_ARG]], %[[C0]] : ([[TYPE]], index) -> (index, index, index)
++
++! TWO_DIM-NEXT:   %[[C1:.*]] = arith.constant 1 : index
++! TWO_DIM-NEXT:   %[[DIMS1:.*]]:3 = fir.box_dims %[[PRIV_ARG]], %[[C1]] : ([[TYPE]], index) -> (index, index, index)
++
++! TWO_DIM-NEXT:   %[[PRIV_ALLOCA:.*]] = fir.alloca !fir.array<{{\?}}x{{\?}}xi32>, %[[DIMS0]]#1, %[[DIMS1]]#1 {bindc_name = "var1", pinned, uniq_name = "_QFdelayed_privatization_private_2dEvar1"}
++! TWO_DIM-NEXT:   %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[DIMS0]]#0, %[[DIMS0]]#1, %[[DIMS1]]#0, %[[DIMS1]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
++
++! TWO_DIM-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOCA]](%[[SHAPE_SHIFT]]) {uniq_name = "_QFdelayed_privatization_private_2dEvar1"}
++! TWO_DIM-NEXT:  omp.yield(%[[PRIV_DECL]]#0 : [[TYPE]])
++
++! TWO_DIM-NEXT: } copy {
++! TWO_DIM-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
++! TWO_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]] temporary_lhs
++! TWO_DIM-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]] : [[TYPE]])
++! TWO_DIM-NEXT: }
++
++!--- one_dim_array_default_lb.f90
++program main
++  implicit none
++  integer, dimension(10) :: var1
++
++!$omp parallel private(var1)
++  var1(1) = 10
++!$omp end parallel
++end program
++
++! ONE_DIM_DEFAULT_LB-LABEL: omp.private {type = private}
++! ONE_DIM_DEFAULT_LB-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.ref<!fir.array<10xi32>>]] alloc {
++
++! ONE_DIM_DEFAULT_LB-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++
++! ONE_DIM_DEFAULT_LB:   %[[C10:.*]] = arith.constant 10 : index
++! ONE_DIM_DEFAULT_LB:   %[[PRIV_ALLOCA:.*]] = fir.alloca !fir.array<10xi32>
++! ONE_DIM_DEFAULT_LB:   %[[SHAPE:.*]] = fir.shape %[[C10]] : (index) -> !fir.shape<1>
++! ONE_DIM_DEFAULT_LB:   hlfir.declare %[[PRIV_ALLOCA]](%[[SHAPE]])
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-character-array.f90 b/flang/test/Lower/OpenMP/delayed-privatization-character-array.f90
+new file mode 100644
+index 0000000000000..9a9d0c01212c8
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/delayed-privatization-character-array.f90
+@@ -0,0 +1,67 @@
++! Test delayed privatization for the `CHARACTER` array type.
++
++! RUN: split-file %s %t
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/static_len.f90 2>&1 | FileCheck %s --check-prefix=STATIC_LEN
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %t/static_len.f90 2>&1 \
++! RUN:   | FileCheck %s --check-prefix=STATIC_LEN
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/dyn_len.f90 2>&1 | FileCheck %s --check-prefix=DYN_LEN
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %t/dyn_len.f90 2>&1 \
++! RUN:   | FileCheck %s --check-prefix=DYN_LEN
++
++!--- static_len.f90
++subroutine delayed_privatization_character_array_static_len(var1)
++  implicit none
++  character(len = 10)  :: var1(5)
++
++!$omp parallel firstprivate(var1)
++  var1(1) = "test"
++!$omp end parallel
++end subroutine
++
++! STATIC_LEN-LABEL: omp.private {type = firstprivate}
++! STATIC_LEN-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.ref<!fir.array<5x!fir.char<1,10>>>]] alloc {
++
++! STATIC_LEN-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! STATIC_LEN-DAG:    %[[C5:.*]] = arith.constant 5 : index
++! STATIC_LEN-DAG:    %[[C10:.*]] = arith.constant 10 : index
++! STATIC_LEN-NEXT:   %[[PRIV_ALLOC:.*]] = fir.alloca !fir.array<5x!fir.char<1,10>>
++! STATIC_LEN-NEXT:   %[[ARRAY_SHAPE:.*]] = fir.shape %[[C5]]
++! STATIC_LEN-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]](%[[ARRAY_SHAPE]]) typeparams %[[C10]]
++! STATIC_LEN-NEXT:   omp.yield(%[[PRIV_DECL]]#0
++
++! STATIC_LEN-NEXT: } copy {
++! STATIC_LEN-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
++! STATIC_LEN-NEXT:   hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]]
++
++! STATIC_LEN-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]]
++! STATIC_LEN-NEXT: }
++
++!--- dyn_len.f90
++subroutine delayed_privatization_character_array_dynamic_len(var1, char_len, array_len)
++  implicit none
++  integer(8):: char_len
++  integer(8):: array_len
++  character(len = char_len)  :: var1(array_len)
++
++!$omp parallel private(var1)
++  var1(1) = "test"
++!$omp end parallel
++end subroutine
++
++! DYN_LEN-LABEL: omp.private {type = private}
++! DYN_LEN-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.box<!fir.array<\?x!fir.char<1,\?>>>]] alloc {
++
++! DYN_LEN-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++
++! DYN_LEN:        %[[C0:.*]] = arith.constant 0 : index
++! DYN_LEN-NEXT:   %[[BOX_DIM:.*]]:3 = fir.box_dims %[[PRIV_ARG]], %[[C0]]
++! DYN_LEN:        %[[CHAR_LEN:.*]] = fir.box_elesize %[[PRIV_ARG]]
++! DYN_LEN-NEXT:   %[[PRIV_ALLOC:.*]] = fir.alloca !fir.array<?x!fir.char<1,?>>(%[[CHAR_LEN]] : index)
++! DYN_LEN-NEXT:   %[[ARRAY_SHAPE:.*]] = fir.shape
++! DYN_LEN-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]](%[[ARRAY_SHAPE]]) typeparams %[[CHAR_LEN]]
++
++! DYN_LEN-NEXT:   omp.yield(%[[PRIV_DECL]]#0
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-character.f90 b/flang/test/Lower/OpenMP/delayed-privatization-character.f90
+new file mode 100644
+index 0000000000000..db678ab13bbe6
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/delayed-privatization-character.f90
+@@ -0,0 +1,59 @@
++! Test delayed privatization for the `CHARACTER` type.
++
++! RUN: split-file %s %t
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/dyn_len.f90 2>&1 | FileCheck %s --check-prefix=DYN_LEN
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %t/dyn_len.f90 2>&1 \
++! RUN:   | FileCheck %s --check-prefix=DYN_LEN
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/static_len.f90 2>&1 | FileCheck %s --check-prefix=STATIC_LEN
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %t/static_len.f90 2>&1 \
++! RUN:   | FileCheck %s --check-prefix=STATIC_LEN
++
++!--- dyn_len.f90
++subroutine delayed_privatization_character(var1, l)
++  implicit none
++  integer(8):: l
++  character(len = l)  :: var1
++
++!$omp parallel firstprivate(var1)
++  var1 = "test"
++!$omp end parallel
++end subroutine
++
++! DYN_LEN-LABEL: omp.private {type = firstprivate}
++! DYN_LEN-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.boxchar<1>]] alloc {
++
++! DYN_LEN-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! DYN_LEN-NEXT:   %[[UNBOX:.*]]:2 = fir.unboxchar %[[PRIV_ARG]]
++! DYN_LEN:        %[[PRIV_ALLOC:.*]] = fir.alloca !fir.char<1,?>(%[[UNBOX]]#1 : index)
++! DYN_LEN-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]] typeparams %[[UNBOX]]#1
++! DYN_LEN-NEXT:   omp.yield(%[[PRIV_DECL]]#0 : !fir.boxchar<1>)
++
++! DYN_LEN-NEXT: } copy {
++! DYN_LEN-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
++
++! DYN_LEN-NEXT:   hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]]
++
++! DYN_LEN-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]] : !fir.boxchar<1>)
++! DYN_LEN-NEXT: }
++
++!--- static_len.f90
++subroutine delayed_privatization_character_static_len(var1)
++  implicit none
++  character(len = 10)  :: var1
++
++!$omp parallel private(var1)
++  var1 = "test"
++!$omp end parallel
++end subroutine
++
++! STATIC_LEN-LABEL: omp.private {type = private}
++! STATIC_LEN-SAME: @[[PRIVATIZER_SYM:.*]] : [[TYPE:!fir.ref<!fir.char<1,10>>]] alloc {
++
++! STATIC_LEN-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! STATIC_LEN-NEXT:   %[[C10:.*]] = arith.constant 10 : index
++! STATIC_LEN-NEXT:   %[[PRIV_ALLOC:.*]] = fir.alloca !fir.char<1,10>
++! STATIC_LEN-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]] typeparams %[[C10]]

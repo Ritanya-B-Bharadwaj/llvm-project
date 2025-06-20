@@ -1,0 +1,371 @@
+diff --git a/flang/test/Integration/OpenMP/parallel-private-reduction-worstcase.f90 b/flang/test/Integration/OpenMP/parallel-private-reduction-worstcase.f90
+index 3aa5d04246397..fe3a326702e52 100644
+--- a/flang/test/Integration/OpenMP/parallel-private-reduction-worstcase.f90
++++ b/flang/test/Integration/OpenMP/parallel-private-reduction-worstcase.f90
+@@ -96,9 +96,12 @@ subroutine worst_case(a, b, c, d)
+ 
+ ! CHECK:       omp.region.cont13:                                ; preds = %omp.private.copy16
+ ! CHECK-NEXT:    %{{.*}} = phi ptr
++! CHECK-NEXT:    br label %omp.par.region
++
++! CHECK:       omp.par.region:                                   ; preds = %omp.region.cont13
+ ! CHECK-NEXT:    br label %omp.reduction.init
+ 
+-! CHECK:       omp.reduction.init:                               ; preds = %omp.region.cont13
++! CHECK:       omp.reduction.init:                               ; preds = %omp.par.region
+ !                [deffered stores for results of reduction alloc regions]
+ ! CHECK:         br label %[[VAL_96:.*]]
+ 
+@@ -132,12 +135,9 @@ subroutine worst_case(a, b, c, d)
+ 
+ ! CHECK:       omp.region.cont21:                                ; preds = %omp.reduction.neutral25
+ ! CHECK-NEXT:    %{{.*}} = phi ptr
+-! CHECK-NEXT:    br label %omp.par.region
+-
+-! CHECK:       omp.par.region:                                   ; preds = %omp.region.cont21
+ ! CHECK-NEXT:    br label %omp.par.region27
+ 
+-! CHECK:       omp.par.region27:                                 ; preds = %omp.par.region
++! CHECK:       omp.par.region27:                                 ; preds = %omp.region.cont21
+ !                [call SUM runtime function]
+ !                [if (sum(a) == 1)]
+ ! CHECK:         br i1 %{{.*}}, label %omp.par.region28, label %omp.par.region29
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90 b/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
+index 8e6f55abd5671..b3e25ae779561 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
+@@ -27,11 +27,11 @@ end subroutine proc
+ !CHECK:  %[[F_priv:.*]] = alloca ptr
+ !CHECK:  %[[I_priv:.*]] = alloca i32
+ 
++!CHECK: omp.par.region:
++
+ !CHECK: omp.reduction.init:
+ !CHECK:  store ptr %{{.*}}, ptr %[[F_priv]]
+ !CHECK:  store i32 0, ptr %[[I_priv]]
+-
+-!CHECK: omp.par.region:
+ !CHECK:  br label %[[MALLOC_BB:.*]]
+ 
+ !CHECK: [[MALLOC_BB]]:
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 87cb7f03fec6a..a364098e0bd8a 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -1025,6 +1025,11 @@ mapInitializationArgs(T loop, LLVM::ModuleTranslation &moduleTranslation,
+   }
+ }
+ 
++/// Inline reductions' `init` regions. This functions assumes that the
++/// `builder`'s insertion point is where the user wants the `init` regions to be
++/// inlined; i.e. it does not try to find a proper insertion location for the
++/// `init` regions. It also leaves the `builder's insertions point in a state
++/// where the user can continue the code-gen directly afterwards.
+ template <typename OP>
+ static LogicalResult
+ initReductionVars(OP op, ArrayRef<BlockArgument> reductionArgs,
+@@ -1039,9 +1044,6 @@ initReductionVars(OP op, ArrayRef<BlockArgument> reductionArgs,
+   if (op.getNumReductionVars() == 0)
+     return success();
+ 
+-  llvm::IRBuilderBase::InsertPointGuard guard(builder);
+-
+-  builder.SetInsertPoint(latestAllocaBlock->getTerminator());
+   llvm::BasicBlock *initBlock = splitBB(builder, true, "omp.reduction.init");
+   auto allocaIP = llvm::IRBuilderBase::InsertPoint(
+       latestAllocaBlock, latestAllocaBlock->getTerminator()->getIterator());
+@@ -1061,7 +1063,10 @@ initReductionVars(OP op, ArrayRef<BlockArgument> reductionArgs,
+     }
+   }
+ 
+-  builder.SetInsertPoint(&*initBlock->getFirstNonPHIOrDbgOrAlloca());
++  if (initBlock->empty() || initBlock->getTerminator() == nullptr)
++    builder.SetInsertPoint(initBlock);
++  else
++    builder.SetInsertPoint(initBlock->getTerminator());
+ 
+   // store result of the alloc region to the allocated pointer to the real
+   // reduction variable
+@@ -1086,7 +1091,11 @@ initReductionVars(OP op, ArrayRef<BlockArgument> reductionArgs,
+     assert(phis.size() == 1 && "expected one value to be yielded from the "
+                                "reduction neutral element declaration region");
+ 
+-    builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
++    if (builder.GetInsertBlock()->empty() ||
++        builder.GetInsertBlock()->getTerminator() == nullptr)
++      builder.SetInsertPoint(builder.GetInsertBlock());
++    else
++      builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
+ 
+     if (isByRef[i]) {
+       if (!reductionDecls[i].getAllocRegion().empty())
+@@ -1271,7 +1280,6 @@ static LogicalResult allocAndInitializeReductionVars(
+   if (op.getNumReductionVars() == 0)
+     return success();
+ 
+-  llvm::IRBuilderBase::InsertPointGuard guard(builder);
+   SmallVector<DeferredStore> deferredStores;
+ 
+   if (failed(allocReductionVars(op, reductionArgs, builder, moduleTranslation,
+@@ -2080,6 +2088,8 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+       return llvm::make_error<PreviouslyReportedError>();
+ 
+     assert(afterAllocas.get()->getSinglePredecessor());
++    builder.restoreIP(codeGenIP);
++
+     if (failed(
+             initReductionVars(opInst, reductionArgs, builder, moduleTranslation,
+                               afterAllocas.get()->getSinglePredecessor(),
+@@ -2099,7 +2109,6 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+         moduleTranslation, allocaIP);
+ 
+     // ParallelOp has only one region associated with it.
+-    builder.restoreIP(codeGenIP);
+     llvm::Expected<llvm::BasicBlock *> regionBlock = convertOmpOpRegions(
+         opInst.getRegion(), "omp.par.region", builder, moduleTranslation);
+     if (!regionBlock)
+diff --git a/mlir/test/Target/LLVMIR/openmp-parallel-reduction-init.mlir b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-init.mlir
+new file mode 100644
+index 0000000000000..7e90ba0f0d937
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-init.mlir
+@@ -0,0 +1,48 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
++
++// Regression test for https://github.com/llvm/llvm-project/issues/120254.
++
++omp.declare_reduction @add_reduction : !llvm.ptr alloc {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x !llvm.struct<(ptr)> : (i64) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++} init {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %6 = llvm.mlir.constant(1 : i32) : i32
++  "llvm.intr.memcpy"(%arg1, %arg0, %6) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++  omp.yield(%arg1 : !llvm.ptr)
++} combiner {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  omp.yield(%arg0 : !llvm.ptr)
++} cleanup {
++^bb0(%arg0: !llvm.ptr):
++  omp.yield
++}
++
++llvm.func @use_reduction() attributes {fir.bindc_name = "test"} {
++  %6 = llvm.mlir.constant(1 : i32) : i32
++  omp.parallel {
++    %18 = llvm.mlir.constant(1 : i64) : i64
++    %19 = llvm.alloca %18 x !llvm.struct<(ptr)> : (i64) -> !llvm.ptr
++    omp.wsloop reduction(byref @add_reduction %19 -> %arg0 : !llvm.ptr) {
++      omp.loop_nest (%arg1) : i32 = (%6) to (%6) inclusive step (%6) {
++        omp.yield
++      }
++    }
++    omp.terminator
++  }
++  llvm.return
++}
++
++// CHECK: omp.par.entry:
++// CHECK:   %[[RED_REGION_ALLOC:.*]] = alloca { ptr }, i64 1, align 8
++
++// CHECK: omp.par.region:
++// CHECK:   br label %omp.par.region1
++
++// CHECK: omp.par.region1:
++// CHECK:   %[[PAR_REG_VAL:.*]] = alloca { ptr }, i64 1, align 8
++// CHECK:   br label %omp.reduction.init
++
++// CHECK: omp.reduction.init:
++// CHECK:   call void @llvm.memcpy{{.*}}(ptr %[[RED_REGION_ALLOC]], ptr %[[PAR_REG_VAL]], {{.*}})
+diff --git a/mlir/test/Target/LLVMIR/openmp-parallel-reduction-multiblock.mlir b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-multiblock.mlir
+index 55fb5954548a0..75161bac2faf4 100644
+--- a/mlir/test/Target/LLVMIR/openmp-parallel-reduction-multiblock.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-multiblock.mlir
+@@ -44,7 +44,7 @@ llvm.func @missordered_blocks_(%arg0: !llvm.ptr {fir.bindc_name = "x"}, %arg1: !
+ // CHECK:         br label %[[VAL_10:.*]]
+ // CHECK:       omp.par.exit.split:                               ; preds = %[[VAL_9]]
+ // CHECK:         ret void
+-// CHECK:       omp.par.entry:
++// CHECK:       [[PAR_ENTRY:omp.par.entry]]:
+ // CHECK:         %[[VAL_11:.*]] = getelementptr { ptr, ptr }, ptr %[[VAL_12:.*]], i32 0, i32 0
+ // CHECK:         %[[VAL_13:.*]] = load ptr, ptr %[[VAL_11]], align 8
+ // CHECK:         %[[VAL_14:.*]] = getelementptr { ptr, ptr }, ptr %[[VAL_12]], i32 0, i32 1
+@@ -56,10 +56,12 @@ llvm.func @missordered_blocks_(%arg0: !llvm.ptr {fir.bindc_name = "x"}, %arg1: !
+ // CHECK:         %[[VAL_20:.*]] = alloca ptr, align 8
+ // CHECK:         %[[VAL_21:.*]] = alloca ptr, align 8
+ // CHECK:         %[[VAL_22:.*]] = alloca [2 x ptr], align 8
+-// CHECK:         br label %[[VAL_23:.*]]
+-// CHECK:       omp.reduction.init:                               ; preds = %[[VAL_24:.*]]
+-// CHECK:         br label %[[VAL_25:.*]]
+-// CHECK:       omp.reduction.neutral:                            ; preds = %[[VAL_23]]
++// CHECK:         br label %[[VAL_23:omp.par.region]]
++// CHECK:       [[VAL_23]]:                                   ; preds = %[[PAR_ENTRY]]
++// CHECK:         br label %[[VAL_42:.*]]
++// CHECK:       [[RED_INIT:omp.reduction.init]]:
++// CHECK:         br label %[[VAL_25:omp.reduction.neutral]]
++// CHECK:       [[VAL_25]]:                            ; preds = %[[RED_INIT]]
+ // CHECK:         %[[VAL_26:.*]] = ptrtoint ptr %[[VAL_13]] to i64
+ // CHECK:         %[[VAL_27:.*]] = icmp eq i64 %[[VAL_26]], 0
+ // CHECK:         br i1 %[[VAL_27]], label %[[VAL_28:.*]], label %[[VAL_29:.*]]
+@@ -79,15 +81,13 @@ llvm.func @missordered_blocks_(%arg0: !llvm.ptr {fir.bindc_name = "x"}, %arg1: !
+ // CHECK:         br label %[[VAL_38:.*]]
+ // CHECK:       omp.reduction.neutral8:                           ; preds = %[[VAL_36]], %[[VAL_37]]
+ // CHECK:         br label %[[VAL_39:.*]]
+-// CHECK:       omp.region.cont4:                                 ; preds = %[[VAL_38]]
++// CHECK:       [[VAL_39]]:                                 ; preds = %[[VAL_38]]
+ // CHECK:         %[[VAL_40:.*]] = phi ptr [ %[[VAL_15]], %[[VAL_38]] ]
+ // CHECK:         store ptr %[[VAL_40]], ptr %[[VAL_21]], align 8
+ // CHECK:         br label %[[VAL_41:.*]]
+-// CHECK:       omp.par.region:                                   ; preds = %[[VAL_39]]
+-// CHECK:         br label %[[VAL_42:.*]]
+-// CHECK:       omp.par.region10:                                 ; preds = %[[VAL_41]]
++// CHECK:       omp.par.region10:                                 ; preds = %[[VAL_39]]
+ // CHECK:         br label %[[VAL_43:.*]]
+-// CHECK:       omp.region.cont9:                                 ; preds = %[[VAL_42]]
++// CHECK:       omp.region.cont9:                                 ; preds = %[[VAL_41]]
+ // CHECK:         %[[VAL_44:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_22]], i64 0, i64 0
+ // CHECK:         store ptr %[[VAL_20]], ptr %[[VAL_44]], align 8
+ // CHECK:         %[[VAL_45:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_22]], i64 0, i64 1
+diff --git a/mlir/test/Target/LLVMIR/openmp-private.mlir b/mlir/test/Target/LLVMIR/openmp-private.mlir
+index 5407f97286eb1..d2ca03a8fa027 100644
+--- a/mlir/test/Target/LLVMIR/openmp-private.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-private.mlir
+@@ -199,6 +199,8 @@ llvm.func @bar(!llvm.ptr)
+ // CHECK-DAG:     %[[RED_ALLOC:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
+ 
+ // CHECK:         omp.par.region:
++// CHECK:           br label %omp.reduction.init
++// CHECK:         omp.reduction.init:
+ // CHECK:           br label %[[PAR_REG_BEG:.*]]
+ // CHECK:         [[PAR_REG_BEG]]:
+ // CHECK-NEXT:      %{{.*}} = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[RED_ALLOC]], align 8
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
+index fdfcc66b91012..912d5568c5f26 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
+@@ -77,7 +77,7 @@ llvm.func @sectionsreduction_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attribute
+ }
+ 
+ // CHECK-LABEL: define internal void @sectionsreduction_..omp_par
+-// CHECK:       omp.par.entry:
++// CHECK:       [[PAR_ENTRY:omp.par.entry]]:
+ // CHECK:         %[[VAL_6:.*]] = alloca i32, align 4
+ // CHECK:         %[[VAL_7:.*]] = alloca i32, align 4
+ // CHECK:         %[[VAL_8:.*]] = alloca i32, align 4
+@@ -90,15 +90,18 @@ llvm.func @sectionsreduction_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attribute
+ // CHECK:         %[[VAL_21:.*]] = alloca ptr, align 8
+ // CHECK:         %[[VAL_14:.*]] = alloca [1 x ptr], align 8
+ // CHECK:         br label %[[VAL_15:.*]]
+-// CHECK:       omp.reduction.init:                               ; preds = %[[VAL_16:.*]]
+-// CHECK:         store ptr %[[VAL_20]], ptr %[[VAL_21]], align 8
+-// CHECK:         br label %[[VAL_17:.*]]
+-// CHECK:       omp.par.region:                                   ; preds = %[[VAL_15]]
++
++// CHECK:       omp.par.region:                                   ; preds = %[[PAR_ENTRY]]
+ // CHECK:         br label %[[VAL_18:.*]]
+-// CHECK:       omp.par.region1:                                  ; preds = %[[VAL_17]]
++// CHECK:       omp.par.region1:                                  ; preds = %[[VAL_15]]
+ // CHECK:         %[[VAL_19:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
+ // CHECK:         br label %[[VAL_22:.*]]
+-// CHECK:       omp_section_loop.preheader:                       ; preds = %[[VAL_18]]
++
++// CHECK:       omp.reduction.init:                               ; preds = %[[VAL_16:.*]]
++// CHECK:         store ptr %[[VAL_20]], ptr %[[VAL_21]], align 8
++// CHECK:         br label %[[VAL_17:.*]]
++
++// CHECK:       omp_section_loop.preheader:                       ; preds = %[[VAL_22]]
+ // CHECK:         store i32 0, ptr %[[VAL_7]], align 4
+ // CHECK:         store i32 1, ptr %[[VAL_8]], align 4
+ // CHECK:         store i32 1, ptr %[[VAL_9]], align 4
+@@ -109,8 +112,8 @@ llvm.func @sectionsreduction_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attribute
+ // CHECK:         %[[VAL_26:.*]] = sub i32 %[[VAL_25]], %[[VAL_24]]
+ // CHECK:         %[[VAL_27:.*]] = add i32 %[[VAL_26]], 1
+ // CHECK:         br label %[[VAL_28:.*]]
+-// CHECK:       omp_section_loop.header:                          ; preds = %[[VAL_29:.*]], %[[VAL_22]]
+-// CHECK:         %[[VAL_30:.*]] = phi i32 [ 0, %[[VAL_22]] ], [ %[[VAL_31:.*]], %[[VAL_29]] ]
++// CHECK:       omp_section_loop.header:                          ; preds = %[[VAL_29:.*]], %[[VAL_17]]
++// CHECK:         %[[VAL_30:.*]] = phi i32 [ 0, %[[VAL_17]] ], [ %[[VAL_31:.*]], %[[VAL_29]] ]
+ // CHECK:         br label %[[VAL_32:.*]]
+ // CHECK:       omp_section_loop.cond:                            ; preds = %[[VAL_28]]
+ // CHECK:         %[[VAL_33:.*]] = icmp ult i32 %[[VAL_30]], %[[VAL_27]]
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
+index 8e28f0b85b259..7f2424381e846 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
+@@ -50,7 +50,7 @@ module {
+ // CHECK:         br label %[[VAL_10:.*]]
+ // CHECK:       omp.par.exit.split:                               ; preds = %[[VAL_9]]
+ // CHECK:         ret void
+-// CHECK:       omp.par.entry:
++// CHECK:       [[PAR_ENTRY:omp.par.entry]]:
+ // CHECK:         %[[VAL_11:.*]] = getelementptr { ptr, ptr }, ptr %[[VAL_12:.*]], i32 0, i32 0
+ // CHECK:         %[[VAL_13:.*]] = load ptr, ptr %[[VAL_11]], align 8
+ // CHECK:         %[[VAL_14:.*]] = getelementptr { ptr, ptr }, ptr %[[VAL_12]], i32 0, i32 1
+@@ -62,16 +62,16 @@ module {
+ // CHECK:         %[[VAL_21:.*]] = alloca ptr, align 8
+ // CHECK:         %[[VAL_23:.*]] = alloca ptr, align 8
+ // CHECK:         %[[VAL_24:.*]] = alloca [2 x ptr], align 8
++// CHECK:         br label %[[VAL_25:.*]]
++// CHECK:       omp.par.region:                                   ; preds = %[[PAR_ENTRY]]
+ // CHECK:         br label %[[INIT_LABEL:.*]]
+ // CHECK: [[INIT_LABEL]]:
+ // CHECK:         %[[VAL_20:.*]] = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[VAL_13]], align 8
+ // CHECK:         store ptr %[[VAL_13]], ptr %[[VAL_21]], align 8
+ // CHECK:         %[[VAL_22:.*]] = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[VAL_15]], align 8
+ // CHECK:         store ptr %[[VAL_15]], ptr %[[VAL_23]], align 8
+-// CHECK:         br label %[[VAL_25:.*]]
+-// CHECK:       omp.par.region:                                   ; preds = %[[VAL_26:.*]]
+ // CHECK:         br label %[[VAL_27:.*]]
+-// CHECK:       omp.par.region1:                                  ; preds = %[[VAL_25]]
++// CHECK:       omp.par.region1:                                  ; preds = %[[INIT_LABEL]]
+ // CHECK:         br label %[[VAL_28:.*]]
+ // CHECK:       omp.region.cont:                                  ; preds = %[[VAL_27]]
+ // CHECK:         %[[VAL_29:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_24]], i64 0, i64 0
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-sections.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-sections.mlir
+index ed7e9fada5fc4..05af32622246a 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-sections.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-sections.mlir
+@@ -36,7 +36,7 @@ llvm.func @sections_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attributes {fir.in
+ }
+ 
+ // CHECK-LABEL: define internal void @sections_..omp_par
+-// CHECK:       omp.par.entry:
++// CHECK:       [[PAR_ENTRY:omp.par.entry]]:
+ // CHECK:         %[[VAL_9:.*]] = getelementptr { ptr }, ptr %[[VAL_10:.*]], i32 0, i32 0
+ // CHECK:         %[[VAL_11:.*]] = load ptr, ptr %[[VAL_9]], align 8
+ // CHECK:         %[[VAL_12:.*]] = alloca i32, align 4
+@@ -50,14 +50,16 @@ llvm.func @sections_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attributes {fir.in
+ // CHECK:         %[[VAL_20:.*]] = alloca float, align 4
+ // CHECK:         %[[VAL_21:.*]] = alloca [1 x ptr], align 8
+ // CHECK:         br label %[[VAL_22:.*]]
+-// CHECK:       omp.reduction.init:                               ; preds = %[[VAL_23:.*]]
+-// CHECK:         store float 0.000000e+00, ptr %[[VAL_20]], align 4
+-// CHECK:         br label %[[VAL_24:.*]]
+-// CHECK:       omp.par.region:                                   ; preds = %[[VAL_22]]
++// CHECK:       omp.par.region:                                   ; preds = %[[PAR_ENTRY]]
+ // CHECK:         br label %[[VAL_25:.*]]
+-// CHECK:       omp.par.region1:                                  ; preds = %[[VAL_24]]
++// CHECK:       omp.par.region1:                                  ; preds = %[[VAL_22]]
+ // CHECK:         br label %[[VAL_26:.*]]
+-// CHECK:       omp_section_loop.preheader:                       ; preds = %[[VAL_25]]
++
++// CHECK:       [[RED_INIT:omp.reduction.init]]:
++// CHECK:         store float 0.000000e+00, ptr %[[VAL_20]], align 4
++// CHECK:         br label %[[VAL_24:.*]]
++
++// CHECK:       omp_section_loop.preheader:                       ; preds = %[[RED_INIT]]
+ // CHECK:         store i32 0, ptr %[[VAL_13]], align 4
+ // CHECK:         store i32 1, ptr %[[VAL_14]], align 4
+ // CHECK:         store i32 1, ptr %[[VAL_15]], align 4
+@@ -68,8 +70,8 @@ llvm.func @sections_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attributes {fir.in
+ // CHECK:         %[[VAL_30:.*]] = sub i32 %[[VAL_29]], %[[VAL_28]]
+ // CHECK:         %[[VAL_31:.*]] = add i32 %[[VAL_30]], 1
+ // CHECK:         br label %[[VAL_32:.*]]
+-// CHECK:       omp_section_loop.header:                          ; preds = %[[VAL_33:.*]], %[[VAL_26]]
+-// CHECK:         %[[VAL_34:.*]] = phi i32 [ 0, %[[VAL_26]] ], [ %[[VAL_35:.*]], %[[VAL_33]] ]
++// CHECK:       omp_section_loop.header:                          ; preds = %[[VAL_33:.*]], %[[VAL_24]]
++// CHECK:         %[[VAL_34:.*]] = phi i32 [ 0, %[[VAL_24]] ], [ %[[VAL_35:.*]], %[[VAL_33]] ]
+ // CHECK:         br label %[[VAL_36:.*]]
+ // CHECK:       omp_section_loop.cond:                            ; preds = %[[VAL_32]]
+ // CHECK:         %[[VAL_37:.*]] = icmp ult i32 %[[VAL_34]], %[[VAL_31]]
