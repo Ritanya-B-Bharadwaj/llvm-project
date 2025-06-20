@@ -98,4 +98,11 @@ If the ratio exceeds 2.0, it will additionally print:
 Function 'compute' has high computational intensity:
 ```
 
+## Please Note:
+All custom modifications related to the Computational Intensity Analysis Pass have been implemented in the `analyze-computational-intensity` branch of this repository.
+This includes:
+The implementation of ComputationalIntensityPass under `llvm/lib/Transforms`.
+Pass registration logic in opt.cpp for supporting `-passes=analyze-computational-intensity`.
+Necessary CMake and build integration to enable the pass in the opt tool.
+Please make sure to switch to the analyze-computational-intensity branch before building or running the pass.
 
