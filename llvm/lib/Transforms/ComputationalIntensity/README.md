@@ -36,7 +36,7 @@ cmake -G Ninja ../llvm \
 - **-DLLVM_ENABLE_PROJECTS="clang"**: Tells LLVM to build Clang (the C/C++/Objective-C frontend).
 - **-DLLVM_TARGETS_TO_BUILD="X86"**:Only build the X86 backend (code generation for x86_64). Speeds up compilation.
 
-*** this command builds the opt binary***
+***this command builds the opt binary***
 ```bash
    ninja -j4 opt
 ```
