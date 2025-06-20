@@ -3705,6 +3705,10 @@ def fno_openmp_target_debug : Flag<["-"], "fno-openmp-target-debug">;
 } // let Visibility = [ClangOption, CC1Option, FC1Option]
 } // let Flags = [NoArgumentUnused]
 
+let Visibility = [CC1Option, ClangOption] in {
+def fdump_auto_type_inference : Flag<["-"], "fdump-auto-type-inference">,
+  HelpText<"Emit notes showing types deduced for 'auto'">;
+}
 //===----------------------------------------------------------------------===//
 // FlangOption + FC1 + ClangOption + CC1Option
 //===----------------------------------------------------------------------===//
@@ -7935,6 +7939,7 @@ def ast_merge : Separate<["-"], "ast-merge">,
   MetaVarName<"<ast file>">,
   HelpText<"Merge the given AST file into the translation unit being compiled.">,
   MarshallingInfoStringVector<FrontendOpts<"ASTMergeFiles">>;
+
 def aux_target_cpu : Separate<["-"], "aux-target-cpu">,
   HelpText<"Target a specific auxiliary cpu type">;
 def aux_target_feature : Separate<["-"], "aux-target-feature">,

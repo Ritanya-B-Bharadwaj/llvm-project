@@ -20,7 +20,7 @@
 namespace clang {
 
 class ASTConsumer;
-
+class ASTContext;
 // AST pretty-printer: prints out the AST in a format that is close to the
 // original C code.  The output is intended to be in a format such that
 // clang could re-parse the output back into the same AST, but the
@@ -48,7 +48,7 @@ std::unique_ptr<ASTConsumer> CreateASTDeclNodeLister();
 // the AST and displays it with the graph viewer "dotty".  Also outputs
 // function declarations to stderr.
 std::unique_ptr<ASTConsumer> CreateASTViewer();
-
-} // end clang namespace
+std::unique_ptr<ASTConsumer> CreateAutoTypeDumper(ASTContext &Ctx);
+} // namespace clang
 
 #endif

@@ -58,7 +58,13 @@ public:
 //===----------------------------------------------------------------------===//
 // AST Consumer Actions
 //===----------------------------------------------------------------------===//
+class AutoTypeDumpAction : public clang::ASTFrontendAction {
 
+public:
+  std::unique_ptr<clang::ASTConsumer>
+  CreateASTConsumer(clang::CompilerInstance &CI,
+                    llvm::StringRef InFile) override;
+};
 class ASTPrintAction : public ASTFrontendAction {
 protected:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
@@ -88,9 +94,7 @@ protected:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  StringRef InFile) override;
 
-  TranslationUnitKind getTranslationUnitKind() override {
-    return TU_Prefix;
-  }
+  TranslationUnitKind getTranslationUnitKind() override { return TU_Prefix; }
 
   bool hasASTFileSupport() const override { return false; }
 
@@ -329,6 +333,6 @@ public:
       : ModuleName(ModuleName) {}
 };
 
-}  // end namespace clang
+} // end namespace clang
 
 #endif

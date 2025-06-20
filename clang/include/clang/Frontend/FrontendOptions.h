@@ -145,7 +145,8 @@ enum ActionKind {
   RunPreprocessorOnly,
 
   /// Print the output of the dependency directives source minimizer.
-  PrintDependencyDirectivesSourceMinimizerOutput
+  PrintDependencyDirectivesSourceMinimizerOutput,
+
 };
 
 } // namespace frontend
@@ -154,11 +155,7 @@ enum ActionKind {
 class InputKind {
 public:
   /// The input file format.
-  enum Format {
-    Source,
-    ModuleMap,
-    Precompiled
-  };
+  enum Format { Source, ModuleMap, Precompiled };
 
   // If we are building a header unit, what kind it is; this affects whether
   // we look for the file in the user or system include search paths before
@@ -347,6 +344,10 @@ public:
   /// Whether we deserialize all decls when forming AST dumps.
   LLVM_PREFERRED_TYPE(bool)
   unsigned ASTDumpAll : 1;
+  /// If true, dump the deduced types for 'auto' variables and function return
+  /// types.
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned DumpAutoTypeInference : 1;
 
   /// Whether we include lookup table dumps in AST dumps.
   LLVM_PREFERRED_TYPE(bool)

@@ -188,8 +188,7 @@ CompilerInvocation::operator=(const CowCompilerInvocation &X) {
   return *this;
 }
 
-template <typename T>
-T &ensureOwned(std::shared_ptr<T> &Storage) {
+template <typename T> T &ensureOwned(std::shared_ptr<T> &Storage) {
   if (Storage.use_count() > 1)
     Storage = std::make_shared<T>(*Storage);
   return *Storage;
@@ -678,7 +677,8 @@ static bool FixupInvocation(CompilerInvocation &Invocation,
     emitError |= (DefaultCC == LangOptions::DCC_VectorCall ||
                   DefaultCC == LangOptions::DCC_RegCall) &&
                  !T.isX86();
-    emitError |= DefaultCC == LangOptions::DCC_RtdCall && Arch != llvm::Triple::m68k;
+    emitError |=
+        DefaultCC == LangOptions::DCC_RtdCall && Arch != llvm::Triple::m68k;
     if (emitError)
       Diags.Report(diag::err_drv_argument_not_allowed_with)
           << A->getSpelling() << T.getTriple();
@@ -1062,13 +1062,12 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
   if (Arg *A = Args.getLastArg(OPT_analyzer_constraints)) {
     StringRef Name = A->getValue();
     AnalysisConstraints Value = llvm::StringSwitch<AnalysisConstraints>(Name)
-#define ANALYSIS_CONSTRAINTS(NAME, CMDFLAG, DESC, CREATFN) \
-      .Case(CMDFLAG, NAME##Model)
+#define ANALYSIS_CONSTRAINTS(NAME, CMDFLAG, DESC, CREATFN)                     \
+  .Case(CMDFLAG, NAME##Model)
 #include "clang/StaticAnalyzer/Core/Analyses.def"
-      .Default(NumConstraints);
+                                    .Default(NumConstraints);
     if (Value == NumConstraints) {
-      Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << Name;
+      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args) << Name;
     } else {
 #ifndef LLVM_WITH_Z3
       if (Value == AnalysisConstraints::Z3ConstraintsModel) {
@@ -1082,13 +1081,12 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
   if (Arg *A = Args.getLastArg(OPT_analyzer_output)) {
     StringRef Name = A->getValue();
     AnalysisDiagClients Value = llvm::StringSwitch<AnalysisDiagClients>(Name)
-#define ANALYSIS_DIAGNOSTICS(NAME, CMDFLAG, DESC, CREATFN) \
-      .Case(CMDFLAG, PD_##NAME)
+#define ANALYSIS_DIAGNOSTICS(NAME, CMDFLAG, DESC, CREATFN)                     \
+  .Case(CMDFLAG, PD_##NAME)
 #include "clang/StaticAnalyzer/Core/Analyses.def"
-      .Default(NUM_ANALYSIS_DIAG_CLIENTS);
+                                    .Default(NUM_ANALYSIS_DIAG_CLIENTS);
     if (Value == NUM_ANALYSIS_DIAG_CLIENTS) {
-      Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << Name;
+      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args) << Name;
     } else {
       Opts.AnalysisDiagOpt = Value;
     }
@@ -1097,13 +1095,11 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
   if (Arg *A = Args.getLastArg(OPT_analyzer_purge)) {
     StringRef Name = A->getValue();
     AnalysisPurgeMode Value = llvm::StringSwitch<AnalysisPurgeMode>(Name)
-#define ANALYSIS_PURGE(NAME, CMDFLAG, DESC) \
-      .Case(CMDFLAG, NAME)
+#define ANALYSIS_PURGE(NAME, CMDFLAG, DESC) .Case(CMDFLAG, NAME)
 #include "clang/StaticAnalyzer/Core/Analyses.def"
-      .Default(NumPurgeModes);
+                                  .Default(NumPurgeModes);
     if (Value == NumPurgeModes) {
-      Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << Name;
+      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args) << Name;
     } else {
       Opts.AnalysisPurgeOpt = Value;
     }
@@ -1112,13 +1108,11 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
   if (Arg *A = Args.getLastArg(OPT_analyzer_inlining_mode)) {
     StringRef Name = A->getValue();
     AnalysisInliningMode Value = llvm::StringSwitch<AnalysisInliningMode>(Name)
-#define ANALYSIS_INLINING_MODE(NAME, CMDFLAG, DESC) \
-      .Case(CMDFLAG, NAME)
+#define ANALYSIS_INLINING_MODE(NAME, CMDFLAG, DESC) .Case(CMDFLAG, NAME)
 #include "clang/StaticAnalyzer/Core/Analyses.def"
-      .Default(NumInliningModes);
+                                     .Default(NumInliningModes);
     if (Value == NumInliningModes) {
-      Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << Name;
+      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args) << Name;
     } else {
       Opts.InliningMode = Value;
     }
@@ -1151,14 +1145,14 @@ static bool ParseAnalyzerArgs(AnalyzerOptions &Opts, ArgList &Args,
       StringRef key, val;
       std::tie(key, val) = configVal.split("=");
       if (val.empty()) {
-        Diags.Report(SourceLocation(),
-                     diag::err_analyzer_config_no_value) << configVal;
+        Diags.Report(SourceLocation(), diag::err_analyzer_config_no_value)
+            << configVal;
         break;
       }
       if (val.contains('=')) {
         Diags.Report(SourceLocation(),
                      diag::err_analyzer_config_multiple_values)
-          << configVal;
+            << configVal;
         break;
       }
 
@@ -1196,9 +1190,8 @@ static StringRef getStringOption(AnalyzerOptions::ConfigTable &Config,
 }
 
 static void initOption(AnalyzerOptions::ConfigTable &Config,
-                       DiagnosticsEngine *Diags,
-                       StringRef &OptionField, StringRef Name,
-                       StringRef DefaultVal) {
+                       DiagnosticsEngine *Diags, StringRef &OptionField,
+                       StringRef Name, StringRef DefaultVal) {
   // String options may be known to invalid (e.g. if the expected string is a
   // file name, but the file does not exist), those will have to be checked in
   // parseConfigs.
@@ -1206,8 +1199,8 @@ static void initOption(AnalyzerOptions::ConfigTable &Config,
 }
 
 static void initOption(AnalyzerOptions::ConfigTable &Config,
-                       DiagnosticsEngine *Diags,
-                       bool &OptionField, StringRef Name, bool DefaultVal) {
+                       DiagnosticsEngine *Diags, bool &OptionField,
+                       StringRef Name, bool DefaultVal) {
   auto PossiblyInvalidVal =
       llvm::StringSwitch<std::optional<bool>>(
           getStringOption(Config, Name, (DefaultVal ? "true" : "false")))
@@ -1218,7 +1211,7 @@ static void initOption(AnalyzerOptions::ConfigTable &Config,
   if (!PossiblyInvalidVal) {
     if (Diags)
       Diags->Report(diag::err_analyzer_config_invalid_input)
-        << Name << "a boolean";
+          << Name << "a boolean";
     else
       OptionField = DefaultVal;
   } else
@@ -1226,16 +1219,15 @@ static void initOption(AnalyzerOptions::ConfigTable &Config,
 }
 
 static void initOption(AnalyzerOptions::ConfigTable &Config,
-                       DiagnosticsEngine *Diags,
-                       unsigned &OptionField, StringRef Name,
-                       unsigned DefaultVal) {
+                       DiagnosticsEngine *Diags, unsigned &OptionField,
+                       StringRef Name, unsigned DefaultVal) {
 
   OptionField = DefaultVal;
   bool HasFailed = getStringOption(Config, Name, std::to_string(DefaultVal))
-                     .getAsInteger(0, OptionField);
+                       .getAsInteger(0, OptionField);
   if (Diags && HasFailed)
     Diags->Report(diag::err_analyzer_config_invalid_input)
-      << Name << "an unsigned";
+        << Name << "an unsigned";
 }
 
 static void initOption(AnalyzerOptions::ConfigTable &Config,
@@ -1398,12 +1390,12 @@ static bool parseDiagnosticLevelMask(StringRef FlagName,
   bool Success = true;
   for (const auto &Level : Levels) {
     DiagnosticLevelMask const PM =
-      llvm::StringSwitch<DiagnosticLevelMask>(Level)
-        .Case("note",    DiagnosticLevelMask::Note)
-        .Case("remark",  DiagnosticLevelMask::Remark)
-        .Case("warning", DiagnosticLevelMask::Warning)
-        .Case("error",   DiagnosticLevelMask::Error)
-        .Default(DiagnosticLevelMask::None);
+        llvm::StringSwitch<DiagnosticLevelMask>(Level)
+            .Case("note", DiagnosticLevelMask::Note)
+            .Case("remark", DiagnosticLevelMask::Remark)
+            .Case("warning", DiagnosticLevelMask::Warning)
+            .Case("error", DiagnosticLevelMask::Error)
+            .Default(DiagnosticLevelMask::None);
     if (PM == DiagnosticLevelMask::None) {
       Success = false;
       Diags.Report(diag::err_drv_invalid_value) << FlagName << Level;
@@ -1486,7 +1478,7 @@ static void setPGOUseInstrumentor(CodeGenOptions &Opts,
     return;
   }
   std::unique_ptr<llvm::IndexedInstrProfReader> PGOReader =
-    std::move(ReaderOrErr.get());
+      std::move(ReaderOrErr.get());
   // Currently memprof profiles are only added at the IR level. Mark the profile
   // type as IR in that case as well and the subsequent matching needs to detect
   // which is available (might be one or both).
@@ -1909,8 +1901,8 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
             .Case("unused-types", llvm::codegenoptions::UnusedTypeInfo)
             .Default(~0U);
     if (Val == ~0U)
-      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args)
-                                                << A->getValue();
+      Diags.Report(diag::err_drv_invalid_value)
+          << A->getAsString(Args) << A->getValue();
     else
       Opts.setDebugInfo(static_cast<llvm::codegenoptions::DebugInfoKind>(Val));
   }
@@ -1938,8 +1930,8 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   }
 
   const llvm::Triple::ArchType DebugEntryValueArchs[] = {
-      llvm::Triple::x86, llvm::Triple::x86_64, llvm::Triple::aarch64,
-      llvm::Triple::arm, llvm::Triple::armeb, llvm::Triple::mips,
+      llvm::Triple::x86,    llvm::Triple::x86_64, llvm::Triple::aarch64,
+      llvm::Triple::arm,    llvm::Triple::armeb,  llvm::Triple::mips,
       llvm::Triple::mipsel, llvm::Triple::mips64, llvm::Triple::mips64el};
 
   if (Opts.OptimizationLevel > 0 && Opts.hasReducedDebugInfo() &&
@@ -1958,9 +1950,8 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   Opts.SimplifyLibCalls = !LangOpts->NoBuiltin;
   if (Opts.SimplifyLibCalls)
     Opts.NoBuiltinFuncs = LangOpts->NoBuiltinFuncs;
-  Opts.UnrollLoops =
-      Args.hasFlag(OPT_funroll_loops, OPT_fno_unroll_loops,
-                   (Opts.OptimizationLevel > 1));
+  Opts.UnrollLoops = Args.hasFlag(OPT_funroll_loops, OPT_fno_unroll_loops,
+                                  (Opts.OptimizationLevel > 1));
   Opts.InterchangeLoops =
       Args.hasFlag(OPT_floop_interchange, OPT_fno_loop_interchange, false);
   Opts.BinutilsVersion =
@@ -1971,9 +1962,9 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   Opts.DebugNameTable = static_cast<unsigned>(
       Args.hasArg(OPT_ggnu_pubnames)
           ? llvm::DICompileUnit::DebugNameTableKind::GNU
-          : Args.hasArg(OPT_gpubnames)
-                ? llvm::DICompileUnit::DebugNameTableKind::Default
-                : llvm::DICompileUnit::DebugNameTableKind::None);
+      : Args.hasArg(OPT_gpubnames)
+          ? llvm::DICompileUnit::DebugNameTableKind::Default
+          : llvm::DICompileUnit::DebugNameTableKind::None);
   if (const Arg *A = Args.getLastArg(OPT_gsimple_template_names_EQ)) {
     StringRef Value = A->getValue();
     if (Value != "simple" && Value != "mangled")
@@ -2204,7 +2195,7 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   if (Arg *A = Args.getLastArg(OPT_mabi_EQ_quadword_atomics)) {
     if (!T.isOSAIX() || T.isPPC32())
       Diags.Report(diag::err_drv_unsupported_opt_for_target)
-        << A->getSpelling() << T.str();
+          << A->getSpelling() << T.str();
   }
 
   bool NeedLocTracking = false;
@@ -2298,12 +2289,12 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
 
   // Parse -fsanitize-recover= arguments.
   // FIXME: Report unrecoverable sanitizers incorrectly specified here.
-  parseSanitizerKinds("-fsanitize-recover=",
-                      Args.getAllArgValues(OPT_fsanitize_recover_EQ), Diags,
-                      Opts.SanitizeRecover);
-  parseSanitizerKinds("-fsanitize-trap=",
-                      Args.getAllArgValues(OPT_fsanitize_trap_EQ), Diags,
-                      Opts.SanitizeTrap);
+  parseSanitizerKinds(
+      "-fsanitize-recover=", Args.getAllArgValues(OPT_fsanitize_recover_EQ),
+      Diags, Opts.SanitizeRecover);
+  parseSanitizerKinds(
+      "-fsanitize-trap=", Args.getAllArgValues(OPT_fsanitize_trap_EQ), Diags,
+      Opts.SanitizeTrap);
   parseSanitizerKinds("-fsanitize-merge=",
                       Args.getAllArgValues(OPT_fsanitize_merge_handlers_EQ),
                       Diags, Opts.SanitizeMergeHandlers);
@@ -2668,7 +2659,8 @@ bool clang::ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
     Opts.DiagnosticSerializationFile = A->getValue();
   Opts.ShowColors = parseShowColorsArgs(Args, DefaultDiagColor);
 
-  Opts.VerifyDiagnostics = Args.hasArg(OPT_verify) || Args.hasArg(OPT_verify_EQ);
+  Opts.VerifyDiagnostics =
+      Args.hasArg(OPT_verify) || Args.hasArg(OPT_verify_EQ);
   Opts.VerifyPrefixes = Args.getAllArgValues(OPT_verify_EQ);
   if (Args.hasArg(OPT_verify))
     Opts.VerifyPrefixes.push_back("expected");
@@ -2704,21 +2696,22 @@ bool clang::ParseDiagnosticArgs(DiagnosticOptions &Opts, ArgList &Args,
 /// command-line argument.
 ///
 /// \returns true on error, false on success.
-static bool parseTestModuleFileExtensionArg(StringRef Arg,
-                                            std::string &BlockName,
-                                            unsigned &MajorVersion,
-                                            unsigned &MinorVersion,
-                                            bool &Hashed,
-                                            std::string &UserInfo) {
+static bool
+parseTestModuleFileExtensionArg(StringRef Arg, std::string &BlockName,
+                                unsigned &MajorVersion, unsigned &MinorVersion,
+                                bool &Hashed, std::string &UserInfo) {
   SmallVector<StringRef, 5> Args;
   Arg.split(Args, ':', 5);
   if (Args.size() < 5)
     return true;
 
   BlockName = std::string(Args[0]);
-  if (Args[1].getAsInteger(10, MajorVersion)) return true;
-  if (Args[2].getAsInteger(10, MinorVersion)) return true;
-  if (Args[3].getAsInteger(2, Hashed)) return true;
+  if (Args[1].getAsInteger(10, MajorVersion))
+    return true;
+  if (Args[2].getAsInteger(10, MinorVersion))
+    return true;
+  if (Args[3].getAsInteger(2, Hashed))
+    return true;
   if (Args.size() > 4)
     UserInfo = std::string(Args[4]);
   return false;
@@ -3060,7 +3053,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
     }
   }
 
-  if (const Arg* A = Args.getLastArg(OPT_plugin)) {
+  if (const Arg *A = Args.getLastArg(OPT_plugin)) {
     Opts.Plugins.emplace_back(A->getValue(0));
     Opts.ProgramAction = frontend::PluginAction;
     Opts.ActionName = A->getValue();
@@ -3069,7 +3062,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
     Opts.PluginArgs[AA->getValue(0)].emplace_back(AA->getValue(1));
 
   for (const std::string &Arg :
-         Args.getAllArgValues(OPT_ftest_module_file_extension_EQ)) {
+       Args.getAllArgValues(OPT_ftest_module_file_extension_EQ)) {
     std::string BlockName;
     unsigned MajorVersion;
     unsigned MinorVersion;
@@ -3089,8 +3082,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
   }
 
   if (const Arg *A = Args.getLastArg(OPT_code_completion_at)) {
-    Opts.CodeCompletionAt =
-      ParsedSourceLocation::FromString(A->getValue());
+    Opts.CodeCompletionAt = ParsedSourceLocation::FromString(A->getValue());
     if (Opts.CodeCompletionAt.FileName.empty()) {
       Diags.Report(diag::err_drv_invalid_value)
           << A->getAsString(Args) << A->getValue();
@@ -3194,7 +3186,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
 
     if (DashX.isUnknown())
       Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << A->getValue();
+          << A->getAsString(Args) << A->getValue();
 
     if (Preprocessed)
       DashX = DashX.getPreprocessed();
@@ -3222,7 +3214,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
     InputKind IK = DashX;
     if (IK.isUnknown()) {
       IK = FrontendOptions::getInputKindForExtension(
-        StringRef(Inputs[i]).rsplit('.').second);
+          StringRef(Inputs[i]).rsplit('.').second);
       // FIXME: Warn on this?
       if (IK.isUnknown())
         IK = Language::C;
@@ -3244,7 +3236,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
   }
 
   Opts.DashX = DashX;
-
+  Opts.DumpAutoTypeInference = Args.hasArg(OPT_fdump_auto_type_inference);
   return Diags.getNumErrors() == NumErrorsBefore;
 }
 
@@ -3401,8 +3393,8 @@ static bool ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args,
     StringRef Val = A->getValue();
     if (Val.contains('=')) {
       auto Split = Val.split('=');
-      Opts.PrebuiltModuleFiles.insert_or_assign(
-          std::string(Split.first), std::string(Split.second));
+      Opts.PrebuiltModuleFiles.insert_or_assign(std::string(Split.first),
+                                                std::string(Split.second));
     }
   }
   for (const auto *A : Args.filtered(OPT_fprebuilt_module_path))
@@ -3476,7 +3468,7 @@ static bool ParseHeaderSearchArgs(HeaderSearchOptions &Opts, ArgList &Args,
   for (const auto *A : Args.filtered(OPT_cxx_isystem))
     Opts.AddPath(A->getValue(), frontend::CXXSystem, false, true);
   for (const auto *A : Args.filtered(OPT_objc_isystem))
-    Opts.AddPath(A->getValue(), frontend::ObjCSystem, false,true);
+    Opts.AddPath(A->getValue(), frontend::ObjCSystem, false, true);
   for (const auto *A : Args.filtered(OPT_objcxx_isystem))
     Opts.AddPath(A->getValue(), frontend::ObjCXXSystem, false, true);
 
@@ -3578,8 +3570,7 @@ static void ParsePointerAuthArgs(LangOptions &Opts, ArgList &Args,
 }
 
 /// Check if input file kind and language standard are compatible.
-static bool IsInputCompatibleWithStandard(InputKind IK,
-                                          const LangStandard &S) {
+static bool IsInputCompatibleWithStandard(InputKind IK, const LangStandard &S) {
   switch (IK.getLanguage()) {
   case Language::Unknown:
   case Language::LLVM_IR:
@@ -3993,26 +3984,27 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
     LangStd = LangStandard::getLangKind(A->getValue());
     if (LangStd == LangStandard::lang_unspecified) {
       Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << A->getValue();
+          << A->getAsString(Args) << A->getValue();
       // Report supported standards with short description.
-      for (unsigned KindValue = 0;
-           KindValue != LangStandard::lang_unspecified;
+      for (unsigned KindValue = 0; KindValue != LangStandard::lang_unspecified;
            ++KindValue) {
         const LangStandard &Std = LangStandard::getLangStandardForKind(
-          static_cast<LangStandard::Kind>(KindValue));
+            static_cast<LangStandard::Kind>(KindValue));
         if (IsInputCompatibleWithStandard(IK, Std)) {
           auto Diag = Diags.Report(diag::note_drv_use_standard);
           Diag << Std.getName() << Std.getDescription();
           unsigned NumAliases = 0;
 #define LANGSTANDARD(id, name, lang, desc, features)
-#define LANGSTANDARD_ALIAS(id, alias) \
-          if (KindValue == LangStandard::lang_##id) ++NumAliases;
+#define LANGSTANDARD_ALIAS(id, alias)                                          \
+  if (KindValue == LangStandard::lang_##id)                                    \
+    ++NumAliases;
 #define LANGSTANDARD_ALIAS_DEPR(id, alias)
 #include "clang/Basic/LangStandards.def"
           Diag << NumAliases;
 #define LANGSTANDARD(id, name, lang, desc, features)
-#define LANGSTANDARD_ALIAS(id, alias) \
-          if (KindValue == LangStandard::lang_##id) Diag << alias;
+#define LANGSTANDARD_ALIAS(id, alias)                                          \
+  if (KindValue == LangStandard::lang_##id)                                    \
+    Diag << alias;
 #define LANGSTANDARD_ALIAS_DEPR(id, alias)
 #include "clang/Basic/LangStandards.def"
         }
@@ -4023,7 +4015,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
       const LangStandard &Std = LangStandard::getLangStandardForKind(LangStd);
       if (!IsInputCompatibleWithStandard(IK, Std)) {
         Diags.Report(diag::err_drv_argument_not_allowed_with)
-          << A->getAsString(Args) << GetInputKindName(IK);
+            << A->getAsString(Args) << GetInputKindName(IK);
       }
     }
   }
@@ -4031,24 +4023,23 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
   // -cl-std only applies for OpenCL language standards.
   // Override the -std option in this case.
   if (const Arg *A = Args.getLastArg(OPT_cl_std_EQ)) {
-    LangStandard::Kind OpenCLLangStd
-      = llvm::StringSwitch<LangStandard::Kind>(A->getValue())
-        .Cases("cl", "CL", LangStandard::lang_opencl10)
-        .Cases("cl1.0", "CL1.0", LangStandard::lang_opencl10)
-        .Cases("cl1.1", "CL1.1", LangStandard::lang_opencl11)
-        .Cases("cl1.2", "CL1.2", LangStandard::lang_opencl12)
-        .Cases("cl2.0", "CL2.0", LangStandard::lang_opencl20)
-        .Cases("cl3.0", "CL3.0", LangStandard::lang_opencl30)
-        .Cases("clc++", "CLC++", LangStandard::lang_openclcpp10)
-        .Cases("clc++1.0", "CLC++1.0", LangStandard::lang_openclcpp10)
-        .Cases("clc++2021", "CLC++2021", LangStandard::lang_openclcpp2021)
-        .Default(LangStandard::lang_unspecified);
+    LangStandard::Kind OpenCLLangStd =
+        llvm::StringSwitch<LangStandard::Kind>(A->getValue())
+            .Cases("cl", "CL", LangStandard::lang_opencl10)
+            .Cases("cl1.0", "CL1.0", LangStandard::lang_opencl10)
+            .Cases("cl1.1", "CL1.1", LangStandard::lang_opencl11)
+            .Cases("cl1.2", "CL1.2", LangStandard::lang_opencl12)
+            .Cases("cl2.0", "CL2.0", LangStandard::lang_opencl20)
+            .Cases("cl3.0", "CL3.0", LangStandard::lang_opencl30)
+            .Cases("clc++", "CLC++", LangStandard::lang_openclcpp10)
+            .Cases("clc++1.0", "CLC++1.0", LangStandard::lang_openclcpp10)
+            .Cases("clc++2021", "CLC++2021", LangStandard::lang_openclcpp2021)
+            .Default(LangStandard::lang_unspecified);
 
     if (OpenCLLangStd == LangStandard::lang_unspecified) {
       Diags.Report(diag::err_drv_invalid_value)
-        << A->getAsString(Args) << A->getValue();
-    }
-    else
+          << A->getAsString(Args) << A->getValue();
+    } else
       LangStd = OpenCLLangStd;
   }
 
@@ -4145,7 +4136,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
     if (Args.hasArg(OPT_fobjc_subscripting_legacy_runtime))
       Opts.ObjCSubscriptingLegacyRuntime =
-        (Opts.ObjCRuntime.getKind() == ObjCRuntime::FragileMacOSX);
+          (Opts.ObjCRuntime.getKind() == ObjCRuntime::FragileMacOSX);
   }
 
   if (Arg *A = Args.getLastArg(options::OPT_fgnuc_version_EQ)) {
@@ -4171,8 +4162,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
     // Set the handler, if one is specified.
     Opts.OverflowHandler =
         std::string(Args.getLastArgValue(OPT_ftrapv_handler));
-  }
-  else if (Args.hasArg(OPT_fwrapv))
+  } else if (Args.hasArg(OPT_fwrapv))
     Opts.setSignedOverflowBehavior(LangOptions::SOB_Defined);
   if (Args.hasArg(OPT_fwrapv_pointer))
     Opts.PointerOverflowDefined = true;
@@ -4181,8 +4171,8 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
   if (const Arg *A = Args.getLastArg(OPT_fms_compatibility_version)) {
     VersionTuple VT;
     if (VT.tryParse(A->getValue()))
-      Diags.Report(diag::err_drv_invalid_value) << A->getAsString(Args)
-                                                << A->getValue();
+      Diags.Report(diag::err_drv_invalid_value)
+          << A->getAsString(Args) << A->getValue();
     Opts.MSCompatibilityVersion = VT.getMajor() * 10000000 +
                                   VT.getMinor().value_or(0) * 100000 +
                                   VT.getSubminor().value_or(0);
@@ -4201,8 +4191,8 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.ZOSExt =
       Args.hasFlag(OPT_fzos_extensions, OPT_fno_zos_extensions, T.isOSzOS());
 
-  Opts.Blocks = Args.hasArg(OPT_fblocks) || (Opts.OpenCL
-    && Opts.OpenCLVersion == 200);
+  Opts.Blocks =
+      Args.hasArg(OPT_fblocks) || (Opts.OpenCL && Opts.OpenCLVersion == 200);
 
   bool HasConvergentOperations = Opts.isTargetDevice() || Opts.OpenCL ||
                                  Opts.HLSL || T.isAMDGPU() || T.isNVPTX();
@@ -4378,7 +4368,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   // FIXME: Eliminate this dependency.
   unsigned Opt = getOptimizationLevel(Args, IK, Diags),
-       OptSize = getOptimizationLevelSize(Args);
+           OptSize = getOptimizationLevelSize(Args);
   Opts.Optimize = Opt != 0;
   Opts.OptimizeSize = OptSize != 0;
 
