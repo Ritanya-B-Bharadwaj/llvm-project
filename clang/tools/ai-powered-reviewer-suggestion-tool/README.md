@@ -102,7 +102,7 @@ make -j$(nproc)
   --vocab-path ../models/vocab.txt
 ```
 
-![Demo SS]("/ai-powered-reviewer-suggestion-tool/media/demo_ss.png")
+![Demo SS](https://github.com/AnanyaBhatblr/llvm-project/blob/main/clang/tools/ai-powered-reviewer-suggestion-tool/demo_ss.png)
 
 ![Demo GIF]("/ai-powered-reviewer-suggestion-tool/media/demo.gif")
 
