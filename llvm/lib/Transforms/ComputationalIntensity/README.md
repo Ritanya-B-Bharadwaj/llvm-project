@@ -56,7 +56,7 @@ clang -O3 -S -emit-llvm ../tests/<testFile.c> -o ../tests/<testFile.c>.ll
 ```bash
 ./build/bin/opt -passes=analyze-computational-intensity -disable-output < tests/clear_array.ll
 ```
-- **-passes=analyze-computational-intensity **: Use the new pass manager to run your custom pass
+- **-passes=analyze-computational-intensity**: Use the new pass manager to run your custom pass
 - **-disable-output**: Suppresses writing transformed output; only performs analysis.
 - **Input**: LLVM IR file (test.ll).
 - **Output**: Diagnostic messages printed to the terminal showing computational intensity per function.
