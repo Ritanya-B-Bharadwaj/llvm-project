@@ -1,0 +1,310 @@
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index 87855fdb79971..fb6e46070afdc 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -4708,23 +4708,7 @@ Driver::getOffloadArchs(Compilation &C, const llvm::opt::DerivedArgList &Args,
+     return KnownArchs.lookup(TC);
+ 
+   llvm::DenseSet<StringRef> Archs;
+-  for (auto *Arg : Args) {
+-    // Extract any '--[no-]offload-arch' arguments intended for this toolchain.
+-    std::unique_ptr<llvm::opt::Arg> ExtractedArg = nullptr;
+-    if (Arg->getOption().matches(options::OPT_Xopenmp_target_EQ) &&
+-        ToolChain::getOpenMPTriple(Arg->getValue(0)) == TC->getTriple()) {
+-      Arg->claim();
+-      unsigned Index = Args.getBaseArgs().MakeIndex(Arg->getValue(1));
+-      unsigned Prev = Index;
+-      ExtractedArg = getOpts().ParseOneArg(Args, Index);
+-      if (!ExtractedArg || Index > Prev + 1) {
+-        TC->getDriver().Diag(diag::err_drv_invalid_Xopenmp_target_with_args)
+-            << Arg->getAsString(Args);
+-        continue;
+-      }
+-      Arg = ExtractedArg.get();
+-    }
+-
++  for (auto *Arg : C.getArgsForToolChain(TC, /*BoundArch=*/"", Kind)) {
+     // Add or remove the seen architectures in order of appearance. If an
+     // invalid architecture is given we simply exit.
+     if (Arg->getOption().matches(options::OPT_offload_arch_EQ)) {
+@@ -4781,14 +4765,31 @@ Driver::getOffloadArchs(Compilation &C, const llvm::opt::DerivedArgList &Args,
+     return Archs;
+ 
+   if (Archs.empty()) {
+-    if (Kind == Action::OFK_Cuda)
++    if (Kind == Action::OFK_Cuda) {
+       Archs.insert(OffloadArchToString(OffloadArch::CudaDefault));
+-    else if (Kind == Action::OFK_HIP)
++    } else if (Kind == Action::OFK_HIP) {
+       Archs.insert(OffloadArchToString(OffloadArch::HIPDefault));
+-    else if (Kind == Action::OFK_OpenMP)
+-      Archs.insert(StringRef());
+-    else if (Kind == Action::OFK_SYCL)
++    } else if (Kind == Action::OFK_SYCL) {
+       Archs.insert(StringRef());
++    } else if (Kind == Action::OFK_OpenMP) {
++      // Accept legacy `-march` device arguments for OpenMP.
++      if (auto *Arg = C.getArgsForToolChain(TC, /*BoundArch=*/"", Kind)
++                          .getLastArg(options::OPT_march_EQ)) {
++        Archs.insert(Arg->getValue());
++      } else {
++        auto ArchsOrErr = TC->getSystemGPUArchs(Args);
++        if (!ArchsOrErr) {
++          TC->getDriver().Diag(diag::err_drv_undetermined_gpu_arch)
++              << llvm::Triple::getArchTypeName(TC->getArch())
++              << llvm::toString(ArchsOrErr.takeError()) << "--offload-arch";
++        } else if (!ArchsOrErr->empty()) {
++          for (auto Arch : *ArchsOrErr)
++            Archs.insert(Args.MakeArgStringRef(Arch));
++        } else {
++          Archs.insert(StringRef());
++        }
++      }
++    }
+   } else {
+     Args.ClaimAllArgs(options::OPT_offload_arch_EQ);
+     Args.ClaimAllArgs(options::OPT_no_offload_arch_EQ);
+diff --git a/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp b/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
+index 3f0b3f2d86b3e..f59e8584abbcb 100644
+--- a/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
++++ b/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
+@@ -71,33 +71,9 @@ llvm::opt::DerivedArgList *AMDGPUOpenMPToolChain::TranslateArgs(
+ 
+   const OptTable &Opts = getDriver().getOpts();
+ 
+-  if (DeviceOffloadKind == Action::OFK_OpenMP) {
+-    for (Arg *A : Args)
+-      if (!llvm::is_contained(*DAL, A))
+-        DAL->append(A);
+-
+-    if (!DAL->hasArg(options::OPT_march_EQ)) {
+-      StringRef Arch = BoundArch;
+-      if (Arch.empty()) {
+-        auto ArchsOrErr = getSystemGPUArchs(Args);
+-        if (!ArchsOrErr) {
+-          std::string ErrMsg =
+-              llvm::formatv("{0}", llvm::fmt_consume(ArchsOrErr.takeError()));
+-          getDriver().Diag(diag::err_drv_undetermined_gpu_arch)
+-              << llvm::Triple::getArchTypeName(getArch()) << ErrMsg << "-march";
+-          Arch = OffloadArchToString(OffloadArch::HIPDefault);
+-        } else {
+-          Arch = Args.MakeArgString(ArchsOrErr->front());
+-        }
+-      }
+-      DAL->AddJoinedArg(nullptr, Opts.getOption(options::OPT_march_EQ), Arch);
+-    }
+-
+-    return DAL;
+-  }
+-
+   for (Arg *A : Args) {
+-    DAL->append(A);
++    if (!llvm::is_contained(*DAL, A))
++      DAL->append(A);
+   }
+ 
+   if (!BoundArch.empty()) {
+diff --git a/clang/lib/Driver/ToolChains/Cuda.cpp b/clang/lib/Driver/ToolChains/Cuda.cpp
+index 0922a97ed7c19..c800e9cfa0a8d 100644
+--- a/clang/lib/Driver/ToolChains/Cuda.cpp
++++ b/clang/lib/Driver/ToolChains/Cuda.cpp
+@@ -969,34 +969,6 @@ CudaToolChain::TranslateArgs(const llvm::opt::DerivedArgList &Args,
+ 
+   const OptTable &Opts = getDriver().getOpts();
+ 
+-  // For OpenMP device offloading, append derived arguments. Make sure
+-  // flags are not duplicated.
+-  // Also append the compute capability.
+-  if (DeviceOffloadKind == Action::OFK_OpenMP) {
+-    for (Arg *A : Args)
+-      if (!llvm::is_contained(*DAL, A))
+-        DAL->append(A);
+-
+-    if (!DAL->hasArg(options::OPT_march_EQ)) {
+-      StringRef Arch = BoundArch;
+-      if (Arch.empty()) {
+-        auto ArchsOrErr = getSystemGPUArchs(Args);
+-        if (!ArchsOrErr) {
+-          std::string ErrMsg =
+-              llvm::formatv("{0}", llvm::fmt_consume(ArchsOrErr.takeError()));
+-          getDriver().Diag(diag::err_drv_undetermined_gpu_arch)
+-              << llvm::Triple::getArchTypeName(getArch()) << ErrMsg << "-march";
+-          Arch = OffloadArchToString(OffloadArch::CudaDefault);
+-        } else {
+-          Arch = Args.MakeArgString(ArchsOrErr->front());
+-        }
+-      }
+-      DAL->AddJoinedArg(nullptr, Opts.getOption(options::OPT_march_EQ), Arch);
+-    }
+-
+-    return DAL;
+-  }
+-
+   for (Arg *A : Args) {
+     // Make sure flags are not duplicated.
+     if (!llvm::is_contained(*DAL, A)) {
+diff --git a/clang/test/Driver/amdgpu-openmp-system-arch-fail.c b/clang/test/Driver/amdgpu-openmp-system-arch-fail.c
+index b7e1d0b2c5665..eb037183b4c3c 100644
+--- a/clang/test/Driver/amdgpu-openmp-system-arch-fail.c
++++ b/clang/test/Driver/amdgpu-openmp-system-arch-fail.c
+@@ -12,9 +12,9 @@
+ // case when amdgpu_arch returns nothing or fails
+ // RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp -fopenmp-targets=amdgcn-amd-amdhsa -nogpulib --amdgpu-arch-tool=%t/amdgpu_arch_fail %s 2>&1 \
+ // RUN:   | FileCheck %s --check-prefix=NO-OUTPUT-ERROR
+-// NO-OUTPUT-ERROR: error: cannot determine amdgcn architecture{{.*}}; consider passing it via '-march'
++// NO-OUTPUT-ERROR: error: cannot determine amdgcn architecture{{.*}}; consider passing it via '--offload-arch'
+ 
+ // case when amdgpu_arch does not return anything with successful execution
+ // RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp -fopenmp-targets=amdgcn-amd-amdhsa -nogpulib --amdgpu-arch-tool=%t/amdgpu_arch_empty %s 2>&1 \
+ // RUN:   | FileCheck %s --check-prefix=EMPTY-OUTPUT
+-// EMPTY-OUTPUT: error: cannot determine amdgcn architecture: No AMD GPU detected in the system; consider passing it via '-march'
++// EMPTY-OUTPUT: error: cannot determine amdgcn architecture: No AMD GPU detected in the system; consider passing it via '--offload-arch'
+diff --git a/clang/test/Driver/amdgpu-openmp-toolchain.c b/clang/test/Driver/amdgpu-openmp-toolchain.c
+index 1c2ee26173139..1f4d724a269e6 100644
+--- a/clang/test/Driver/amdgpu-openmp-toolchain.c
++++ b/clang/test/Driver/amdgpu-openmp-toolchain.c
+@@ -16,12 +16,12 @@
+ // CHECK-PHASES: 0: input, "[[INPUT:.+]]", c, (host-openmp)
+ // CHECK-PHASES: 1: preprocessor, {0}, cpp-output, (host-openmp)
+ // CHECK-PHASES: 2: compiler, {1}, ir, (host-openmp)
+-// CHECK-PHASES: 3: input, "[[INPUT]]", c, (device-openmp)
+-// CHECK-PHASES: 4: preprocessor, {3}, cpp-output, (device-openmp)
+-// CHECK-PHASES: 5: compiler, {4}, ir, (device-openmp)
+-// CHECK-PHASES: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (amdgcn-amd-amdhsa)" {5}, ir
+-// CHECK-PHASES: 7: backend, {6}, ir, (device-openmp)
+-// CHECK-PHASES: 8: offload, "device-openmp (amdgcn-amd-amdhsa)" {7}, ir
++// CHECK-PHASES: 3: input, "[[INPUT]]", c, (device-openmp, gfx906)
++// CHECK-PHASES: 4: preprocessor, {3}, cpp-output, (device-openmp, gfx906)
++// CHECK-PHASES: 5: compiler, {4}, ir, (device-openmp, gfx906)
++// CHECK-PHASES: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (amdgcn-amd-amdhsa:gfx906)" {5}, ir
++// CHECK-PHASES: 7: backend, {6}, ir, (device-openmp, gfx906)
++// CHECK-PHASES: 8: offload, "device-openmp (amdgcn-amd-amdhsa:gfx906)" {7}, ir
+ // CHECK-PHASES: 9: clang-offload-packager, {8}, image, (device-openmp)
+ // CHECK-PHASES: 10: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (x86_64-unknown-linux-gnu)" {9}, ir
+ // CHECK-PHASES: 11: backend, {10}, assembler, (host-openmp)
+diff --git a/clang/test/Driver/openmp-offload-gpu.c b/clang/test/Driver/openmp-offload-gpu.c
+index 74bd2a6aeee46..1f7e2996068c4 100644
+--- a/clang/test/Driver/openmp-offload-gpu.c
++++ b/clang/test/Driver/openmp-offload-gpu.c
+@@ -235,13 +235,13 @@
+ // CHECK-PHASES: 0: input, "[[INPUT:.+]]", c, (host-openmp)
+ // CHECK-PHASES: 1: preprocessor, {0}, cpp-output, (host-openmp)
+ // CHECK-PHASES: 2: compiler, {1}, ir, (host-openmp)
+-// CHECK-PHASES: 3: input, "[[INPUT]]", c, (device-openmp)
+-// CHECK-PHASES: 4: preprocessor, {3}, cpp-output, (device-openmp)
+-// CHECK-PHASES: 5: compiler, {4}, ir, (device-openmp)
+-// CHECK-PHASES: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (nvptx64-nvidia-cuda)" {5}, ir
+-// CHECK-PHASES: 7: backend, {6}, assembler, (device-openmp)
+-// CHECK-PHASES: 8: assembler, {7}, object, (device-openmp)
+-// CHECK-PHASES: 9: offload, "device-openmp (nvptx64-nvidia-cuda)" {8}, object
++// CHECK-PHASES: 3: input, "[[INPUT]]", c, (device-openmp, sm_52)
++// CHECK-PHASES: 4: preprocessor, {3}, cpp-output, (device-openmp, sm_52)
++// CHECK-PHASES: 5: compiler, {4}, ir, (device-openmp, sm_52)
++// CHECK-PHASES: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (nvptx64-nvidia-cuda:sm_52)" {5}, ir
++// CHECK-PHASES: 7: backend, {6}, assembler, (device-openmp, sm_52)
++// CHECK-PHASES: 8: assembler, {7}, object, (device-openmp, sm_52)
++// CHECK-PHASES: 9: offload, "device-openmp (nvptx64-nvidia-cuda:sm_52)" {8}, object
+ // CHECK-PHASES: 10: clang-offload-packager, {9}, image
+ // CHECK-PHASES: 11: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (x86_64-unknown-linux-gnu)" {10}, ir
+ // CHECK-PHASES: 12: backend, {11}, assembler, (host-openmp)
+@@ -315,7 +315,7 @@
+ // RUN:     -Xopenmp-target=nvptx64-nvidia-cuda -march=sm_52 --offload-device-only -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-DEVICE-ONLY
+ // CHECK-DEVICE-ONLY: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[INPUT:.*]]"], output: "[[HOST_BC:.*]]"
+ // CHECK-DEVICE-ONLY: "nvptx64-nvidia-cuda" - "clang", inputs: ["[[INPUT]]", "[[HOST_BC]]"], output: "[[DEVICE_ASM:.*]]"
+-// CHECK-DEVICE-ONLY: "nvptx64-nvidia-cuda" - "NVPTX::Assembler", inputs: ["[[DEVICE_ASM]]"], output: "{{.*}}-openmp-nvptx64-nvidia-cuda.o"
++// CHECK-DEVICE-ONLY: "nvptx64-nvidia-cuda" - "NVPTX::Assembler", inputs: ["[[DEVICE_ASM]]"], output: "{{.*}}-openmp-nvptx64-nvidia-cuda-sm_52.o"
+ 
+ // RUN:   %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-bindings -fopenmp=libomp -fopenmp-targets=nvptx64-nvidia-cuda \
+ // RUN:     -Xopenmp-target=nvptx64-nvidia-cuda -march=sm_52 --offload-device-only -E -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-DEVICE-ONLY-PP
+diff --git a/clang/test/Driver/openmp-offload-jit.c b/clang/test/Driver/openmp-offload-jit.c
+index 57f265ac37eac..b3566f06bbee1 100644
+--- a/clang/test/Driver/openmp-offload-jit.c
++++ b/clang/test/Driver/openmp-offload-jit.c
+@@ -1,29 +1,29 @@
+ // Check that we enable LTO-mode properly with '-fopenmp-target-jit' and that it
+ // still enabled LTO-mode if `-fno-offload-lto` is on.
+ // RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-phases -fopenmp=libomp \
+-// RUN:   -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-target-jit %s 2>&1 \
++// RUN:  --offload-arch=sm_52 -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=PHASES-JIT %s
+ // RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-phases -fopenmp=libomp \
+-// RUN:   -fopenmp-targets=nvptx64-nvidia-cuda -foffload-lto -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=sm_52 -foffload-lto -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=PHASES-JIT %s
+ // RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-phases -fopenmp=libomp \
+-// RUN:   -fopenmp-targets=amdgcn-amd-amdhsa -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=gfx90a -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=PHASES-JIT %s
+ // RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-phases -fopenmp=libomp \
+-// RUN:   -fopenmp-targets=amdgcn-amd-amdhsa -foffload-lto -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=gfx90a -foffload-lto -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=PHASES-JIT %s
+ // RUN: not %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-phases -fopenmp=libomp \
+-// RUN:   -fopenmp-targets=amdgcn-amd-amdhsa -fno-offload-lto -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=gfx90a -fno-offload-lto -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=PHASES-JIT %s
+ //
+ //      PHASES-JIT: 0: input, "[[INPUT:.+]]", c, (host-openmp)
+ // PHASES-JIT-NEXT: 1: preprocessor, {0}, cpp-output, (host-openmp)
+ // PHASES-JIT-NEXT: 2: compiler, {1}, ir, (host-openmp)
+-// PHASES-JIT-NEXT: 3: input, "[[INPUT]]", c, (device-openmp)
+-// PHASES-JIT-NEXT: 4: preprocessor, {3}, cpp-output, (device-openmp)
+-// PHASES-JIT-NEXT: 5: compiler, {4}, ir, (device-openmp)
++// PHASES-JIT-NEXT: 3: input, "[[INPUT]]", c, (device-openmp, {{.*}})
++// PHASES-JIT-NEXT: 4: preprocessor, {3}, cpp-output, (device-openmp, {{.*}})
++// PHASES-JIT-NEXT: 5: compiler, {4}, ir, (device-openmp, {{.*}})
+ // PHASES-JIT-NEXT: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp ([[TARGET:.+]])" {5}, ir
+-// PHASES-JIT-NEXT: 7: backend, {6}, lto-bc, (device-openmp)
++// PHASES-JIT-NEXT: 7: backend, {6}, lto-bc, (device-openmp, {{.*}})
+ // PHASES-JIT-NEXT: 8: offload, "device-openmp ([[TARGET]])" {7}, lto-bc
+ // PHASES-JIT-NEXT: 9: clang-offload-packager, {8}, image, (device-openmp)
+ // PHASES-JIT-NEXT: 10: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (x86_64-unknown-linux-gnu)" {9}, ir
+@@ -41,11 +41,11 @@
+ // Check for incompatible combinations
+ 
+ // RUN: not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp -fno-offload-lto \
+-// RUN:   -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=sm_52 -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=NO-LTO %s
+ // NO-LTO: error: the combination of '-fno-offload-lto' and '-fopenmp-target-jit' is incompatible
+ 
+ // RUN: not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp -foffload-lto=thin \
+-// RUN:   -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-target-jit %s 2>&1 \
++// RUN:   --offload-arch=sm_52 -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-target-jit %s 2>&1 \
+ // RUN: | FileCheck -check-prefix=THIN-LTO %s
+ // THIN-LTO: error: the combination of '-foffload-lto=' and '-fopenmp-target-jit' is incompatible
+diff --git a/clang/test/Driver/openmp-system-arch.c b/clang/test/Driver/openmp-system-arch.c
+index d097c6bc06548..51021e352f4d3 100644
+--- a/clang/test/Driver/openmp-system-arch.c
++++ b/clang/test/Driver/openmp-system-arch.c
+@@ -68,13 +68,13 @@
+ // RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -nogpulib -fopenmp=libomp \
+ // RUN:     -fopenmp-targets=nvptx64-nvidia-cuda --nvptx-arch-tool=%t/nvptx_arch_empty %s 2>&1 \
+ // RUN:   | FileCheck %s --check-prefix=NVPTX
+-// NVPTX: error: cannot determine nvptx64 architecture: No NVIDIA GPU detected in the system; consider passing it via '-march'
++// NVPTX: error: cannot determine nvptx64 architecture: No NVIDIA GPU detected in the system; consider passing it via '--offload-arch'
+ 
+ // case when 'amdgpu-arch' returns nothing using `-fopenmp-targets=`.
+ // RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -nogpulib -fopenmp=libomp \
+ // RUN:     -fopenmp-targets=amdgcn-amd-amdhsa --amdgpu-arch-tool=%t/amdgpu_arch_empty %s 2>&1 \
+ // RUN:   | FileCheck %s --check-prefix=AMDGPU
+-// AMDGPU: error: cannot determine amdgcn architecture: No AMD GPU detected in the system; consider passing it via '-march'
++// AMDGPU: error: cannot determine amdgcn architecture: No AMD GPU detected in the system; consider passing it via '--offload-arch'
+ 
+ // case when CLANG_TOOLCHAIN_PROGRAM_TIMEOUT is malformed for nvptx-arch.
+ // RUN: env CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=foo \
+@@ -82,7 +82,7 @@
+ // RUN:     -fopenmp-targets=nvptx64-nvidia-cuda -nogpulib \
+ // RUN:     --nvptx-arch-tool=%t/nvptx_arch_sm_70 %s 2>&1 | \
+ // RUN:   FileCheck %s --check-prefix=BAD-TIMEOUT-NVPTX
+-// BAD-TIMEOUT-NVPTX: clang: error: cannot determine nvptx64 architecture: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT expected an integer, got 'foo'; consider passing it via '-march'; environment variable CLANG_TOOLCHAIN_PROGRAM_TIMEOUT specifies the tool timeout (integer secs, <=0 is infinite)
++// BAD-TIMEOUT-NVPTX: clang: error: cannot determine nvptx64 architecture: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT expected an integer, got 'foo'; consider passing it via '--offload-arch'; environment variable CLANG_TOOLCHAIN_PROGRAM_TIMEOUT specifies the tool timeout (integer secs, <=0 is infinite)
+ 
+ // case when CLANG_TOOLCHAIN_PROGRAM_TIMEOUT is malformed for amdgpu-arch.
+ // RUN: env CLANG_TOOLCHAIN_PROGRAM_TIMEOUT= \
+@@ -90,4 +90,4 @@
+ // RUN:     -fopenmp-targets=amdgcn-amd-amdhsa -nogpulib \
+ // RUN:     --amdgpu-arch-tool=%t/amdgpu_arch_gfx906 %s 2>&1 | \
+ // RUN:   FileCheck %s --check-prefix=BAD-TIMEOUT-AMDGPU
+-// BAD-TIMEOUT-AMDGPU: clang: error: cannot determine amdgcn architecture: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT expected an integer, got ''; consider passing it via '-march'; environment variable CLANG_TOOLCHAIN_PROGRAM_TIMEOUT specifies the tool timeout (integer secs, <=0 is infinite)
++// BAD-TIMEOUT-AMDGPU: clang: error: cannot determine amdgcn architecture: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT expected an integer, got ''; consider passing it via '--offload-arch'; environment variable CLANG_TOOLCHAIN_PROGRAM_TIMEOUT specifies the tool timeout (integer secs, <=0 is infinite)

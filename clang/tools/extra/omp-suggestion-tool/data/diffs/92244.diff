@@ -1,0 +1,1781 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 40d66460a6984..875599098b3dc 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -917,20 +917,18 @@ bool ClauseProcessor::processReduction(
+     llvm::SmallVectorImpl<const semantics::Symbol *> *outReductionSyms) const {
+   return findRepeatableClause<omp::clause::Reduction>(
+       [&](const omp::clause::Reduction &clause, const parser::CharBlock &) {
+-        // Use local lists of reductions to prevent variables from other
+-        // already-processed reduction clauses from impacting this reduction.
+-        // For example, the whole `reductionVars` array is queried to decide
+-        // whether to do the reduction byref.
+         llvm::SmallVector<mlir::Value> reductionVars;
++        llvm::SmallVector<bool> reduceVarByRef;
+         llvm::SmallVector<mlir::Attribute> reductionDeclSymbols;
+         llvm::SmallVector<const semantics::Symbol *> reductionSyms;
+         ReductionProcessor rp;
+-        rp.addDeclareReduction(currentLocation, converter, clause,
+-                               reductionVars, reductionDeclSymbols,
+-                               outReductionSyms ? &reductionSyms : nullptr);
++        rp.addDeclareReduction(
++            currentLocation, converter, clause, reductionVars, reduceVarByRef,
++            reductionDeclSymbols, outReductionSyms ? &reductionSyms : nullptr);
+ 
+         // Copy local lists into the output.
+         llvm::copy(reductionVars, std::back_inserter(result.reductionVars));
++        llvm::copy(reduceVarByRef, std::back_inserter(result.reduceVarByRef));
+         llvm::copy(reductionDeclSymbols,
+                    std::back_inserter(result.reductionDeclSymbols));
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index af27c59eb9937..4ae1fe6d99020 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -984,8 +984,6 @@ static void genParallelClauses(
+ 
+   if (processReduction) {
+     cp.processReduction(loc, clauseOps, &reductionTypes, &reductionSyms);
+-    if (ReductionProcessor::doReductionByRef(clauseOps.reductionVars))
+-      clauseOps.reductionByRefAttr = converter.getFirOpBuilder().getUnitAttr();
+   }
+ }
+ 
+@@ -1173,7 +1171,6 @@ static void genWsloopClauses(
+     mlir::Location loc, mlir::omp::WsloopClauseOps &clauseOps,
+     llvm::SmallVectorImpl<mlir::Type> &reductionTypes,
+     llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSyms) {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   ClauseProcessor cp(converter, semaCtx, clauses);
+   cp.processNowait(clauseOps);
+   cp.processOrdered(clauseOps);
+@@ -1181,9 +1178,6 @@ static void genWsloopClauses(
+   cp.processSchedule(stmtCtx, clauseOps);
+   // TODO Support delayed privatization.
+ 
+-  if (ReductionProcessor::doReductionByRef(clauseOps.reductionVars))
+-    clauseOps.reductionByRefAttr = firOpBuilder.getUnitAttr();
+-
+   cp.processTODO<clause::Allocate, clause::Linear, clause::Order>(
+       loc, llvm::omp::Directive::OMPD_do);
+ }
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index be6dcd6f5569a..1a63e316ef068 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -657,25 +657,17 @@ mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
+   return decl;
+ }
+ 
+-// TODO: By-ref vs by-val reductions are currently toggled for the whole
+-//       operation (possibly effecting multiple reduction variables).
+-//       This could cause a problem with openmp target reductions because
+-//       by-ref trivial types may not be supported.
+-bool ReductionProcessor::doReductionByRef(
+-    const llvm::SmallVectorImpl<mlir::Value> &reductionVars) {
+-  if (reductionVars.empty())
+-    return false;
++static bool doReductionByRef(mlir::Value reductionVar) {
+   if (forceByrefReduction)
+     return true;
+ 
+-  for (mlir::Value reductionVar : reductionVars) {
+-    if (auto declare =
+-            mlir::dyn_cast<hlfir::DeclareOp>(reductionVar.getDefiningOp()))
+-      reductionVar = declare.getMemref();
++  if (auto declare =
++          mlir::dyn_cast<hlfir::DeclareOp>(reductionVar.getDefiningOp()))
++    reductionVar = declare.getMemref();
++
++  if (!fir::isa_trivial(fir::unwrapRefType(reductionVar.getType())))
++    return true;
+ 
+-    if (!fir::isa_trivial(fir::unwrapRefType(reductionVar.getType())))
+-      return true;
+-  }
+   return false;
+ }
+ 
+@@ -683,6 +675,7 @@ void ReductionProcessor::addDeclareReduction(
+     mlir::Location currentLocation, lower::AbstractConverter &converter,
+     const omp::clause::Reduction &reduction,
+     llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++    llvm::SmallVectorImpl<bool> &reduceVarByRef,
+     llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+     llvm::SmallVectorImpl<const semantics::Symbol *> *reductionSymbols) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+@@ -761,8 +754,8 @@ void ReductionProcessor::addDeclareReduction(
+            "reduction input var is a reference");
+ 
+     reductionVars.push_back(symVal);
++    reduceVarByRef.push_back(doReductionByRef(symVal));
+   }
+-  const bool isByRef = doReductionByRef(reductionVars);
+ 
+   if (const auto &redDefinedOp =
+           std::get_if<omp::clause::DefinedOperator>(&redOperator.u)) {
+@@ -784,7 +777,7 @@ void ReductionProcessor::addDeclareReduction(
+       break;
+     }
+ 
+-    for (mlir::Value symVal : reductionVars) {
++    for (auto [symVal, isByRef] : llvm::zip(reductionVars, reduceVarByRef)) {
+       auto redType = mlir::cast<fir::ReferenceType>(symVal.getType());
+       const auto &kindMap = firOpBuilder.getKindMap();
+       if (mlir::isa<fir::LogicalType>(redType.getEleTy()))
+@@ -808,7 +801,7 @@ void ReductionProcessor::addDeclareReduction(
+             *reductionIntrinsic)) {
+       ReductionProcessor::ReductionIdentifier redId =
+           ReductionProcessor::getReductionType(*reductionIntrinsic);
+-      for (mlir::Value symVal : reductionVars) {
++      for (auto [symVal, isByRef] : llvm::zip(reductionVars, reduceVarByRef)) {
+         auto redType = mlir::cast<fir::ReferenceType>(symVal.getType());
+         if (!redType.getEleTy().isIntOrIndexOrFloat())
+           TODO(currentLocation,
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.h b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+index 2852abad00369..0ed5782e5da1b 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.h
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+@@ -73,9 +73,6 @@ class ReductionProcessor {
+   static const semantics::SourceName
+   getRealName(const omp::clause::ProcedureDesignator &pd);
+ 
+-  static bool
+-  doReductionByRef(const llvm::SmallVectorImpl<mlir::Value> &reductionVars);
+-
+   static std::string getReductionName(llvm::StringRef name,
+                                       const fir::KindMapping &kindMap,
+                                       mlir::Type ty, bool isByRef);
+@@ -127,6 +124,7 @@ class ReductionProcessor {
+       mlir::Location currentLocation, lower::AbstractConverter &converter,
+       const omp::clause::Reduction &reduction,
+       llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++      llvm::SmallVectorImpl<bool> &reduceVarByRef,
+       llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+       llvm::SmallVectorImpl<const semantics::Symbol *> *reductionSymbols =
+           nullptr);
+diff --git a/flang/test/Fir/omp-reduction-embox-codegen.fir b/flang/test/Fir/omp-reduction-embox-codegen.fir
+index 7602012ebc5c9..1645e1a407ad4 100644
+--- a/flang/test/Fir/omp-reduction-embox-codegen.fir
++++ b/flang/test/Fir/omp-reduction-embox-codegen.fir
+@@ -25,7 +25,7 @@ omp.declare_reduction @test_reduction : !fir.ref<!fir.box<i32>> init {
+ 
+ func.func @_QQmain() attributes {fir.bindc_name = "reduce"} {
+   %4 = fir.alloca !fir.box<i32>
+-  omp.parallel byref reduction(@test_reduction %4 -> %arg0 : !fir.ref<!fir.box<i32>>) {
++  omp.parallel reduction(byref @test_reduction %4 -> %arg0 : !fir.ref<!fir.box<i32>>) {
+     omp.terminator
+   }
+   return
+diff --git a/flang/test/Lower/OpenMP/default-clause-byref.f90 b/flang/test/Lower/OpenMP/default-clause-byref.f90
+index 7cc2bc2e0c710..7893c4d7d5732 100644
+--- a/flang/test/Lower/OpenMP/default-clause-byref.f90
++++ b/flang/test/Lower/OpenMP/default-clause-byref.f90
+@@ -351,7 +351,7 @@ subroutine skipped_default_clause_checks()
+        type(it)::iii
+ 
+ !CHECK: omp.parallel {
+-!CHECK: omp.wsloop byref reduction(@min_byref_i32 %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) {
++!CHECK: omp.wsloop reduction(byref @min_byref_i32 %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) {
+ !CHECK-NEXT: omp.loop_nest (%[[ARG:.*]]) {{.*}} {
+ !CHECK: omp.yield
+ !CHECK: }
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90 b/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
+index 49d1142ea4b6a..72e91680a4310 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
+@@ -26,5 +26,5 @@ subroutine red_and_delayed_private
+ 
+ ! CHECK-LABEL: _QPred_and_delayed_private
+ ! CHECK: omp.parallel
+-! CHECK-SAME: reduction(@[[REDUCTION_SYM]] %{{.*}} -> %arg0 : !fir.ref<i32>)
++! CHECK-SAME: reduction(byref @[[REDUCTION_SYM]] %{{.*}} -> %arg0 : !fir.ref<i32>)
+ ! CHECK-SAME: private(@[[PRIVATIZER_SYM]] %{{.*}} -> %arg1 : !fir.ref<i32>) {
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
+index 2a1d26407b27e..7347d9324feac 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
+@@ -40,7 +40,7 @@
+ !CHECK:  %[[I_DECL:.*]]:2 = hlfir.declare %[[IREF]] {uniq_name = "_QFsimple_int_addEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:  %[[I_START:.*]] = arith.constant 0 : i32
+ !CHECK:  hlfir.assign %[[I_START]] to %[[I_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK:  omp.parallel byref reduction(@[[RED_I32_NAME]] %[[I_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) {
++!CHECK:  omp.parallel reduction(byref @[[RED_I32_NAME]] %[[I_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) {
+ !CHECK:    %[[P_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:    %[[LPRV:.+]] = fir.load %[[P_DECL]]#0 : !fir.ref<i32>
+ !CHECK:    %[[I_INCR:.*]] = arith.constant 1 : i32
+@@ -65,7 +65,7 @@ subroutine simple_int_add
+ !CHECK:  %[[R_DECL:.*]]:2 = hlfir.declare %[[RREF]] {uniq_name = "_QFsimple_real_addEr"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK:  %[[R_START:.*]] = arith.constant 0.000000e+00 : f32
+ !CHECK:  hlfir.assign %[[R_START]] to %[[R_DECL]]#0 : f32, !fir.ref<f32>
+-!CHECK:  omp.parallel byref reduction(@[[RED_F32_NAME]] %[[R_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<f32>) {
++!CHECK:  omp.parallel reduction(byref @[[RED_F32_NAME]] %[[R_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<f32>) {
+ !CHECK:    %[[P_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK:    %[[LPRV:.+]] = fir.load %[[P_DECL]]#0 : !fir.ref<f32>
+ !CHECK:    %[[R_INCR:.*]] = arith.constant 1.500000e+00 : f32
+@@ -94,7 +94,7 @@ subroutine simple_real_add
+ !CHECK:  hlfir.assign %[[R_START]] to %[[R_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK:  %[[I_START:.*]] = arith.constant 0 : i32
+ !CHECK:  hlfir.assign %[[I_START]] to %[[I_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK:  omp.parallel byref reduction(@[[RED_I32_NAME]] %[[I_DECL]]#0 -> %[[IPRV:.+]] : !fir.ref<i32>, @[[RED_F32_NAME]] %[[R_DECL]]#0 -> %[[RPRV:.+]] : !fir.ref<f32>) {
++!CHECK:  omp.parallel reduction(byref @[[RED_I32_NAME]] %[[I_DECL]]#0 -> %[[IPRV:.+]] : !fir.ref<i32>, byref @[[RED_F32_NAME]] %[[R_DECL]]#0 -> %[[RPRV:.+]] : !fir.ref<f32>) {
+ !CHECK:    %[[IP_DECL:.+]]:2 = hlfir.declare %[[IPRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:    %[[RP_DECL:.+]]:2 = hlfir.declare %[[RPRV]] {{.*}} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK:    %[[R_INCR:.*]] = arith.constant 1.500000e+00 : f32
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+index 28216ef91c3a3..f6d3b0b73f738 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+@@ -95,7 +95,7 @@ program reduce
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 0 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_heap_Uxi32 %[[VAL_3]]#0 -> %[[VAL_17:.*]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_heap_Uxi32 %[[VAL_3]]#0 -> %[[VAL_17:.*]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_18:.*]]) : i32 = (%[[VAL_14]]) to (%[[VAL_15]]) inclusive step (%[[VAL_16]]) {
+ ! CHECK:                 %[[VAL_19:.*]]:2 = hlfir.declare %[[VAL_17]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ ! CHECK:                 fir.store %[[VAL_18]] to %[[VAL_13]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+index 8202e6d897157..b44fe4c1f4cc2 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+@@ -77,7 +77,7 @@ program reduce
+ ! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_0]](%[[VAL_5]]) {uniq_name = "_QFEi"} : (!fir.ref<!fir.array<3x2xi32>>, !fir.shapeshift<2>) -> (!fir.box<!fir.array<3x2xi32>>, !fir.ref<!fir.array<3x2xi32>>)
+ ! CHECK:           %[[VAL_7:.*]] = fir.alloca !fir.box<!fir.array<3x2xi32>>
+ ! CHECK:           fir.store %[[VAL_6]]#0 to %[[VAL_7]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+-! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3x2xi32 %[[VAL_7]] -> %[[VAL_8:.*]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>) {
++! CHECK:           omp.parallel reduction(byref @add_reduction_byref_box_3x2xi32 %[[VAL_7]] -> %[[VAL_8:.*]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>) {
+ ! CHECK:             %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3x2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3x2xi32>>>, !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 3 : i32
+ ! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]]#0 : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+index 34f4ee0a9eb3a..60b21c9b1ebbe 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+@@ -70,7 +70,7 @@ program reduce
+ ! CHECK:           %[[VAL_4:.*]] = fir.embox %[[VAL_3]]#0(%[[VAL_2]]) : (!fir.ref<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_4]] to %[[VAL_5]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
++! CHECK:           omp.parallel reduction(byref @add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3xi32>>>, !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<!fir.box<!fir.array<3xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+index aa14092554eda..5d4c86d1d76e8 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+@@ -69,7 +69,7 @@ program reduce
+ ! CHECK:           %[[VAL_4:.*]] = fir.embox %[[VAL_3]]#0(%[[VAL_2]]) : (!fir.ref<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_4]] to %[[VAL_5]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
++! CHECK:           omp.parallel reduction(byref @add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3xi32>>>, !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:             %[[VAL_8:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : index
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-byref.f90 b/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
+index fdcdf0c0b8d95..5685e2c584ace 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
+@@ -21,7 +21,7 @@
+ !CHECK:    %[[RED_ACCUM_DECL:[_a-z0-9]+]]:2 = hlfir.declare %[[RED_ACCUM_REF]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:    %[[C0:[_a-z0-9]+]] = arith.constant 0 : i32
+ !CHECK:    hlfir.assign %[[C0]] to %[[RED_ACCUM_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK:    omp.parallel byref reduction(@[[REDUCTION_DECLARE]] %[[RED_ACCUM_DECL]]#0 -> %[[PRIVATE_RED:[a-z0-9]+]] : !fir.ref<i32>) {
++!CHECK:    omp.parallel reduction(byref @[[REDUCTION_DECLARE]] %[[RED_ACCUM_DECL]]#0 -> %[[PRIVATE_RED:[a-z0-9]+]] : !fir.ref<i32>) {
+ !CHECK:      %[[PRIVATE_DECL:[_a-z0-9]+]]:2 = hlfir.declare %[[PRIVATE_RED]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:      %[[C1:[_a-z0-9]+]] = arith.constant 1 : i32
+ !CHECK:      hlfir.assign %[[C1]] to %[[PRIVATE_DECL]]#0 : i32, !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 17d805c0d142b..47b743a558b49 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -74,7 +74,7 @@
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_19:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
+ ! CHECK:             fir.store %[[VAL_12]]#0 to %[[VAL_19]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_Uxi32 %[[VAL_19]] -> %[[VAL_20:.*]] : !fir.ref<!fir.box<!fir.array<?xi32>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxi32 %[[VAL_19]] -> %[[VAL_20:.*]] : !fir.ref<!fir.box<!fir.array<?xi32>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_21:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFsEc"} : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> (!fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.array<?xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_21]] to %[[VAL_15]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
+index 66c80c31917ba..32caac39778de 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
+@@ -4,7 +4,7 @@
+ ! RUN: flang-new -fc1 -fopenmp -mmlir --force-byref-reduction -emit-hlfir %s -o - | FileCheck %s
+ 
+ ! CHECK: omp.parallel {
+-! CHECK: omp.wsloop byref reduction(@add_reduction_byref_i32
++! CHECK: omp.wsloop reduction(byref @add_reduction_byref_i32
+ subroutine sb
+   integer :: x
+   x = 0
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+index c9d03435d9e18..cc4d055b3ea1f 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+@@ -82,7 +82,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -125,7 +125,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -169,7 +169,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -211,7 +211,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -262,7 +262,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, byref @add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, byref @add_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -326,7 +326,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, byref @add_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, byref @add_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -397,7 +397,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @add_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @add_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @add_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, byref @add_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, byref @add_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, byref @add_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:                 %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
+index 6a09fece80ae9..ec9abba41db0e 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
+@@ -31,7 +31,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+index 8310aeb23df08..ccf186cf9908d 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+@@ -80,7 +80,7 @@ program reduce
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 0 : i32
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_heap_i32 %[[VAL_5]]#0 -> %[[VAL_14:.*]] : !fir.ref<!fir.box<!fir.heap<i32>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_heap_i32 %[[VAL_5]]#0 -> %[[VAL_14:.*]] : !fir.ref<!fir.box<!fir.heap<i32>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_15:.*]]) : i32 = (%[[VAL_11]]) to (%[[VAL_12]]) inclusive step (%[[VAL_13]]) {
+ ! CHECK:                 %[[VAL_16:.*]]:2 = hlfir.declare %[[VAL_14]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
+ ! CHECK:                 fir.store %[[VAL_15]] to %[[VAL_10]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index 197800486c39e..be1e3ec0cb9d9 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -84,7 +84,7 @@ subroutine reduce(r)
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = fir.alloca !fir.box<!fir.array<?xf64>>
+ ! CHECK:             fir.store %[[VAL_3]]#1 to %[[VAL_9]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_Uxf64 %[[VAL_9]] -> %[[VAL_10:.*]] : !fir.ref<!fir.box<!fir.array<?xf64>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxf64 %[[VAL_9]] -> %[[VAL_10:.*]] : !fir.ref<!fir.box<!fir.array<?xf64>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {fortran_attrs = {{.*}}, uniq_name = "_QFFreduceEr"} : (!fir.ref<!fir.box<!fir.array<?xf64>>>) -> (!fir.ref<!fir.box<!fir.array<?xf64>>>, !fir.ref<!fir.box<!fir.array<?xf64>>>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_5]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index 7aecf870cf800..add422f5d9564 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -79,7 +79,7 @@ program reduce
+ ! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index d1d8a2c599444..e988567fc3371 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -79,7 +79,7 @@ program reduce
+ ! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+index df07a90653315..bcc71415f1dd1 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+@@ -35,7 +35,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@iand_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @iand_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iandEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+index 50cec61b602bc..6825800b2cd87 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+@@ -28,7 +28,7 @@
+ !CHECK: omp.parallel
+ !CHECK: %[[I_REF:.*]] = fir.alloca i32 {adapt.valuebyref, pinned}
+ !CHECK: %[[I_DECL:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFreduction_ieorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: omp.wsloop byref reduction(@ieor_byref_i32 %[[X_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>)
++!CHECK: omp.wsloop reduction(byref @ieor_byref_i32 %[[X_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>)
+ !CHECK-NEXT: omp.loop_nest
+ !CHECK: %[[PRV_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: fir.store %{{.*}} to %[[I_DECL]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+index d847bba89782d..00f4552917aa3 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+@@ -33,7 +33,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@ior_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @ior_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iorEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+index 69789e4c751e0..331232a08e624 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+@@ -42,7 +42,7 @@
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@and_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @and_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -92,7 +92,7 @@ end subroutine simple_reduction
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@and_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @and_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -151,7 +151,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:             %[[VAL_20:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_21:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_22:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@and_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, @and_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, @and_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @and_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, byref @and_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, byref @and_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_26:.*]]) : i32 = (%[[VAL_20]]) to (%[[VAL_21]]) inclusive step (%[[VAL_22]]) {
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+index 54175994ecd8a..d1cb7b05f0af5 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+@@ -42,7 +42,7 @@
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@eqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @eqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -91,7 +91,7 @@ subroutine simple_reduction(y)
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@eqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @eqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -150,7 +150,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:             %[[VAL_20:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_21:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_22:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@eqv_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, @eqv_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, @eqv_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @eqv_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, byref @eqv_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, byref @eqv_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_26:.*]]) : i32 = (%[[VAL_20]]) to (%[[VAL_21]]) inclusive step (%[[VAL_22]]) {
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+index c0a82476c7b18..64c056c9c6bd2 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+@@ -42,7 +42,7 @@
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@neqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @neqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -92,7 +92,7 @@ subroutine simple_reduction(y)
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@neqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @neqv_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -153,7 +153,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:             %[[VAL_20:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_21:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_22:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@neqv_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, @neqv_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, @neqv_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @neqv_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, byref @neqv_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, byref @neqv_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_26:.*]]) : i32 = (%[[VAL_20]]) to (%[[VAL_21]]) inclusive step (%[[VAL_22]]) {
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+index 0af9e0d5c9fd2..1e5f91de801c4 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+@@ -41,7 +41,7 @@
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@or_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @or_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -90,7 +90,7 @@ subroutine simple_reduction(y)
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@or_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @or_reduction %[[VAL_4]]#0 -> %[[VAL_15:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
+@@ -149,7 +149,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:             %[[VAL_20:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_21:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_22:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@or_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, @or_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, @or_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
++! CHECK:             omp.wsloop reduction(byref @or_reduction %[[VAL_7]]#0 -> %[[VAL_23:.*]] : !fir.ref<!fir.logical<4>>, byref @or_reduction %[[VAL_9]]#0 -> %[[VAL_24:.*]] : !fir.ref<!fir.logical<4>>, byref @or_reduction %[[VAL_11]]#0 -> %[[VAL_25:.*]] : !fir.ref<!fir.logical<4>>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_26:.*]]) : i32 = (%[[VAL_20]]) to (%[[VAL_21]]) inclusive step (%[[VAL_22]]) {
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
+index 5358806cdcdec..28c70899e6ccc 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ 
+-! CHECK: omp.wsloop byref reduction(@max_byref_i32
++! CHECK: omp.wsloop reduction(byref @max_byref_i32
+ ! CHECK: arith.cmpi sgt
+ ! CHECK: arith.select
+ 
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+index 11d039f9226cc..399afa1065560 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+@@ -46,7 +46,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+@@ -77,7 +77,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+@@ -98,7 +98,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
+index a352cb195c25d..2f3aee9f1300a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
+@@ -33,7 +33,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+index d168b2a89295f..ccab017a1b0c6 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+@@ -46,7 +46,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @min_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+@@ -77,7 +77,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+@@ -100,7 +100,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+index 7c538cdd470f8..762d9dd4f254f 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+@@ -85,7 +85,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -123,7 +123,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -162,7 +162,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -200,7 +200,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+@@ -247,7 +247,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, byref @multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, byref @multiply_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -307,7 +307,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, byref @multiply_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, byref @multiply_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -374,7 +374,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @multiply_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>) {
++! CHECK:             omp.wsloop reduction(byref @multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, byref @multiply_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, byref @multiply_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, byref @multiply_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:                 %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+new file mode 100644
+index 0000000000000..ed462b58bbf88
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+@@ -0,0 +1,164 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s | FileCheck %s
++
++program main
++  implicit none
++
++  integer:: i
++  REAL(8) :: scalar
++  REAL(8) :: array(3,3)
++
++  scalar = 0
++  array = 0
++
++  !$omp parallel do reduction(+:scalar) reduction(+:array)
++  do i=1,10
++    scalar = i
++    array(1, 1) = i + 1
++    array(2, 2) = i + 2
++    array(3, 3) = i + 3
++  enddo
++
++  print *,scalar
++  print *,array
++
++endprogram
++
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x3xf64 : !fir.ref<!fir.box<!fir.array<3x3xf64>>> init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
++! CHECK:           %[[VAL_4:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_5:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_6:.*]] = fir.shape %[[VAL_4]], %[[VAL_5]] : (index, index) -> !fir.shape<2>
++! CHECK:           %[[VAL_7:.*]] = fir.allocmem !fir.array<3x3xf64> {bindc_name = ".tmp", uniq_name = ""}
++! CHECK:           %[[VAL_8:.*]] = arith.constant true
++! CHECK:           %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_7]](%[[VAL_6]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<3x3xf64>>, !fir.shape<2>) -> (!fir.heap<!fir.array<3x3xf64>>, !fir.heap<!fir.array<3x3xf64>>)
++! CHECK:           %[[VAL_10:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_11:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_12:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_13:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_12]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_14:.*]] = fir.shape_shift %[[VAL_11]]#0, %[[VAL_11]]#1, %[[VAL_13]]#0, %[[VAL_13]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[VAL_15:.*]] = fir.embox %[[VAL_9]]#0(%[[VAL_14]]) : (!fir.heap<!fir.array<3x3xf64>>, !fir.shapeshift<2>) -> !fir.box<!fir.array<3x3xf64>>
++! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_15]] : f64, !fir.box<!fir.array<3x3xf64>>
++! CHECK:           fir.store %[[VAL_15]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
++
++! CHECK-LABEL:   } combiner {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
++! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_6:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_7:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_6]] : (!fir.box<!fir.array<3x3xf64>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_8:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1, %[[VAL_7]]#0, %[[VAL_7]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[VAL_9:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[VAL_9]] to %[[VAL_7]]#1 step %[[VAL_9]] unordered {
++! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[VAL_9]] to %[[VAL_5]]#1 step %[[VAL_9]] unordered {
++! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
++! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x3xf64>>, !fir.shapeshift<2>, index, index) -> !fir.ref<f64>
++! CHECK:               %[[VAL_14:.*]] = fir.load %[[VAL_12]] : !fir.ref<f64>
++! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_13]] : !fir.ref<f64>
++! CHECK:               %[[VAL_16:.*]] = arith.addf %[[VAL_14]], %[[VAL_15]] fastmath<contract> : f64
++! CHECK:               fir.store %[[VAL_16]] to %[[VAL_12]] : !fir.ref<f64>
++! CHECK:             }
++! CHECK:           }
++! CHECK:           omp.yield(%[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
++
++! CHECK-LABEL:   }  cleanup {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
++! CHECK:           %[[VAL_1:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           %[[VAL_2:.*]] = fir.box_addr %[[VAL_1]] : (!fir.box<!fir.array<3x3xf64>>) -> !fir.ref<!fir.array<3x3xf64>>
++! CHECK:           %[[VAL_3:.*]] = fir.convert %[[VAL_2]] : (!fir.ref<!fir.array<3x3xf64>>) -> i64
++! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i64
++! CHECK:           %[[VAL_5:.*]] = arith.cmpi ne, %[[VAL_3]], %[[VAL_4]] : i64
++! CHECK:           fir.if %[[VAL_5]] {
++! CHECK:             %[[VAL_6:.*]] = fir.convert %[[VAL_2]] : (!fir.ref<!fir.array<3x3xf64>>) -> !fir.heap<!fir.array<3x3xf64>>
++! CHECK:             fir.freemem %[[VAL_6]] : !fir.heap<!fir.array<3x3xf64>>
++! CHECK:           }
++! CHECK:           omp.yield
++! CHECK:         }
++
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_f64 : f64 init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: f64):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK:           omp.yield(%[[VAL_1]] : f64)
++
++! CHECK-LABEL:   } combiner {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: f64, %[[VAL_1:.*]]: f64):
++! CHECK:           %[[VAL_2:.*]] = arith.addf %[[VAL_0]], %[[VAL_1]] fastmath<contract> : f64
++! CHECK:           omp.yield(%[[VAL_2]] : f64)
++! CHECK:         }
++
++! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "main"} {
++! CHECK:           %[[VAL_0:.*]] = fir.address_of(@_QFEarray) : !fir.ref<!fir.array<3x3xf64>>
++! CHECK:           %[[VAL_1:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_2:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_3:.*]] = fir.shape %[[VAL_1]], %[[VAL_2]] : (index, index) -> !fir.shape<2>
++! CHECK:           %[[VAL_4:.*]]:2 = hlfir.declare %[[VAL_0]](%[[VAL_3]]) {uniq_name = "_QFEarray"} : (!fir.ref<!fir.array<3x3xf64>>, !fir.shape<2>) -> (!fir.ref<!fir.array<3x3xf64>>, !fir.ref<!fir.array<3x3xf64>>)
++! CHECK:           %[[VAL_5:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFEi"}
++! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:           %[[VAL_7:.*]] = fir.alloca f64 {bindc_name = "scalar", uniq_name = "_QFEscalar"}
++! CHECK:           %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFEscalar"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
++! CHECK:           %[[VAL_9:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK:           hlfir.assign %[[VAL_9]] to %[[VAL_8]]#0 : f64, !fir.ref<f64>
++! CHECK:           %[[VAL_10:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK:           hlfir.assign %[[VAL_10]] to %[[VAL_4]]#0 : f64, !fir.ref<!fir.array<3x3xf64>>
++! CHECK:           omp.parallel {
++! CHECK:             %[[VAL_11:.*]] = fir.alloca i32 {adapt.valuebyref, pinned}
++! CHECK:             %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_11]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
++! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
++! CHECK:             %[[VAL_16:.*]] = fir.embox %[[VAL_4]]#0(%[[VAL_3]]) : (!fir.ref<!fir.array<3x3xf64>>, !fir.shape<2>) -> !fir.box<!fir.array<3x3xf64>>
++! CHECK:             %[[VAL_17:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
++! CHECK:             fir.store %[[VAL_16]] to %[[VAL_17]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:             omp.wsloop reduction(@add_reduction_f64 %[[VAL_8]]#0 -> %[[VAL_18:.*]] : !fir.ref<f64>, byref @add_reduction_byref_box_3x3xf64 %[[VAL_17]] -> %[[VAL_19:.*]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>) {
++! CHECK:               omp.loop_nest (%[[VAL_20:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFEscalar"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
++! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFEarray"} : (!fir.ref<!fir.box<!fir.array<3x3xf64>>>) -> (!fir.ref<!fir.box<!fir.array<3x3xf64>>>, !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
++! CHECK:                 fir.store %[[VAL_20]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
++! CHECK:                 %[[VAL_24:.*]] = fir.convert %[[VAL_23]] : (i32) -> f64
++! CHECK:                 hlfir.assign %[[VAL_24]] to %[[VAL_21]]#0 : f64, !fir.ref<f64>
++! CHECK:                 %[[VAL_25:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
++! CHECK:                 %[[VAL_26:.*]] = arith.constant 1 : i32
++! CHECK:                 %[[VAL_27:.*]] = arith.addi %[[VAL_25]], %[[VAL_26]] : i32
++! CHECK:                 %[[VAL_28:.*]] = fir.convert %[[VAL_27]] : (i32) -> f64
++! CHECK:                 %[[VAL_29:.*]] = fir.load %[[VAL_22]]#0 : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:                 %[[VAL_30:.*]] = arith.constant 1 : index
++! CHECK:                 %[[VAL_31:.*]] = arith.constant 1 : index
++! CHECK:                 %[[VAL_32:.*]] = hlfir.designate %[[VAL_29]] (%[[VAL_30]], %[[VAL_31]])  : (!fir.box<!fir.array<3x3xf64>>, index, index) -> !fir.ref<f64>
++! CHECK:                 hlfir.assign %[[VAL_28]] to %[[VAL_32]] : f64, !fir.ref<f64>
++! CHECK:                 %[[VAL_33:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
++! CHECK:                 %[[VAL_34:.*]] = arith.constant 2 : i32
++! CHECK:                 %[[VAL_35:.*]] = arith.addi %[[VAL_33]], %[[VAL_34]] : i32
++! CHECK:                 %[[VAL_36:.*]] = fir.convert %[[VAL_35]] : (i32) -> f64
++! CHECK:                 %[[VAL_37:.*]] = fir.load %[[VAL_22]]#0 : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:                 %[[VAL_38:.*]] = arith.constant 2 : index
++! CHECK:                 %[[VAL_39:.*]] = arith.constant 2 : index
++! CHECK:                 %[[VAL_40:.*]] = hlfir.designate %[[VAL_37]] (%[[VAL_38]], %[[VAL_39]])  : (!fir.box<!fir.array<3x3xf64>>, index, index) -> !fir.ref<f64>
++! CHECK:                 hlfir.assign %[[VAL_36]] to %[[VAL_40]] : f64, !fir.ref<f64>
++! CHECK:                 %[[VAL_41:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
++! CHECK:                 %[[VAL_42:.*]] = arith.constant 3 : i32
++! CHECK:                 %[[VAL_43:.*]] = arith.addi %[[VAL_41]], %[[VAL_42]] : i32
++! CHECK:                 %[[VAL_44:.*]] = fir.convert %[[VAL_43]] : (i32) -> f64
++! CHECK:                 %[[VAL_45:.*]] = fir.load %[[VAL_22]]#0 : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:                 %[[VAL_46:.*]] = arith.constant 3 : index
++! CHECK:                 %[[VAL_47:.*]] = arith.constant 3 : index
++! CHECK:                 %[[VAL_48:.*]] = hlfir.designate %[[VAL_45]] (%[[VAL_46]], %[[VAL_47]])  : (!fir.box<!fir.array<3x3xf64>>, index, index) -> !fir.ref<f64>
++! CHECK:                 hlfir.assign %[[VAL_44]] to %[[VAL_48]] : f64, !fir.ref<f64>
++! CHECK:                 omp.yield
++! CHECK:               }
++! CHECK:               omp.terminator
++! CHECK:             }
++! CHECK:             omp.terminator
++! CHECK:           }
++
++! CHECK-LABEL:   fir.global internal @_QFEarray : !fir.array<3x3xf64> {
++! CHECK:           %[[VAL_0:.*]] = fir.zero_bits !fir.array<3x3xf64>
++! CHECK:           fir.has_value %[[VAL_0]] : !fir.array<3x3xf64>
++! CHECK:         }
++! CHECK:         func.func private @_FortranAioBeginExternalListOutput(i32, !fir.ref<i8>, i32) -> !fir.ref<i8> attributes {fir.io, fir.runtime}
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index c9ee0c25194c2..e54ec4f2b1d72 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -1344,7 +1344,7 @@ class OpenMPIRBuilder {
+   InsertPointTy createReductions(const LocationDescription &Loc,
+                                  InsertPointTy AllocaIP,
+                                  ArrayRef<ReductionInfo> ReductionInfos,
+-                                 bool IsNoWait = false, bool IsByRef = false);
++                                 ArrayRef<bool> IsByRef, bool IsNoWait = false);
+ 
+   ///}
+ 
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 391a4947877a6..cb4de9c8876dc 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -2121,9 +2121,12 @@ Function *getFreshReductionFunc(Module &M) {
+                           ".omp.reduction.func", &M);
+ }
+ 
+-OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+-    const LocationDescription &Loc, InsertPointTy AllocaIP,
+-    ArrayRef<ReductionInfo> ReductionInfos, bool IsNoWait, bool IsByRef) {
++OpenMPIRBuilder::InsertPointTy
++OpenMPIRBuilder::createReductions(const LocationDescription &Loc,
++                                  InsertPointTy AllocaIP,
++                                  ArrayRef<ReductionInfo> ReductionInfos,
++                                  ArrayRef<bool> IsByRef, bool IsNoWait) {
++  assert(ReductionInfos.size() == IsByRef.size());
+   for (const ReductionInfo &RI : ReductionInfos) {
+     (void)RI;
+     assert(RI.Variable && "expected non-null variable");
+@@ -2213,7 +2216,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+     // We have one less load for by-ref case because that load is now inside of
+     // the reduction region
+     Value *RedValue = nullptr;
+-    if (!IsByRef) {
++    if (!IsByRef[En.index()]) {
+       RedValue = Builder.CreateLoad(ValueType, RI.Variable,
+                                     "red.value." + Twine(En.index()));
+     }
+@@ -2221,7 +2224,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+         Builder.CreateLoad(ValueType, RI.PrivateVariable,
+                            "red.private.value." + Twine(En.index()));
+     Value *Reduced;
+-    if (IsByRef) {
++    if (IsByRef[En.index()]) {
+       Builder.restoreIP(RI.ReductionGen(Builder.saveIP(), RI.Variable,
+                                         PrivateRedValue, Reduced));
+     } else {
+@@ -2231,7 +2234,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+     if (!Builder.GetInsertBlock())
+       return InsertPointTy();
+     // for by-ref case, the load is inside of the reduction region
+-    if (!IsByRef)
++    if (!IsByRef[En.index()])
+       Builder.CreateStore(Reduced, RI.Variable);
+   }
+   Function *EndReduceFunc = getOrCreateRuntimeFunctionPtr(
+@@ -2244,7 +2247,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+   // function. There are no loads/stores here because they will be happening
+   // inside the atomic elementwise reduction.
+   Builder.SetInsertPoint(AtomicRedBlock);
+-  if (CanGenerateAtomic && !IsByRef) {
++  if (CanGenerateAtomic && llvm::none_of(IsByRef, [](bool P) { return P; })) {
+     for (const ReductionInfo &RI : ReductionInfos) {
+       Builder.restoreIP(RI.AtomicReductionGen(Builder.saveIP(), RI.ElementType,
+                                               RI.Variable, RI.PrivateVariable));
+@@ -2283,7 +2286,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createReductions(
+     if (!Builder.GetInsertBlock())
+       return InsertPointTy();
+     // store is inside of the reduction region when using by-ref
+-    if (!IsByRef)
++    if (!IsByRef[En.index()])
+       Builder.CreateStore(Reduced, LHSPtr);
+   }
+   Builder.CreateRetVoid();
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index 8344bca08404e..3ed3034f489ce 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -4982,8 +4982,10 @@ TEST_F(OpenMPIRBuilderTest, CreateReductions) {
+   OpenMPIRBuilder::ReductionInfo ReductionInfos[] = {
+       {SumType, SumReduced, SumPrivatized, sumReduction, sumAtomicReduction},
+       {XorType, XorReduced, XorPrivatized, xorReduction, xorAtomicReduction}};
++  bool ReduceVariableByRef[] = {false, false};
+ 
+-  OMPBuilder.createReductions(BodyIP, BodyAllocaIP, ReductionInfos);
++  OMPBuilder.createReductions(BodyIP, BodyAllocaIP, ReductionInfos,
++                              ReduceVariableByRef);
+ 
+   Builder.restoreIP(AfterIP);
+   Builder.CreateRetVoid();
+@@ -5230,12 +5232,16 @@ TEST_F(OpenMPIRBuilderTest, CreateTwoReductions) {
+       /* NumThreads */ nullptr, OMP_PROC_BIND_default,
+       /* IsCancellable */ false);
+ 
++  bool ReduceVariableByRef[] = {false};
++
+   OMPBuilder.createReductions(
+       FirstBodyIP, FirstBodyAllocaIP,
+-      {{SumType, SumReduced, SumPrivatized, sumReduction, sumAtomicReduction}});
++      {{SumType, SumReduced, SumPrivatized, sumReduction, sumAtomicReduction}},
++      ReduceVariableByRef);
+   OMPBuilder.createReductions(
+       SecondBodyIP, SecondBodyAllocaIP,
+-      {{XorType, XorReduced, XorPrivatized, xorReduction, xorAtomicReduction}});
++      {{XorType, XorReduced, XorPrivatized, xorReduction, xorAtomicReduction}},
++      ReduceVariableByRef);
+ 
+   Builder.restoreIP(AfterIP);
+   Builder.CreateRetVoid();
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+index 244cee1dd635b..de7959db489e9 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+@@ -177,8 +177,8 @@ struct ProcBindClauseOps {
+ 
+ struct ReductionClauseOps {
+   llvm::SmallVector<Value> reductionVars;
++  llvm::SmallVector<bool> reduceVarByRef;
+   llvm::SmallVector<Attribute> reductionDeclSymbols;
+-  UnitAttr reductionByRefAttr;
+ };
+ 
+ struct SafelenClauseOps {
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index f248be1639fe9..29c287cad06e9 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -272,22 +272,21 @@ def ParallelOp : OpenMP_Op<"parallel", [
+     that specify the memory allocator to be used to obtain storage for private values.
+ 
+     Reductions can be performed in a parallel construct by specifying reduction
+-    accumulator variables in `reduction_vars` and symbols referring to reduction
+-    declarations in the `reductions` attribute. Each reduction is identified
+-    by the accumulator it uses and accumulators must not be repeated in the same
+-    reduction. The `omp.reduction` operation accepts the accumulator and a
+-    partial value which is considered to be produced by the thread for the
+-    given reduction. If multiple values are produced for the same accumulator,
+-    i.e. there are multiple `omp.reduction`s, the last value is taken. The
+-    reduction declaration specifies how to combine the values from each thread
+-    into the final value, which is available in the accumulator after all the
+-    threads complete.
++    accumulator variables in `reduction_vars`, symbols referring to reduction
++    declarations in the `reductions` attribute, and whether the reduction
++    variable should be passed into the reduction region by value or by reference
++    in `reduction_vars_byref`. Each reduction is identified by the accumulator
++    it uses and accumulators must not be repeated in the same reduction. The
++    `omp.reduction` operation accepts the accumulator and a partial value which
++    is considered to be produced by the thread for the given reduction. If
++    multiple values are produced for the same accumulator, i.e. there are
++    multiple `omp.reduction`s, the last value is taken. The reduction
++    declaration specifies how to combine the values from each thread into the
++    final value, which is available in the accumulator after all the threads
++    complete.
+ 
+     The optional $proc_bind_val attribute controls the thread affinity for the execution
+     of the parallel region.
+-
+-    The optional byref attribute controls whether reduction arguments are passed by
+-    reference or by value.
+   }];
+ 
+   let arguments = (ins Optional<I1>:$if_expr_var,
+@@ -295,11 +294,11 @@ def ParallelOp : OpenMP_Op<"parallel", [
+              Variadic<AnyType>:$allocate_vars,
+              Variadic<AnyType>:$allocators_vars,
+              Variadic<OpenMP_PointerLikeType>:$reduction_vars,
++             OptionalAttr<DenseBoolArrayAttr>:$reduction_vars_byref,
+              OptionalAttr<SymbolRefArrayAttr>:$reductions,
+              OptionalAttr<ProcBindKindAttr>:$proc_bind_val,
+              Variadic<AnyType>:$private_vars,
+-             OptionalAttr<SymbolRefArrayAttr>:$privatizers,
+-             UnitAttr:$byref);
++             OptionalAttr<SymbolRefArrayAttr>:$privatizers);
+ 
+   let regions = (region AnyRegion:$region);
+ 
+@@ -321,10 +320,9 @@ def ParallelOp : OpenMP_Op<"parallel", [
+                 $allocators_vars, type($allocators_vars)
+               ) `)`
+           | `proc_bind` `(` custom<ClauseAttr>($proc_bind_val) `)`
+-          | `byref` $byref
+     ) custom<ParallelRegion>($region, $reduction_vars, type($reduction_vars),
+-                             $reductions, $private_vars, type($private_vars),
+-                             $privatizers) attr-dict
++                             $reduction_vars_byref, $reductions, $private_vars,
++                             type($private_vars), $privatizers) attr-dict
+   }];
+   let hasVerifier = 1;
+ }
+@@ -649,14 +647,15 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+     elements.
+ 
+     Reductions can be performed in a worksharing-loop by specifying reduction
+-    accumulator variables in `reduction_vars` and symbols referring to reduction
+-    declarations in the `reductions` attribute. Each reduction is identified
+-    by the accumulator it uses and accumulators must not be repeated in the same
+-    reduction. A private variable corresponding to the accumulator is used in
+-    place of the accumulator inside the body of the worksharing-loop. The
+-    reduction declaration specifies how to combine the values from each
+-    iteration into the final value, which is available in the accumulator after
+-    the loop completes.
++    accumulator variables in `reduction_vars`, symbols referring to reduction
++    declarations in the `reductions` attribute, and whether the reduction
++    variable should be passed by reference or value in `reduction_vars_byref`.
++    Each reduction is identified by the accumulator it uses and accumulators
++    must not be repeated in the same reduction. A private variable corresponding
++    to the accumulator is used in place of the accumulator inside the body of
++    the worksharing-loop. The reduction declaration specifies how to combine the
++    values from each iteration into the final value, which is available in the
++    accumulator after the loop completes.
+ 
+     The optional `schedule_val` attribute specifies the loop schedule for this
+     loop, determining how the loop is distributed across the parallel threads.
+@@ -677,21 +676,18 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+     The optional `order` attribute specifies which order the iterations of the
+     associate loops are executed in. Currently the only option for this
+     attribute is "concurrent".
+-
+-    The optional `byref` attribute indicates that reduction arguments should be
+-    passed by reference.
+   }];
+ 
+   let arguments = (ins Variadic<AnyType>:$linear_vars,
+              Variadic<I32>:$linear_step_vars,
+              Variadic<OpenMP_PointerLikeType>:$reduction_vars,
++             OptionalAttr<DenseBoolArrayAttr>:$reduction_vars_byref,
+              OptionalAttr<SymbolRefArrayAttr>:$reductions,
+              OptionalAttr<ScheduleKindAttr>:$schedule_val,
+              Optional<AnyType>:$schedule_chunk_var,
+              OptionalAttr<ScheduleModifierAttr>:$schedule_modifier,
+              UnitAttr:$simd_modifier,
+              UnitAttr:$nowait,
+-             UnitAttr:$byref,
+              ConfinedAttr<OptionalAttr<I64Attr>, [IntMinValue<0>]>:$ordered_val,
+              OptionalAttr<OrderKindAttr>:$order_val);
+ 
+@@ -716,11 +712,10 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+                 $schedule_val, $schedule_modifier, $simd_modifier,
+                 $schedule_chunk_var, type($schedule_chunk_var)) `)`
+           |`nowait` $nowait
+-          |`byref` $byref
+           |`ordered` `(` $ordered_val `)`
+           |`order` `(` custom<ClauseAttr>($order_val) `)`
+     ) custom<Wsloop>($region, $reduction_vars, type($reduction_vars),
+-                     $reductions) attr-dict
++                     $reduction_vars_byref, $reductions) attr-dict
+   }];
+   let hasVerifier = 1;
+ }
+diff --git a/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp b/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
+index d6f85451ee5d3..60c62131752f6 100644
+--- a/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
++++ b/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
+@@ -449,6 +449,7 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+         /* allocate_vars = */ llvm::SmallVector<Value>{},
+         /* allocators_vars = */ llvm::SmallVector<Value>{},
+         /* reduction_vars = */ llvm::SmallVector<Value>{},
++        /* reduction_vars_isbyref = */ DenseBoolArrayAttr{},
+         /* reductions = */ ArrayAttr{},
+         /* proc_bind_val = */ omp::ClauseProcBindKindAttr{},
+         /* private_vars = */ ValueRange(),
+@@ -467,6 +468,12 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+           wsloopOp.setReductionsAttr(
+               ArrayAttr::get(rewriter.getContext(), reductionDeclSymbols));
+           wsloopOp.getReductionVarsMutable().append(reductionVariables);
++          llvm::SmallVector<bool> byRefVec;
++          // false because these reductions always reduce scalars and so do
++          // not need to pass by reference
++          byRefVec.resize(reductionVariables.size(), false);
++          wsloopOp.setReductionVarsByref(
++              DenseBoolArrayAttr::get(rewriter.getContext(), byRefVec));
+         }
+         rewriter.create<omp::TerminatorOp>(loc); // omp.parallel terminator.
+ 
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 61073af2aa4d6..24a6d5b5d6849 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -15,11 +15,13 @@
+ #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+ #include "mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.h"
+ #include "mlir/IR/Attributes.h"
++#include "mlir/IR/BuiltinAttributes.h"
+ #include "mlir/IR/DialectImplementation.h"
+ #include "mlir/IR/OpImplementation.h"
+ #include "mlir/IR/OperationSupport.h"
+ #include "mlir/Interfaces/FoldInterfaces.h"
+ 
++#include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/BitVector.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/STLForwardCompat.h"
+@@ -435,25 +437,30 @@ static void printScheduleClause(OpAsmPrinter &p, Operation *op,
+ // Parser, printer and verifier for ReductionVarList
+ //===----------------------------------------------------------------------===//
+ 
+-ParseResult parseClauseWithRegionArgs(
++static ParseResult parseClauseWithRegionArgs(
+     OpAsmParser &parser, Region &region,
+     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &operands,
+-    SmallVectorImpl<Type> &types, ArrayAttr &symbols,
++    SmallVectorImpl<Type> &types, DenseBoolArrayAttr &isByRef,
++    ArrayAttr &symbols,
+     SmallVectorImpl<OpAsmParser::Argument> &regionPrivateArgs) {
+   SmallVector<SymbolRefAttr> reductionVec;
++  SmallVector<bool> isByRefVec;
+   unsigned regionArgOffset = regionPrivateArgs.size();
+ 
+   if (failed(
+           parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren, [&]() {
++            ParseResult optionalByref = parser.parseOptionalKeyword("byref");
+             if (parser.parseAttribute(reductionVec.emplace_back()) ||
+                 parser.parseOperand(operands.emplace_back()) ||
+                 parser.parseArrow() ||
+                 parser.parseArgument(regionPrivateArgs.emplace_back()) ||
+                 parser.parseColonType(types.emplace_back()))
+               return failure();
++            isByRefVec.push_back(optionalByref.succeeded());
+             return success();
+           })))
+     return failure();
++  isByRef = DenseBoolArrayAttr::get(parser.getContext(), isByRefVec);
+ 
+   auto *argsBegin = regionPrivateArgs.begin();
+   MutableArrayRef argsSubrange(argsBegin + regionArgOffset,
+@@ -469,15 +476,18 @@ ParseResult parseClauseWithRegionArgs(
+ static void printClauseWithRegionArgs(OpAsmPrinter &p, Operation *op,
+                                       ValueRange argsSubrange,
+                                       StringRef clauseName, ValueRange operands,
+-                                      TypeRange types, ArrayAttr symbols) {
++                                      TypeRange types, DenseBoolArrayAttr byRef,
++                                      ArrayAttr symbols) {
+   if (!clauseName.empty())
+     p << clauseName << "(";
+ 
+-  llvm::interleaveComma(
+-      llvm::zip_equal(symbols, operands, argsSubrange, types), p, [&p](auto t) {
+-        auto [sym, op, arg, type] = t;
+-        p << sym << " " << op << " -> " << arg << " : " << type;
+-      });
++  llvm::interleaveComma(llvm::zip_equal(symbols, operands, argsSubrange, types,
++                                        byRef.asArrayRef()),
++                        p, [&p](auto t) {
++                          auto [sym, op, arg, type, isByRef] = t;
++                          p << (isByRef ? "byref " : "") << sym << " " << op
++                            << " -> " << arg << " : " << type;
++                        });
+ 
+   if (!clauseName.empty())
+     p << ") ";
+@@ -486,7 +496,8 @@ static void printClauseWithRegionArgs(OpAsmPrinter &p, Operation *op,
+ static ParseResult parseParallelRegion(
+     OpAsmParser &parser, Region &region,
+     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &reductionVarOperands,
+-    SmallVectorImpl<Type> &reductionVarTypes, ArrayAttr &reductionSymbols,
++    SmallVectorImpl<Type> &reductionVarTypes,
++    DenseBoolArrayAttr &reductionByRef, ArrayAttr &reductionSymbols,
+     llvm::SmallVectorImpl<OpAsmParser::UnresolvedOperand> &privateVarOperands,
+     llvm::SmallVectorImpl<Type> &privateVarsTypes,
+     ArrayAttr &privatizerSymbols) {
+@@ -494,16 +505,23 @@ static ParseResult parseParallelRegion(
+ 
+   if (succeeded(parser.parseOptionalKeyword("reduction"))) {
+     if (failed(parseClauseWithRegionArgs(parser, region, reductionVarOperands,
+-                                         reductionVarTypes, reductionSymbols,
+-                                         regionPrivateArgs)))
++                                         reductionVarTypes, reductionByRef,
++                                         reductionSymbols, regionPrivateArgs)))
+       return failure();
+   }
+ 
+   if (succeeded(parser.parseOptionalKeyword("private"))) {
++    auto privateByRef = DenseBoolArrayAttr::get(parser.getContext(), {});
+     if (failed(parseClauseWithRegionArgs(parser, region, privateVarOperands,
+-                                         privateVarsTypes, privatizerSymbols,
+-                                         regionPrivateArgs)))
++                                         privateVarsTypes, privateByRef,
++                                         privatizerSymbols, regionPrivateArgs)))
+       return failure();
++    if (llvm::any_of(privateByRef.asArrayRef(),
++                     [](bool byref) { return byref; })) {
++      parser.emitError(parser.getCurrentLocation(),
++                       "private clause cannot have byref attributes");
++      return failure();
++    }
+   }
+ 
+   return parser.parseRegion(region, regionPrivateArgs);
+@@ -512,6 +530,7 @@ static ParseResult parseParallelRegion(
+ static void printParallelRegion(OpAsmPrinter &p, Operation *op, Region &region,
+                                 ValueRange reductionVarOperands,
+                                 TypeRange reductionVarTypes,
++                                DenseBoolArrayAttr reductionVarIsByRef,
+                                 ArrayAttr reductionSymbols,
+                                 ValueRange privateVarOperands,
+                                 TypeRange privateVarTypes,
+@@ -522,7 +541,7 @@ static void printParallelRegion(OpAsmPrinter &p, Operation *op, Region &region,
+                                  argsBegin + reductionVarTypes.size());
+     printClauseWithRegionArgs(p, op, argsSubrange, "reduction",
+                               reductionVarOperands, reductionVarTypes,
+-                              reductionSymbols);
++                              reductionVarIsByRef, reductionSymbols);
+   }
+ 
+   if (privatizerSymbols) {
+@@ -530,8 +549,13 @@ static void printParallelRegion(OpAsmPrinter &p, Operation *op, Region &region,
+     MutableArrayRef argsSubrange(argsBegin + reductionVarOperands.size(),
+                                  argsBegin + reductionVarOperands.size() +
+                                      privateVarTypes.size());
++    mlir::SmallVector<bool> isByRefVec;
++    isByRefVec.resize(privateVarTypes.size(), false);
++    DenseBoolArrayAttr isByRef =
++        DenseBoolArrayAttr::get(op->getContext(), isByRefVec);
++
+     printClauseWithRegionArgs(p, op, argsSubrange, "private",
+-                              privateVarOperands, privateVarTypes,
++                              privateVarOperands, privateVarTypes, isByRef,
+                               privatizerSymbols);
+   }
+ 
+@@ -575,14 +599,22 @@ static void printReductionVarList(OpAsmPrinter &p, Operation *op,
+ }
+ 
+ /// Verifies Reduction Clause
+-static LogicalResult verifyReductionVarList(Operation *op,
+-                                            std::optional<ArrayAttr> reductions,
+-                                            OperandRange reductionVars) {
++static LogicalResult
++verifyReductionVarList(Operation *op, std::optional<ArrayAttr> reductions,
++                       OperandRange reductionVars,
++                       std::optional<ArrayRef<bool>> byRef = std::nullopt) {
+   if (!reductionVars.empty()) {
+     if (!reductions || reductions->size() != reductionVars.size())
+       return op->emitOpError()
+              << "expected as many reduction symbol references "
+                 "as reduction variables";
++    if (mlir::isa<omp::WsloopOp, omp::ParallelOp>(op))
++      assert(byRef);
++    else
++      assert(!byRef); // TODO: support byref reductions on other operations
++    if (byRef && byRef->size() != reductionVars.size())
++      return op->emitError() << "expected as many reduction variable by "
++                                "reference attributes as reduction variables";
+   } else {
+     if (reductions)
+       return op->emitOpError() << "unexpected reduction symbol references";
+@@ -1163,9 +1195,14 @@ static void printPrivateList(OpAsmPrinter &p, Operation *op,
+   MutableArrayRef argsSubrange(argsBegin + targetOp.getMapOperands().size(),
+                                argsBegin + targetOp.getMapOperands().size() +
+                                    privateVarTypes.size());
++  mlir::SmallVector<bool> isByRefVec;
++  isByRefVec.resize(privateVarTypes.size(), false);
++  DenseBoolArrayAttr isByRef =
++      DenseBoolArrayAttr::get(op->getContext(), isByRefVec);
++
+   printClauseWithRegionArgs(
+       p, op, argsSubrange, /*clauseName=*/llvm::StringRef{}, privateVarOperands,
+-      privateVarTypes, privatizerSymbols);
++      privateVarTypes, isByRef, privatizerSymbols);
+ }
+ 
+ static void printCaptureType(OpAsmPrinter &p, Operation *op,
+@@ -1402,21 +1439,24 @@ void ParallelOp::build(OpBuilder &builder, OperationState &state,
+   ParallelOp::build(
+       builder, state, /*if_expr_var=*/nullptr, /*num_threads_var=*/nullptr,
+       /*allocate_vars=*/ValueRange(), /*allocators_vars=*/ValueRange(),
+-      /*reduction_vars=*/ValueRange(), /*reductions=*/nullptr,
++      /*reduction_vars=*/ValueRange(), /*reduction_vars_byref=*/nullptr,
++      /*reductions=*/nullptr,
+       /*proc_bind_val=*/nullptr, /*private_vars=*/ValueRange(),
+-      /*privatizers=*/nullptr, /*byref=*/false);
++      /*privatizers=*/nullptr);
+   state.addAttributes(attributes);
+ }
+ 
+ void ParallelOp::build(OpBuilder &builder, OperationState &state,
+                        const ParallelClauseOps &clauses) {
+   MLIRContext *ctx = builder.getContext();
+-  ParallelOp::build(
+-      builder, state, clauses.ifVar, clauses.numThreadsVar,
+-      clauses.allocateVars, clauses.allocatorVars, clauses.reductionVars,
+-      makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+-      clauses.procBindKindAttr, clauses.privateVars,
+-      makeArrayAttr(ctx, clauses.privatizers), clauses.reductionByRefAttr);
++
++  ParallelOp::build(builder, state, clauses.ifVar, clauses.numThreadsVar,
++                    clauses.allocateVars, clauses.allocatorVars,
++                    clauses.reductionVars,
++                    DenseBoolArrayAttr::get(ctx, clauses.reduceVarByRef),
++                    makeArrayAttr(ctx, clauses.reductionDeclSymbols),
++                    clauses.procBindKindAttr, clauses.privateVars,
++                    makeArrayAttr(ctx, clauses.privatizers));
+ }
+ 
+ template <typename OpType>
+@@ -1488,7 +1528,8 @@ LogicalResult ParallelOp::verify() {
+   if (failed(verifyPrivateVarList(*this)))
+     return failure();
+ 
+-  return verifyReductionVarList(*this, getReductions(), getReductionVars());
++  return verifyReductionVarList(*this, getReductions(), getReductionVars(),
++                                getReductionVarsByref());
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1609,13 +1650,13 @@ ParseResult
+ parseWsloop(OpAsmParser &parser, Region &region,
+             SmallVectorImpl<OpAsmParser::UnresolvedOperand> &reductionOperands,
+             SmallVectorImpl<Type> &reductionTypes,
+-            ArrayAttr &reductionSymbols) {
++            DenseBoolArrayAttr &reductionByRef, ArrayAttr &reductionSymbols) {
+   // Parse an optional reduction clause
+   llvm::SmallVector<OpAsmParser::Argument> privates;
+   if (succeeded(parser.parseOptionalKeyword("reduction"))) {
+     if (failed(parseClauseWithRegionArgs(parser, region, reductionOperands,
+-                                         reductionTypes, reductionSymbols,
+-                                         privates)))
++                                         reductionTypes, reductionByRef,
++                                         reductionSymbols, privates)))
+       return failure();
+   }
+   return parser.parseRegion(region, privates);
+@@ -1623,11 +1664,11 @@ parseWsloop(OpAsmParser &parser, Region &region,
+ 
+ void printWsloop(OpAsmPrinter &p, Operation *op, Region &region,
+                  ValueRange reductionOperands, TypeRange reductionTypes,
+-                 ArrayAttr reductionSymbols) {
++                 DenseBoolArrayAttr isByRef, ArrayAttr reductionSymbols) {
+   if (reductionSymbols) {
+     auto reductionArgs = region.front().getArguments();
+     printClauseWithRegionArgs(p, op, reductionArgs, "reduction",
+-                              reductionOperands, reductionTypes,
++                              reductionOperands, reductionTypes, isByRef,
+                               reductionSymbols);
+   }
+   p.printRegion(region, /*printEntryBlockArgs=*/false);
+@@ -1637,9 +1678,10 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+                      ArrayRef<NamedAttribute> attributes) {
+   build(builder, state, /*linear_vars=*/ValueRange(),
+         /*linear_step_vars=*/ValueRange(), /*reduction_vars=*/ValueRange(),
++        /*reduction_vars_byref=*/nullptr,
+         /*reductions=*/nullptr, /*schedule_val=*/nullptr,
+         /*schedule_chunk_var=*/nullptr, /*schedule_modifier=*/nullptr,
+-        /*simd_modifier=*/false, /*nowait=*/false, /*byref=*/false,
++        /*simd_modifier=*/false, /*nowait=*/false,
+         /*ordered_val=*/nullptr, /*order_val=*/nullptr);
+   state.addAttributes(attributes);
+ }
+@@ -1649,12 +1691,13 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+   MLIRContext *ctx = builder.getContext();
+   // TODO: Store clauses in op: allocateVars, allocatorVars, privateVars,
+   // privatizers.
+-  WsloopOp::build(
+-      builder, state, clauses.linearVars, clauses.linearStepVars,
+-      clauses.reductionVars, makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+-      clauses.scheduleValAttr, clauses.scheduleChunkVar,
+-      clauses.scheduleModAttr, clauses.scheduleSimdAttr, clauses.nowaitAttr,
+-      clauses.reductionByRefAttr, clauses.orderedAttr, clauses.orderAttr);
++  WsloopOp::build(builder, state, clauses.linearVars, clauses.linearStepVars,
++                  clauses.reductionVars,
++                  DenseBoolArrayAttr::get(ctx, clauses.reduceVarByRef),
++                  makeArrayAttr(ctx, clauses.reductionDeclSymbols),
++                  clauses.scheduleValAttr, clauses.scheduleChunkVar,
++                  clauses.scheduleModAttr, clauses.scheduleSimdAttr,
++                  clauses.nowaitAttr, clauses.orderedAttr, clauses.orderAttr);
+ }
+ 
+ LogicalResult WsloopOp::verify() {
+@@ -1668,7 +1711,8 @@ LogicalResult WsloopOp::verify() {
+       return emitError() << "only supported nested wrapper is 'omp.simd'";
+   }
+ 
+-  return verifyReductionVarList(*this, getReductions(), getReductionVars());
++  return verifyReductionVarList(*this, getReductions(), getReductionVars(),
++                                getReductionVarsByref());
+ }
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index ed9fb44cf08ed..8576be67f04a8 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -22,6 +22,7 @@
+ #include "mlir/Target/LLVMIR/ModuleTranslation.h"
+ #include "mlir/Transforms/RegionUtils.h"
+ 
++#include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/SetVector.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ #include "llvm/Frontend/OpenMP/OMPConstants.h"
+@@ -813,13 +814,16 @@ static void allocByValReductionVars(
+     llvm::OpenMPIRBuilder::InsertPointTy &allocaIP,
+     SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
+     SmallVectorImpl<llvm::Value *> &privateReductionVariables,
+-    DenseMap<Value, llvm::Value *> &reductionVariableMap) {
++    DenseMap<Value, llvm::Value *> &reductionVariableMap,
++    llvm::ArrayRef<bool> isByRefs) {
+   llvm::IRBuilderBase::InsertPointGuard guard(builder);
+   builder.restoreIP(allocaIP);
+   auto args =
+       loop.getRegion().getArguments().take_back(loop.getNumReductionVars());
+ 
+   for (std::size_t i = 0; i < loop.getNumReductionVars(); ++i) {
++    if (isByRefs[i])
++      continue;
+     llvm::Value *var = builder.CreateAlloca(
+         moduleTranslation.convertType(reductionDecls[i].getType()));
+     moduleTranslation.mapValue(args[i], var);
+@@ -919,13 +923,21 @@ inlineOmpRegionCleanup(llvm::SmallVectorImpl<Region *> &cleanupRegions,
+   return success();
+ }
+ 
++static ArrayRef<bool> getIsByRef(std::optional<ArrayRef<bool>> attr) {
++  if (!attr)
++    return {};
++  return *attr;
++}
++
+ /// Converts an OpenMP workshare loop into LLVM IR using OpenMPIRBuilder.
+ static LogicalResult
+ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+                  LLVM::ModuleTranslation &moduleTranslation) {
+   auto wsloopOp = cast<omp::WsloopOp>(opInst);
+   auto loopOp = cast<omp::LoopNestOp>(wsloopOp.getWrappedLoop());
+-  const bool isByRef = wsloopOp.getByref();
++
++  llvm::ArrayRef<bool> isByRef = getIsByRef(wsloopOp.getReductionVarsByref());
++  assert(isByRef.size() == wsloopOp.getNumReductionVars());
+ 
+   // TODO: this should be in the op verifier instead.
+   if (loopOp.getLowerBound().empty())
+@@ -952,11 +964,9 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   SmallVector<llvm::Value *> privateReductionVariables;
+   DenseMap<Value, llvm::Value *> reductionVariableMap;
+-  if (!isByRef) {
+-    allocByValReductionVars(wsloopOp, builder, moduleTranslation, allocaIP,
+-                            reductionDecls, privateReductionVariables,
+-                            reductionVariableMap);
+-  }
++  allocByValReductionVars(wsloopOp, builder, moduleTranslation, allocaIP,
++                          reductionDecls, privateReductionVariables,
++                          reductionVariableMap, isByRef);
+ 
+   // Before the loop, store the initial values of reductions into reduction
+   // variables. Although this could be done after allocas, we don't want to mess
+@@ -974,7 +984,7 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+       return failure();
+     assert(phis.size() == 1 && "expected one value to be yielded from the "
+                                "reduction neutral element declaration region");
+-    if (isByRef) {
++    if (isByRef[i]) {
+       // Allocate reduction variable (which is a pointer to the real reduction
+       // variable allocated in the inlined region)
+       llvm::Value *var = builder.CreateAlloca(
+@@ -1108,7 +1118,7 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+   builder.SetInsertPoint(tempTerminator);
+   llvm::OpenMPIRBuilder::InsertPointTy contInsertPoint =
+       ompBuilder->createReductions(builder.saveIP(), allocaIP, reductionInfos,
+-                                   wsloopOp.getNowait(), isByRef);
++                                   isByRef, wsloopOp.getNowait());
+   if (!contInsertPoint.getBlock())
+     return wsloopOp->emitOpError() << "failed to convert reductions";
+   auto nextInsertionPoint =
+@@ -1170,7 +1180,8 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+                    LLVM::ModuleTranslation &moduleTranslation) {
+   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+   OmpParallelOpConversionManager raii(opInst);
+-  const bool isByRef = opInst.getByref();
++  ArrayRef<bool> isByRef = getIsByRef(opInst.getReductionVarsByref());
++  assert(isByRef.size() == opInst.getNumReductionVars());
+ 
+   // TODO: support error propagation in OpenMPIRBuilder and use it instead of
+   // relying on captured variables.
+@@ -1185,11 +1196,9 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+   auto bodyGenCB = [&](InsertPointTy allocaIP, InsertPointTy codeGenIP) {
+     // Allocate reduction vars
+     DenseMap<Value, llvm::Value *> reductionVariableMap;
+-    if (!isByRef) {
+-      allocByValReductionVars(opInst, builder, moduleTranslation, allocaIP,
+-                              reductionDecls, privateReductionVariables,
+-                              reductionVariableMap);
+-    }
++    allocByValReductionVars(opInst, builder, moduleTranslation, allocaIP,
++                            reductionDecls, privateReductionVariables,
++                            reductionVariableMap, isByRef);
+ 
+     // Initialize reduction vars
+     builder.restoreIP(allocaIP);
+@@ -1210,7 +1219,7 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+              "reduction neutral element declaration region");
+       builder.restoreIP(allocaIP);
+ 
+-      if (isByRef) {
++      if (isByRef[i]) {
+         // Allocate reduction variable (which is a pointer to the real reduciton
+         // variable allocated in the inlined region)
+         llvm::Value *var = builder.CreateAlloca(
+@@ -1269,7 +1278,7 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+ 
+       llvm::OpenMPIRBuilder::InsertPointTy contInsertPoint =
+           ompBuilder->createReductions(builder.saveIP(), allocaIP,
+-                                       reductionInfos, false, isByRef);
++                                       reductionInfos, isByRef, false);
+       if (!contInsertPoint.getBlock()) {
+         bodyGenStatus = opInst->emitOpError() << "failed to convert reductions";
+         return;
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index aee79264313ef..db016fe8e7ba8 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -2272,3 +2272,22 @@ func.func @undefined_privatizer(%arg0: !llvm.ptr) {
+     }) : (!llvm.ptr) -> ()
+   return
+ }
++
++// -----
++
++omp.private {type = private} @var1.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  omp.yield(%arg0 : !llvm.ptr)
++} copy {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  omp.yield(%arg0 : !llvm.ptr)
++}
++
++func.func @byref_in_private(%arg0: index) {
++  // expected-error @below {{private clause cannot have byref attributes}}
++  omp.parallel private(byref @var1.privatizer %arg0 -> %arg2 : index) {
++    omp.terminator
++  }
++
++  return
++}
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index fc6d1c3165316..0d5fd9383a92f 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -869,6 +869,28 @@ func.func @wsloop_reduction(%lb : index, %ub : index, %step : index) {
+   return
+ }
+ 
++// CHECK-LABEL: func @wsloop_reduction_byref
++func.func @wsloop_reduction_byref(%lb : index, %ub : index, %step : index) {
++  %c1 = arith.constant 1 : i32
++  %0 = llvm.alloca %c1 x i32 : (i32) -> !llvm.ptr
++  // CHECK: reduction(byref @add_f32 %{{.+}} -> %[[PRV:.+]] : !llvm.ptr)
++  omp.wsloop reduction(byref @add_f32 %0 -> %prv : !llvm.ptr) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      // CHECK: %[[CST:.+]] = arith.constant 2.0{{.*}} : f32
++      %cst = arith.constant 2.0 : f32
++      // CHECK: %[[LPRV:.+]] = llvm.load %[[PRV]] : !llvm.ptr -> f32
++      %lprv = llvm.load %prv : !llvm.ptr -> f32
++      // CHECK: %[[RES:.+]] = llvm.fadd %[[LPRV]], %[[CST]] : f32
++      %res = llvm.fadd %lprv, %cst: f32
++      // CHECK: llvm.store %[[RES]], %[[PRV]] :  f32, !llvm.ptr
++      llvm.store %res, %prv :  f32, !llvm.ptr
++      omp.yield
++    }
++    omp.terminator
++  }
++  return
++}
++
+ // CHECK-LABEL: func @parallel_reduction
+ func.func @parallel_reduction() {
+   %c1 = arith.constant 1 : i32
+@@ -885,6 +907,22 @@ func.func @parallel_reduction() {
+   return
+ }
+ 
++// CHECK-LABEL: func @parallel_reduction_byref
++func.func @parallel_reduction_byref() {
++  %c1 = arith.constant 1 : i32
++  %0 = llvm.alloca %c1 x i32 : (i32) -> !llvm.ptr
++  // CHECK: omp.parallel reduction(byref @add_f32 {{.+}} -> {{.+}} : !llvm.ptr)
++  omp.parallel reduction(byref @add_f32 %0 -> %prv : !llvm.ptr) {
++    %1 = arith.constant 2.0 : f32
++    %2 = llvm.load %prv : !llvm.ptr -> f32
++    // CHECK: llvm.fadd %{{.*}}, %{{.*}} : f32
++    %3 = llvm.fadd %1, %2 : f32
++    llvm.store %3, %prv : f32, !llvm.ptr
++    omp.terminator
++  }
++  return
++}
++
+ // CHECK: func @parallel_wsloop_reduction
+ func.func @parallel_wsloop_reduction(%lb : index, %ub : index, %step : index) {
+   %c1 = arith.constant 1 : i32
+diff --git a/mlir/test/Target/LLVMIR/openmp-parallel-reduction-cleanup.mlir b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-cleanup.mlir
+index b7f71f438e56b..84a487cb8c98f 100644
+--- a/mlir/test/Target/LLVMIR/openmp-parallel-reduction-cleanup.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-parallel-reduction-cleanup.mlir
+@@ -27,7 +27,7 @@
+     %0 = llvm.mlir.constant(-1 : i32) : i32
+     %1 = llvm.mlir.addressof @i : !llvm.ptr
+     %2 = llvm.mlir.addressof @j : !llvm.ptr
+-    omp.parallel byref reduction(@add_reduction_i_32 %1 -> %arg0 : !llvm.ptr, @add_reduction_i_32 %2 -> %arg1 : !llvm.ptr) {
++    omp.parallel reduction(byref @add_reduction_i_32 %1 -> %arg0 : !llvm.ptr, byref @add_reduction_i_32 %2 -> %arg1 : !llvm.ptr) {
+       llvm.store %0, %arg0 : i32, !llvm.ptr
+       llvm.store %0, %arg1 : i32, !llvm.ptr
+       omp.terminator
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
+index e720969e82c11..ef1284547a88a 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
+@@ -20,7 +20,7 @@
+   llvm.func @main()  {
+     %0 = llvm.mlir.constant(-1 : i32) : i32
+     %1 = llvm.mlir.addressof @i : !llvm.ptr
+-    omp.parallel byref reduction(@add_reduction_i_32 %1 -> %arg0 : !llvm.ptr) {
++    omp.parallel reduction(byref @add_reduction_i_32 %1 -> %arg0 : !llvm.ptr) {
+       llvm.store %0, %arg0 : i32, !llvm.ptr
+       omp.terminator
+     }
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
+index 5dd31c425566c..f4b77cbf413d4 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-init-arg.mlir
+@@ -24,7 +24,7 @@ module {
+   %87 = llvm.alloca %86 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> : (i64) -> !llvm.ptr
+ // test multiple reduction variables to ensure they don't intefere with eachother
+ // when inlining the reduction init region multiple times
+-    omp.parallel byref reduction(@add_reduction_byref_box_Uxf64 %84 -> %arg3 : !llvm.ptr, @add_reduction_byref_box_Uxf64 %87 -> %arg4 : !llvm.ptr) {
++    omp.parallel reduction(byref @add_reduction_byref_box_Uxf64 %84 -> %arg3 : !llvm.ptr, byref @add_reduction_byref_box_Uxf64 %87 -> %arg4 : !llvm.ptr) {
+       omp.terminator
+     }
+     llvm.return
+diff --git a/mlir/test/Target/LLVMIR/openmp-wsloop-reduction-cleanup.mlir b/mlir/test/Target/LLVMIR/openmp-wsloop-reduction-cleanup.mlir
+index 7a1a31830ce9b..0b28294dc1ced 100644
+--- a/mlir/test/Target/LLVMIR/openmp-wsloop-reduction-cleanup.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-wsloop-reduction-cleanup.mlir
+@@ -30,7 +30,7 @@
+     %loop_ub = llvm.mlir.constant(9 : i32) : i32
+     %loop_lb = llvm.mlir.constant(0 : i32) : i32
+     %loop_step = llvm.mlir.constant(1 : i32) : i32 
+-    omp.wsloop byref reduction(@add_reduction_i_32 %1 -> %arg0 : !llvm.ptr, @add_reduction_i_32 %2 -> %arg1 : !llvm.ptr) {
++    omp.wsloop reduction(byref @add_reduction_i_32 %1 -> %arg0 : !llvm.ptr, byref @add_reduction_i_32 %2 -> %arg1 : !llvm.ptr) {
+       omp.loop_nest (%loop_cnt) : i32 = (%loop_lb) to (%loop_ub) inclusive step (%loop_step) {
+         llvm.store %0, %arg0 : i32, !llvm.ptr
+         llvm.store %0, %arg1 : i32, !llvm.ptr

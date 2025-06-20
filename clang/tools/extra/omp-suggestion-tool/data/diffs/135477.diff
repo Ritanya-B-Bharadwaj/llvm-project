@@ -1,0 +1,96 @@
+diff --git a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index 61f8713028a7f..3fcb4b04a7b76 100644
+--- a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -153,7 +153,15 @@ class MapInfoFinalizationPass
+     builder.setInsertionPointToStart(allocaBlock);
+     auto alloca = builder.create<fir::AllocaOp>(loc, descriptor.getType());
+     builder.restoreInsertionPoint(insPt);
+-    builder.create<fir::StoreOp>(loc, descriptor, alloca);
++    // We should only emit a store if the passed in data is present, it is
++    // possible a user passes in no argument to an optional parameter, in which
++    // case we cannot store or we'll segfault on the emitted memcpy.
++    auto isPresent =
++        builder.create<fir::IsPresentOp>(loc, builder.getI1Type(), descriptor);
++    builder.genIfOp(loc, {}, isPresent, false)
++        .genThen(
++            [&]() { builder.create<fir::StoreOp>(loc, descriptor, alloca); })
++        .end();
+     return slot = alloca;
+   }
+ 
+diff --git a/flang/test/Lower/OpenMP/optional-argument-map.f90 b/flang/test/Lower/OpenMP/optional-argument-map.f90
+new file mode 100644
+index 0000000000000..863742ce67927
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/optional-argument-map.f90
+@@ -0,0 +1,27 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++module foo
++    implicit none
++    contains
++    subroutine test(I,A)
++      implicit none
++      real(4), optional, intent(inout) :: A(:)
++      integer(kind=4), intent(in) :: I
++
++     !$omp target data map(to: A) if (I>0)
++     !$omp end target data
++
++    end subroutine test
++end module foo
++
++! CHECK-LABEL:   func.func @_QMfooPtest(
++! CHECK-SAME:                           %[[VAL_0:.*]]: !fir.ref<i32> {fir.bindc_name = "i"},
++! CHECK-SAME:                           %[[VAL_1:.*]]: !fir.box<!fir.array<?xf32>> {fir.bindc_name = "a", fir.optional}) {
++! CHECK:           %[[VAL_2:.*]] = fir.alloca !fir.box<!fir.array<?xf32>>
++! CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_1]] dummy_scope %{{.*}} {fortran_attrs = #fir.var_attrs<intent_inout, optional>, uniq_name = "_QMfooFtestEa"} : (!fir.box<!fir.array<?xf32>>, !fir.dscope) -> (!fir.box<!fir.array<?xf32>>, !fir.box<!fir.array<?xf32>>)
++! CHECK:           %{{.*}} = fir.is_present %{{.*}}#1 : (!fir.box<!fir.array<?xf32>>) -> i1
++! CHECK:           %{{.*}}:5 = fir.if %{{.*}}
++! CHECK:           %[[VAL_4:.*]] = fir.is_present %[[VAL_3]]#1 : (!fir.box<!fir.array<?xf32>>) -> i1
++! CHECK:           fir.if %[[VAL_4]] {
++! CHECK:             fir.store %[[VAL_3]]#1 to %[[VAL_2]] : !fir.ref<!fir.box<!fir.array<?xf32>>>
++! CHECK:           }
+diff --git a/offload/test/offloading/fortran/optional-mapped-arguments.f90 b/offload/test/offloading/fortran/optional-mapped-arguments.f90
+new file mode 100644
+index 0000000000000..e0cdddb8e1bf7
+--- /dev/null
++++ b/offload/test/offloading/fortran/optional-mapped-arguments.f90
+@@ -0,0 +1,36 @@
++! OpenMP offloading test that checks we do not cause a segfault when mapping
++! optional function arguments (present or otherwise). No results requiring
++! checking other than that the program compiles and runs to completion with no
++! error.
++! REQUIRES: flang, amdgpu
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++module foo
++    implicit none
++    contains
++    subroutine test(I,A)
++        implicit none
++        real(4), optional, intent(inout) :: A(:)
++        integer(kind=4), intent(in) :: I
++
++        !$omp target data map(to: A) if (I>0)
++        !$omp end target data
++
++        !$omp target enter data map(to:A) if (I>0)
++
++        !$omp target exit data map(from:A) if (I>0)
++    end subroutine test
++end module foo
++
++program main
++    use foo
++    implicit none
++    real :: array(10)
++    call test(0)
++    call test(1)
++    call test(0, array)
++    call test(1, array)
++    print *, "PASSED"
++end program main
++
++! CHECK: PASSED

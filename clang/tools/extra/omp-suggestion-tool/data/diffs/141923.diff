@@ -1,0 +1,138 @@
+diff --git a/flang/include/flang/Evaluate/tools.h b/flang/include/flang/Evaluate/tools.h
+index 7f2e91ae128bd..4dce1257a6507 100644
+--- a/flang/include/flang/Evaluate/tools.h
++++ b/flang/include/flang/Evaluate/tools.h
+@@ -414,6 +414,16 @@ const Symbol *IsArrayElement(const Expr<T> &expr, bool intoSubstring = true,
+   return nullptr;
+ }
+ 
++template <typename T>
++bool isStructureComponent(const Fortran::evaluate::Expr<T> &expr) {
++  if (auto dataRef{ExtractDataRef(expr, /*intoSubstring=*/false)}) {
++    const Fortran::evaluate::DataRef *ref{&*dataRef};
++    return std::holds_alternative<Fortran::evaluate::Component>(ref->u);
++  }
++
++  return false;
++}
++
+ template <typename A>
+ std::optional<NamedEntity> ExtractNamedEntity(const A &x) {
+   if (auto dataRef{ExtractDataRef(x)}) {
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index ebdda9885d5c2..307e2ac2c66f9 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -944,6 +944,11 @@ bool ClauseProcessor::processDepend(lower::SymMap &symMap,
+               converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);
+           dependVar = entity.getBase();
+         }
++      } else if (evaluate::isStructureComponent(*object.ref())) {
++        SomeExpr expr = *object.ref();
++        hlfir::EntityWithAttributes entity = convertExprToHLFIR(
++            converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);
++        dependVar = entity.getBase();
+       } else {
+         semantics::Symbol *sym = object.sym();
+         dependVar = converter.getSymbolAddress(*sym);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index bda0d62829506..a3eeac4524eff 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -5493,12 +5493,8 @@ void OmpStructureChecker::CheckDependList(const parser::DataRef &d) {
+             // Check if the base element is valid on Depend Clause
+             CheckDependList(elem.value().base);
+           },
+-          [&](const common::Indirection<parser::StructureComponent> &) {
+-            context_.Say(GetContext().clauseSource,
+-                "A variable that is part of another variable "
+-                "(such as an element of a structure) but is not an array "
+-                "element or an array section cannot appear in a DEPEND "
+-                "clause"_err_en_US);
++          [&](const common::Indirection<parser::StructureComponent> &comp) {
++            CheckDependList(comp.value().base);
+           },
+           [&](const common::Indirection<parser::CoindexedNamedObject> &) {
+             context_.Say(GetContext().clauseSource,
+diff --git a/flang/test/Lower/OpenMP/task-depend-structure-component.f90 b/flang/test/Lower/OpenMP/task-depend-structure-component.f90
+new file mode 100644
+index 0000000000000..7cf6dbfac2729
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/task-depend-structure-component.f90
+@@ -0,0 +1,21 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++subroutine depend
++   type :: my_struct
++       integer :: my_component(10)
++   end type
++
++   type(my_struct) :: my_var
++
++   !$omp task depend(in:my_var%my_component)
++   !$omp end task
++end subroutine depend
++
++! CHECK: %[[VAR_ALLOC:.*]] = fir.alloca !fir.type<{{.*}}my_struct{{.*}}> {bindc_name = "my_var", {{.*}}}
++! CHECK: %[[VAR_DECL:.*]]:2 = hlfir.declare %[[VAR_ALLOC]]
++
++! CHECK: %[[COMP_SELECTOR:.*]] = hlfir.designate %[[VAR_DECL]]#0{"my_component"}
++
++! CHECK: omp.task depend(taskdependin -> %[[COMP_SELECTOR]] : {{.*}}) {
++! CHECK:   omp.terminator
++! CHECK: }
+diff --git a/flang/test/Semantics/OpenMP/depend02.f90 b/flang/test/Semantics/OpenMP/depend02.f90
+deleted file mode 100644
+index 76c02c8f9cbab..0000000000000
+--- a/flang/test/Semantics/OpenMP/depend02.f90
++++ /dev/null
+@@ -1,49 +0,0 @@
+-! RUN: %python %S/../test_errors.py %s %flang -fopenmp
+-! OpenMP Version 4.5
+-! 2.13.9 Depend Clause
+-! A variable that is part of another variable
+-! (such as an element of a structure) but is not an array element or
+-! an array section cannot appear in a DEPEND clause
+-
+-subroutine vec_mult(N)
+-  implicit none
+-  integer :: i, N
+-  real, allocatable :: p(:), v1(:), v2(:)
+-
+-  type my_type
+-    integer :: a(10)
+-  end type my_type
+-
+-  type(my_type) :: my_var
+-  allocate( p(N), v1(N), v2(N) )
+-
+-  !$omp parallel num_threads(2)
+-  !$omp single
+-
+-  !$omp task depend(out:v1)
+-  call init(v1, N)
+-  !$omp end task
+-
+-  !$omp task depend(out:v2)
+-  call init(v2, N)
+-  !$omp end task
+-
+-  !ERROR: A variable that is part of another variable (such as an element of a structure) but is not an array element or an array section cannot appear in a DEPEND clause
+-  !$omp target nowait depend(in:v1,v2, my_var%a) depend(out:p) &
+-  !$omp& map(to:v1,v2) map(from: p)
+-  !$omp parallel do
+-  do i=1,N
+-    p(i) = v1(i) * v2(i)
+-  end do
+-  !$omp end target
+-
+-  !$omp task depend(in:p)
+-  call output(p, N)
+-  !$omp end task
+-
+-  !$omp end single
+-  !$omp end parallel
+-
+-  deallocate( p, v1, v2 )
+-
+-end subroutine

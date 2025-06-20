@@ -1,0 +1,107 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 77786742b3e13..2cfc1bd88dcef 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2192,6 +2192,21 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                            /*useDelayedPrivatization=*/true, symTable);
+   dsp.processStep1(&clauseOps);
+ 
++  // Check if a value of type `type` can be passed to the kernel by value.
++  // All kernel parameters are of pointer type, so if the value can be
++  // represented inside of a pointer, then it can be passed by value.
++  auto isLiteralType = [&](mlir::Type type) {
++    const mlir::DataLayout &dl = firOpBuilder.getDataLayout();
++    mlir::Type ptrTy =
++        mlir::LLVM::LLVMPointerType::get(&converter.getMLIRContext());
++    uint64_t ptrSize = dl.getTypeSize(ptrTy);
++    uint64_t ptrAlign = dl.getTypePreferredAlignment(ptrTy);
++
++    auto [size, align] = fir::getTypeSizeAndAlignmentOrCrash(
++        loc, type, dl, converter.getKindMap());
++    return size <= ptrSize && align <= ptrAlign;
++  };
++
+   // 5.8.1 Implicit Data-Mapping Attribute Rules
+   // The following code follows the implicit data-mapping rules to map all the
+   // symbols used inside the region that do not have explicit data-environment
+@@ -2269,7 +2284,14 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+           mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+         }
+       } else if (fir::isa_trivial(eleType) || fir::isa_char(eleType)) {
+-        captureKind = mlir::omp::VariableCaptureKind::ByCopy;
++        // Scalars behave as if they were "firstprivate".
++        // TODO: Handle objects that are shared/lastprivate or were listed
++        // in an in_reduction clause.
++        if (isLiteralType(eleType)) {
++          captureKind = mlir::omp::VariableCaptureKind::ByCopy;
++        } else {
++          mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
++        }
+       } else if (!fir::isa_builtin_cptr_type(eleType)) {
+         mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
+         mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+diff --git a/flang/test/Lower/OpenMP/target-map-complex.f90 b/flang/test/Lower/OpenMP/target-map-complex.f90
+new file mode 100644
+index 0000000000000..c15a10e4804dd
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/target-map-complex.f90
+@@ -0,0 +1,33 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++! Check that the complex*4 is passed by value. but complex*8 is passed by
++! reference
++
++!CHECK-LABEL: func.func @_QMmPbar()
++!CHECK:  %[[V0:[0-9]+]]:2 = hlfir.declare {{.*}} (!fir.ref<complex<f64>>) -> (!fir.ref<complex<f64>>, !fir.ref<complex<f64>>)
++!CHECK:  %[[V1:[0-9]+]]:2 = hlfir.declare {{.*}} (!fir.ref<complex<f32>>) -> (!fir.ref<complex<f32>>, !fir.ref<complex<f32>>)
++!CHECK:  %[[V2:[0-9]+]] = omp.map.info var_ptr(%[[V1]]#1 : !fir.ref<complex<f32>>, complex<f32>) {{.*}} capture(ByCopy)
++!CHECK:  %[[V3:[0-9]+]] = omp.map.info var_ptr(%[[V0]]#1 : !fir.ref<complex<f64>>, complex<f64>) {{.*}} capture(ByRef)
++!CHECK:  omp.target map_entries(%[[V2]] -> {{.*}}, %[[V3]] -> {{.*}} : !fir.ref<complex<f32>>, !fir.ref<complex<f64>>)
++
++module m
++  implicit none
++  complex(kind=4) :: cfval = (24, 25)
++  complex(kind=8) :: cdval = (28, 29)
++  interface
++    subroutine foo(x, y)
++      complex(kind=4) :: x
++      complex(kind=8) :: y
++      !$omp declare target
++    end
++  end interface
++
++contains
++
++subroutine bar()
++!$omp target
++    call foo(cfval, cdval)
++!$omp end target
++end
++
++end module
+diff --git a/offload/test/offloading/fortran/target-map-literal-write.f90 b/offload/test/offloading/fortran/target-map-literal-write.f90
+new file mode 100644
+index 0000000000000..8f0cb95338eed
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-literal-write.f90
+@@ -0,0 +1,20 @@
++!REQUIRES: flang, amdgpu
++
++!RUN: %libomptarget-compile-fortran-run-and-check-generic
++
++program m
++  complex(kind=8) :: x
++  x = (1.0, 2.0)
++!$omp target
++  x = (-1.0, -2.0)
++!$omp end target
++  print *, "x=", x
++end program
++
++! The host variable "x" should be passed to the kernel as "firstprivate",
++! hence the kernel should have its own copy of it. This is in contrast to
++! other cases where implicitly mapped variables have the TOFROM map-type.
++
++! Make sure that the target region didn't overwrite the host variable.
++
++!CHECK: x= (1.,2.)

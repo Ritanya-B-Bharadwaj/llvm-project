@@ -1,0 +1,734 @@
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index ee783f8b09c24..c457183877108 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -6974,6 +6974,10 @@ defm loop_versioning : BoolOptionWithoutMarshalling<"f", "version-loops-for-stri
+ 
+ def fhermetic_module_files : Flag<["-"], "fhermetic-module-files">, Group<f_Group>,
+   HelpText<"Emit hermetic module files (no nested USE association)">;
++
++def fdo_concurrent_to_openmp_EQ : Joined<["-"], "fdo-concurrent-to-openmp=">,
++  HelpText<"Try to map `do concurrent` loops to OpenMP [none|host|device]">,
++      Values<"none, host, device">;
+ } // let Visibility = [FC1Option, FlangOption]
+ 
+ def J : JoinedOrSeparate<["-"], "J">,
+diff --git a/clang/lib/Driver/ToolChains/Flang.cpp b/clang/lib/Driver/ToolChains/Flang.cpp
+index 5dbc5cbe77d0a..6960c001c258b 100644
+--- a/clang/lib/Driver/ToolChains/Flang.cpp
++++ b/clang/lib/Driver/ToolChains/Flang.cpp
+@@ -165,7 +165,8 @@ void Flang::addCodegenOptions(const ArgList &Args,
+     CmdArgs.push_back("-fversion-loops-for-stride");
+ 
+   Args.addAllArgs(CmdArgs,
+-                  {options::OPT_flang_experimental_hlfir,
++                  {options::OPT_fdo_concurrent_to_openmp_EQ,
++                   options::OPT_flang_experimental_hlfir,
+                    options::OPT_flang_deprecated_no_hlfir,
+                    options::OPT_fno_ppc_native_vec_elem_order,
+                    options::OPT_fppc_native_vec_elem_order,
+diff --git a/flang/docs/DoConcurrentConversionToOpenMP.md b/flang/docs/DoConcurrentConversionToOpenMP.md
+new file mode 100644
+index 0000000000000..62bc3172f8e3b
+--- /dev/null
++++ b/flang/docs/DoConcurrentConversionToOpenMP.md
+@@ -0,0 +1,155 @@
++<!--===- docs/DoConcurrentMappingToOpenMP.md
++
++   Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++   See https://llvm.org/LICENSE.txt for license information.
++   SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++-->
++
++# `DO CONCURRENT` mapping to OpenMP
++
++```{contents}
++---
++local:
++---
++```
++
++This document seeks to describe the effort to parallelize `do concurrent` loops
++by mapping them to OpenMP worksharing constructs. The goals of this document
++are:
++* Describing how to instruct `flang` to map `DO CONCURRENT` loops to OpenMP
++  constructs.
++* Tracking the current status of such mapping.
++* Describing the limitations of the current implementation.
++* Describing next steps.
++* Tracking the current upstreaming status (from the AMD ROCm fork).
++
++## Usage
++
++In order to enable `do concurrent` to OpenMP mapping, `flang` adds a new
++compiler flag: `-fdo-concurrent-to-openmp`. This flag has 3 possible values:
++1. `host`: this maps `do concurrent` loops to run in parallel on the host CPU.
++   This maps such loops to the equivalent of `omp parallel do`.
++2. `device`: this maps `do concurrent` loops to run in parallel on a target device.
++   This maps such loops to the equivalent of
++   `omp target teams distribute parallel do`.
++3. `none`: this disables `do concurrent` mapping altogether. In that case, such
++   loops are emitted as sequential loops.
++
++The `-fdo-concurrent-to-openmp` compiler switch is currently available only when
++OpenMP is also enabled. So you need to provide the following options to flang in
++order to enable it:
++```
++flang ... -fopenmp -fdo-concurrent-to-openmp=[host|device|none] ...
++```
++For mapping to device, the target device architecture must be specified as well.
++See `-fopenmp-targets` and `--offload-arch` for more info.
++
++## Current status
++
++Under the hood, `do concurrent` mapping is implemented in the
++`DoConcurrentConversionPass`. This is still an experimental pass which means
++that:
++* It has been tested in a very limited way so far.
++* It has been tested mostly on simple synthetic inputs.
++
++<!--
++More details about current status will be added along with relevant parts of the
++implementation in later upstreaming patches.
++-->
++
++## Next steps
++
++This section describes some of the open questions/issues that are not tackled yet
++even in the downstream implementation.
++
++### Delayed privatization
++
++So far, we emit the privatization logic for IVs inline in the parallel/target
++region. This is enough for our purposes right now since we don't
++localize/privatize any sophisticated types of variables yet. Once we have need
++for more advanced localization through `do concurrent`'s locality specifiers
++(see below), delayed privatization will enable us to have a much cleaner IR.
++Once delayed privatization's implementation upstream is supported for the
++required constructs by the pass, we will move to it rather than inlined/early
++privatization.
++
++### Locality specifiers for `do concurrent`
++
++Locality specifiers will enable the user to control the data environment of the
++loop nest in a more fine-grained way. Implementing these specifiers on the
++`FIR` dialect level is needed in order to support this in the
++`DoConcurrentConversionPass`.
++
++Such specifiers will also unlock a potential solution to the
++non-perfectly-nested loops' IVs issue described above. In particular, for a
++non-perfectly nested loop, one middle-ground proposal/solution would be to:
++* Emit the loop's IV as shared/mapped just like we do currently.
++* Emit a warning that the IV of the loop is emitted as shared/mapped.
++* Given support for `LOCAL`, we can recommend the user to explicitly
++  localize/privatize the loop's IV if they choose to.
++
++#### Sharing TableGen clause records from the OpenMP dialect
++
++At the moment, the FIR dialect does not have a way to model locality specifiers
++on the IR level. Instead, something similar to early/eager privatization in OpenMP
++is done for the locality specifiers in `fir.do_loop` ops. Having locality specifier
++modelled in a way similar to delayed privatization (i.e. the `omp.private` op) and
++reductions (i.e. the `omp.declare_reduction` op) can make mapping `do concurrent`
++to OpenMP (and other parallel programming models) much easier.
++
++Therefore, one way to approach this problem is to extract the TableGen records
++for relevant OpenMP clauses in a shared dialect for "data environment management"
++and use these shared records for OpenMP, `do concurrent`, and possibly OpenACC
++as well.
++
++#### Supporting reductions
++
++Similar to locality specifiers, mapping reductions from `do concurrent` to OpenMP
++is also still an open TODO. We can potentially extend the MLIR infrastructure
++proposed in the previous section to share reduction records among the different 
++relevant dialects as well.
++
++### More advanced detection of loop nests
++
++As pointed out earlier, any intervening code between the headers of 2 nested
++`do concurrent` loops prevents us from detecting this as a loop nest. In some
++cases this is overly conservative. Therefore, a more flexible detection logic
++of loop nests needs to be implemented.
++
++### Data-dependence analysis
++
++Right now, we map loop nests without analysing whether such mapping is safe to
++do or not. We probably need to at least warn the user of unsafe loop nests due
++to loop-carried dependencies.
++
++### Non-rectangular loop nests
++
++So far, we did not need to use the pass for non-rectangular loop nests. For
++example:
++```fortran
++do concurrent(i=1:n)
++  do concurrent(j=i:n)
++    ...
++  end do
++end do
++```
++We defer this to the (hopefully) near future when we get the conversion in a
++good share for the samples/projects at hand.
++
++### Generalizing the pass to other parallel programming models
++
++Once we have a stable and capable `do concurrent` to OpenMP mapping, we can take
++this in a more generalized direction and allow the pass to target other models;
++e.g. OpenACC. This goal should be kept in mind from the get-go even while only
++targeting OpenMP.
++
++
++## Upstreaming status
++
++- [x] Command line options for `flang` and `bbc`.
++- [x] Conversion pass skeleton (no transormations happen yet).
++- [x] Status description and tracking document (this document).
++- [ ] Basic host/CPU mapping support.
++- [ ] Basic device/GPU mapping support.
++- [ ] More advanced host and device support (expaned to multiple items as needed).
+diff --git a/flang/docs/index.md b/flang/docs/index.md
+index 1de0ee2e6f0d6..8ab5c0bcb2123 100644
+--- a/flang/docs/index.md
++++ b/flang/docs/index.md
+@@ -51,6 +51,7 @@ on how to get in touch with us and to learn more about the current status.
+    DebugGeneration
+    Directives
+    DoConcurrent
++   DoConcurrentConversionToOpenMP
+    Extensions
+    F202X
+    FIRArrayOperations
+diff --git a/flang/include/flang/Frontend/CodeGenOptions.def b/flang/include/flang/Frontend/CodeGenOptions.def
+index 44cb5a2cdd497..beb3838680f4c 100644
+--- a/flang/include/flang/Frontend/CodeGenOptions.def
++++ b/flang/include/flang/Frontend/CodeGenOptions.def
+@@ -42,5 +42,7 @@ ENUM_CODEGENOPT(DebugInfo,  llvm::codegenoptions::DebugInfoKind, 4,  llvm::codeg
+ ENUM_CODEGENOPT(VecLib, llvm::driver::VectorLibrary, 3, llvm::driver::VectorLibrary::NoLibrary) ///< Vector functions library to use
+ ENUM_CODEGENOPT(FramePointer, llvm::FramePointerKind, 2, llvm::FramePointerKind::None) ///< Enable the usage of frame pointers
+ 
++ENUM_CODEGENOPT(DoConcurrentMapping, DoConcurrentMappingKind, 2, DoConcurrentMappingKind::DCMK_None) ///< Map `do concurrent` to OpenMP
++
+ #undef CODEGENOPT
+ #undef ENUM_CODEGENOPT
+diff --git a/flang/include/flang/Frontend/CodeGenOptions.h b/flang/include/flang/Frontend/CodeGenOptions.h
+index f19943335737b..23d99e1f0897a 100644
+--- a/flang/include/flang/Frontend/CodeGenOptions.h
++++ b/flang/include/flang/Frontend/CodeGenOptions.h
+@@ -15,6 +15,7 @@
+ #ifndef FORTRAN_FRONTEND_CODEGENOPTIONS_H
+ #define FORTRAN_FRONTEND_CODEGENOPTIONS_H
+ 
++#include "flang/Optimizer/OpenMP/Utils.h"
+ #include "llvm/Frontend/Debug/Options.h"
+ #include "llvm/Frontend/Driver/CodeGenOptions.h"
+ #include "llvm/Support/CodeGen.h"
+@@ -143,6 +144,10 @@ class CodeGenOptions : public CodeGenOptionsBase {
+   /// (-mlarge-data-threshold).
+   uint64_t LargeDataThreshold;
+ 
++  /// Optionally map `do concurrent` loops to OpenMP. This is only valid of
++  /// OpenMP is enabled.
++  using DoConcurrentMappingKind = flangomp::DoConcurrentMappingKind;
++
+   // Define accessors/mutators for code generation options of enumeration type.
+ #define CODEGENOPT(Name, Bits, Default)
+ #define ENUM_CODEGENOPT(Name, Type, Bits, Default)                             \
+diff --git a/flang/include/flang/Optimizer/OpenMP/Passes.h b/flang/include/flang/Optimizer/OpenMP/Passes.h
+index feb395f1a12db..c67bddbcd2704 100644
+--- a/flang/include/flang/Optimizer/OpenMP/Passes.h
++++ b/flang/include/flang/Optimizer/OpenMP/Passes.h
+@@ -13,6 +13,7 @@
+ #ifndef FORTRAN_OPTIMIZER_OPENMP_PASSES_H
+ #define FORTRAN_OPTIMIZER_OPENMP_PASSES_H
+ 
++#include "flang/Optimizer/OpenMP/Utils.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/Pass/Pass.h"
+@@ -30,6 +31,7 @@ namespace flangomp {
+ /// divided into units of work.
+ bool shouldUseWorkshareLowering(mlir::Operation *op);
+ 
++std::unique_ptr<mlir::Pass> createDoConcurrentConversionPass(bool mapToDevice);
+ } // namespace flangomp
+ 
+ #endif // FORTRAN_OPTIMIZER_OPENMP_PASSES_H
+diff --git a/flang/include/flang/Optimizer/OpenMP/Passes.td b/flang/include/flang/Optimizer/OpenMP/Passes.td
+index 3add0c560f88d..fcc7a4ca31fef 100644
+--- a/flang/include/flang/Optimizer/OpenMP/Passes.td
++++ b/flang/include/flang/Optimizer/OpenMP/Passes.td
+@@ -50,6 +50,36 @@ def FunctionFilteringPass : Pass<"omp-function-filtering"> {
+   ];
+ }
+ 
++def DoConcurrentConversionPass : Pass<"omp-do-concurrent-conversion", "mlir::func::FuncOp"> {
++  let summary = "Map `DO CONCURRENT` loops to OpenMP worksharing loops.";
++
++  let description = [{ This is an experimental pass to map `DO CONCURRENT` loops
++     to their correspnding equivalent OpenMP worksharing constructs.
++
++     For now the following is supported:
++       - Mapping simple loops to `parallel do`.
++
++     Still TODO:
++       - More extensive testing.
++  }];
++
++  let dependentDialects = ["mlir::omp::OpenMPDialect"];
++
++  let options = [
++    Option<"mapTo", "map-to",
++           "flangomp::DoConcurrentMappingKind",
++           /*default=*/"flangomp::DoConcurrentMappingKind::DCMK_None",
++           "Try to map `do concurrent` loops to OpenMP [none|host|device]",
++           [{::llvm::cl::values(
++               clEnumValN(flangomp::DoConcurrentMappingKind::DCMK_None,
++                          "none", "Do not lower `do concurrent` to OpenMP"),
++               clEnumValN(flangomp::DoConcurrentMappingKind::DCMK_Host,
++                          "host", "Lower to run in parallel on the CPU"),
++               clEnumValN(flangomp::DoConcurrentMappingKind::DCMK_Device,
++                          "device", "Lower to run in parallel on the GPU")
++           )}]>,
++  ];
++}
+ 
+ // Needs to be scheduled on Module as we create functions in it
+ def LowerWorkshare : Pass<"lower-workshare", "::mlir::ModuleOp"> {
+diff --git a/flang/include/flang/Optimizer/OpenMP/Utils.h b/flang/include/flang/Optimizer/OpenMP/Utils.h
+new file mode 100644
+index 0000000000000..636c768b016b7
+--- /dev/null
++++ b/flang/include/flang/Optimizer/OpenMP/Utils.h
+@@ -0,0 +1,26 @@
++//===-- Optimizer/OpenMP/Utils.h --------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Coding style: https://mlir.llvm.org/getting_started/DeveloperGuide/
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FORTRAN_OPTIMIZER_OPENMP_UTILS_H
++#define FORTRAN_OPTIMIZER_OPENMP_UTILS_H
++
++namespace flangomp {
++
++enum class DoConcurrentMappingKind {
++  DCMK_None,  ///< Do not lower `do concurrent` to OpenMP.
++  DCMK_Host,  ///< Lower to run in parallel on the CPU.
++  DCMK_Device ///< Lower to run in parallel on the GPU.
++};
++
++} // namespace flangomp
++
++#endif // FORTRAN_OPTIMIZER_OPENMP_UTILS_H
+diff --git a/flang/include/flang/Optimizer/Passes/Pipelines.h b/flang/include/flang/Optimizer/Passes/Pipelines.h
+index ef5d44ded706c..a3f59ee8dd013 100644
+--- a/flang/include/flang/Optimizer/Passes/Pipelines.h
++++ b/flang/include/flang/Optimizer/Passes/Pipelines.h
+@@ -128,6 +128,17 @@ void createHLFIRToFIRPassPipeline(
+     mlir::PassManager &pm, bool enableOpenMP,
+     llvm::OptimizationLevel optLevel = defaultOptLevel);
+ 
++struct OpenMPFIRPassPipelineOpts {
++  /// Whether code is being generated for a target device rather than the host
++  /// device
++  bool isTargetDevice;
++
++  /// Controls how to map `do concurrent` loops; to device, host, or none at
++  /// all.
++  Fortran::frontend::CodeGenOptions::DoConcurrentMappingKind
++      doConcurrentMappingKind;
++};
++
+ /// Create a pass pipeline for handling certain OpenMP transformations needed
+ /// prior to FIR lowering.
+ ///
+@@ -135,9 +146,10 @@ void createHLFIRToFIRPassPipeline(
+ /// that the FIR is correct with respect to OpenMP operations/attributes.
+ ///
+ /// \param pm - MLIR pass manager that will hold the pipeline definition.
+-/// \param isTargetDevice - Whether code is being generated for a target device
+-/// rather than the host device.
+-void createOpenMPFIRPassPipeline(mlir::PassManager &pm, bool isTargetDevice);
++/// \param opts - options to control OpenMP code-gen; see struct docs for more
++/// details.
++void createOpenMPFIRPassPipeline(mlir::PassManager &pm,
++                                 OpenMPFIRPassPipelineOpts opts);
+ 
+ #if !defined(FLANG_EXCLUDE_CODEGEN)
+ void createDebugPasses(mlir::PassManager &pm,
+diff --git a/flang/lib/Frontend/CompilerInvocation.cpp b/flang/lib/Frontend/CompilerInvocation.cpp
+index f433ec9966922..8dda9b5d493dc 100644
+--- a/flang/lib/Frontend/CompilerInvocation.cpp
++++ b/flang/lib/Frontend/CompilerInvocation.cpp
+@@ -158,6 +158,32 @@ static bool parseDebugArgs(Fortran::frontend::CodeGenOptions &opts,
+   return true;
+ }
+ 
++static void parseDoConcurrentMapping(Fortran::frontend::CodeGenOptions &opts,
++                                     llvm::opt::ArgList &args,
++                                     clang::DiagnosticsEngine &diags) {
++  llvm::opt::Arg *arg =
++      args.getLastArg(clang::driver::options::OPT_fdo_concurrent_to_openmp_EQ);
++  if (!arg)
++    return;
++
++  using DoConcurrentMappingKind =
++      Fortran::frontend::CodeGenOptions::DoConcurrentMappingKind;
++  std::optional<DoConcurrentMappingKind> val =
++      llvm::StringSwitch<std::optional<DoConcurrentMappingKind>>(
++          arg->getValue())
++          .Case("none", DoConcurrentMappingKind::DCMK_None)
++          .Case("host", DoConcurrentMappingKind::DCMK_Host)
++          .Case("device", DoConcurrentMappingKind::DCMK_Device)
++          .Default(std::nullopt);
++
++  if (!val.has_value()) {
++    diags.Report(clang::diag::err_drv_invalid_value)
++        << arg->getAsString(args) << arg->getValue();
++  }
++
++  opts.setDoConcurrentMapping(val.value());
++}
++
+ static bool parseVectorLibArg(Fortran::frontend::CodeGenOptions &opts,
+                               llvm::opt::ArgList &args,
+                               clang::DiagnosticsEngine &diags) {
+@@ -430,6 +456,8 @@ static void parseCodeGenArgs(Fortran::frontend::CodeGenOptions &opts,
+                    clang::driver::options::OPT_funderscoring, false)) {
+     opts.Underscoring = 0;
+   }
++
++  parseDoConcurrentMapping(opts, args, diags);
+ }
+ 
+ /// Parses all target input arguments and populates the target
+diff --git a/flang/lib/Frontend/FrontendActions.cpp b/flang/lib/Frontend/FrontendActions.cpp
+index 46ec7550e4140..bccf24926138e 100644
+--- a/flang/lib/Frontend/FrontendActions.cpp
++++ b/flang/lib/Frontend/FrontendActions.cpp
+@@ -344,16 +344,45 @@ bool CodeGenAction::beginSourceFileAction() {
+   // Add OpenMP-related passes
+   // WARNING: These passes must be run immediately after the lowering to ensure
+   // that the FIR is correct with respect to OpenMP operations/attributes.
+-  if (ci.getInvocation().getFrontendOpts().features.IsEnabled(
+-          Fortran::common::LanguageFeature::OpenMP)) {
+-    bool isDevice = false;
++  bool isOpenMPEnabled =
++      ci.getInvocation().getFrontendOpts().features.IsEnabled(
++          Fortran::common::LanguageFeature::OpenMP);
++
++  fir::OpenMPFIRPassPipelineOpts opts;
++
++  using DoConcurrentMappingKind =
++      Fortran::frontend::CodeGenOptions::DoConcurrentMappingKind;
++  opts.doConcurrentMappingKind =
++      ci.getInvocation().getCodeGenOpts().getDoConcurrentMapping();
++
++  if (opts.doConcurrentMappingKind != DoConcurrentMappingKind::DCMK_None &&
++      !isOpenMPEnabled) {
++    unsigned diagID = ci.getDiagnostics().getCustomDiagID(
++        clang::DiagnosticsEngine::Warning,
++        "OpenMP is required for lowering `do concurrent` loops to OpenMP."
++        "Enable OpenMP using `-fopenmp`."
++        "`do concurrent` loops will be serialized.");
++    ci.getDiagnostics().Report(diagID);
++    opts.doConcurrentMappingKind = DoConcurrentMappingKind::DCMK_None;
++  }
++
++  if (opts.doConcurrentMappingKind != DoConcurrentMappingKind::DCMK_None) {
++    unsigned diagID = ci.getDiagnostics().getCustomDiagID(
++        clang::DiagnosticsEngine::Warning,
++        "Mapping `do concurrent` to OpenMP is still experimental.");
++    ci.getDiagnostics().Report(diagID);
++  }
++
++  if (isOpenMPEnabled) {
++    opts.isTargetDevice = false;
+     if (auto offloadMod = llvm::dyn_cast<mlir::omp::OffloadModuleInterface>(
+             mlirModule->getOperation()))
+-      isDevice = offloadMod.getIsTargetDevice();
++      opts.isTargetDevice = offloadMod.getIsTargetDevice();
++
+     // WARNING: This pipeline must be run immediately after the lowering to
+     // ensure that the FIR is correct with respect to OpenMP operations/
+     // attributes.
+-    fir::createOpenMPFIRPassPipeline(pm, isDevice);
++    fir::createOpenMPFIRPassPipeline(pm, opts);
+   }
+ 
+   pm.enableVerifier(/*verifyPasses=*/true);
+diff --git a/flang/lib/Optimizer/OpenMP/CMakeLists.txt b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+index 4a48d6e0936db..3acf143594356 100644
+--- a/flang/lib/Optimizer/OpenMP/CMakeLists.txt
++++ b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+ 
+ add_flang_library(FlangOpenMPTransforms
++  DoConcurrentConversion.cpp
+   FunctionFiltering.cpp
+   GenericLoopConversion.cpp
+   MapsForPrivatizedSymbols.cpp
+diff --git a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+new file mode 100644
+index 0000000000000..cebf6cd8ed0df
+--- /dev/null
++++ b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+@@ -0,0 +1,99 @@
++//===- DoConcurrentConversion.cpp -- map `DO CONCURRENT` to OpenMP loops --===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "flang/Optimizer/Dialect/FIROps.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
++#include "flang/Optimizer/OpenMP/Utils.h"
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/Transforms/DialectConversion.h"
++
++namespace flangomp {
++#define GEN_PASS_DEF_DOCONCURRENTCONVERSIONPASS
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
++
++#define DEBUG_TYPE "do-concurrent-conversion"
++#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE << "]: ")
++
++namespace {
++class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
++public:
++  using mlir::OpConversionPattern<fir::DoLoopOp>::OpConversionPattern;
++
++  DoConcurrentConversion(mlir::MLIRContext *context, bool mapToDevice)
++      : OpConversionPattern(context), mapToDevice(mapToDevice) {}
++
++  mlir::LogicalResult
++  matchAndRewrite(fir::DoLoopOp doLoop, OpAdaptor adaptor,
++                  mlir::ConversionPatternRewriter &rewriter) const override {
++    // TODO This will be filled in with the next PRs that upstreams the rest of
++    // the ROCm implementaion.
++    return mlir::success();
++  }
++
++  bool mapToDevice;
++};
++
++class DoConcurrentConversionPass
++    : public flangomp::impl::DoConcurrentConversionPassBase<
++          DoConcurrentConversionPass> {
++public:
++  DoConcurrentConversionPass() = default;
++
++  DoConcurrentConversionPass(
++      const flangomp::DoConcurrentConversionPassOptions &options)
++      : DoConcurrentConversionPassBase(options) {}
++
++  void runOnOperation() override {
++    mlir::func::FuncOp func = getOperation();
++
++    if (func.isDeclaration())
++      return;
++
++    mlir::MLIRContext *context = &getContext();
++
++    if (mapTo != flangomp::DoConcurrentMappingKind::DCMK_Host &&
++        mapTo != flangomp::DoConcurrentMappingKind::DCMK_Device) {
++      mlir::emitWarning(mlir::UnknownLoc::get(context),
++                        "DoConcurrentConversionPass: invalid `map-to` value. "
++                        "Valid values are: `host` or `device`");
++      return;
++    }
++
++    mlir::RewritePatternSet patterns(context);
++    patterns.insert<DoConcurrentConversion>(
++        context, mapTo == flangomp::DoConcurrentMappingKind::DCMK_Device);
++    mlir::ConversionTarget target(*context);
++    target.addDynamicallyLegalOp<fir::DoLoopOp>([&](fir::DoLoopOp op) {
++      // The goal is to handle constructs that eventually get lowered to
++      // `fir.do_loop` with the `unordered` attribute (e.g. array expressions).
++      // Currently, this is only enabled for the `do concurrent` construct since
++      // the pass runs early in the pipeline.
++      return !op.getUnordered();
++    });
++    target.markUnknownOpDynamicallyLegal(
++        [](mlir::Operation *) { return true; });
++
++    if (mlir::failed(mlir::applyFullConversion(getOperation(), target,
++                                               std::move(patterns)))) {
++      mlir::emitError(mlir::UnknownLoc::get(context),
++                      "error in converting do-concurrent op");
++      signalPassFailure();
++    }
++  }
++};
++} // namespace
++
++std::unique_ptr<mlir::Pass>
++flangomp::createDoConcurrentConversionPass(bool mapToDevice) {
++  DoConcurrentConversionPassOptions options;
++  options.mapTo = mapToDevice ? flangomp::DoConcurrentMappingKind::DCMK_Device
++                              : flangomp::DoConcurrentMappingKind::DCMK_Host;
++
++  return std::make_unique<DoConcurrentConversionPass>(options);
++}
+diff --git a/flang/lib/Optimizer/Passes/Pipelines.cpp b/flang/lib/Optimizer/Passes/Pipelines.cpp
+index 3aea021e596f6..47b3ae3810309 100644
+--- a/flang/lib/Optimizer/Passes/Pipelines.cpp
++++ b/flang/lib/Optimizer/Passes/Pipelines.cpp
+@@ -286,12 +286,20 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm, bool enableOpenMP,
+ /// \param pm - MLIR pass manager that will hold the pipeline definition.
+ /// \param isTargetDevice - Whether code is being generated for a target device
+ /// rather than the host device.
+-void createOpenMPFIRPassPipeline(mlir::PassManager &pm, bool isTargetDevice) {
++void createOpenMPFIRPassPipeline(mlir::PassManager &pm,
++                                 OpenMPFIRPassPipelineOpts opts) {
++  using DoConcurrentMappingKind =
++      Fortran::frontend::CodeGenOptions::DoConcurrentMappingKind;
++
++  if (opts.doConcurrentMappingKind != DoConcurrentMappingKind::DCMK_None)
++    pm.addPass(flangomp::createDoConcurrentConversionPass(
++        opts.doConcurrentMappingKind == DoConcurrentMappingKind::DCMK_Device));
++
+   pm.addPass(flangomp::createMapInfoFinalizationPass());
+   pm.addPass(flangomp::createMapsForPrivatizedSymbolsPass());
+   pm.addPass(flangomp::createMarkDeclareTargetPass());
+   pm.addPass(flangomp::createGenericLoopConversionPass());
+-  if (isTargetDevice)
++  if (opts.isTargetDevice)
+     pm.addPass(flangomp::createFunctionFilteringPass());
+ }
+ 
+diff --git a/flang/test/Driver/do_concurrent_to_omp_cli.f90 b/flang/test/Driver/do_concurrent_to_omp_cli.f90
+new file mode 100644
+index 0000000000000..41b7575e206af
+--- /dev/null
++++ b/flang/test/Driver/do_concurrent_to_omp_cli.f90
+@@ -0,0 +1,20 @@
++! UNSUPPORTED: system-windows
++
++! RUN: %flang --help | FileCheck %s --check-prefix=FLANG
++
++! FLANG:      -fdo-concurrent-to-openmp=<value>
++! FLANG-NEXT:   Try to map `do concurrent` loops to OpenMP [none|host|device] 
++
++! RUN: bbc --help | FileCheck %s --check-prefix=BBC
++
++! BBC:      -fdo-concurrent-to-openmp=<string>
++! BBC-SAME:   Try to map `do concurrent` loops to OpenMP [none|host|device] 
++
++! RUN: %flang -fdo-concurrent-to-openmp=host %s 2>&1 \
++! RUN: | FileCheck %s --check-prefix=OPT
++
++! OPT: warning: OpenMP is required for lowering `do concurrent` loops to OpenMP.
++! OPT-SAME:     Enable OpenMP using `-fopenmp`.
++
++program test_cli
++end program
+diff --git a/flang/test/Transforms/DoConcurrent/basic_host.f90 b/flang/test/Transforms/DoConcurrent/basic_host.f90
+new file mode 100644
+index 0000000000000..b569668ab0f0e
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/basic_host.f90
+@@ -0,0 +1,53 @@
++! Mark as xfail for now until we upstream the relevant part. This is just for
++! demo purposes at this point. Upstreaming this is the next step.
++! XFAIL: *
++
++! Tests mapping of a basic `do concurrent` loop to `!$omp parallel do`.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
++! RUN:   | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
++! RUN:   | FileCheck %s
++ 
++! CHECK-LABEL: do_concurrent_basic
++program do_concurrent_basic
++    ! CHECK: %[[ARR:.*]]:2 = hlfir.declare %{{.*}}(%{{.*}}) {uniq_name = "_QFEa"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++
++    implicit none
++    integer :: a(10)
++    integer :: i
++
++    ! CHECK-NOT: fir.do_loop
++
++    ! CHECK: omp.parallel {
++
++    ! CHECK-NEXT: %[[ITER_VAR:.*]] = fir.alloca i32 {bindc_name = "i"}
++    ! CHECK-NEXT: %[[BINDING:.*]]:2 = hlfir.declare %[[ITER_VAR]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++    ! CHECK: %[[C1:.*]] = arith.constant 1 : i32
++    ! CHECK: %[[LB:.*]] = fir.convert %[[C1]] : (i32) -> index
++    ! CHECK: %[[C10:.*]] = arith.constant 10 : i32
++    ! CHECK: %[[UB:.*]] = fir.convert %[[C10]] : (i32) -> index
++    ! CHECK: %[[STEP:.*]] = arith.constant 1 : index
++
++    ! CHECK: omp.wsloop {
++    ! CHECK-NEXT: omp.loop_nest (%[[ARG0:.*]]) : index = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++    ! CHECK-NEXT: %[[IV_IDX:.*]] = fir.convert %[[ARG0]] : (index) -> i32
++    ! CHECK-NEXT: fir.store %[[IV_IDX]] to %[[BINDING]]#1 : !fir.ref<i32>
++    ! CHECK-NEXT: %[[IV_VAL1:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
++    ! CHECK-NEXT: %[[IV_VAL2:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
++    ! CHECK-NEXT: %[[IV_VAL_I64:.*]] = fir.convert %[[IV_VAL2]] : (i32) -> i64
++    ! CHECK-NEXT: %[[ARR_ACCESS:.*]] = hlfir.designate %[[ARR]]#0 (%[[IV_VAL_I64]])  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++    ! CHECK-NEXT: hlfir.assign %[[IV_VAL1]] to %[[ARR_ACCESS]] : i32, !fir.ref<i32>
++    ! CHECK-NEXT: omp.yield
++    ! CHECK-NEXT: }
++    ! CHECK-NEXT: }
++
++    ! CHECK-NEXT: omp.terminator
++    ! CHECK-NEXT: }
++    do concurrent (i=1:10)
++        a(i) = i
++    end do
++
++    ! CHECK-NOT: fir.do_loop
++end program do_concurrent_basic
+diff --git a/flang/tools/bbc/bbc.cpp b/flang/tools/bbc/bbc.cpp
+index 2cc75b7aa4e87..c38e59f47c542 100644
+--- a/flang/tools/bbc/bbc.cpp
++++ b/flang/tools/bbc/bbc.cpp
+@@ -142,6 +142,12 @@ static llvm::cl::opt<bool>
+                        llvm::cl::desc("enable openmp device compilation"),
+                        llvm::cl::init(false));
+ 
++static llvm::cl::opt<std::string> enableDoConcurrentToOpenMPConversion(
++    "fdo-concurrent-to-openmp",
++    llvm::cl::desc(
++        "Try to map `do concurrent` loops to OpenMP [none|host|device]"),
++    llvm::cl::init("none"));
++
+ static llvm::cl::opt<bool>
+     enableOpenMPGPU("fopenmp-is-gpu",
+                     llvm::cl::desc("enable openmp GPU target codegen"),
+@@ -315,7 +321,19 @@ createTargetMachine(llvm::StringRef targetTriple, std::string &error) {
+ static llvm::LogicalResult runOpenMPPasses(mlir::ModuleOp mlirModule) {
+   mlir::PassManager pm(mlirModule->getName(),
+                        mlir::OpPassManager::Nesting::Implicit);
+-  fir::createOpenMPFIRPassPipeline(pm, enableOpenMPDevice);
++  using DoConcurrentMappingKind =
++      Fortran::frontend::CodeGenOptions::DoConcurrentMappingKind;
++
++  fir::OpenMPFIRPassPipelineOpts opts;
++  opts.isTargetDevice = enableOpenMPDevice;
++  opts.doConcurrentMappingKind =
++      llvm::StringSwitch<DoConcurrentMappingKind>(
++          enableDoConcurrentToOpenMPConversion)
++          .Case("host", DoConcurrentMappingKind::DCMK_Host)
++          .Case("device", DoConcurrentMappingKind::DCMK_Device)
++          .Default(DoConcurrentMappingKind::DCMK_None);
++
++  fir::createOpenMPFIRPassPipeline(pm, opts);
+   (void)mlir::applyPassManagerCLOptions(pm);
+   if (mlir::failed(pm.run(mlirModule))) {
+     llvm::errs() << "FATAL: failed to correctly apply OpenMP pass pipeline";

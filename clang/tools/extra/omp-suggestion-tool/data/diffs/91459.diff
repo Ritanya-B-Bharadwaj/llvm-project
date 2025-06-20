@@ -1,0 +1,3873 @@
+diff --git a/clang/include/clang/Sema/SemaOpenMP.h b/clang/include/clang/Sema/SemaOpenMP.h
+index 9927459bbc594..51981e1c9a8b9 100644
+--- a/clang/include/clang/Sema/SemaOpenMP.h
++++ b/clang/include/clang/Sema/SemaOpenMP.h
+@@ -1390,9 +1390,7 @@ class SemaOpenMP : public SemaBase {
+   bool checkTransformableLoopNest(
+       OpenMPDirectiveKind Kind, Stmt *AStmt, int NumLoops,
+       SmallVectorImpl<OMPLoopBasedDirective::HelperExprs> &LoopHelpers,
+-      Stmt *&Body,
+-      SmallVectorImpl<SmallVector<llvm::PointerUnion<Stmt *, Decl *>, 0>>
+-          &OriginalInits);
++      Stmt *&Body, SmallVectorImpl<SmallVector<Stmt *, 0>> &OriginalInits);
+ 
+   /// Helper to keep information about the current `omp begin/end declare
+   /// variant` nesting.
+diff --git a/clang/lib/CodeGen/CGStmtOpenMP.cpp b/clang/lib/CodeGen/CGStmtOpenMP.cpp
+index eac5ef3262937..6410f9e102c90 100644
+--- a/clang/lib/CodeGen/CGStmtOpenMP.cpp
++++ b/clang/lib/CodeGen/CGStmtOpenMP.cpp
+@@ -142,7 +142,7 @@ class OMPTeamsScope final : public OMPLexicalScope {
+ /// of used expression from loop statement.
+ class OMPLoopScope : public CodeGenFunction::RunCleanupsScope {
+   void emitPreInitStmt(CodeGenFunction &CGF, const OMPLoopBasedDirective &S) {
+-    const DeclStmt *PreInits;
++    const Stmt *PreInits;
+     CodeGenFunction::OMPMapVars PreCondVars;
+     if (auto *LD = dyn_cast<OMPLoopDirective>(&S)) {
+       llvm::DenseSet<const VarDecl *> EmittedAsPrivate;
+@@ -182,17 +182,34 @@ class OMPLoopScope : public CodeGenFunction::RunCleanupsScope {
+             }
+             return false;
+           });
+-      PreInits = cast_or_null<DeclStmt>(LD->getPreInits());
++      PreInits = LD->getPreInits();
+     } else if (const auto *Tile = dyn_cast<OMPTileDirective>(&S)) {
+-      PreInits = cast_or_null<DeclStmt>(Tile->getPreInits());
++      PreInits = Tile->getPreInits();
+     } else if (const auto *Unroll = dyn_cast<OMPUnrollDirective>(&S)) {
+-      PreInits = cast_or_null<DeclStmt>(Unroll->getPreInits());
++      PreInits = Unroll->getPreInits();
+     } else {
+       llvm_unreachable("Unknown loop-based directive kind.");
+     }
+     if (PreInits) {
+-      for (const auto *I : PreInits->decls())
+-        CGF.EmitVarDecl(cast<VarDecl>(*I));
++      // CompoundStmts and DeclStmts are used as lists of PreInit statements and
++      // declarations. Since declarations must be visible in the the following
++      // that they initialize, unpack the ComboundStmt they are nested in.
++      SmallVector<const Stmt *> PreInitStmts;
++      if (auto *PreInitCompound = dyn_cast<CompoundStmt>(PreInits))
++        llvm::append_range(PreInitStmts, PreInitCompound->body());
++      else
++        PreInitStmts.push_back(PreInits);
++
++      for (const Stmt *S : PreInitStmts) {
++        // EmitStmt skips any OMPCapturedExprDecls, but needs to be emitted
++        // here.
++        if (auto *PreInitDecl = dyn_cast<DeclStmt>(S)) {
++          for (Decl *I : PreInitDecl->decls())
++            CGF.EmitVarDecl(cast<VarDecl>(*I));
++          continue;
++        }
++        CGF.EmitStmt(S);
++      }
+     }
+     PreCondVars.restore(CGF);
+   }
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 6110e5229b076..bab61e8fd54e8 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -9815,6 +9815,25 @@ static Stmt *buildPreInits(ASTContext &Context,
+   return nullptr;
+ }
+ 
++/// Append the \p Item or the content of a CompoundStmt to the list \p
++/// TargetList.
++///
++/// A CompoundStmt is used as container in case multiple statements need to be
++/// stored in lieu of using an explicit list. Flattening is necessary because
++/// contained DeclStmts need to be visible after the execution of the list. Used
++/// for OpenMP pre-init declarations/statements.
++static void appendFlattendedStmtList(SmallVectorImpl<Stmt *> &TargetList,
++                                     Stmt *Item) {
++  // nullptr represents an empty list.
++  if (!Item)
++    return;
++
++  if (auto *CS = dyn_cast<CompoundStmt>(Item))
++    llvm::append_range(TargetList, CS->body());
++  else
++    TargetList.push_back(Item);
++}
++
+ /// Build preinits statement for the given declarations.
+ static Stmt *
+ buildPreInits(ASTContext &Context,
+@@ -9828,6 +9847,17 @@ buildPreInits(ASTContext &Context,
+   return nullptr;
+ }
+ 
++/// Build pre-init statement for the given statements.
++static Stmt *buildPreInits(ASTContext &Context, ArrayRef<Stmt *> PreInits) {
++  if (PreInits.empty())
++    return nullptr;
++
++  SmallVector<Stmt *> Stmts;
++  for (Stmt *S : PreInits)
++    appendFlattendedStmtList(Stmts, S);
++  return CompoundStmt::Create(Context, PreInits, FPOptionsOverride(), {}, {});
++}
++
+ /// Build postupdate expression for the given list of postupdates expressions.
+ static Expr *buildPostUpdate(Sema &S, ArrayRef<Expr *> PostUpdates) {
+   Expr *PostUpdate = nullptr;
+@@ -9924,11 +9954,21 @@ checkOpenMPLoop(OpenMPDirectiveKind DKind, Expr *CollapseLoopCountExpr,
+             Stmt *DependentPreInits = Transform->getPreInits();
+             if (!DependentPreInits)
+               return;
+-            for (Decl *C : cast<DeclStmt>(DependentPreInits)->getDeclGroup()) {
+-              auto *D = cast<VarDecl>(C);
+-              DeclRefExpr *Ref = buildDeclRefExpr(SemaRef, D, D->getType(),
+-                                                  Transform->getBeginLoc());
+-              Captures[Ref] = Ref;
++
++            // Search for pre-init declared variables that need to be captured
++            // to be referenceable inside the directive.
++            SmallVector<Stmt *> Constituents;
++            appendFlattendedStmtList(Constituents, DependentPreInits);
++            for (Stmt *S : Constituents) {
++              if (auto *DC = dyn_cast<DeclStmt>(S)) {
++                for (Decl *C : DC->decls()) {
++                  auto *D = cast<VarDecl>(C);
++                  DeclRefExpr *Ref = buildDeclRefExpr(
++                      SemaRef, D, D->getType().getNonReferenceType(),
++                      Transform->getBeginLoc());
++                  Captures[Ref] = Ref;
++                }
++              }
+             }
+           }))
+     return 0;
+@@ -15059,9 +15099,7 @@ StmtResult SemaOpenMP::ActOnOpenMPTargetTeamsDistributeSimdDirective(
+ bool SemaOpenMP::checkTransformableLoopNest(
+     OpenMPDirectiveKind Kind, Stmt *AStmt, int NumLoops,
+     SmallVectorImpl<OMPLoopBasedDirective::HelperExprs> &LoopHelpers,
+-    Stmt *&Body,
+-    SmallVectorImpl<SmallVector<llvm::PointerUnion<Stmt *, Decl *>, 0>>
+-        &OriginalInits) {
++    Stmt *&Body, SmallVectorImpl<SmallVector<Stmt *, 0>> &OriginalInits) {
+   OriginalInits.emplace_back();
+   bool Result = OMPLoopBasedDirective::doForAllLoops(
+       AStmt->IgnoreContainers(), /*TryImperfectlyNestedLoops=*/false, NumLoops,
+@@ -15095,16 +15133,70 @@ bool SemaOpenMP::checkTransformableLoopNest(
+           DependentPreInits = Dir->getPreInits();
+         else
+           llvm_unreachable("Unhandled loop transformation");
+-        if (!DependentPreInits)
+-          return;
+-        llvm::append_range(OriginalInits.back(),
+-                           cast<DeclStmt>(DependentPreInits)->getDeclGroup());
++
++        appendFlattendedStmtList(OriginalInits.back(), DependentPreInits);
+       });
+   assert(OriginalInits.back().empty() && "No preinit after innermost loop");
+   OriginalInits.pop_back();
+   return Result;
+ }
+ 
++/// Add preinit statements that need to be propageted from the selected loop.
++static void addLoopPreInits(ASTContext &Context,
++                            OMPLoopBasedDirective::HelperExprs &LoopHelper,
++                            Stmt *LoopStmt, ArrayRef<Stmt *> OriginalInit,
++                            SmallVectorImpl<Stmt *> &PreInits) {
++
++  // For range-based for-statements, ensure that their syntactic sugar is
++  // executed by adding them as pre-init statements.
++  if (auto *CXXRangeFor = dyn_cast<CXXForRangeStmt>(LoopStmt)) {
++    Stmt *RangeInit = CXXRangeFor->getInit();
++    if (RangeInit)
++      PreInits.push_back(RangeInit);
++
++    DeclStmt *RangeStmt = CXXRangeFor->getRangeStmt();
++    PreInits.push_back(new (Context) DeclStmt(RangeStmt->getDeclGroup(),
++                                              RangeStmt->getBeginLoc(),
++                                              RangeStmt->getEndLoc()));
++
++    DeclStmt *RangeEnd = CXXRangeFor->getEndStmt();
++    PreInits.push_back(new (Context) DeclStmt(RangeEnd->getDeclGroup(),
++                                              RangeEnd->getBeginLoc(),
++                                              RangeEnd->getEndLoc()));
++  }
++
++  llvm::append_range(PreInits, OriginalInit);
++
++  // List of OMPCapturedExprDecl, for __begin, __end, and NumIterations
++  if (auto *PI = cast_or_null<DeclStmt>(LoopHelper.PreInits)) {
++    PreInits.push_back(new (Context) DeclStmt(
++        PI->getDeclGroup(), PI->getBeginLoc(), PI->getEndLoc()));
++  }
++
++  // Gather declarations for the data members used as counters.
++  for (Expr *CounterRef : LoopHelper.Counters) {
++    auto *CounterDecl = cast<DeclRefExpr>(CounterRef)->getDecl();
++    if (isa<OMPCapturedExprDecl>(CounterDecl))
++      PreInits.push_back(new (Context) DeclStmt(
++          DeclGroupRef(CounterDecl), SourceLocation(), SourceLocation()));
++  }
++}
++
++/// Collect the loop statements (ForStmt or CXXRangeForStmt) of the affected
++/// loop of a construct.
++static void collectLoopStmts(Stmt *AStmt, MutableArrayRef<Stmt *> LoopStmts) {
++  size_t NumLoops = LoopStmts.size();
++  OMPLoopBasedDirective::doForAllLoops(
++      AStmt, /*TryImperfectlyNestedLoops=*/false, NumLoops,
++      [LoopStmts](unsigned Cnt, Stmt *CurStmt) {
++        assert(!LoopStmts[Cnt] && "Loop statement must not yet be assigned");
++        LoopStmts[Cnt] = CurStmt;
++        return false;
++      });
++  assert(!is_contained(LoopStmts, nullptr) &&
++         "Expecting a loop statement for each affected loop");
++}
++
+ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+                                                 Stmt *AStmt,
+                                                 SourceLocation StartLoc,
+@@ -15126,8 +15218,7 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+   // Verify and diagnose loop nest.
+   SmallVector<OMPLoopBasedDirective::HelperExprs, 4> LoopHelpers(NumLoops);
+   Stmt *Body = nullptr;
+-  SmallVector<SmallVector<llvm::PointerUnion<Stmt *, Decl *>, 0>, 4>
+-      OriginalInits;
++  SmallVector<SmallVector<Stmt *, 0>, 4> OriginalInits;
+   if (!checkTransformableLoopNest(OMPD_tile, AStmt, NumLoops, LoopHelpers, Body,
+                                   OriginalInits))
+     return StmtError();
+@@ -15144,7 +15235,11 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+          "Expecting loop iteration space dimensionality to match number of "
+          "affected loops");
+ 
+-  SmallVector<Decl *, 4> PreInits;
++  // Collect all affected loop statements.
++  SmallVector<Stmt *> LoopStmts(NumLoops, nullptr);
++  collectLoopStmts(AStmt, LoopStmts);
++
++  SmallVector<Stmt *, 4> PreInits;
+   CaptureVars CopyTransformer(SemaRef);
+ 
+   // Create iteration variables for the generated loops.
+@@ -15184,20 +15279,9 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+           &SemaRef.PP.getIdentifierTable().get(TileCntName));
+       TileIndVars[I] = TileCntDecl;
+     }
+-    for (auto &P : OriginalInits[I]) {
+-      if (auto *D = P.dyn_cast<Decl *>())
+-        PreInits.push_back(D);
+-      else if (auto *PI = dyn_cast_or_null<DeclStmt>(P.dyn_cast<Stmt *>()))
+-        PreInits.append(PI->decl_begin(), PI->decl_end());
+-    }
+-    if (auto *PI = cast_or_null<DeclStmt>(LoopHelper.PreInits))
+-      PreInits.append(PI->decl_begin(), PI->decl_end());
+-    // Gather declarations for the data members used as counters.
+-    for (Expr *CounterRef : LoopHelper.Counters) {
+-      auto *CounterDecl = cast<DeclRefExpr>(CounterRef)->getDecl();
+-      if (isa<OMPCapturedExprDecl>(CounterDecl))
+-        PreInits.push_back(CounterDecl);
+-    }
++
++    addLoopPreInits(Context, LoopHelper, LoopStmts[I], OriginalInits[I],
++                    PreInits);
+   }
+ 
+   // Once the original iteration values are set, append the innermost body.
+@@ -15246,19 +15330,20 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     OMPLoopBasedDirective::HelperExprs &LoopHelper = LoopHelpers[I];
+     Expr *NumIterations = LoopHelper.NumIterations;
+     auto *OrigCntVar = cast<DeclRefExpr>(LoopHelper.Counters[0]);
+-    QualType CntTy = OrigCntVar->getType();
++    QualType IVTy = NumIterations->getType();
++    Stmt *LoopStmt = LoopStmts[I];
+ 
+     // Commonly used variables. One of the constraints of an AST is that every
+     // node object must appear at most once, hence we define lamdas that create
+     // a new AST node at every use.
+-    auto MakeTileIVRef = [&SemaRef = this->SemaRef, &TileIndVars, I, CntTy,
++    auto MakeTileIVRef = [&SemaRef = this->SemaRef, &TileIndVars, I, IVTy,
+                           OrigCntVar]() {
+-      return buildDeclRefExpr(SemaRef, TileIndVars[I], CntTy,
++      return buildDeclRefExpr(SemaRef, TileIndVars[I], IVTy,
+                               OrigCntVar->getExprLoc());
+     };
+-    auto MakeFloorIVRef = [&SemaRef = this->SemaRef, &FloorIndVars, I, CntTy,
++    auto MakeFloorIVRef = [&SemaRef = this->SemaRef, &FloorIndVars, I, IVTy,
+                            OrigCntVar]() {
+-      return buildDeclRefExpr(SemaRef, FloorIndVars[I], CntTy,
++      return buildDeclRefExpr(SemaRef, FloorIndVars[I], IVTy,
+                               OrigCntVar->getExprLoc());
+     };
+ 
+@@ -15320,6 +15405,8 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     // further into the inner loop.
+     SmallVector<Stmt *, 4> BodyParts;
+     BodyParts.append(LoopHelper.Updates.begin(), LoopHelper.Updates.end());
++    if (auto *SourceCXXFor = dyn_cast<CXXForRangeStmt>(LoopStmt))
++      BodyParts.push_back(SourceCXXFor->getLoopVarStmt());
+     BodyParts.push_back(Inner);
+     Inner = CompoundStmt::Create(Context, BodyParts, FPOptionsOverride(),
+                                  Inner->getBeginLoc(), Inner->getEndLoc());
+@@ -15334,12 +15421,14 @@ StmtResult SemaOpenMP::ActOnOpenMPTileDirective(ArrayRef<OMPClause *> Clauses,
+     auto &LoopHelper = LoopHelpers[I];
+     Expr *NumIterations = LoopHelper.NumIterations;
+     DeclRefExpr *OrigCntVar = cast<DeclRefExpr>(LoopHelper.Counters[0]);
+-    QualType CntTy = OrigCntVar->getType();
++    QualType IVTy = NumIterations->getType();
+ 
+-    // Commonly used variables.
+-    auto MakeFloorIVRef = [&SemaRef = this->SemaRef, &FloorIndVars, I, CntTy,
++    // Commonly used variables. One of the constraints of an AST is that every
++    // node object must appear at most once, hence we define lamdas that create
++    // a new AST node at every use.
++    auto MakeFloorIVRef = [&SemaRef = this->SemaRef, &FloorIndVars, I, IVTy,
+                            OrigCntVar]() {
+-      return buildDeclRefExpr(SemaRef, FloorIndVars[I], CntTy,
++      return buildDeclRefExpr(SemaRef, FloorIndVars[I], IVTy,
+                               OrigCntVar->getExprLoc());
+     };
+ 
+@@ -15405,8 +15494,7 @@ StmtResult SemaOpenMP::ActOnOpenMPUnrollDirective(ArrayRef<OMPClause *> Clauses,
+   Stmt *Body = nullptr;
+   SmallVector<OMPLoopBasedDirective::HelperExprs, NumLoops> LoopHelpers(
+       NumLoops);
+-  SmallVector<SmallVector<llvm::PointerUnion<Stmt *, Decl *>, 0>, NumLoops + 1>
+-      OriginalInits;
++  SmallVector<SmallVector<Stmt *, 0>, NumLoops + 1> OriginalInits;
+   if (!checkTransformableLoopNest(OMPD_unroll, AStmt, NumLoops, LoopHelpers,
+                                   Body, OriginalInits))
+     return StmtError();
+@@ -15418,6 +15506,10 @@ StmtResult SemaOpenMP::ActOnOpenMPUnrollDirective(ArrayRef<OMPClause *> Clauses,
+     return OMPUnrollDirective::Create(Context, StartLoc, EndLoc, Clauses, AStmt,
+                                       NumGeneratedLoops, nullptr, nullptr);
+ 
++  assert(LoopHelpers.size() == NumLoops &&
++         "Expecting a single-dimensional loop iteration space");
++  assert(OriginalInits.size() == NumLoops &&
++         "Expecting a single-dimensional loop iteration space");
+   OMPLoopBasedDirective::HelperExprs &LoopHelper = LoopHelpers.front();
+ 
+   if (FullClause) {
+@@ -15481,24 +15573,13 @@ StmtResult SemaOpenMP::ActOnOpenMPUnrollDirective(ArrayRef<OMPClause *> Clauses,
+   // of a canonical loop nest where these PreInits are emitted before the
+   // outermost directive.
+ 
++  // Find the loop statement.
++  Stmt *LoopStmt = nullptr;
++  collectLoopStmts(AStmt, {LoopStmt});
++
+   // Determine the PreInit declarations.
+-  SmallVector<Decl *, 4> PreInits;
+-  assert(OriginalInits.size() == 1 &&
+-         "Expecting a single-dimensional loop iteration space");
+-  for (auto &P : OriginalInits[0]) {
+-    if (auto *D = P.dyn_cast<Decl *>())
+-      PreInits.push_back(D);
+-    else if (auto *PI = dyn_cast_or_null<DeclStmt>(P.dyn_cast<Stmt *>()))
+-      PreInits.append(PI->decl_begin(), PI->decl_end());
+-  }
+-  if (auto *PI = cast_or_null<DeclStmt>(LoopHelper.PreInits))
+-    PreInits.append(PI->decl_begin(), PI->decl_end());
+-  // Gather declarations for the data members used as counters.
+-  for (Expr *CounterRef : LoopHelper.Counters) {
+-    auto *CounterDecl = cast<DeclRefExpr>(CounterRef)->getDecl();
+-    if (isa<OMPCapturedExprDecl>(CounterDecl))
+-      PreInits.push_back(CounterDecl);
+-  }
++  SmallVector<Stmt *, 4> PreInits;
++  addLoopPreInits(Context, LoopHelper, LoopStmt, OriginalInits[0], PreInits);
+ 
+   auto *IterationVarRef = cast<DeclRefExpr>(LoopHelper.IterationVarRef);
+   QualType IVTy = IterationVarRef->getType();
+@@ -15604,6 +15685,8 @@ StmtResult SemaOpenMP::ActOnOpenMPUnrollDirective(ArrayRef<OMPClause *> Clauses,
+   // Inner For statement.
+   SmallVector<Stmt *> InnerBodyStmts;
+   InnerBodyStmts.append(LoopHelper.Updates.begin(), LoopHelper.Updates.end());
++  if (auto *CXXRangeFor = dyn_cast<CXXForRangeStmt>(LoopStmt))
++    InnerBodyStmts.push_back(CXXRangeFor->getLoopVarStmt());
+   InnerBodyStmts.push_back(Body);
+   CompoundStmt *InnerBody =
+       CompoundStmt::Create(getASTContext(), InnerBodyStmts, FPOptionsOverride(),
+diff --git a/clang/test/OpenMP/tile_codegen.cpp b/clang/test/OpenMP/tile_codegen.cpp
+index 93a3a14133ab5..5fd5609b844cc 100644
+--- a/clang/test/OpenMP/tile_codegen.cpp
++++ b/clang/test/OpenMP/tile_codegen.cpp
+@@ -1,10 +1,10 @@
+-// NOTE: Assertions have been autogenerated by utils/update_cc_test_checks.py UTC_ARGS: --function-signature --include-generated-funcs --replace-value-regex "__omp_offloading_[0-9a-z]+_[0-9a-z]+" "reduction_size[.].+[.]" "pl_cond[.].+[.|,]" --prefix-filecheck-ir-name _
++// NOTE: Assertions have been autogenerated by utils/update_cc_test_checks.py UTC_ARGS: --include-generated-funcs --replace-value-regex "__omp_offloading_[0-9a-z]+_[0-9a-z]+" "reduction_size[.].+[.]" "pl_cond[.].+[.|,]" --prefix-filecheck-ir-name _ --version 4
+ // Check code generation
+-// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -fopenmp -emit-llvm %s -o - | FileCheck %s --check-prefix=CHECK1
++// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -std=c++20 -fopenmp -emit-llvm %s -o - | FileCheck %s --check-prefix=CHECK1
+ 
+ // Check same results after serialization round-trip
+-// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -fopenmp -emit-pch -o %t %s
+-// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -fopenmp -include-pch %t -emit-llvm %s -o - | FileCheck %s --check-prefix=CHECK2
++// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -std=c++20 -fopenmp -emit-pch -o %t %s
++// RUN: %clang_cc1 -verify -triple x86_64-pc-linux-gnu -fclang-abi-compat=latest -std=c++20 -fopenmp -include-pch %t -emit-llvm %s -o - | FileCheck %s --check-prefix=CHECK2
+ // expected-no-diagnostics
+ 
+ #ifndef HEADER
+@@ -91,22 +91,38 @@ extern "C" void foo8(int a) {
+ }
+ 
+ 
++typedef struct { double array[12]; } data_t;
++extern "C" void foo9(data_t data) {
++#pragma omp tile sizes(5)
++  for (double v : data.array)
++    body(v);
++}
++
++
++extern "C" void foo10(data_t data) {
++#pragma omp tile sizes(5)
++  for (double c = 42.0; double v : data.array)
++    body(c, v);
++}
++
++
+ #endif /* HEADER */
+-// CHECK1-LABEL: define {{[^@]+}}@body
+-// CHECK1-SAME: (...) #[[ATTR0:[0-9]+]] {
++
++// CHECK1-LABEL: define dso_local void @body(
++// CHECK1-SAME: ...) #[[ATTR0:[0-9]+]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@__cxx_global_var_init
+-// CHECK1-SAME: () #[[ATTR1:[0-9]+]] section ".text.startup" {
++// CHECK1-LABEL: define internal void @__cxx_global_var_init(
++// CHECK1-SAME: ) #[[ATTR1:[0-9]+]] section ".text.startup" {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    call void @_ZN1SC1Ev(ptr noundef nonnull align 4 dereferenceable(4) @s)
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@_ZN1SC1Ev
+-// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
++// CHECK1-LABEL: define linkonce_odr void @_ZN1SC1Ev(
++// CHECK1-SAME: ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    store ptr [[THIS]], ptr [[THIS_ADDR]], align 8
+@@ -115,50 +131,52 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@_ZN1SC2Ev
+-// CHECK1-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
++// CHECK1-LABEL: define linkonce_odr void @_ZN1SC2Ev(
++// CHECK1-SAME: ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR0]] comdat align 2 {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+-// CHECK1-NEXT:    [[I:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[I2:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    [[DOTFLOOR_0_IV_I:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[DOTTILE_0_IV_I:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    store ptr [[THIS]], ptr [[THIS_ADDR]], align 8
+ // CHECK1-NEXT:    [[THIS1:%.*]] = load ptr, ptr [[THIS_ADDR]], align 8
+-// CHECK1-NEXT:    [[I2:%.*]] = getelementptr inbounds [[STRUCT_S:%.*]], ptr [[THIS1]], i32 0, i32 0
+-// CHECK1-NEXT:    store ptr [[I2]], ptr [[I]], align 8
++// CHECK1-NEXT:    [[I:%.*]] = getelementptr inbounds [[STRUCT_S:%.*]], ptr [[THIS1]], i32 0, i32 0
++// CHECK1-NEXT:    store i32 7, ptr [[I]], align 4
++// CHECK1-NEXT:    [[I3:%.*]] = getelementptr inbounds [[STRUCT_S]], ptr [[THIS1]], i32 0, i32 0
++// CHECK1-NEXT:    store ptr [[I3]], ptr [[I2]], align 8
+ // CHECK1-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND:%.*]]
+ // CHECK1:       for.cond:
+ // CHECK1-NEXT:    [[TMP0:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    [[CMP:%.*]] = icmp slt i32 [[TMP0]], 4
+-// CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END11:%.*]]
++// CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END12:%.*]]
+ // CHECK1:       for.body:
+ // CHECK1-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    store i32 [[TMP1]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    br label [[FOR_COND3:%.*]]
+-// CHECK1:       for.cond3:
++// CHECK1-NEXT:    br label [[FOR_COND4:%.*]]
++// CHECK1:       for.cond4:
+ // CHECK1-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP3]], 5
+-// CHECK1-NEXT:    [[CMP4:%.*]] = icmp slt i32 4, [[ADD]]
+-// CHECK1-NEXT:    br i1 [[CMP4]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK1-NEXT:    [[CMP5:%.*]] = icmp slt i32 4, [[ADD]]
++// CHECK1-NEXT:    br i1 [[CMP5]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK1:       cond.true:
+ // CHECK1-NEXT:    br label [[COND_END:%.*]]
+ // CHECK1:       cond.false:
+ // CHECK1-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD5:%.*]] = add nsw i32 [[TMP4]], 5
++// CHECK1-NEXT:    [[ADD6:%.*]] = add nsw i32 [[TMP4]], 5
+ // CHECK1-NEXT:    br label [[COND_END]]
+ // CHECK1:       cond.end:
+-// CHECK1-NEXT:    [[COND:%.*]] = phi i32 [ 4, [[COND_TRUE]] ], [ [[ADD5]], [[COND_FALSE]] ]
+-// CHECK1-NEXT:    [[CMP6:%.*]] = icmp slt i32 [[TMP2]], [[COND]]
+-// CHECK1-NEXT:    br i1 [[CMP6]], label [[FOR_BODY7:%.*]], label [[FOR_END:%.*]]
+-// CHECK1:       for.body7:
++// CHECK1-NEXT:    [[COND:%.*]] = phi i32 [ 4, [[COND_TRUE]] ], [ [[ADD6]], [[COND_FALSE]] ]
++// CHECK1-NEXT:    [[CMP7:%.*]] = icmp slt i32 [[TMP2]], [[COND]]
++// CHECK1-NEXT:    br i1 [[CMP7]], label [[FOR_BODY8:%.*]], label [[FOR_END:%.*]]
++// CHECK1:       for.body8:
+ // CHECK1-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP5]], 3
+-// CHECK1-NEXT:    [[ADD8:%.*]] = add nsw i32 7, [[MUL]]
+-// CHECK1-NEXT:    [[TMP6:%.*]] = load ptr, ptr [[I]], align 8
+-// CHECK1-NEXT:    store i32 [[ADD8]], ptr [[TMP6]], align 4
+-// CHECK1-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[I]], align 8
++// CHECK1-NEXT:    [[ADD9:%.*]] = add nsw i32 7, [[MUL]]
++// CHECK1-NEXT:    [[TMP6:%.*]] = load ptr, ptr [[I2]], align 8
++// CHECK1-NEXT:    store i32 [[ADD9]], ptr [[TMP6]], align 4
++// CHECK1-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[I2]], align 8
+ // CHECK1-NEXT:    [[TMP8:%.*]] = load i32, ptr [[TMP7]], align 4
+ // CHECK1-NEXT:    call void (...) @body(i32 noundef [[TMP8]])
+ // CHECK1-NEXT:    br label [[FOR_INC:%.*]]
+@@ -166,20 +184,20 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP9]], 1
+ // CHECK1-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    br label [[FOR_COND3]], !llvm.loop [[LOOP3:![0-9]+]]
++// CHECK1-NEXT:    br label [[FOR_COND4]], !llvm.loop [[LOOP3:![0-9]+]]
+ // CHECK1:       for.end:
+-// CHECK1-NEXT:    br label [[FOR_INC9:%.*]]
+-// CHECK1:       for.inc9:
++// CHECK1-NEXT:    br label [[FOR_INC10:%.*]]
++// CHECK1:       for.inc10:
+ // CHECK1-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD10:%.*]] = add nsw i32 [[TMP10]], 5
+-// CHECK1-NEXT:    store i32 [[ADD10]], ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP10]], 5
++// CHECK1-NEXT:    store i32 [[ADD11]], ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP5:![0-9]+]]
+-// CHECK1:       for.end11:
++// CHECK1:       for.end12:
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo1
+-// CHECK1-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo1(
++// CHECK1-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -195,81 +213,83 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    store i32 [[END]], ptr [[END_ADDR]], align 4
+ // CHECK1-NEXT:    store i32 [[STEP]], ptr [[STEP_ADDR]], align 4
+ // CHECK1-NEXT:    [[TMP0:%.*]] = load i32, ptr [[START_ADDR]], align 4
+-// CHECK1-NEXT:    store i32 [[TMP0]], ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK1-NEXT:    [[TMP1:%.*]] = load i32, ptr [[END_ADDR]], align 4
+-// CHECK1-NEXT:    store i32 [[TMP1]], ptr [[DOTCAPTURE_EXPR_1]], align 4
+-// CHECK1-NEXT:    [[TMP2:%.*]] = load i32, ptr [[STEP_ADDR]], align 4
+-// CHECK1-NEXT:    store i32 [[TMP2]], ptr [[DOTNEW_STEP]], align 4
+-// CHECK1-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_1]], align 4
+-// CHECK1-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK1-NEXT:    [[SUB:%.*]] = sub i32 [[TMP3]], [[TMP4]]
++// CHECK1-NEXT:    store i32 [[TMP0]], ptr [[I]], align 4
++// CHECK1-NEXT:    [[TMP1:%.*]] = load i32, ptr [[START_ADDR]], align 4
++// CHECK1-NEXT:    store i32 [[TMP1]], ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK1-NEXT:    [[TMP2:%.*]] = load i32, ptr [[END_ADDR]], align 4
++// CHECK1-NEXT:    store i32 [[TMP2]], ptr [[DOTCAPTURE_EXPR_1]], align 4
++// CHECK1-NEXT:    [[TMP3:%.*]] = load i32, ptr [[STEP_ADDR]], align 4
++// CHECK1-NEXT:    store i32 [[TMP3]], ptr [[DOTNEW_STEP]], align 4
++// CHECK1-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_1]], align 4
++// CHECK1-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK1-NEXT:    [[SUB:%.*]] = sub i32 [[TMP4]], [[TMP5]]
+ // CHECK1-NEXT:    [[SUB3:%.*]] = sub i32 [[SUB]], 1
+-// CHECK1-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK1-NEXT:    [[ADD:%.*]] = add i32 [[SUB3]], [[TMP5]]
+ // CHECK1-NEXT:    [[TMP6:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK1-NEXT:    [[DIV:%.*]] = udiv i32 [[ADD]], [[TMP6]]
++// CHECK1-NEXT:    [[ADD:%.*]] = add i32 [[SUB3]], [[TMP6]]
++// CHECK1-NEXT:    [[TMP7:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
++// CHECK1-NEXT:    [[DIV:%.*]] = udiv i32 [[ADD]], [[TMP7]]
+ // CHECK1-NEXT:    [[SUB4:%.*]] = sub i32 [[DIV]], 1
+ // CHECK1-NEXT:    store i32 [[SUB4]], ptr [[DOTCAPTURE_EXPR_2]], align 4
+ // CHECK1-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND:%.*]]
+ // CHECK1:       for.cond:
+-// CHECK1-NEXT:    [[TMP7:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[TMP8:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK1-NEXT:    [[ADD5:%.*]] = add i32 [[TMP8]], 1
+-// CHECK1-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP7]], [[ADD5]]
++// CHECK1-NEXT:    [[TMP8:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK1-NEXT:    [[ADD5:%.*]] = add i32 [[TMP9]], 1
++// CHECK1-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP8]], [[ADD5]]
+ // CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END17:%.*]]
+ // CHECK1:       for.body:
+-// CHECK1-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    store i32 [[TMP9]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    store i32 [[TMP10]], ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND6:%.*]]
+ // CHECK1:       for.cond6:
+-// CHECK1-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK1-NEXT:    [[ADD7:%.*]] = add i32 [[TMP11]], 1
+-// CHECK1-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD8:%.*]] = add nsw i32 [[TMP12]], 5
++// CHECK1-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK1-NEXT:    [[ADD7:%.*]] = add i32 [[TMP12]], 1
++// CHECK1-NEXT:    [[TMP13:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[ADD8:%.*]] = add i32 [[TMP13]], 5
+ // CHECK1-NEXT:    [[CMP9:%.*]] = icmp ult i32 [[ADD7]], [[ADD8]]
+ // CHECK1-NEXT:    br i1 [[CMP9]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK1:       cond.true:
+-// CHECK1-NEXT:    [[TMP13:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK1-NEXT:    [[ADD10:%.*]] = add i32 [[TMP13]], 1
++// CHECK1-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK1-NEXT:    [[ADD10:%.*]] = add i32 [[TMP14]], 1
+ // CHECK1-NEXT:    br label [[COND_END:%.*]]
+ // CHECK1:       cond.false:
+-// CHECK1-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP14]], 5
++// CHECK1-NEXT:    [[TMP15:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[ADD11:%.*]] = add i32 [[TMP15]], 5
+ // CHECK1-NEXT:    br label [[COND_END]]
+ // CHECK1:       cond.end:
+ // CHECK1-NEXT:    [[COND:%.*]] = phi i32 [ [[ADD10]], [[COND_TRUE]] ], [ [[ADD11]], [[COND_FALSE]] ]
+-// CHECK1-NEXT:    [[CMP12:%.*]] = icmp ult i32 [[TMP10]], [[COND]]
++// CHECK1-NEXT:    [[CMP12:%.*]] = icmp ult i32 [[TMP11]], [[COND]]
+ // CHECK1-NEXT:    br i1 [[CMP12]], label [[FOR_BODY13:%.*]], label [[FOR_END:%.*]]
+ // CHECK1:       for.body13:
+-// CHECK1-NEXT:    [[TMP15:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK1-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK1-NEXT:    [[MUL:%.*]] = mul i32 [[TMP16]], [[TMP17]]
+-// CHECK1-NEXT:    [[ADD14:%.*]] = add i32 [[TMP15]], [[MUL]]
++// CHECK1-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK1-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[TMP18:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
++// CHECK1-NEXT:    [[MUL:%.*]] = mul i32 [[TMP17]], [[TMP18]]
++// CHECK1-NEXT:    [[ADD14:%.*]] = add i32 [[TMP16]], [[MUL]]
+ // CHECK1-NEXT:    store i32 [[ADD14]], ptr [[I]], align 4
+-// CHECK1-NEXT:    [[TMP18:%.*]] = load i32, ptr [[I]], align 4
+-// CHECK1-NEXT:    call void (...) @body(i32 noundef [[TMP18]])
++// CHECK1-NEXT:    [[TMP19:%.*]] = load i32, ptr [[I]], align 4
++// CHECK1-NEXT:    call void (...) @body(i32 noundef [[TMP19]])
+ // CHECK1-NEXT:    br label [[FOR_INC:%.*]]
+ // CHECK1:       for.inc:
+-// CHECK1-NEXT:    [[TMP19:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP19]], 1
++// CHECK1-NEXT:    [[TMP20:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK1-NEXT:    [[INC:%.*]] = add i32 [[TMP20]], 1
+ // CHECK1-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP6:![0-9]+]]
+ // CHECK1:       for.end:
+ // CHECK1-NEXT:    br label [[FOR_INC15:%.*]]
+ // CHECK1:       for.inc15:
+-// CHECK1-NEXT:    [[TMP20:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD16:%.*]] = add nsw i32 [[TMP20]], 5
++// CHECK1-NEXT:    [[TMP21:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK1-NEXT:    [[ADD16:%.*]] = add i32 [[TMP21]], 5
+ // CHECK1-NEXT:    store i32 [[ADD16]], ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP7:![0-9]+]]
+ // CHECK1:       for.end17:
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo2
+-// CHECK1-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo2(
++// CHECK1-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -381,8 +401,8 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo3
+-// CHECK1-SAME: () #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo3(
++// CHECK1-SAME: ) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -523,8 +543,8 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo4
+-// CHECK1-SAME: () #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo4(
++// CHECK1-SAME: ) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -676,8 +696,8 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo5
+-// CHECK1-SAME: () #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo5(
++// CHECK1-SAME: ) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[DOTOMP_IV:%.*]] = alloca i64, align 8
+ // CHECK1-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -885,15 +905,15 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo6
+-// CHECK1-SAME: () #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo6(
++// CHECK1-SAME: ) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    call void (ptr, i32, ptr, ...) @__kmpc_fork_call(ptr @[[GLOB2]], i32 0, ptr @foo6.omp_outlined)
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo6.omp_outlined
+-// CHECK1-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
++// CHECK1-LABEL: define internal void @foo6.omp_outlined(
++// CHECK1-SAME: ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[DOTGLOBAL_TID__ADDR:%.*]] = alloca ptr, align 8
+ // CHECK1-NEXT:    [[DOTBOUND_TID__ADDR:%.*]] = alloca ptr, align 8
+@@ -988,15 +1008,15 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@tfoo7
+-// CHECK1-SAME: () #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @tfoo7(
++// CHECK1-SAME: ) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    call void @_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_(i32 noundef 0, i32 noundef 42)
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_
+-// CHECK1-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR0]] comdat {
++// CHECK1-LABEL: define linkonce_odr void @_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_(
++// CHECK1-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR0]] comdat {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -1039,7 +1059,7 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+ // CHECK1-NEXT:    [[ADD7:%.*]] = add i32 [[TMP9]], 1
+ // CHECK1-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD8:%.*]] = add nsw i32 [[TMP10]], 5
++// CHECK1-NEXT:    [[ADD8:%.*]] = add i32 [[TMP10]], 5
+ // CHECK1-NEXT:    [[CMP9:%.*]] = icmp ult i32 [[ADD7]], [[ADD8]]
+ // CHECK1-NEXT:    br i1 [[CMP9]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK1:       cond.true:
+@@ -1048,7 +1068,7 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    br label [[COND_END:%.*]]
+ // CHECK1:       cond.false:
+ // CHECK1-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP12]], 5
++// CHECK1-NEXT:    [[ADD11:%.*]] = add i32 [[TMP12]], 5
+ // CHECK1-NEXT:    br label [[COND_END]]
+ // CHECK1:       cond.end:
+ // CHECK1-NEXT:    [[COND:%.*]] = phi i32 [ [[ADD10]], [[COND_TRUE]] ], [ [[ADD11]], [[COND_FALSE]] ]
+@@ -1065,22 +1085,22 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    br label [[FOR_INC:%.*]]
+ // CHECK1:       for.inc:
+ // CHECK1-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP16]], 1
++// CHECK1-NEXT:    [[INC:%.*]] = add i32 [[TMP16]], 1
+ // CHECK1-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP21:![0-9]+]]
+ // CHECK1:       for.end:
+ // CHECK1-NEXT:    br label [[FOR_INC15:%.*]]
+ // CHECK1:       for.inc15:
+ // CHECK1-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK1-NEXT:    [[ADD16:%.*]] = add nsw i32 [[TMP17]], 5
++// CHECK1-NEXT:    [[ADD16:%.*]] = add i32 [[TMP17]], 5
+ // CHECK1-NEXT:    store i32 [[ADD16]], ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP22:![0-9]+]]
+ // CHECK1:       for.end17:
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@foo8
+-// CHECK1-SAME: (i32 noundef [[A:%.*]]) #[[ATTR0]] {
++// CHECK1-LABEL: define dso_local void @foo8(
++// CHECK1-SAME: i32 noundef [[A:%.*]]) #[[ATTR0]] {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
+ // CHECK1-NEXT:    [[I:%.*]] = alloca i32, align 4
+@@ -1168,22 +1188,219 @@ extern "C" void foo8(int a) {
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK1-LABEL: define {{[^@]+}}@_GLOBAL__sub_I_tile_codegen.cpp
+-// CHECK1-SAME: () #[[ATTR1]] section ".text.startup" {
++// CHECK1-LABEL: define dso_local void @foo9(
++// CHECK1-SAME: ptr noundef byval([[STRUCT_DATA_T:%.*]]) align 8 [[DATA:%.*]]) #[[ATTR0]] {
++// CHECK1-NEXT:  entry:
++// CHECK1-NEXT:    [[__RANGE2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[__END2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[__BEGIN2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_3:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_4:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[DOTFLOOR_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[DOTTILE_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[V:%.*]] = alloca double, align 8
++// CHECK1-NEXT:    [[ARRAY:%.*]] = getelementptr inbounds [[STRUCT_DATA_T]], ptr [[DATA]], i32 0, i32 0
++// CHECK1-NEXT:    store ptr [[ARRAY]], ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP0]], i64 0, i64 0
++// CHECK1-NEXT:    [[ADD_PTR:%.*]] = getelementptr inbounds double, ptr [[ARRAYDECAY]], i64 12
++// CHECK1-NEXT:    store ptr [[ADD_PTR]], ptr [[__END2]], align 8
++// CHECK1-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY1:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP1]], i64 0, i64 0
++// CHECK1-NEXT:    store ptr [[ARRAYDECAY1]], ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY2:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP2]], i64 0, i64 0
++// CHECK1-NEXT:    store ptr [[ARRAYDECAY2]], ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[TMP3:%.*]] = load ptr, ptr [[__END2]], align 8
++// CHECK1-NEXT:    store ptr [[TMP3]], ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK1-NEXT:    [[TMP4:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK1-NEXT:    [[TMP5:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[SUB_PTR_LHS_CAST:%.*]] = ptrtoint ptr [[TMP4]] to i64
++// CHECK1-NEXT:    [[SUB_PTR_RHS_CAST:%.*]] = ptrtoint ptr [[TMP5]] to i64
++// CHECK1-NEXT:    [[SUB_PTR_SUB:%.*]] = sub i64 [[SUB_PTR_LHS_CAST]], [[SUB_PTR_RHS_CAST]]
++// CHECK1-NEXT:    [[SUB_PTR_DIV:%.*]] = sdiv exact i64 [[SUB_PTR_SUB]], 8
++// CHECK1-NEXT:    [[SUB:%.*]] = sub nsw i64 [[SUB_PTR_DIV]], 1
++// CHECK1-NEXT:    [[ADD:%.*]] = add nsw i64 [[SUB]], 1
++// CHECK1-NEXT:    [[DIV:%.*]] = sdiv i64 [[ADD]], 1
++// CHECK1-NEXT:    [[SUB5:%.*]] = sub nsw i64 [[DIV]], 1
++// CHECK1-NEXT:    store i64 [[SUB5]], ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    store i64 0, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK1:       for.cond:
++// CHECK1-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP7:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD6:%.*]] = add nsw i64 [[TMP7]], 1
++// CHECK1-NEXT:    [[CMP:%.*]] = icmp slt i64 [[TMP6]], [[ADD6]]
++// CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END18:%.*]]
++// CHECK1:       for.body:
++// CHECK1-NEXT:    [[TMP8:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    store i64 [[TMP8]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND7:%.*]]
++// CHECK1:       for.cond7:
++// CHECK1-NEXT:    [[TMP9:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP10:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD8:%.*]] = add nsw i64 [[TMP10]], 1
++// CHECK1-NEXT:    [[TMP11:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD9:%.*]] = add nsw i64 [[TMP11]], 5
++// CHECK1-NEXT:    [[CMP10:%.*]] = icmp slt i64 [[ADD8]], [[ADD9]]
++// CHECK1-NEXT:    br i1 [[CMP10]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK1:       cond.true:
++// CHECK1-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i64 [[TMP12]], 1
++// CHECK1-NEXT:    br label [[COND_END:%.*]]
++// CHECK1:       cond.false:
++// CHECK1-NEXT:    [[TMP13:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD12:%.*]] = add nsw i64 [[TMP13]], 5
++// CHECK1-NEXT:    br label [[COND_END]]
++// CHECK1:       cond.end:
++// CHECK1-NEXT:    [[COND:%.*]] = phi i64 [ [[ADD11]], [[COND_TRUE]] ], [ [[ADD12]], [[COND_FALSE]] ]
++// CHECK1-NEXT:    [[CMP13:%.*]] = icmp slt i64 [[TMP9]], [[COND]]
++// CHECK1-NEXT:    br i1 [[CMP13]], label [[FOR_BODY14:%.*]], label [[FOR_END:%.*]]
++// CHECK1:       for.body14:
++// CHECK1-NEXT:    [[TMP14:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[TMP15:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[MUL:%.*]] = mul nsw i64 [[TMP15]], 1
++// CHECK1-NEXT:    [[ADD_PTR15:%.*]] = getelementptr inbounds double, ptr [[TMP14]], i64 [[MUL]]
++// CHECK1-NEXT:    store ptr [[ADD_PTR15]], ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP16:%.*]] = load ptr, ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP17:%.*]] = load double, ptr [[TMP16]], align 8
++// CHECK1-NEXT:    store double [[TMP17]], ptr [[V]], align 8
++// CHECK1-NEXT:    [[TMP18:%.*]] = load double, ptr [[V]], align 8
++// CHECK1-NEXT:    call void (...) @body(double noundef [[TMP18]])
++// CHECK1-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK1:       for.inc:
++// CHECK1-NEXT:    [[TMP19:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[INC:%.*]] = add nsw i64 [[TMP19]], 1
++// CHECK1-NEXT:    store i64 [[INC]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND7]], !llvm.loop [[LOOP25:![0-9]+]]
++// CHECK1:       for.end:
++// CHECK1-NEXT:    br label [[FOR_INC16:%.*]]
++// CHECK1:       for.inc16:
++// CHECK1-NEXT:    [[TMP20:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD17:%.*]] = add nsw i64 [[TMP20]], 5
++// CHECK1-NEXT:    store i64 [[ADD17]], ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP26:![0-9]+]]
++// CHECK1:       for.end18:
++// CHECK1-NEXT:    ret void
++//
++//
++// CHECK1-LABEL: define dso_local void @foo10(
++// CHECK1-SAME: ptr noundef byval([[STRUCT_DATA_T:%.*]]) align 8 [[DATA:%.*]]) #[[ATTR0]] {
++// CHECK1-NEXT:  entry:
++// CHECK1-NEXT:    [[C:%.*]] = alloca double, align 8
++// CHECK1-NEXT:    [[__RANGE2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[__END2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[__BEGIN2:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_3:%.*]] = alloca ptr, align 8
++// CHECK1-NEXT:    [[DOTCAPTURE_EXPR_4:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[DOTFLOOR_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[DOTTILE_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK1-NEXT:    [[V:%.*]] = alloca double, align 8
++// CHECK1-NEXT:    store double 4.200000e+01, ptr [[C]], align 8
++// CHECK1-NEXT:    [[ARRAY:%.*]] = getelementptr inbounds [[STRUCT_DATA_T]], ptr [[DATA]], i32 0, i32 0
++// CHECK1-NEXT:    store ptr [[ARRAY]], ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP0]], i64 0, i64 0
++// CHECK1-NEXT:    [[ADD_PTR:%.*]] = getelementptr inbounds double, ptr [[ARRAYDECAY]], i64 12
++// CHECK1-NEXT:    store ptr [[ADD_PTR]], ptr [[__END2]], align 8
++// CHECK1-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY1:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP1]], i64 0, i64 0
++// CHECK1-NEXT:    store ptr [[ARRAYDECAY1]], ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK1-NEXT:    [[ARRAYDECAY2:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP2]], i64 0, i64 0
++// CHECK1-NEXT:    store ptr [[ARRAYDECAY2]], ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[TMP3:%.*]] = load ptr, ptr [[__END2]], align 8
++// CHECK1-NEXT:    store ptr [[TMP3]], ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK1-NEXT:    [[TMP4:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK1-NEXT:    [[TMP5:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[SUB_PTR_LHS_CAST:%.*]] = ptrtoint ptr [[TMP4]] to i64
++// CHECK1-NEXT:    [[SUB_PTR_RHS_CAST:%.*]] = ptrtoint ptr [[TMP5]] to i64
++// CHECK1-NEXT:    [[SUB_PTR_SUB:%.*]] = sub i64 [[SUB_PTR_LHS_CAST]], [[SUB_PTR_RHS_CAST]]
++// CHECK1-NEXT:    [[SUB_PTR_DIV:%.*]] = sdiv exact i64 [[SUB_PTR_SUB]], 8
++// CHECK1-NEXT:    [[SUB:%.*]] = sub nsw i64 [[SUB_PTR_DIV]], 1
++// CHECK1-NEXT:    [[ADD:%.*]] = add nsw i64 [[SUB]], 1
++// CHECK1-NEXT:    [[DIV:%.*]] = sdiv i64 [[ADD]], 1
++// CHECK1-NEXT:    [[SUB5:%.*]] = sub nsw i64 [[DIV]], 1
++// CHECK1-NEXT:    store i64 [[SUB5]], ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    store i64 0, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK1:       for.cond:
++// CHECK1-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP7:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD6:%.*]] = add nsw i64 [[TMP7]], 1
++// CHECK1-NEXT:    [[CMP:%.*]] = icmp slt i64 [[TMP6]], [[ADD6]]
++// CHECK1-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END18:%.*]]
++// CHECK1:       for.body:
++// CHECK1-NEXT:    [[TMP8:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    store i64 [[TMP8]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND7:%.*]]
++// CHECK1:       for.cond7:
++// CHECK1-NEXT:    [[TMP9:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP10:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD8:%.*]] = add nsw i64 [[TMP10]], 1
++// CHECK1-NEXT:    [[TMP11:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD9:%.*]] = add nsw i64 [[TMP11]], 5
++// CHECK1-NEXT:    [[CMP10:%.*]] = icmp slt i64 [[ADD8]], [[ADD9]]
++// CHECK1-NEXT:    br i1 [[CMP10]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK1:       cond.true:
++// CHECK1-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK1-NEXT:    [[ADD11:%.*]] = add nsw i64 [[TMP12]], 1
++// CHECK1-NEXT:    br label [[COND_END:%.*]]
++// CHECK1:       cond.false:
++// CHECK1-NEXT:    [[TMP13:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD12:%.*]] = add nsw i64 [[TMP13]], 5
++// CHECK1-NEXT:    br label [[COND_END]]
++// CHECK1:       cond.end:
++// CHECK1-NEXT:    [[COND:%.*]] = phi i64 [ [[ADD11]], [[COND_TRUE]] ], [ [[ADD12]], [[COND_FALSE]] ]
++// CHECK1-NEXT:    [[CMP13:%.*]] = icmp slt i64 [[TMP9]], [[COND]]
++// CHECK1-NEXT:    br i1 [[CMP13]], label [[FOR_BODY14:%.*]], label [[FOR_END:%.*]]
++// CHECK1:       for.body14:
++// CHECK1-NEXT:    [[TMP14:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK1-NEXT:    [[TMP15:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[MUL:%.*]] = mul nsw i64 [[TMP15]], 1
++// CHECK1-NEXT:    [[ADD_PTR15:%.*]] = getelementptr inbounds double, ptr [[TMP14]], i64 [[MUL]]
++// CHECK1-NEXT:    store ptr [[ADD_PTR15]], ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP16:%.*]] = load ptr, ptr [[__BEGIN2]], align 8
++// CHECK1-NEXT:    [[TMP17:%.*]] = load double, ptr [[TMP16]], align 8
++// CHECK1-NEXT:    store double [[TMP17]], ptr [[V]], align 8
++// CHECK1-NEXT:    [[TMP18:%.*]] = load double, ptr [[C]], align 8
++// CHECK1-NEXT:    [[TMP19:%.*]] = load double, ptr [[V]], align 8
++// CHECK1-NEXT:    call void (...) @body(double noundef [[TMP18]], double noundef [[TMP19]])
++// CHECK1-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK1:       for.inc:
++// CHECK1-NEXT:    [[TMP20:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[INC:%.*]] = add nsw i64 [[TMP20]], 1
++// CHECK1-NEXT:    store i64 [[INC]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND7]], !llvm.loop [[LOOP27:![0-9]+]]
++// CHECK1:       for.end:
++// CHECK1-NEXT:    br label [[FOR_INC16:%.*]]
++// CHECK1:       for.inc16:
++// CHECK1-NEXT:    [[TMP21:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    [[ADD17:%.*]] = add nsw i64 [[TMP21]], 5
++// CHECK1-NEXT:    store i64 [[ADD17]], ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK1-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP28:![0-9]+]]
++// CHECK1:       for.end18:
++// CHECK1-NEXT:    ret void
++//
++//
++// CHECK1-LABEL: define internal void @_GLOBAL__sub_I_tile_codegen.cpp(
++// CHECK1-SAME: ) #[[ATTR1]] section ".text.startup" {
+ // CHECK1-NEXT:  entry:
+ // CHECK1-NEXT:    call void @__cxx_global_var_init()
+ // CHECK1-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@__cxx_global_var_init
+-// CHECK2-SAME: () #[[ATTR0:[0-9]+]] section ".text.startup" {
++// CHECK2-LABEL: define internal void @__cxx_global_var_init(
++// CHECK2-SAME: ) #[[ATTR0:[0-9]+]] section ".text.startup" {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void @_ZN1SC1Ev(ptr noundef nonnull align 4 dereferenceable(4) @s)
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@_ZN1SC1Ev
+-// CHECK2-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR1:[0-9]+]] comdat align 2 {
++// CHECK2-LABEL: define linkonce_odr void @_ZN1SC1Ev(
++// CHECK2-SAME: ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR1:[0-9]+]] comdat align 2 {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+ // CHECK2-NEXT:    store ptr [[THIS]], ptr [[THIS_ADDR]], align 8
+@@ -1192,50 +1409,52 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@_ZN1SC2Ev
+-// CHECK2-SAME: (ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR1]] comdat align 2 {
++// CHECK2-LABEL: define linkonce_odr void @_ZN1SC2Ev(
++// CHECK2-SAME: ptr noundef nonnull align 4 dereferenceable(4) [[THIS:%.*]]) unnamed_addr #[[ATTR1]] comdat align 2 {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[THIS_ADDR:%.*]] = alloca ptr, align 8
+-// CHECK2-NEXT:    [[I:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[I2:%.*]] = alloca ptr, align 8
+ // CHECK2-NEXT:    [[DOTFLOOR_0_IV_I:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[DOTTILE_0_IV_I:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    store ptr [[THIS]], ptr [[THIS_ADDR]], align 8
+ // CHECK2-NEXT:    [[THIS1:%.*]] = load ptr, ptr [[THIS_ADDR]], align 8
+-// CHECK2-NEXT:    [[I2:%.*]] = getelementptr inbounds [[STRUCT_S:%.*]], ptr [[THIS1]], i32 0, i32 0
+-// CHECK2-NEXT:    store ptr [[I2]], ptr [[I]], align 8
++// CHECK2-NEXT:    [[I:%.*]] = getelementptr inbounds [[STRUCT_S:%.*]], ptr [[THIS1]], i32 0, i32 0
++// CHECK2-NEXT:    store i32 7, ptr [[I]], align 4
++// CHECK2-NEXT:    [[I3:%.*]] = getelementptr inbounds [[STRUCT_S]], ptr [[THIS1]], i32 0, i32 0
++// CHECK2-NEXT:    store ptr [[I3]], ptr [[I2]], align 8
+ // CHECK2-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND:%.*]]
+ // CHECK2:       for.cond:
+ // CHECK2-NEXT:    [[TMP0:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[CMP:%.*]] = icmp slt i32 [[TMP0]], 4
+-// CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END11:%.*]]
++// CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END12:%.*]]
+ // CHECK2:       for.body:
+ // CHECK2-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    store i32 [[TMP1]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND3:%.*]]
+-// CHECK2:       for.cond3:
++// CHECK2-NEXT:    br label [[FOR_COND4:%.*]]
++// CHECK2:       for.cond4:
+ // CHECK2-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP3]], 5
+-// CHECK2-NEXT:    [[CMP4:%.*]] = icmp slt i32 4, [[ADD]]
+-// CHECK2-NEXT:    br i1 [[CMP4]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK2-NEXT:    [[CMP5:%.*]] = icmp slt i32 4, [[ADD]]
++// CHECK2-NEXT:    br i1 [[CMP5]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK2:       cond.true:
+ // CHECK2-NEXT:    br label [[COND_END:%.*]]
+ // CHECK2:       cond.false:
+ // CHECK2-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD5:%.*]] = add nsw i32 [[TMP4]], 5
++// CHECK2-NEXT:    [[ADD6:%.*]] = add nsw i32 [[TMP4]], 5
+ // CHECK2-NEXT:    br label [[COND_END]]
+ // CHECK2:       cond.end:
+-// CHECK2-NEXT:    [[COND:%.*]] = phi i32 [ 4, [[COND_TRUE]] ], [ [[ADD5]], [[COND_FALSE]] ]
+-// CHECK2-NEXT:    [[CMP6:%.*]] = icmp slt i32 [[TMP2]], [[COND]]
+-// CHECK2-NEXT:    br i1 [[CMP6]], label [[FOR_BODY7:%.*]], label [[FOR_END:%.*]]
+-// CHECK2:       for.body7:
++// CHECK2-NEXT:    [[COND:%.*]] = phi i32 [ 4, [[COND_TRUE]] ], [ [[ADD6]], [[COND_FALSE]] ]
++// CHECK2-NEXT:    [[CMP7:%.*]] = icmp slt i32 [[TMP2]], [[COND]]
++// CHECK2-NEXT:    br i1 [[CMP7]], label [[FOR_BODY8:%.*]], label [[FOR_END:%.*]]
++// CHECK2:       for.body8:
+ // CHECK2-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[MUL:%.*]] = mul nsw i32 [[TMP5]], 3
+-// CHECK2-NEXT:    [[ADD8:%.*]] = add nsw i32 7, [[MUL]]
+-// CHECK2-NEXT:    [[TMP6:%.*]] = load ptr, ptr [[I]], align 8
+-// CHECK2-NEXT:    store i32 [[ADD8]], ptr [[TMP6]], align 4
+-// CHECK2-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[I]], align 8
++// CHECK2-NEXT:    [[ADD9:%.*]] = add nsw i32 7, [[MUL]]
++// CHECK2-NEXT:    [[TMP6:%.*]] = load ptr, ptr [[I2]], align 8
++// CHECK2-NEXT:    store i32 [[ADD9]], ptr [[TMP6]], align 4
++// CHECK2-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[I2]], align 8
+ // CHECK2-NEXT:    [[TMP8:%.*]] = load i32, ptr [[TMP7]], align 4
+ // CHECK2-NEXT:    call void (...) @body(i32 noundef [[TMP8]])
+ // CHECK2-NEXT:    br label [[FOR_INC:%.*]]
+@@ -1243,26 +1462,26 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP9]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND3]], !llvm.loop [[LOOP3:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND4]], !llvm.loop [[LOOP3:![0-9]+]]
+ // CHECK2:       for.end:
+-// CHECK2-NEXT:    br label [[FOR_INC9:%.*]]
+-// CHECK2:       for.inc9:
++// CHECK2-NEXT:    br label [[FOR_INC10:%.*]]
++// CHECK2:       for.inc10:
+ // CHECK2-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD10:%.*]] = add nsw i32 [[TMP10]], 5
+-// CHECK2-NEXT:    store i32 [[ADD10]], ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP10]], 5
++// CHECK2-NEXT:    store i32 [[ADD11]], ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP5:![0-9]+]]
+-// CHECK2:       for.end11:
++// CHECK2:       for.end12:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@body
+-// CHECK2-SAME: (...) #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @body(
++// CHECK2-SAME: ...) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo1
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo1(
++// CHECK2-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -1278,81 +1497,183 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    store i32 [[END]], ptr [[END_ADDR]], align 4
+ // CHECK2-NEXT:    store i32 [[STEP]], ptr [[STEP_ADDR]], align 4
+ // CHECK2-NEXT:    [[TMP0:%.*]] = load i32, ptr [[START_ADDR]], align 4
+-// CHECK2-NEXT:    store i32 [[TMP0]], ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK2-NEXT:    [[TMP1:%.*]] = load i32, ptr [[END_ADDR]], align 4
+-// CHECK2-NEXT:    store i32 [[TMP1]], ptr [[DOTCAPTURE_EXPR_1]], align 4
+-// CHECK2-NEXT:    [[TMP2:%.*]] = load i32, ptr [[STEP_ADDR]], align 4
+-// CHECK2-NEXT:    store i32 [[TMP2]], ptr [[DOTNEW_STEP]], align 4
+-// CHECK2-NEXT:    [[TMP3:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_1]], align 4
+-// CHECK2-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK2-NEXT:    [[SUB:%.*]] = sub i32 [[TMP3]], [[TMP4]]
++// CHECK2-NEXT:    store i32 [[TMP0]], ptr [[I]], align 4
++// CHECK2-NEXT:    [[TMP1:%.*]] = load i32, ptr [[START_ADDR]], align 4
++// CHECK2-NEXT:    store i32 [[TMP1]], ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK2-NEXT:    [[TMP2:%.*]] = load i32, ptr [[END_ADDR]], align 4
++// CHECK2-NEXT:    store i32 [[TMP2]], ptr [[DOTCAPTURE_EXPR_1]], align 4
++// CHECK2-NEXT:    [[TMP3:%.*]] = load i32, ptr [[STEP_ADDR]], align 4
++// CHECK2-NEXT:    store i32 [[TMP3]], ptr [[DOTNEW_STEP]], align 4
++// CHECK2-NEXT:    [[TMP4:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_1]], align 4
++// CHECK2-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK2-NEXT:    [[SUB:%.*]] = sub i32 [[TMP4]], [[TMP5]]
+ // CHECK2-NEXT:    [[SUB3:%.*]] = sub i32 [[SUB]], 1
+-// CHECK2-NEXT:    [[TMP5:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK2-NEXT:    [[ADD:%.*]] = add i32 [[SUB3]], [[TMP5]]
+ // CHECK2-NEXT:    [[TMP6:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK2-NEXT:    [[DIV:%.*]] = udiv i32 [[ADD]], [[TMP6]]
++// CHECK2-NEXT:    [[ADD:%.*]] = add i32 [[SUB3]], [[TMP6]]
++// CHECK2-NEXT:    [[TMP7:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
++// CHECK2-NEXT:    [[DIV:%.*]] = udiv i32 [[ADD]], [[TMP7]]
+ // CHECK2-NEXT:    [[SUB4:%.*]] = sub i32 [[DIV]], 1
+ // CHECK2-NEXT:    store i32 [[SUB4]], ptr [[DOTCAPTURE_EXPR_2]], align 4
+ // CHECK2-NEXT:    store i32 0, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND:%.*]]
+ // CHECK2:       for.cond:
+-// CHECK2-NEXT:    [[TMP7:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[TMP8:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK2-NEXT:    [[ADD5:%.*]] = add i32 [[TMP8]], 1
+-// CHECK2-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP7]], [[ADD5]]
++// CHECK2-NEXT:    [[TMP8:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK2-NEXT:    [[ADD5:%.*]] = add i32 [[TMP9]], 1
++// CHECK2-NEXT:    [[CMP:%.*]] = icmp ult i32 [[TMP8]], [[ADD5]]
+ // CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END17:%.*]]
+ // CHECK2:       for.body:
+-// CHECK2-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    store i32 [[TMP9]], ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    store i32 [[TMP10]], ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND6:%.*]]
+ // CHECK2:       for.cond6:
+-// CHECK2-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK2-NEXT:    [[ADD7:%.*]] = add i32 [[TMP11]], 1
+-// CHECK2-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD8:%.*]] = add nsw i32 [[TMP12]], 5
++// CHECK2-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK2-NEXT:    [[ADD7:%.*]] = add i32 [[TMP12]], 1
++// CHECK2-NEXT:    [[TMP13:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[ADD8:%.*]] = add i32 [[TMP13]], 5
+ // CHECK2-NEXT:    [[CMP9:%.*]] = icmp ult i32 [[ADD7]], [[ADD8]]
+ // CHECK2-NEXT:    br i1 [[CMP9]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK2:       cond.true:
+-// CHECK2-NEXT:    [[TMP13:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+-// CHECK2-NEXT:    [[ADD10:%.*]] = add i32 [[TMP13]], 1
++// CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
++// CHECK2-NEXT:    [[ADD10:%.*]] = add i32 [[TMP14]], 1
+ // CHECK2-NEXT:    br label [[COND_END:%.*]]
+ // CHECK2:       cond.false:
+-// CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP14]], 5
++// CHECK2-NEXT:    [[TMP15:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[ADD11:%.*]] = add i32 [[TMP15]], 5
+ // CHECK2-NEXT:    br label [[COND_END]]
+ // CHECK2:       cond.end:
+ // CHECK2-NEXT:    [[COND:%.*]] = phi i32 [ [[ADD10]], [[COND_TRUE]] ], [ [[ADD11]], [[COND_FALSE]] ]
+-// CHECK2-NEXT:    [[CMP12:%.*]] = icmp ult i32 [[TMP10]], [[COND]]
++// CHECK2-NEXT:    [[CMP12:%.*]] = icmp ult i32 [[TMP11]], [[COND]]
+ // CHECK2-NEXT:    br i1 [[CMP12]], label [[FOR_BODY13:%.*]], label [[FOR_END:%.*]]
+ // CHECK2:       for.body13:
+-// CHECK2-NEXT:    [[TMP15:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
+-// CHECK2-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
+-// CHECK2-NEXT:    [[MUL:%.*]] = mul i32 [[TMP16]], [[TMP17]]
+-// CHECK2-NEXT:    [[ADD14:%.*]] = add i32 [[TMP15]], [[MUL]]
++// CHECK2-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_]], align 4
++// CHECK2-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[TMP18:%.*]] = load i32, ptr [[DOTNEW_STEP]], align 4
++// CHECK2-NEXT:    [[MUL:%.*]] = mul i32 [[TMP17]], [[TMP18]]
++// CHECK2-NEXT:    [[ADD14:%.*]] = add i32 [[TMP16]], [[MUL]]
+ // CHECK2-NEXT:    store i32 [[ADD14]], ptr [[I]], align 4
+-// CHECK2-NEXT:    [[TMP18:%.*]] = load i32, ptr [[I]], align 4
+-// CHECK2-NEXT:    call void (...) @body(i32 noundef [[TMP18]])
++// CHECK2-NEXT:    [[TMP19:%.*]] = load i32, ptr [[I]], align 4
++// CHECK2-NEXT:    call void (...) @body(i32 noundef [[TMP19]])
+ // CHECK2-NEXT:    br label [[FOR_INC:%.*]]
+ // CHECK2:       for.inc:
+-// CHECK2-NEXT:    [[TMP19:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP19]], 1
++// CHECK2-NEXT:    [[TMP20:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
++// CHECK2-NEXT:    [[INC:%.*]] = add i32 [[TMP20]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP6:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC15:%.*]]
+ // CHECK2:       for.inc15:
+-// CHECK2-NEXT:    [[TMP20:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD16:%.*]] = add nsw i32 [[TMP20]], 5
++// CHECK2-NEXT:    [[TMP21:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
++// CHECK2-NEXT:    [[ADD16:%.*]] = add i32 [[TMP21]], 5
+ // CHECK2-NEXT:    store i32 [[ADD16]], ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP7:![0-9]+]]
+ // CHECK2:       for.end17:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo2
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo10(
++// CHECK2-SAME: ptr noundef byval([[STRUCT_DATA_T:%.*]]) align 8 [[DATA:%.*]]) #[[ATTR1]] {
++// CHECK2-NEXT:  entry:
++// CHECK2-NEXT:    [[C:%.*]] = alloca double, align 8
++// CHECK2-NEXT:    [[__RANGE2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[__END2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[__BEGIN2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_3:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_4:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[DOTFLOOR_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[DOTTILE_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[V:%.*]] = alloca double, align 8
++// CHECK2-NEXT:    store double 4.200000e+01, ptr [[C]], align 8
++// CHECK2-NEXT:    [[ARRAY:%.*]] = getelementptr inbounds [[STRUCT_DATA_T]], ptr [[DATA]], i32 0, i32 0
++// CHECK2-NEXT:    store ptr [[ARRAY]], ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP0]], i64 0, i64 0
++// CHECK2-NEXT:    [[ADD_PTR:%.*]] = getelementptr inbounds double, ptr [[ARRAYDECAY]], i64 12
++// CHECK2-NEXT:    store ptr [[ADD_PTR]], ptr [[__END2]], align 8
++// CHECK2-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY1:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP1]], i64 0, i64 0
++// CHECK2-NEXT:    store ptr [[ARRAYDECAY1]], ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY2:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP2]], i64 0, i64 0
++// CHECK2-NEXT:    store ptr [[ARRAYDECAY2]], ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[TMP3:%.*]] = load ptr, ptr [[__END2]], align 8
++// CHECK2-NEXT:    store ptr [[TMP3]], ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK2-NEXT:    [[TMP4:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK2-NEXT:    [[TMP5:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[SUB_PTR_LHS_CAST:%.*]] = ptrtoint ptr [[TMP4]] to i64
++// CHECK2-NEXT:    [[SUB_PTR_RHS_CAST:%.*]] = ptrtoint ptr [[TMP5]] to i64
++// CHECK2-NEXT:    [[SUB_PTR_SUB:%.*]] = sub i64 [[SUB_PTR_LHS_CAST]], [[SUB_PTR_RHS_CAST]]
++// CHECK2-NEXT:    [[SUB_PTR_DIV:%.*]] = sdiv exact i64 [[SUB_PTR_SUB]], 8
++// CHECK2-NEXT:    [[SUB:%.*]] = sub nsw i64 [[SUB_PTR_DIV]], 1
++// CHECK2-NEXT:    [[ADD:%.*]] = add nsw i64 [[SUB]], 1
++// CHECK2-NEXT:    [[DIV:%.*]] = sdiv i64 [[ADD]], 1
++// CHECK2-NEXT:    [[SUB5:%.*]] = sub nsw i64 [[DIV]], 1
++// CHECK2-NEXT:    store i64 [[SUB5]], ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    store i64 0, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK2:       for.cond:
++// CHECK2-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP7:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD6:%.*]] = add nsw i64 [[TMP7]], 1
++// CHECK2-NEXT:    [[CMP:%.*]] = icmp slt i64 [[TMP6]], [[ADD6]]
++// CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END18:%.*]]
++// CHECK2:       for.body:
++// CHECK2-NEXT:    [[TMP8:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    store i64 [[TMP8]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND7:%.*]]
++// CHECK2:       for.cond7:
++// CHECK2-NEXT:    [[TMP9:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP10:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD8:%.*]] = add nsw i64 [[TMP10]], 1
++// CHECK2-NEXT:    [[TMP11:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD9:%.*]] = add nsw i64 [[TMP11]], 5
++// CHECK2-NEXT:    [[CMP10:%.*]] = icmp slt i64 [[ADD8]], [[ADD9]]
++// CHECK2-NEXT:    br i1 [[CMP10]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK2:       cond.true:
++// CHECK2-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i64 [[TMP12]], 1
++// CHECK2-NEXT:    br label [[COND_END:%.*]]
++// CHECK2:       cond.false:
++// CHECK2-NEXT:    [[TMP13:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD12:%.*]] = add nsw i64 [[TMP13]], 5
++// CHECK2-NEXT:    br label [[COND_END]]
++// CHECK2:       cond.end:
++// CHECK2-NEXT:    [[COND:%.*]] = phi i64 [ [[ADD11]], [[COND_TRUE]] ], [ [[ADD12]], [[COND_FALSE]] ]
++// CHECK2-NEXT:    [[CMP13:%.*]] = icmp slt i64 [[TMP9]], [[COND]]
++// CHECK2-NEXT:    br i1 [[CMP13]], label [[FOR_BODY14:%.*]], label [[FOR_END:%.*]]
++// CHECK2:       for.body14:
++// CHECK2-NEXT:    [[TMP14:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[TMP15:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[MUL:%.*]] = mul nsw i64 [[TMP15]], 1
++// CHECK2-NEXT:    [[ADD_PTR15:%.*]] = getelementptr inbounds double, ptr [[TMP14]], i64 [[MUL]]
++// CHECK2-NEXT:    store ptr [[ADD_PTR15]], ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP16:%.*]] = load ptr, ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP17:%.*]] = load double, ptr [[TMP16]], align 8
++// CHECK2-NEXT:    store double [[TMP17]], ptr [[V]], align 8
++// CHECK2-NEXT:    [[TMP18:%.*]] = load double, ptr [[C]], align 8
++// CHECK2-NEXT:    [[TMP19:%.*]] = load double, ptr [[V]], align 8
++// CHECK2-NEXT:    call void (...) @body(double noundef [[TMP18]], double noundef [[TMP19]])
++// CHECK2-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK2:       for.inc:
++// CHECK2-NEXT:    [[TMP20:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[INC:%.*]] = add nsw i64 [[TMP20]], 1
++// CHECK2-NEXT:    store i64 [[INC]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND7]], !llvm.loop [[LOOP8:![0-9]+]]
++// CHECK2:       for.end:
++// CHECK2-NEXT:    br label [[FOR_INC16:%.*]]
++// CHECK2:       for.inc16:
++// CHECK2-NEXT:    [[TMP21:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD17:%.*]] = add nsw i64 [[TMP21]], 5
++// CHECK2-NEXT:    store i64 [[ADD17]], ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP9:![0-9]+]]
++// CHECK2:       for.end18:
++// CHECK2-NEXT:    ret void
++//
++//
++// CHECK2-LABEL: define dso_local void @foo2(
++// CHECK2-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]], i32 noundef [[STEP:%.*]]) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -1438,34 +1759,34 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTTILE_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP14]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND10]], !llvm.loop [[LOOP8:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND10]], !llvm.loop [[LOOP10:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC22:%.*]]
+ // CHECK2:       for.inc22:
+ // CHECK2-NEXT:    [[TMP15:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC23:%.*]] = add nsw i32 [[TMP15]], 1
+ // CHECK2-NEXT:    store i32 [[INC23]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND4]], !llvm.loop [[LOOP9:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND4]], !llvm.loop [[LOOP11:![0-9]+]]
+ // CHECK2:       for.end24:
+ // CHECK2-NEXT:    br label [[FOR_INC25:%.*]]
+ // CHECK2:       for.inc25:
+ // CHECK2-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTFLOOR_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[ADD26:%.*]] = add nsw i32 [[TMP16]], 5
+ // CHECK2-NEXT:    store i32 [[ADD26]], ptr [[DOTFLOOR_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP10:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP12:![0-9]+]]
+ // CHECK2:       for.end27:
+ // CHECK2-NEXT:    br label [[FOR_INC28:%.*]]
+ // CHECK2:       for.inc28:
+ // CHECK2-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[ADD29:%.*]] = add nsw i32 [[TMP17]], 5
+ // CHECK2-NEXT:    store i32 [[ADD29]], ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP11:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP13:![0-9]+]]
+ // CHECK2:       for.end30:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo3
+-// CHECK2-SAME: () #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo3(
++// CHECK2-SAME: ) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1574,21 +1895,21 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP20:%.*]] = load i32, ptr [[DOTTILE_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP20]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND15]], !llvm.loop [[LOOP12:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND15]], !llvm.loop [[LOOP14:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC27:%.*]]
+ // CHECK2:       for.inc27:
+ // CHECK2-NEXT:    [[TMP21:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC28:%.*]] = add nsw i32 [[TMP21]], 1
+ // CHECK2-NEXT:    store i32 [[INC28]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND3]], !llvm.loop [[LOOP13:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND3]], !llvm.loop [[LOOP15:![0-9]+]]
+ // CHECK2:       for.end29:
+ // CHECK2-NEXT:    br label [[FOR_INC30:%.*]]
+ // CHECK2:       for.inc30:
+ // CHECK2-NEXT:    [[TMP22:%.*]] = load i32, ptr [[DOTFLOOR_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[ADD31:%.*]] = add nsw i32 [[TMP22]], 5
+ // CHECK2-NEXT:    store i32 [[ADD31]], ptr [[DOTFLOOR_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP14:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP16:![0-9]+]]
+ // CHECK2:       for.end32:
+ // CHECK2-NEXT:    br label [[OMP_BODY_CONTINUE:%.*]]
+ // CHECK2:       omp.body.continue:
+@@ -1606,8 +1927,8 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo4
+-// CHECK2-SAME: () #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo4(
++// CHECK2-SAME: ) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1727,21 +2048,21 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP22:%.*]] = load i32, ptr [[DOTTILE_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP22]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND20]], !llvm.loop [[LOOP15:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND20]], !llvm.loop [[LOOP17:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC32:%.*]]
+ // CHECK2:       for.inc32:
+ // CHECK2-NEXT:    [[TMP23:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC33:%.*]] = add nsw i32 [[TMP23]], 1
+ // CHECK2-NEXT:    store i32 [[INC33]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND8]], !llvm.loop [[LOOP16:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND8]], !llvm.loop [[LOOP18:![0-9]+]]
+ // CHECK2:       for.end34:
+ // CHECK2-NEXT:    br label [[FOR_INC35:%.*]]
+ // CHECK2:       for.inc35:
+ // CHECK2-NEXT:    [[TMP24:%.*]] = load i32, ptr [[DOTFLOOR_1_IV_J]], align 4
+ // CHECK2-NEXT:    [[ADD36:%.*]] = add nsw i32 [[TMP24]], 5
+ // CHECK2-NEXT:    store i32 [[ADD36]], ptr [[DOTFLOOR_1_IV_J]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP17:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP19:![0-9]+]]
+ // CHECK2:       for.end37:
+ // CHECK2-NEXT:    br label [[OMP_BODY_CONTINUE:%.*]]
+ // CHECK2:       omp.body.continue:
+@@ -1759,8 +2080,8 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo5
+-// CHECK2-SAME: () #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo5(
++// CHECK2-SAME: ) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTOMP_IV:%.*]] = alloca i64, align 8
+ // CHECK2-NEXT:    [[TMP:%.*]] = alloca i32, align 4
+@@ -1968,15 +2289,15 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo6
+-// CHECK2-SAME: () #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo6(
++// CHECK2-SAME: ) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void (ptr, i32, ptr, ...) @__kmpc_fork_call(ptr @[[GLOB2]], i32 0, ptr @foo6.omp_outlined)
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo6.omp_outlined
+-// CHECK2-SAME: (ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
++// CHECK2-LABEL: define internal void @foo6.omp_outlined(
++// CHECK2-SAME: ptr noalias noundef [[DOTGLOBAL_TID_:%.*]], ptr noalias noundef [[DOTBOUND_TID_:%.*]]) #[[ATTR4:[0-9]+]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[DOTGLOBAL_TID__ADDR:%.*]] = alloca ptr, align 8
+ // CHECK2-NEXT:    [[DOTBOUND_TID__ADDR:%.*]] = alloca ptr, align 8
+@@ -2054,7 +2375,7 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP14]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP18:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP20:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[OMP_BODY_CONTINUE:%.*]]
+ // CHECK2:       omp.body.continue:
+@@ -2071,8 +2392,8 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@foo8
+-// CHECK2-SAME: (i32 noundef [[A:%.*]]) #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo8(
++// CHECK2-SAME: i32 noundef [[A:%.*]]) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[I:%.*]] = alloca i32, align 4
+@@ -2138,7 +2459,7 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP11:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP11]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP21:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND1]], !llvm.loop [[LOOP23:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC17:%.*]]
+ // CHECK2:       for.inc17:
+@@ -2155,20 +2476,117 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP14:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+ // CHECK2-NEXT:    [[ADD23:%.*]] = add nsw i32 [[TMP14]], [[COND22]]
+ // CHECK2-NEXT:    store i32 [[ADD23]], ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP22:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP24:![0-9]+]]
+ // CHECK2:       for.end24:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@tfoo7
+-// CHECK2-SAME: () #[[ATTR1]] {
++// CHECK2-LABEL: define dso_local void @foo9(
++// CHECK2-SAME: ptr noundef byval([[STRUCT_DATA_T:%.*]]) align 8 [[DATA:%.*]]) #[[ATTR1]] {
++// CHECK2-NEXT:  entry:
++// CHECK2-NEXT:    [[__RANGE2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[__END2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[__BEGIN2:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_3:%.*]] = alloca ptr, align 8
++// CHECK2-NEXT:    [[DOTCAPTURE_EXPR_4:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[DOTFLOOR_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[DOTTILE_0_IV___BEGIN2:%.*]] = alloca i64, align 8
++// CHECK2-NEXT:    [[V:%.*]] = alloca double, align 8
++// CHECK2-NEXT:    [[ARRAY:%.*]] = getelementptr inbounds [[STRUCT_DATA_T]], ptr [[DATA]], i32 0, i32 0
++// CHECK2-NEXT:    store ptr [[ARRAY]], ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP0]], i64 0, i64 0
++// CHECK2-NEXT:    [[ADD_PTR:%.*]] = getelementptr inbounds double, ptr [[ARRAYDECAY]], i64 12
++// CHECK2-NEXT:    store ptr [[ADD_PTR]], ptr [[__END2]], align 8
++// CHECK2-NEXT:    [[TMP1:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY1:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP1]], i64 0, i64 0
++// CHECK2-NEXT:    store ptr [[ARRAYDECAY1]], ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP2:%.*]] = load ptr, ptr [[__RANGE2]], align 8
++// CHECK2-NEXT:    [[ARRAYDECAY2:%.*]] = getelementptr inbounds [12 x double], ptr [[TMP2]], i64 0, i64 0
++// CHECK2-NEXT:    store ptr [[ARRAYDECAY2]], ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[TMP3:%.*]] = load ptr, ptr [[__END2]], align 8
++// CHECK2-NEXT:    store ptr [[TMP3]], ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK2-NEXT:    [[TMP4:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_3]], align 8
++// CHECK2-NEXT:    [[TMP5:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[SUB_PTR_LHS_CAST:%.*]] = ptrtoint ptr [[TMP4]] to i64
++// CHECK2-NEXT:    [[SUB_PTR_RHS_CAST:%.*]] = ptrtoint ptr [[TMP5]] to i64
++// CHECK2-NEXT:    [[SUB_PTR_SUB:%.*]] = sub i64 [[SUB_PTR_LHS_CAST]], [[SUB_PTR_RHS_CAST]]
++// CHECK2-NEXT:    [[SUB_PTR_DIV:%.*]] = sdiv exact i64 [[SUB_PTR_SUB]], 8
++// CHECK2-NEXT:    [[SUB:%.*]] = sub nsw i64 [[SUB_PTR_DIV]], 1
++// CHECK2-NEXT:    [[ADD:%.*]] = add nsw i64 [[SUB]], 1
++// CHECK2-NEXT:    [[DIV:%.*]] = sdiv i64 [[ADD]], 1
++// CHECK2-NEXT:    [[SUB5:%.*]] = sub nsw i64 [[DIV]], 1
++// CHECK2-NEXT:    store i64 [[SUB5]], ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    store i64 0, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND:%.*]]
++// CHECK2:       for.cond:
++// CHECK2-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP7:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD6:%.*]] = add nsw i64 [[TMP7]], 1
++// CHECK2-NEXT:    [[CMP:%.*]] = icmp slt i64 [[TMP6]], [[ADD6]]
++// CHECK2-NEXT:    br i1 [[CMP]], label [[FOR_BODY:%.*]], label [[FOR_END18:%.*]]
++// CHECK2:       for.body:
++// CHECK2-NEXT:    [[TMP8:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    store i64 [[TMP8]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND7:%.*]]
++// CHECK2:       for.cond7:
++// CHECK2-NEXT:    [[TMP9:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP10:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD8:%.*]] = add nsw i64 [[TMP10]], 1
++// CHECK2-NEXT:    [[TMP11:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD9:%.*]] = add nsw i64 [[TMP11]], 5
++// CHECK2-NEXT:    [[CMP10:%.*]] = icmp slt i64 [[ADD8]], [[ADD9]]
++// CHECK2-NEXT:    br i1 [[CMP10]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
++// CHECK2:       cond.true:
++// CHECK2-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTCAPTURE_EXPR_4]], align 8
++// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i64 [[TMP12]], 1
++// CHECK2-NEXT:    br label [[COND_END:%.*]]
++// CHECK2:       cond.false:
++// CHECK2-NEXT:    [[TMP13:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD12:%.*]] = add nsw i64 [[TMP13]], 5
++// CHECK2-NEXT:    br label [[COND_END]]
++// CHECK2:       cond.end:
++// CHECK2-NEXT:    [[COND:%.*]] = phi i64 [ [[ADD11]], [[COND_TRUE]] ], [ [[ADD12]], [[COND_FALSE]] ]
++// CHECK2-NEXT:    [[CMP13:%.*]] = icmp slt i64 [[TMP9]], [[COND]]
++// CHECK2-NEXT:    br i1 [[CMP13]], label [[FOR_BODY14:%.*]], label [[FOR_END:%.*]]
++// CHECK2:       for.body14:
++// CHECK2-NEXT:    [[TMP14:%.*]] = load ptr, ptr [[DOTCAPTURE_EXPR_]], align 8
++// CHECK2-NEXT:    [[TMP15:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[MUL:%.*]] = mul nsw i64 [[TMP15]], 1
++// CHECK2-NEXT:    [[ADD_PTR15:%.*]] = getelementptr inbounds double, ptr [[TMP14]], i64 [[MUL]]
++// CHECK2-NEXT:    store ptr [[ADD_PTR15]], ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP16:%.*]] = load ptr, ptr [[__BEGIN2]], align 8
++// CHECK2-NEXT:    [[TMP17:%.*]] = load double, ptr [[TMP16]], align 8
++// CHECK2-NEXT:    store double [[TMP17]], ptr [[V]], align 8
++// CHECK2-NEXT:    [[TMP18:%.*]] = load double, ptr [[V]], align 8
++// CHECK2-NEXT:    call void (...) @body(double noundef [[TMP18]])
++// CHECK2-NEXT:    br label [[FOR_INC:%.*]]
++// CHECK2:       for.inc:
++// CHECK2-NEXT:    [[TMP19:%.*]] = load i64, ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[INC:%.*]] = add nsw i64 [[TMP19]], 1
++// CHECK2-NEXT:    store i64 [[INC]], ptr [[DOTTILE_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND7]], !llvm.loop [[LOOP25:![0-9]+]]
++// CHECK2:       for.end:
++// CHECK2-NEXT:    br label [[FOR_INC16:%.*]]
++// CHECK2:       for.inc16:
++// CHECK2-NEXT:    [[TMP20:%.*]] = load i64, ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    [[ADD17:%.*]] = add nsw i64 [[TMP20]], 5
++// CHECK2-NEXT:    store i64 [[ADD17]], ptr [[DOTFLOOR_0_IV___BEGIN2]], align 8
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP26:![0-9]+]]
++// CHECK2:       for.end18:
++// CHECK2-NEXT:    ret void
++//
++//
++// CHECK2-LABEL: define dso_local void @tfoo7(
++// CHECK2-SAME: ) #[[ATTR1]] {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void @_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_(i32 noundef 0, i32 noundef 42)
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_
+-// CHECK2-SAME: (i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR1]] comdat {
++// CHECK2-LABEL: define linkonce_odr void @_Z4foo7IiTnT_Li3ETnS0_Li5EEvS0_S0_(
++// CHECK2-SAME: i32 noundef [[START:%.*]], i32 noundef [[END:%.*]]) #[[ATTR1]] comdat {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    [[START_ADDR:%.*]] = alloca i32, align 4
+ // CHECK2-NEXT:    [[END_ADDR:%.*]] = alloca i32, align 4
+@@ -2211,7 +2629,7 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    [[TMP9:%.*]] = load i32, ptr [[DOTCAPTURE_EXPR_2]], align 4
+ // CHECK2-NEXT:    [[ADD7:%.*]] = add i32 [[TMP9]], 1
+ // CHECK2-NEXT:    [[TMP10:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD8:%.*]] = add nsw i32 [[TMP10]], 5
++// CHECK2-NEXT:    [[ADD8:%.*]] = add i32 [[TMP10]], 5
+ // CHECK2-NEXT:    [[CMP9:%.*]] = icmp ult i32 [[ADD7]], [[ADD8]]
+ // CHECK2-NEXT:    br i1 [[CMP9]], label [[COND_TRUE:%.*]], label [[COND_FALSE:%.*]]
+ // CHECK2:       cond.true:
+@@ -2220,7 +2638,7 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    br label [[COND_END:%.*]]
+ // CHECK2:       cond.false:
+ // CHECK2-NEXT:    [[TMP12:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD11:%.*]] = add nsw i32 [[TMP12]], 5
++// CHECK2-NEXT:    [[ADD11:%.*]] = add i32 [[TMP12]], 5
+ // CHECK2-NEXT:    br label [[COND_END]]
+ // CHECK2:       cond.end:
+ // CHECK2-NEXT:    [[COND:%.*]] = phi i32 [ [[ADD10]], [[COND_TRUE]] ], [ [[ADD11]], [[COND_FALSE]] ]
+@@ -2237,23 +2655,74 @@ extern "C" void foo8(int a) {
+ // CHECK2-NEXT:    br label [[FOR_INC:%.*]]
+ // CHECK2:       for.inc:
+ // CHECK2-NEXT:    [[TMP16:%.*]] = load i32, ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP16]], 1
++// CHECK2-NEXT:    [[INC:%.*]] = add i32 [[TMP16]], 1
+ // CHECK2-NEXT:    store i32 [[INC]], ptr [[DOTTILE_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP23:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND6]], !llvm.loop [[LOOP27:![0-9]+]]
+ // CHECK2:       for.end:
+ // CHECK2-NEXT:    br label [[FOR_INC15:%.*]]
+ // CHECK2:       for.inc15:
+ // CHECK2-NEXT:    [[TMP17:%.*]] = load i32, ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    [[ADD16:%.*]] = add nsw i32 [[TMP17]], 5
++// CHECK2-NEXT:    [[ADD16:%.*]] = add i32 [[TMP17]], 5
+ // CHECK2-NEXT:    store i32 [[ADD16]], ptr [[DOTFLOOR_0_IV_I]], align 4
+-// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP24:![0-9]+]]
++// CHECK2-NEXT:    br label [[FOR_COND]], !llvm.loop [[LOOP28:![0-9]+]]
+ // CHECK2:       for.end17:
+ // CHECK2-NEXT:    ret void
+ //
+ //
+-// CHECK2-LABEL: define {{[^@]+}}@_GLOBAL__sub_I_tile_codegen.cpp
+-// CHECK2-SAME: () #[[ATTR0]] section ".text.startup" {
++// CHECK2-LABEL: define internal void @_GLOBAL__sub_I_tile_codegen.cpp(
++// CHECK2-SAME: ) #[[ATTR0]] section ".text.startup" {
+ // CHECK2-NEXT:  entry:
+ // CHECK2-NEXT:    call void @__cxx_global_var_init()
+ // CHECK2-NEXT:    ret void
+ //
++//.
++// CHECK1: [[LOOP3]] = distinct !{[[LOOP3]], [[META4:![0-9]+]]}
++// CHECK1: [[META4]] = !{!"llvm.loop.mustprogress"}
++// CHECK1: [[LOOP5]] = distinct !{[[LOOP5]], [[META4]]}
++// CHECK1: [[LOOP6]] = distinct !{[[LOOP6]], [[META4]]}
++// CHECK1: [[LOOP7]] = distinct !{[[LOOP7]], [[META4]]}
++// CHECK1: [[LOOP8]] = distinct !{[[LOOP8]], [[META4]]}
++// CHECK1: [[LOOP9]] = distinct !{[[LOOP9]], [[META4]]}
++// CHECK1: [[LOOP10]] = distinct !{[[LOOP10]], [[META4]]}
++// CHECK1: [[LOOP11]] = distinct !{[[LOOP11]], [[META4]]}
++// CHECK1: [[LOOP12]] = distinct !{[[LOOP12]], [[META4]]}
++// CHECK1: [[LOOP13]] = distinct !{[[LOOP13]], [[META4]]}
++// CHECK1: [[LOOP14]] = distinct !{[[LOOP14]], [[META4]]}
++// CHECK1: [[LOOP15]] = distinct !{[[LOOP15]], [[META4]]}
++// CHECK1: [[LOOP16]] = distinct !{[[LOOP16]], [[META4]]}
++// CHECK1: [[LOOP17]] = distinct !{[[LOOP17]], [[META4]]}
++// CHECK1: [[LOOP18]] = distinct !{[[LOOP18]], [[META4]]}
++// CHECK1: [[LOOP21]] = distinct !{[[LOOP21]], [[META4]]}
++// CHECK1: [[LOOP22]] = distinct !{[[LOOP22]], [[META4]]}
++// CHECK1: [[LOOP23]] = distinct !{[[LOOP23]], [[META4]]}
++// CHECK1: [[LOOP24]] = distinct !{[[LOOP24]], [[META4]]}
++// CHECK1: [[LOOP25]] = distinct !{[[LOOP25]], [[META4]]}
++// CHECK1: [[LOOP26]] = distinct !{[[LOOP26]], [[META4]]}
++// CHECK1: [[LOOP27]] = distinct !{[[LOOP27]], [[META4]]}
++// CHECK1: [[LOOP28]] = distinct !{[[LOOP28]], [[META4]]}
++//.
++// CHECK2: [[LOOP3]] = distinct !{[[LOOP3]], [[META4:![0-9]+]]}
++// CHECK2: [[META4]] = !{!"llvm.loop.mustprogress"}
++// CHECK2: [[LOOP5]] = distinct !{[[LOOP5]], [[META4]]}
++// CHECK2: [[LOOP6]] = distinct !{[[LOOP6]], [[META4]]}
++// CHECK2: [[LOOP7]] = distinct !{[[LOOP7]], [[META4]]}
++// CHECK2: [[LOOP8]] = distinct !{[[LOOP8]], [[META4]]}
++// CHECK2: [[LOOP9]] = distinct !{[[LOOP9]], [[META4]]}
++// CHECK2: [[LOOP10]] = distinct !{[[LOOP10]], [[META4]]}
++// CHECK2: [[LOOP11]] = distinct !{[[LOOP11]], [[META4]]}
++// CHECK2: [[LOOP12]] = distinct !{[[LOOP12]], [[META4]]}
++// CHECK2: [[LOOP13]] = distinct !{[[LOOP13]], [[META4]]}
++// CHECK2: [[LOOP14]] = distinct !{[[LOOP14]], [[META4]]}
++// CHECK2: [[LOOP15]] = distinct !{[[LOOP15]], [[META4]]}
++// CHECK2: [[LOOP16]] = distinct !{[[LOOP16]], [[META4]]}
++// CHECK2: [[LOOP17]] = distinct !{[[LOOP17]], [[META4]]}
++// CHECK2: [[LOOP18]] = distinct !{[[LOOP18]], [[META4]]}
++// CHECK2: [[LOOP19]] = distinct !{[[LOOP19]], [[META4]]}
++// CHECK2: [[LOOP20]] = distinct !{[[LOOP20]], [[META4]]}
++// CHECK2: [[LOOP23]] = distinct !{[[LOOP23]], [[META4]]}
++// CHECK2: [[LOOP24]] = distinct !{[[LOOP24]], [[META4]]}
++// CHECK2: [[LOOP25]] = distinct !{[[LOOP25]], [[META4]]}
++// CHECK2: [[LOOP26]] = distinct !{[[LOOP26]], [[META4]]}
++// CHECK2: [[LOOP27]] = distinct !{[[LOOP27]], [[META4]]}
++// CHECK2: [[LOOP28]] = distinct !{[[LOOP28]], [[META4]]}
++//.
+diff --git a/clang/test/OpenMP/tile_codegen_for_dependent.cpp b/clang/test/OpenMP/tile_codegen_for_dependent.cpp
+index 93c51c9165a47..820d33d15287b 100644
+--- a/clang/test/OpenMP/tile_codegen_for_dependent.cpp
++++ b/clang/test/OpenMP/tile_codegen_for_dependent.cpp
+@@ -17,7 +17,7 @@
+ extern "C" void body(...) {}
+ 
+ 
+-// IR-LABEL: @func(
++// IR-LABEL: define {{.*}}@func(
+ // IR-NEXT:  [[ENTRY:.*]]:
+ // IR-NEXT:    %[[START_ADDR:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[END_ADDR:.+]] = alloca i32, align 4
+@@ -27,18 +27,18 @@ extern "C" void body(...) {}
+ // IR-NEXT:    %[[I:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_1:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTNEW_STEP:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_2:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_3:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_6:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_8:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_5:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_7:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTFLOOR_0_IV_I:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_LB:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_UB:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_STRIDE:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_IS_LAST:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTFLOOR_0_IV_I12:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTFLOOR_0_IV_I11:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTTILE_0_IV_I:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[TMP0:.+]] = call i32 @__kmpc_global_thread_num(ptr @2)
++// IR-NEXT:    %[[TMP0:.+]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB2:.+]])
+ // IR-NEXT:    store i32 %[[START:.+]], ptr %[[START_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[END:.+]], ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[STEP:.+]], ptr %[[STEP_ADDR]], align 4
+@@ -49,44 +49,44 @@ extern "C" void body(...) {}
+ // IR-NEXT:    %[[TMP3:.+]] = load i32, ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[TMP3]], ptr %[[DOTCAPTURE_EXPR_1]], align 4
+ // IR-NEXT:    %[[TMP4:.+]] = load i32, ptr %[[STEP_ADDR]], align 4
+-// IR-NEXT:    store i32 %[[TMP4]], ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    store i32 %[[TMP4]], ptr %[[DOTNEW_STEP]], align 4
+ // IR-NEXT:    %[[TMP5:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_1]], align 4
+ // IR-NEXT:    %[[TMP6:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_]], align 4
+ // IR-NEXT:    %[[SUB:.+]] = sub i32 %[[TMP5]], %[[TMP6]]
+-// IR-NEXT:    %[[SUB4:.+]] = sub i32 %[[SUB]], 1
+-// IR-NEXT:    %[[TMP7:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
+-// IR-NEXT:    %[[ADD:.+]] = add i32 %[[SUB4]], %[[TMP7]]
+-// IR-NEXT:    %[[TMP8:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[SUB3:.+]] = sub i32 %[[SUB]], 1
++// IR-NEXT:    %[[TMP7:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
++// IR-NEXT:    %[[ADD:.+]] = add i32 %[[SUB3]], %[[TMP7]]
++// IR-NEXT:    %[[TMP8:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
+ // IR-NEXT:    %[[DIV:.+]] = udiv i32 %[[ADD]], %[[TMP8]]
+-// IR-NEXT:    %[[SUB5:.+]] = sub i32 %[[DIV]], 1
+-// IR-NEXT:    store i32 %[[SUB5]], ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[TMP9:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD7:.+]] = add i32 %[[TMP9]], 1
+-// IR-NEXT:    store i32 %[[ADD7]], ptr %[[DOTCAPTURE_EXPR_6]], align 4
+-// IR-NEXT:    %[[TMP10:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_6]], align 4
+-// IR-NEXT:    %[[SUB9:.+]] = sub i32 %[[TMP10]], -3
+-// IR-NEXT:    %[[DIV10:.+]] = udiv i32 %[[SUB9]], 4
+-// IR-NEXT:    %[[SUB11:.+]] = sub i32 %[[DIV10]], 1
+-// IR-NEXT:    store i32 %[[SUB11]], ptr %[[DOTCAPTURE_EXPR_8]], align 4
++// IR-NEXT:    %[[SUB4:.+]] = sub i32 %[[DIV]], 1
++// IR-NEXT:    store i32 %[[SUB4]], ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[TMP9:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD6:.+]] = add i32 %[[TMP9]], 1
++// IR-NEXT:    store i32 %[[ADD6]], ptr %[[DOTCAPTURE_EXPR_5]], align 4
++// IR-NEXT:    %[[TMP10:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_5]], align 4
++// IR-NEXT:    %[[SUB8:.+]] = sub i32 %[[TMP10]], -3
++// IR-NEXT:    %[[DIV9:.+]] = udiv i32 %[[SUB8]], 4
++// IR-NEXT:    %[[SUB10:.+]] = sub i32 %[[DIV9]], 1
++// IR-NEXT:    store i32 %[[SUB10]], ptr %[[DOTCAPTURE_EXPR_7]], align 4
+ // IR-NEXT:    store i32 0, ptr %[[DOTFLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP11:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_6]], align 4
++// IR-NEXT:    %[[TMP11:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_5]], align 4
+ // IR-NEXT:    %[[CMP:.+]] = icmp ult i32 0, %[[TMP11]]
+ // IR-NEXT:    br i1 %[[CMP]], label %[[OMP_PRECOND_THEN:.+]], label %[[OMP_PRECOND_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_PRECOND_THEN]]:
+ // IR-NEXT:    store i32 0, ptr %[[DOTOMP_LB]], align 4
+-// IR-NEXT:    %[[TMP12:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
++// IR-NEXT:    %[[TMP12:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
+ // IR-NEXT:    store i32 %[[TMP12]], ptr %[[DOTOMP_UB]], align 4
+ // IR-NEXT:    store i32 1, ptr %[[DOTOMP_STRIDE]], align 4
+ // IR-NEXT:    store i32 0, ptr %[[DOTOMP_IS_LAST]], align 4
+-// IR-NEXT:    call void @__kmpc_for_static_init_4u(ptr @1, i32 %[[TMP0]], i32 34, ptr %[[DOTOMP_IS_LAST]], ptr %[[DOTOMP_LB]], ptr %[[DOTOMP_UB]], ptr %[[DOTOMP_STRIDE]], i32 1, i32 1)
++// IR-NEXT:    call void @__kmpc_for_static_init_4u(ptr @[[GLOB1:.+]], i32 %[[TMP0]], i32 34, ptr %[[DOTOMP_IS_LAST]], ptr %[[DOTOMP_LB]], ptr %[[DOTOMP_UB]], ptr %[[DOTOMP_STRIDE]], i32 1, i32 1)
+ // IR-NEXT:    %[[TMP13:.+]] = load i32, ptr %[[DOTOMP_UB]], align 4
+-// IR-NEXT:    %[[TMP14:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
+-// IR-NEXT:    %[[CMP13:.+]] = icmp ugt i32 %[[TMP13]], %[[TMP14]]
+-// IR-NEXT:    br i1 %[[CMP13]], label %[[COND_TRUE:.+]], label %[[COND_FALSE:.+]]
++// IR-NEXT:    %[[TMP14:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
++// IR-NEXT:    %[[CMP12:.+]] = icmp ugt i32 %[[TMP13]], %[[TMP14]]
++// IR-NEXT:    br i1 %[[CMP12]], label %[[COND_TRUE:.+]], label %[[COND_FALSE:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[COND_TRUE]]:
+-// IR-NEXT:    %[[TMP15:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
++// IR-NEXT:    %[[TMP15:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
+ // IR-NEXT:    br label %[[COND_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[COND_FALSE]]:
+@@ -103,50 +103,50 @@ extern "C" void body(...) {}
+ // IR-NEXT:  [[OMP_INNER_FOR_COND]]:
+ // IR-NEXT:    %[[TMP18:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    %[[TMP19:.+]] = load i32, ptr %[[DOTOMP_UB]], align 4
+-// IR-NEXT:    %[[ADD14:.+]] = add i32 %[[TMP19]], 1
+-// IR-NEXT:    %[[CMP15:.+]] = icmp ult i32 %[[TMP18]], %[[ADD14]]
+-// IR-NEXT:    br i1 %[[CMP15]], label %[[OMP_INNER_FOR_BODY:.+]], label %[[OMP_INNER_FOR_END:.+]]
++// IR-NEXT:    %[[ADD13:.+]] = add i32 %[[TMP19]], 1
++// IR-NEXT:    %[[CMP14:.+]] = icmp ult i32 %[[TMP18]], %[[ADD13]]
++// IR-NEXT:    br i1 %[[CMP14]], label %[[OMP_INNER_FOR_BODY:.+]], label %[[OMP_INNER_FOR_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_BODY]]:
+ // IR-NEXT:    %[[TMP20:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    %[[MUL:.+]] = mul i32 %[[TMP20]], 4
+-// IR-NEXT:    %[[ADD16:.+]] = add i32 0, %[[MUL]]
+-// IR-NEXT:    store i32 %[[ADD16]], ptr %[[DOTFLOOR_0_IV_I12]], align 4
+-// IR-NEXT:    %[[TMP21:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I12]], align 4
++// IR-NEXT:    %[[ADD15:.+]] = add i32 0, %[[MUL]]
++// IR-NEXT:    store i32 %[[ADD15]], ptr %[[DOTFLOOR_0_IV_I11]], align 4
++// IR-NEXT:    %[[TMP21:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I11]], align 4
+ // IR-NEXT:    store i32 %[[TMP21]], ptr %[[DOTTILE_0_IV_I]], align 4
+ // IR-NEXT:    br label %[[FOR_COND:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_COND]]:
+ // IR-NEXT:    %[[TMP22:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP23:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD17:.+]] = add i32 %[[TMP23]], 1
+-// IR-NEXT:    %[[TMP24:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I12]], align 4
+-// IR-NEXT:    %[[ADD18:.+]] = add nsw i32 %[[TMP24]], 4
+-// IR-NEXT:    %[[CMP19:.+]] = icmp ult i32 %[[ADD17]], %[[ADD18]]
+-// IR-NEXT:    br i1 %[[CMP19]], label %[[COND_TRUE20:.+]], label %[[COND_FALSE22:.+]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_TRUE20]]:
+-// IR-NEXT:    %[[TMP25:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD21:.+]] = add i32 %[[TMP25]], 1
+-// IR-NEXT:    br label %[[COND_END24:.+]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_FALSE22]]:
+-// IR-NEXT:    %[[TMP26:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I12]], align 4
+-// IR-NEXT:    %[[ADD23:.+]] = add nsw i32 %[[TMP26]], 4
+-// IR-NEXT:    br label %[[COND_END24]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_END24]]:
+-// IR-NEXT:    %[[COND25:.+]] = phi i32 [ %[[ADD21]], %[[COND_TRUE20]] ], [ %[[ADD23]], %[[COND_FALSE22]] ]
+-// IR-NEXT:    %[[CMP26:.+]] = icmp ult i32 %[[TMP22]], %[[COND25]]
+-// IR-NEXT:    br i1 %[[CMP26]], label %[[FOR_BODY:.+]], label %[[FOR_END:.+]]
++// IR-NEXT:    %[[TMP23:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD16:.+]] = add i32 %[[TMP23]], 1
++// IR-NEXT:    %[[TMP24:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I11]], align 4
++// IR-NEXT:    %[[ADD17:.+]] = add i32 %[[TMP24]], 4
++// IR-NEXT:    %[[CMP18:.+]] = icmp ult i32 %[[ADD16]], %[[ADD17]]
++// IR-NEXT:    br i1 %[[CMP18]], label %[[COND_TRUE19:.+]], label %[[COND_FALSE21:.+]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_TRUE19]]:
++// IR-NEXT:    %[[TMP25:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD20:.+]] = add i32 %[[TMP25]], 1
++// IR-NEXT:    br label %[[COND_END23:.+]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_FALSE21]]:
++// IR-NEXT:    %[[TMP26:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I11]], align 4
++// IR-NEXT:    %[[ADD22:.+]] = add i32 %[[TMP26]], 4
++// IR-NEXT:    br label %[[COND_END23]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_END23]]:
++// IR-NEXT:    %[[COND24:.+]] = phi i32 [ %[[ADD20]], %[[COND_TRUE19]] ], [ %[[ADD22]], %[[COND_FALSE21]] ]
++// IR-NEXT:    %[[CMP25:.+]] = icmp ult i32 %[[TMP22]], %[[COND24]]
++// IR-NEXT:    br i1 %[[CMP25]], label %[[FOR_BODY:.+]], label %[[FOR_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_BODY]]:
+ // IR-NEXT:    %[[TMP27:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_]], align 4
+ // IR-NEXT:    %[[TMP28:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP29:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
+-// IR-NEXT:    %[[MUL27:.+]] = mul i32 %[[TMP28]], %[[TMP29]]
+-// IR-NEXT:    %[[ADD28:.+]] = add i32 %[[TMP27]], %[[MUL27]]
+-// IR-NEXT:    store i32 %[[ADD28]], ptr %[[I]], align 4
++// IR-NEXT:    %[[TMP29:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
++// IR-NEXT:    %[[MUL26:.+]] = mul i32 %[[TMP28]], %[[TMP29]]
++// IR-NEXT:    %[[ADD27:.+]] = add i32 %[[TMP27]], %[[MUL26]]
++// IR-NEXT:    store i32 %[[ADD27]], ptr %[[I]], align 4
+ // IR-NEXT:    %[[TMP30:.+]] = load i32, ptr %[[START_ADDR]], align 4
+ // IR-NEXT:    %[[TMP31:.+]] = load i32, ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    %[[TMP32:.+]] = load i32, ptr %[[STEP_ADDR]], align 4
+@@ -156,9 +156,9 @@ extern "C" void body(...) {}
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_INC]]:
+ // IR-NEXT:    %[[TMP34:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[INC:.+]] = add nsw i32 %[[TMP34]], 1
++// IR-NEXT:    %[[INC:.+]] = add i32 %[[TMP34]], 1
+ // IR-NEXT:    store i32 %[[INC]], ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    br label %[[FOR_COND]], !llvm.loop ![[LOOP2:[0-9]+]]
++// IR-NEXT:    br label %[[FOR_COND]], !llvm.loop ![[LOOP3:[0-9]+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_END]]:
+ // IR-NEXT:    br label %[[OMP_BODY_CONTINUE:.+]]
+@@ -168,19 +168,19 @@ extern "C" void body(...) {}
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_INC]]:
+ // IR-NEXT:    %[[TMP35:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+-// IR-NEXT:    %[[ADD29:.+]] = add i32 %[[TMP35]], 1
+-// IR-NEXT:    store i32 %[[ADD29]], ptr %[[DOTOMP_IV]], align 4
++// IR-NEXT:    %[[ADD28:.+]] = add i32 %[[TMP35]], 1
++// IR-NEXT:    store i32 %[[ADD28]], ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    br label %[[OMP_INNER_FOR_COND]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_END]]:
+ // IR-NEXT:    br label %[[OMP_LOOP_EXIT:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_LOOP_EXIT]]:
+-// IR-NEXT:    call void @__kmpc_for_static_fini(ptr @1, i32 %[[TMP0]])
++// IR-NEXT:    call void @__kmpc_for_static_fini(ptr @[[GLOB1]], i32 %[[TMP0]])
+ // IR-NEXT:    br label %[[OMP_PRECOND_END]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_PRECOND_END]]:
+-// IR-NEXT:    call void @__kmpc_barrier(ptr @3, i32 %[[TMP0]])
++// IR-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB3:.+]], i32 %[[TMP0]])
+ // IR-NEXT:    ret void
+ // IR-NEXT:  }
+ extern "C" void func(int start, int end, int step) {
+diff --git a/clang/test/OpenMP/tile_codegen_tile_for.cpp b/clang/test/OpenMP/tile_codegen_tile_for.cpp
+index d0fb89398c241..91536c406368b 100644
+--- a/clang/test/OpenMP/tile_codegen_tile_for.cpp
++++ b/clang/test/OpenMP/tile_codegen_tile_for.cpp
+@@ -16,7 +16,7 @@
+ extern "C" void body(...) {}
+ 
+ 
+-// IR-LABEL: @func(
++// IR-LABEL: define {{.*}}@func(
+ // IR-NEXT:  [[ENTRY:.*]]:
+ // IR-NEXT:    %[[START_ADDR:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[END_ADDR:.+]] = alloca i32, align 4
+@@ -26,22 +26,22 @@ extern "C" void body(...) {}
+ // IR-NEXT:    %[[I:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_1:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTNEW_STEP:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTCAPTURE_EXPR_2:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_3:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTFLOOR_0_IV_I:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_6:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_8:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_12:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTCAPTURE_EXPR_14:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_5:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_7:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_11:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTCAPTURE_EXPR_13:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTFLOOR_0_IV__FLOOR_0_IV_I:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_LB:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_UB:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_STRIDE:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTOMP_IS_LAST:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[DOTFLOOR_0_IV__FLOOR_0_IV_I18:.+]] = alloca i32, align 4
++// IR-NEXT:    %[[DOTFLOOR_0_IV__FLOOR_0_IV_I17:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTTILE_0_IV__FLOOR_0_IV_I:.+]] = alloca i32, align 4
+ // IR-NEXT:    %[[DOTTILE_0_IV_I:.+]] = alloca i32, align 4
+-// IR-NEXT:    %[[TMP0:.+]] = call i32 @__kmpc_global_thread_num(ptr @2)
++// IR-NEXT:    %[[TMP0:.+]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB2:.+]])
+ // IR-NEXT:    store i32 %[[START:.+]], ptr %[[START_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[END:.+]], ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[STEP:.+]], ptr %[[STEP_ADDR]], align 4
+@@ -52,53 +52,53 @@ extern "C" void body(...) {}
+ // IR-NEXT:    %[[TMP3:.+]] = load i32, ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    store i32 %[[TMP3]], ptr %[[DOTCAPTURE_EXPR_1]], align 4
+ // IR-NEXT:    %[[TMP4:.+]] = load i32, ptr %[[STEP_ADDR]], align 4
+-// IR-NEXT:    store i32 %[[TMP4]], ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    store i32 %[[TMP4]], ptr %[[DOTNEW_STEP]], align 4
+ // IR-NEXT:    %[[TMP5:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_1]], align 4
+ // IR-NEXT:    %[[TMP6:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_]], align 4
+ // IR-NEXT:    %[[SUB:.+]] = sub i32 %[[TMP5]], %[[TMP6]]
+-// IR-NEXT:    %[[SUB4:.+]] = sub i32 %[[SUB]], 1
+-// IR-NEXT:    %[[TMP7:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
+-// IR-NEXT:    %[[ADD:.+]] = add i32 %[[SUB4]], %[[TMP7]]
+-// IR-NEXT:    %[[TMP8:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[SUB3:.+]] = sub i32 %[[SUB]], 1
++// IR-NEXT:    %[[TMP7:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
++// IR-NEXT:    %[[ADD:.+]] = add i32 %[[SUB3]], %[[TMP7]]
++// IR-NEXT:    %[[TMP8:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
+ // IR-NEXT:    %[[DIV:.+]] = udiv i32 %[[ADD]], %[[TMP8]]
+-// IR-NEXT:    %[[SUB5:.+]] = sub i32 %[[DIV]], 1
+-// IR-NEXT:    store i32 %[[SUB5]], ptr %[[DOTCAPTURE_EXPR_3]], align 4
++// IR-NEXT:    %[[SUB4:.+]] = sub i32 %[[DIV]], 1
++// IR-NEXT:    store i32 %[[SUB4]], ptr %[[DOTCAPTURE_EXPR_2]], align 4
+ // IR-NEXT:    store i32 0, ptr %[[DOTFLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP9:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD7:.+]] = add i32 %[[TMP9]], 1
+-// IR-NEXT:    store i32 %[[ADD7]], ptr %[[DOTCAPTURE_EXPR_6]], align 4
+-// IR-NEXT:    %[[TMP10:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_6]], align 4
+-// IR-NEXT:    %[[SUB9:.+]] = sub i32 %[[TMP10]], -3
+-// IR-NEXT:    %[[DIV10:.+]] = udiv i32 %[[SUB9]], 4
+-// IR-NEXT:    %[[SUB11:.+]] = sub i32 %[[DIV10]], 1
+-// IR-NEXT:    store i32 %[[SUB11]], ptr %[[DOTCAPTURE_EXPR_8]], align 4
+-// IR-NEXT:    %[[TMP11:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
+-// IR-NEXT:    %[[ADD13:.+]] = add i32 %[[TMP11]], 1
+-// IR-NEXT:    store i32 %[[ADD13]], ptr %[[DOTCAPTURE_EXPR_12]], align 4
+-// IR-NEXT:    %[[TMP12:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_12]], align 4
+-// IR-NEXT:    %[[SUB15:.+]] = sub i32 %[[TMP12]], -2
+-// IR-NEXT:    %[[DIV16:.+]] = udiv i32 %[[SUB15]], 3
+-// IR-NEXT:    %[[SUB17:.+]] = sub i32 %[[DIV16]], 1
+-// IR-NEXT:    store i32 %[[SUB17]], ptr %[[DOTCAPTURE_EXPR_14]], align 4
++// IR-NEXT:    %[[TMP9:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD6:.+]] = add i32 %[[TMP9]], 1
++// IR-NEXT:    store i32 %[[ADD6]], ptr %[[DOTCAPTURE_EXPR_5]], align 4
++// IR-NEXT:    %[[TMP10:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_5]], align 4
++// IR-NEXT:    %[[SUB8:.+]] = sub i32 %[[TMP10]], -3
++// IR-NEXT:    %[[DIV9:.+]] = udiv i32 %[[SUB8]], 4
++// IR-NEXT:    %[[SUB10:.+]] = sub i32 %[[DIV9]], 1
++// IR-NEXT:    store i32 %[[SUB10]], ptr %[[DOTCAPTURE_EXPR_7]], align 4
++// IR-NEXT:    %[[TMP11:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
++// IR-NEXT:    %[[ADD12:.+]] = add i32 %[[TMP11]], 1
++// IR-NEXT:    store i32 %[[ADD12]], ptr %[[DOTCAPTURE_EXPR_11]], align 4
++// IR-NEXT:    %[[TMP12:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_11]], align 4
++// IR-NEXT:    %[[SUB14:.+]] = sub i32 %[[TMP12]], -2
++// IR-NEXT:    %[[DIV15:.+]] = udiv i32 %[[SUB14]], 3
++// IR-NEXT:    %[[SUB16:.+]] = sub i32 %[[DIV15]], 1
++// IR-NEXT:    store i32 %[[SUB16]], ptr %[[DOTCAPTURE_EXPR_13]], align 4
+ // IR-NEXT:    store i32 0, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP13:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_12]], align 4
++// IR-NEXT:    %[[TMP13:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_11]], align 4
+ // IR-NEXT:    %[[CMP:.+]] = icmp ult i32 0, %[[TMP13]]
+ // IR-NEXT:    br i1 %[[CMP]], label %[[OMP_PRECOND_THEN:.+]], label %[[OMP_PRECOND_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_PRECOND_THEN]]:
+ // IR-NEXT:    store i32 0, ptr %[[DOTOMP_LB]], align 4
+-// IR-NEXT:    %[[TMP14:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_14]], align 4
++// IR-NEXT:    %[[TMP14:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_13]], align 4
+ // IR-NEXT:    store i32 %[[TMP14]], ptr %[[DOTOMP_UB]], align 4
+ // IR-NEXT:    store i32 1, ptr %[[DOTOMP_STRIDE]], align 4
+ // IR-NEXT:    store i32 0, ptr %[[DOTOMP_IS_LAST]], align 4
+-// IR-NEXT:    call void @__kmpc_for_static_init_4u(ptr @1, i32 %[[TMP0]], i32 34, ptr %[[DOTOMP_IS_LAST]], ptr %[[DOTOMP_LB]], ptr %[[DOTOMP_UB]], ptr %[[DOTOMP_STRIDE]], i32 1, i32 1)
++// IR-NEXT:    call void @__kmpc_for_static_init_4u(ptr @[[GLOB1:.+]], i32 %[[TMP0]], i32 34, ptr %[[DOTOMP_IS_LAST]], ptr %[[DOTOMP_LB]], ptr %[[DOTOMP_UB]], ptr %[[DOTOMP_STRIDE]], i32 1, i32 1)
+ // IR-NEXT:    %[[TMP15:.+]] = load i32, ptr %[[DOTOMP_UB]], align 4
+-// IR-NEXT:    %[[TMP16:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_14]], align 4
+-// IR-NEXT:    %[[CMP19:.+]] = icmp ugt i32 %[[TMP15]], %[[TMP16]]
+-// IR-NEXT:    br i1 %[[CMP19]], label %[[COND_TRUE:.+]], label %[[COND_FALSE:.+]]
++// IR-NEXT:    %[[TMP16:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_13]], align 4
++// IR-NEXT:    %[[CMP18:.+]] = icmp ugt i32 %[[TMP15]], %[[TMP16]]
++// IR-NEXT:    br i1 %[[CMP18]], label %[[COND_TRUE:.+]], label %[[COND_FALSE:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[COND_TRUE]]:
+-// IR-NEXT:    %[[TMP17:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_14]], align 4
++// IR-NEXT:    %[[TMP17:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_13]], align 4
+ // IR-NEXT:    br label %[[COND_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[COND_FALSE]]:
+@@ -115,83 +115,83 @@ extern "C" void body(...) {}
+ // IR-NEXT:  [[OMP_INNER_FOR_COND]]:
+ // IR-NEXT:    %[[TMP20:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    %[[TMP21:.+]] = load i32, ptr %[[DOTOMP_UB]], align 4
+-// IR-NEXT:    %[[ADD20:.+]] = add i32 %[[TMP21]], 1
+-// IR-NEXT:    %[[CMP21:.+]] = icmp ult i32 %[[TMP20]], %[[ADD20]]
+-// IR-NEXT:    br i1 %[[CMP21]], label %[[OMP_INNER_FOR_BODY:.+]], label %[[OMP_INNER_FOR_END:.+]]
++// IR-NEXT:    %[[ADD19:.+]] = add i32 %[[TMP21]], 1
++// IR-NEXT:    %[[CMP20:.+]] = icmp ult i32 %[[TMP20]], %[[ADD19]]
++// IR-NEXT:    br i1 %[[CMP20]], label %[[OMP_INNER_FOR_BODY:.+]], label %[[OMP_INNER_FOR_END:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_BODY]]:
+ // IR-NEXT:    %[[TMP22:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    %[[MUL:.+]] = mul i32 %[[TMP22]], 3
+-// IR-NEXT:    %[[ADD22:.+]] = add i32 0, %[[MUL]]
+-// IR-NEXT:    store i32 %[[ADD22]], ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I18]], align 4
+-// IR-NEXT:    %[[TMP23:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I18]], align 4
++// IR-NEXT:    %[[ADD21:.+]] = add i32 0, %[[MUL]]
++// IR-NEXT:    store i32 %[[ADD21]], ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I17]], align 4
++// IR-NEXT:    %[[TMP23:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I17]], align 4
+ // IR-NEXT:    store i32 %[[TMP23]], ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
+ // IR-NEXT:    br label %[[FOR_COND:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_COND]]:
+ // IR-NEXT:    %[[TMP24:.+]] = load i32, ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP25:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
+-// IR-NEXT:    %[[ADD23:.+]] = add i32 %[[TMP25]], 1
+-// IR-NEXT:    %[[TMP26:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I18]], align 4
+-// IR-NEXT:    %[[ADD24:.+]] = add i32 %[[TMP26]], 3
+-// IR-NEXT:    %[[CMP25:.+]] = icmp ult i32 %[[ADD23]], %[[ADD24]]
+-// IR-NEXT:    br i1 %[[CMP25]], label %[[COND_TRUE26:.+]], label %[[COND_FALSE28:.+]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_TRUE26]]:
+-// IR-NEXT:    %[[TMP27:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_8]], align 4
+-// IR-NEXT:    %[[ADD27:.+]] = add i32 %[[TMP27]], 1
+-// IR-NEXT:    br label %[[COND_END30:.+]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_FALSE28]]:
+-// IR-NEXT:    %[[TMP28:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I18]], align 4
+-// IR-NEXT:    %[[ADD29:.+]] = add i32 %[[TMP28]], 3
+-// IR-NEXT:    br label %[[COND_END30]]
+-// IR-EMPTY:
+-// IR-NEXT:  [[COND_END30]]:
+-// IR-NEXT:    %[[COND31:.+]] = phi i32 [ %[[ADD27]], %[[COND_TRUE26]] ], [ %[[ADD29]], %[[COND_FALSE28]] ]
+-// IR-NEXT:    %[[CMP32:.+]] = icmp ult i32 %[[TMP24]], %[[COND31]]
+-// IR-NEXT:    br i1 %[[CMP32]], label %[[FOR_BODY:.+]], label %[[FOR_END51:.+]]
++// IR-NEXT:    %[[TMP25:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
++// IR-NEXT:    %[[ADD22:.+]] = add i32 %[[TMP25]], 1
++// IR-NEXT:    %[[TMP26:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I17]], align 4
++// IR-NEXT:    %[[ADD23:.+]] = add i32 %[[TMP26]], 3
++// IR-NEXT:    %[[CMP24:.+]] = icmp ult i32 %[[ADD22]], %[[ADD23]]
++// IR-NEXT:    br i1 %[[CMP24]], label %[[COND_TRUE25:.+]], label %[[COND_FALSE27:.+]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_TRUE25]]:
++// IR-NEXT:    %[[TMP27:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_7]], align 4
++// IR-NEXT:    %[[ADD26:.+]] = add i32 %[[TMP27]], 1
++// IR-NEXT:    br label %[[COND_END29:.+]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_FALSE27]]:
++// IR-NEXT:    %[[TMP28:.+]] = load i32, ptr %[[DOTFLOOR_0_IV__FLOOR_0_IV_I17]], align 4
++// IR-NEXT:    %[[ADD28:.+]] = add i32 %[[TMP28]], 3
++// IR-NEXT:    br label %[[COND_END29]]
++// IR-EMPTY:
++// IR-NEXT:  [[COND_END29]]:
++// IR-NEXT:    %[[COND30:.+]] = phi i32 [ %[[ADD26]], %[[COND_TRUE25]] ], [ %[[ADD28]], %[[COND_FALSE27]] ]
++// IR-NEXT:    %[[CMP31:.+]] = icmp ult i32 %[[TMP24]], %[[COND30]]
++// IR-NEXT:    br i1 %[[CMP31]], label %[[FOR_BODY:.+]], label %[[FOR_END50:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_BODY]]:
+ // IR-NEXT:    %[[TMP29:.+]] = load i32, ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[MUL33:.+]] = mul i32 %[[TMP29]], 4
+-// IR-NEXT:    %[[ADD34:.+]] = add i32 0, %[[MUL33]]
+-// IR-NEXT:    store i32 %[[ADD34]], ptr %[[DOTFLOOR_0_IV_I]], align 4
++// IR-NEXT:    %[[MUL32:.+]] = mul i32 %[[TMP29]], 4
++// IR-NEXT:    %[[ADD33:.+]] = add i32 0, %[[MUL32]]
++// IR-NEXT:    store i32 %[[ADD33]], ptr %[[DOTFLOOR_0_IV_I]], align 4
+ // IR-NEXT:    %[[TMP30:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I]], align 4
+ // IR-NEXT:    store i32 %[[TMP30]], ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    br label %[[FOR_COND35:.+]]
++// IR-NEXT:    br label %[[FOR_COND34:.+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[FOR_COND35]]:
++// IR-NEXT:  [[FOR_COND34]]:
+ // IR-NEXT:    %[[TMP31:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP32:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD36:.+]] = add i32 %[[TMP32]], 1
++// IR-NEXT:    %[[TMP32:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD35:.+]] = add i32 %[[TMP32]], 1
+ // IR-NEXT:    %[[TMP33:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[ADD37:.+]] = add nsw i32 %[[TMP33]], 4
+-// IR-NEXT:    %[[CMP38:.+]] = icmp ult i32 %[[ADD36]], %[[ADD37]]
+-// IR-NEXT:    br i1 %[[CMP38]], label %[[COND_TRUE39:.+]], label %[[COND_FALSE41:.+]]
++// IR-NEXT:    %[[ADD36:.+]] = add i32 %[[TMP33]], 4
++// IR-NEXT:    %[[CMP37:.+]] = icmp ult i32 %[[ADD35]], %[[ADD36]]
++// IR-NEXT:    br i1 %[[CMP37]], label %[[COND_TRUE38:.+]], label %[[COND_FALSE40:.+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[COND_TRUE39]]:
+-// IR-NEXT:    %[[TMP34:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_3]], align 4
+-// IR-NEXT:    %[[ADD40:.+]] = add i32 %[[TMP34]], 1
+-// IR-NEXT:    br label %[[COND_END43:.+]]
++// IR-NEXT:  [[COND_TRUE38]]:
++// IR-NEXT:    %[[TMP34:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
++// IR-NEXT:    %[[ADD39:.+]] = add i32 %[[TMP34]], 1
++// IR-NEXT:    br label %[[COND_END42:.+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[COND_FALSE41]]:
++// IR-NEXT:  [[COND_FALSE40]]:
+ // IR-NEXT:    %[[TMP35:.+]] = load i32, ptr %[[DOTFLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[ADD42:.+]] = add nsw i32 %[[TMP35]], 4
+-// IR-NEXT:    br label %[[COND_END43]]
++// IR-NEXT:    %[[ADD41:.+]] = add i32 %[[TMP35]], 4
++// IR-NEXT:    br label %[[COND_END42]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[COND_END43]]:
+-// IR-NEXT:    %[[COND44:.+]] = phi i32 [ %[[ADD40]], %[[COND_TRUE39]] ], [ %[[ADD42]], %[[COND_FALSE41]] ]
+-// IR-NEXT:    %[[CMP45:.+]] = icmp ult i32 %[[TMP31]], %[[COND44]]
+-// IR-NEXT:    br i1 %[[CMP45]], label %[[FOR_BODY46:.+]], label %[[FOR_END:.+]]
++// IR-NEXT:  [[COND_END42]]:
++// IR-NEXT:    %[[COND43:.+]] = phi i32 [ %[[ADD39]], %[[COND_TRUE38]] ], [ %[[ADD41]], %[[COND_FALSE40]] ]
++// IR-NEXT:    %[[CMP44:.+]] = icmp ult i32 %[[TMP31]], %[[COND43]]
++// IR-NEXT:    br i1 %[[CMP44]], label %[[FOR_BODY45:.+]], label %[[FOR_END:.+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[FOR_BODY46]]:
++// IR-NEXT:  [[FOR_BODY45]]:
+ // IR-NEXT:    %[[TMP36:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_]], align 4
+ // IR-NEXT:    %[[TMP37:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[TMP38:.+]] = load i32, ptr %[[DOTCAPTURE_EXPR_2]], align 4
+-// IR-NEXT:    %[[MUL47:.+]] = mul i32 %[[TMP37]], %[[TMP38]]
+-// IR-NEXT:    %[[ADD48:.+]] = add i32 %[[TMP36]], %[[MUL47]]
+-// IR-NEXT:    store i32 %[[ADD48]], ptr %[[I]], align 4
++// IR-NEXT:    %[[TMP38:.+]] = load i32, ptr %[[DOTNEW_STEP]], align 4
++// IR-NEXT:    %[[MUL46:.+]] = mul i32 %[[TMP37]], %[[TMP38]]
++// IR-NEXT:    %[[ADD47:.+]] = add i32 %[[TMP36]], %[[MUL46]]
++// IR-NEXT:    store i32 %[[ADD47]], ptr %[[I]], align 4
+ // IR-NEXT:    %[[TMP39:.+]] = load i32, ptr %[[START_ADDR]], align 4
+ // IR-NEXT:    %[[TMP40:.+]] = load i32, ptr %[[END_ADDR]], align 4
+ // IR-NEXT:    %[[TMP41:.+]] = load i32, ptr %[[STEP_ADDR]], align 4
+@@ -201,20 +201,20 @@ extern "C" void body(...) {}
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_INC]]:
+ // IR-NEXT:    %[[TMP43:.+]] = load i32, ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    %[[INC:.+]] = add nsw i32 %[[TMP43]], 1
++// IR-NEXT:    %[[INC:.+]] = add i32 %[[TMP43]], 1
+ // IR-NEXT:    store i32 %[[INC]], ptr %[[DOTTILE_0_IV_I]], align 4
+-// IR-NEXT:    br label %[[FOR_COND35]], !llvm.loop ![[LOOP2:[0-9]+]]
++// IR-NEXT:    br label %[[FOR_COND34]], !llvm.loop ![[LOOP3:[0-9]+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[FOR_END]]:
+-// IR-NEXT:    br label %[[FOR_INC49:.+]]
++// IR-NEXT:    br label %[[FOR_INC48:.+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[FOR_INC49]]:
++// IR-NEXT:  [[FOR_INC48]]:
+ // IR-NEXT:    %[[TMP44:.+]] = load i32, ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
+-// IR-NEXT:    %[[INC50:.+]] = add i32 %[[TMP44]], 1
+-// IR-NEXT:    store i32 %[[INC50]], ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
+-// IR-NEXT:    br label %[[FOR_COND]], !llvm.loop ![[LOOP4:[0-9]+]]
++// IR-NEXT:    %[[INC49:.+]] = add i32 %[[TMP44]], 1
++// IR-NEXT:    store i32 %[[INC49]], ptr %[[DOTTILE_0_IV__FLOOR_0_IV_I]], align 4
++// IR-NEXT:    br label %[[FOR_COND]], !llvm.loop ![[LOOP5:[0-9]+]]
+ // IR-EMPTY:
+-// IR-NEXT:  [[FOR_END51]]:
++// IR-NEXT:  [[FOR_END50]]:
+ // IR-NEXT:    br label %[[OMP_BODY_CONTINUE:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_BODY_CONTINUE]]:
+@@ -222,21 +222,23 @@ extern "C" void body(...) {}
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_INC]]:
+ // IR-NEXT:    %[[TMP45:.+]] = load i32, ptr %[[DOTOMP_IV]], align 4
+-// IR-NEXT:    %[[ADD52:.+]] = add i32 %[[TMP45]], 1
+-// IR-NEXT:    store i32 %[[ADD52]], ptr %[[DOTOMP_IV]], align 4
++// IR-NEXT:    %[[ADD51:.+]] = add i32 %[[TMP45]], 1
++// IR-NEXT:    store i32 %[[ADD51]], ptr %[[DOTOMP_IV]], align 4
+ // IR-NEXT:    br label %[[OMP_INNER_FOR_COND]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_INNER_FOR_END]]:
+ // IR-NEXT:    br label %[[OMP_LOOP_EXIT:.+]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_LOOP_EXIT]]:
+-// IR-NEXT:    call void @__kmpc_for_static_fini(ptr @1, i32 %[[TMP0]])
++// IR-NEXT:    call void @__kmpc_for_static_fini(ptr @[[GLOB1]], i32 %[[TMP0]])
+ // IR-NEXT:    br label %[[OMP_PRECOND_END]]
+ // IR-EMPTY:
+ // IR-NEXT:  [[OMP_PRECOND_END]]:
+-// IR-NEXT:    call void @__kmpc_barrier(ptr @3, i32 %[[TMP0]])
++// IR-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB3:.+]], i32 %[[TMP0]])
+ // IR-NEXT:    ret void
+ // IR-NEXT:  }
++
++
+ extern "C" void func(int start, int end, int step) {
+ #pragma omp for
+ #pragma omp tile sizes(3)
+@@ -246,8 +248,10 @@ extern "C" void func(int start, int end, int step) {
+ }
+ 
+ #endif /* HEADER */
++
+ // IR: ![[META0:[0-9]+]] = !{i32 1, !"wchar_size", i32 4}
+-// IR: ![[META1:[0-9]+]] = !{!"{{[^"]*}}"}
+-// IR: ![[LOOP2]] = distinct !{![[LOOP2]], ![[LOOPPROP3:[0-9]+]]}
+-// IR: ![[LOOPPROP3]] = !{!"llvm.loop.mustprogress"}
+-// IR: ![[LOOP4]] = distinct !{![[LOOP4]], ![[LOOPPROP3]]}
++// IR: ![[META1:[0-9]+]] = !{i32 7, !"openmp", i32 51}
++// IR: ![[META2:[0-9]+]] =
++// IR: ![[LOOP3]] = distinct !{![[LOOP3]], ![[LOOPPROP4:[0-9]+]]}
++// IR: ![[LOOPPROP4]] = !{!"llvm.loop.mustprogress"}
++// IR: ![[LOOP5]] = distinct !{![[LOOP5]], ![[LOOPPROP4]]}
+diff --git a/openmp/runtime/test/lit.cfg b/openmp/runtime/test/lit.cfg
+index e8f7f3470580e..14c7468982137 100644
+--- a/openmp/runtime/test/lit.cfg
++++ b/openmp/runtime/test/lit.cfg
+@@ -171,10 +171,14 @@ config.substitutions.append(("%libomp-c99-compile-and-run", \
+     "%libomp-c99-compile && %libomp-run"))
+ config.substitutions.append(("%libomp-cxx-compile-and-run", \
+     "%libomp-cxx-compile && %libomp-run"))
++config.substitutions.append(("%libomp-cxx20-compile-and-run", \
++    "%libomp-cxx20-compile && %libomp-run"))
+ config.substitutions.append(("%libomp-cxx-compile-c", \
+     "%clangXX %openmp_flags %flags -std=c++17 -x c++ %s -o %t" + libs))
+ config.substitutions.append(("%libomp-cxx-compile", \
+     "%clangXX %openmp_flags %flags -std=c++17 %s -o %t" + libs))
++config.substitutions.append(("%libomp-cxx20-compile", \
++    "%clangXX %openmp_flags %flags -std=c++20 %s -o %t" + libs))
+ config.substitutions.append(("%libomp-compile", \
+     "%clang %openmp_flags %flags %s -o %t" + libs))
+ config.substitutions.append(("%libomp-irbuilder-compile", \
+diff --git a/openmp/runtime/test/transform/tile/foreach.cpp b/openmp/runtime/test/transform/tile/foreach.cpp
+new file mode 100644
+index 0000000000000..4fb3595760974
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/foreach.cpp
+@@ -0,0 +1,228 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator move ctor");
++    }
++
++    ~Iterator() { owner->print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      owner->print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      owner->print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    Iterator &operator++() {
++      owner->print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      owner->print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++
++    void print(const char *msg) const { owner->print(msg); }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++#pragma omp tile sizes(2, 2)
++  for (Reporter c{"C"}; auto &&v : Reporter("A"))
++    for (Reporter d{"D"}; auto &&w : Reporter("B"))
++      printf("v=%d w=%d\n", v, w);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [C] ctor
++// CHECK-NEXT: [A] ctor
++// CHECK-NEXT: [A] end()
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] iterator distance: 3
++// CHECK-NEXT: [D] ctor
++// CHECK-NEXT: [B] ctor
++// CHECK-NEXT: [B] end()
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] iterator distance: 3
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: v=0 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: v=0 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: v=1 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: v=1 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: v=0 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: v=1 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: v=2 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: v=2 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: v=2 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] dtor
++// CHECK-NEXT: [D] dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] dtor
++// CHECK-NEXT: [C] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/tile/iterfor.cpp b/openmp/runtime/test/transform/tile/iterfor.cpp
+new file mode 100644
+index 0000000000000..12613544f6e5b
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/iterfor.cpp
+@@ -0,0 +1,233 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator move ctor");
++    }
++
++    ~Iterator() { owner->print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      owner->print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      owner->print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    bool operator!=(const Iterator &that) const {
++      owner->print("iterator %d != %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    Iterator &operator++() {
++      owner->print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      owner->print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++  {
++    Reporter A("A"), B("B");
++#pragma omp tile sizes(2, 2)
++    for (auto it = A.begin(); it != A.end(); ++it)
++      for (auto jt = B.begin(); jt != B.end(); ++jt)
++        printf("i=%d j=%d\n", *it, *jt);
++  }
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [A] ctor
++// CHECK-NEXT: [B] ctor
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] end()
++// CHECK-NEXT: [A] iterator distance: 3
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] end()
++// CHECK-NEXT: [B] iterator distance: 3
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=0 j=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=0 j=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=1 j=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=1 j=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=0 j=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=1 j=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=2 j=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=2 j=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=2 j=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [B] dtor
++// CHECK-NEXT: [A] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-foreach.cpp b/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-foreach.cpp
+new file mode 100644
+index 0000000000000..b1f4d98a52ddc
+--- /dev/null
++++ b/openmp/runtime/test/transform/tile/parallel-wsloop-collapse-foreach.cpp
+@@ -0,0 +1,366 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator move ctor");
++    }
++
++    ~Iterator() { owner->print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      owner->print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      owner->print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    Iterator &operator++() {
++      owner->print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      owner->print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++#pragma omp parallel for collapse(3) num_threads(1)
++  for (int i = 0; i < 3; ++i)
++#pragma omp tile sizes(2, 2)
++    for (Reporter c{"C"}; auto &&v : Reporter("A"))
++      for (Reporter d{"D"}; auto &&w : Reporter("B"))
++        printf("i=%d v=%d w=%d\n", i, v, w);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [C] ctor
++// CHECK-NEXT: [A] ctor
++// CHECK-NEXT: [A] end()
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] begin()
++// CHECK-NEXT: [A] iterator distance: 3
++// CHECK-NEXT: [D] ctor
++// CHECK-NEXT: [B] ctor
++// CHECK-NEXT: [B] end()
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] begin()
++// CHECK-NEXT: [B] iterator distance: 3
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=0 v=0 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=0 v=0 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=0 v=1 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=0 v=1 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=0 v=0 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=0 v=1 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=0 v=2 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=0 v=2 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=0 v=2 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=1 v=0 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=1 v=0 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=1 v=1 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=1 v=1 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=1 v=0 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=1 v=1 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=1 v=2 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=1 v=2 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=1 v=2 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=2 v=0 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=2 v=0 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=2 v=1 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=2 v=1 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 0
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 0
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=2 v=0 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 1
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 1
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=2 v=1 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 0
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 0
++// CHECK-NEXT: i=2 v=2 w=0
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator advance: 0 += 1
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 1
++// CHECK-NEXT: i=2 v=2 w=1
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator advance: 0 += 2
++// CHECK-NEXT: [A] iterator move assign
++// CHECK-NEXT: [A] iterator deref: 2
++// CHECK-NEXT: [B] iterator advance: 0 += 2
++// CHECK-NEXT: [B] iterator move assign
++// CHECK-NEXT: [B] iterator deref: 2
++// CHECK-NEXT: i=2 v=2 w=2
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] iterator dtor
++// CHECK-NEXT: [B] dtor
++// CHECK-NEXT: [D] dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] iterator dtor
++// CHECK-NEXT: [A] dtor
++// CHECK-NEXT: [C] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/factor_foreach.cpp b/openmp/runtime/test/transform/unroll/factor_foreach.cpp
+new file mode 100644
+index 0000000000000..29fef7c187362
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/factor_foreach.cpp
+@@ -0,0 +1,162 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator move ctor");
++    }
++
++    ~Iterator() { owner->print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      owner->print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      owner->print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    bool operator!=(const Iterator &that) const {
++      owner->print("iterator %d != %d", 2 - this->pos, 2 - that.pos);
++      return this->pos != that.pos;
++    }
++
++    Iterator &operator++() {
++      owner->print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      owner->print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++
++    void print(const char *msg) const { owner->print(msg); }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++#pragma omp unroll partial(2)
++  for (Reporter c{"init-stmt"}; auto &&v : Reporter("range"))
++    printf("v=%d\n", v);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [init-stmt] ctor
++// CHECK-NEXT: [range] ctor
++// CHECK-NEXT: [range] begin()
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] iterator 0 != 3
++// CHECK-NEXT: [range] iterator deref: 0
++// CHECK-NEXT: v=0
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator 1 != 3
++// CHECK-NEXT: [range] iterator deref: 1
++// CHECK-NEXT: v=1
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator 2 != 3
++// CHECK-NEXT: [range] iterator deref: 2
++// CHECK-NEXT: v=2
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator 3 != 3
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] dtor
++// CHECK-NEXT: [init-stmt] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/factor_intfor.c b/openmp/runtime/test/transform/unroll/factor_intfor.c
+new file mode 100644
+index 0000000000000..42ebeb48e41c8
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/factor_intfor.c
+@@ -0,0 +1,25 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++int main() {
++  printf("do\n");
++#pragma omp unroll partial(2)
++  for (int i = 7; i < 19; i += 3)
++    printf("i=%d\n", i);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=7
++// CHECK-NEXT: i=10
++// CHECK-NEXT: i=13
++// CHECK-NEXT: i=16
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/factor_iterfor.cpp b/openmp/runtime/test/transform/unroll/factor_iterfor.cpp
+new file mode 100644
+index 0000000000000..0298477110b25
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/factor_iterfor.cpp
+@@ -0,0 +1,169 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      print("iterator move ctor");
++    }
++
++    ~Iterator() { print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    bool operator!=(const Iterator &that) const {
++      owner->print("iterator %d != %d", 2 - this->pos, 2 - that.pos);
++      return this->pos != that.pos;
++    }
++
++    Iterator &operator++() {
++      print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++
++    void print(const char *msg) const { owner->print(msg); }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++  {
++    Reporter range("range");
++#pragma omp unroll partial(2)
++    for (auto it = range.begin(); it != range.end(); ++it)
++      printf("v=%d\n", *it);
++  }
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [range] ctor
++// CHECK-NEXT: [range] begin()
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] iterator 0 != 3
++// CHECK-NEXT: [range] iterator deref: 0
++// CHECK-NEXT: v=0
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] iterator 1 != 3
++// CHECK-NEXT: [range] iterator deref: 1
++// CHECK-NEXT: v=1
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] iterator 2 != 3
++// CHECK-NEXT: [range] iterator deref: 2
++// CHECK-NEXT: v=2
++// CHECK-NEXT: [range] iterator prefix ++
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] iterator 3 != 3
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-foreach.cpp b/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-foreach.cpp
+new file mode 100644
+index 0000000000000..71567faf79646
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-foreach.cpp
+@@ -0,0 +1,199 @@
++// RUN: %libomp-cxx20-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdarg>
++#include <cstdio>
++#include <vector>
++
++struct Reporter {
++  const char *name;
++
++  Reporter(const char *name) : name(name) { print("ctor"); }
++
++  Reporter() : name("<anon>") { print("ctor"); }
++
++  Reporter(const Reporter &that) : name(that.name) { print("copy ctor"); }
++
++  Reporter(Reporter &&that) : name(that.name) { print("move ctor"); }
++
++  ~Reporter() { print("dtor"); }
++
++  const Reporter &operator=(const Reporter &that) {
++    print("copy assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  const Reporter &operator=(Reporter &&that) {
++    print("move assign");
++    this->name = that.name;
++    return *this;
++  }
++
++  struct Iterator {
++    const Reporter *owner;
++    int pos;
++
++    Iterator(const Reporter *owner, int pos) : owner(owner), pos(pos) {}
++
++    Iterator(const Iterator &that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator copy ctor");
++    }
++
++    Iterator(Iterator &&that) : owner(that.owner), pos(that.pos) {
++      owner->print("iterator move ctor");
++    }
++
++    ~Iterator() { owner->print("iterator dtor"); }
++
++    const Iterator &operator=(const Iterator &that) {
++      owner->print("iterator copy assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    const Iterator &operator=(Iterator &&that) {
++      owner->print("iterator move assign");
++      this->owner = that.owner;
++      this->pos = that.pos;
++      return *this;
++    }
++
++    bool operator==(const Iterator &that) const {
++      owner->print("iterator %d == %d", 2 - this->pos, 2 - that.pos);
++      return this->pos == that.pos;
++    }
++
++    bool operator!=(const Iterator &that) const {
++      owner->print("iterator %d != %d", 2 - this->pos, 2 - that.pos);
++      return this->pos != that.pos;
++    }
++
++    Iterator &operator++() {
++      owner->print("iterator prefix ++");
++      pos -= 1;
++      return *this;
++    }
++
++    Iterator operator++(int) {
++      owner->print("iterator postfix ++");
++      auto result = *this;
++      pos -= 1;
++      return result;
++    }
++
++    int operator*() const {
++      int result = 2 - pos;
++      owner->print("iterator deref: %i", result);
++      return result;
++    }
++
++    size_t operator-(const Iterator &that) const {
++      int result = (2 - this->pos) - (2 - that.pos);
++      owner->print("iterator distance: %d", result);
++      return result;
++    }
++
++    Iterator operator+(int steps) const {
++      owner->print("iterator advance: %i += %i", 2 - this->pos, steps);
++      return Iterator(owner, pos - steps);
++    }
++
++    void print(const char *msg) const { owner->print(msg); }
++  };
++
++  Iterator begin() const {
++    print("begin()");
++    return Iterator(this, 2);
++  }
++
++  Iterator end() const {
++    print("end()");
++    return Iterator(this, -1);
++  }
++
++  void print(const char *msg, ...) const {
++    va_list args;
++    va_start(args, msg);
++    printf("[%s] ", name);
++    vprintf(msg, args);
++    printf("\n");
++    va_end(args);
++  }
++};
++
++int main() {
++  printf("do\n");
++#pragma omp parallel for collapse(2) num_threads(1)
++  for (int i = 0; i < 3; ++i)
++#pragma omp unroll partial(2)
++    for (Reporter c{"init-stmt"}; auto &&v : Reporter("range"))
++      printf("i=%d v=%d\n", i, v);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: [init-stmt] ctor
++// CHECK-NEXT: [range] ctor
++// CHECK-NEXT: [range] end()
++// CHECK-NEXT: [range] begin()
++// CHECK-NEXT: [range] begin()
++// CHECK-NEXT: [range] iterator distance: 3
++// CHECK-NEXT: [range] iterator advance: 0 += 0
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 0
++// CHECK-NEXT: i=0 v=0
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 1
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 1
++// CHECK-NEXT: i=0 v=1
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 2
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 2
++// CHECK-NEXT: i=0 v=2
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 0
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 0
++// CHECK-NEXT: i=1 v=0
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 1
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 1
++// CHECK-NEXT: i=1 v=1
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 2
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 2
++// CHECK-NEXT: i=1 v=2
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 0
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 0
++// CHECK-NEXT: i=2 v=0
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 1
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 1
++// CHECK-NEXT: i=2 v=1
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator advance: 0 += 2
++// CHECK-NEXT: [range] iterator move assign
++// CHECK-NEXT: [range] iterator deref: 2
++// CHECK-NEXT: i=2 v=2
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] iterator dtor
++// CHECK-NEXT: [range] dtor
++// CHECK-NEXT: [init-stmt] dtor
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-intfor.cpp b/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-intfor.cpp
+new file mode 100644
+index 0000000000000..0a31f8db07016
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/factor_parallel-wsloop-collapse-intfor.cpp
+@@ -0,0 +1,32 @@
++// RUN: %libomp-cxx-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <cstdlib>
++#include <cstdio>
++
++int main() {
++  printf("do\n");
++#pragma omp parallel for collapse(2) num_threads(1)
++  for (int i = 0; i < 3; ++i)
++#pragma omp unroll partial(2)
++    for (int j = 0; j < 3; ++j)
++      printf("i=%d j=%d\n", i, j);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=0 j=0
++// CHECK-NEXT: i=0 j=1
++// CHECK-NEXT: i=0 j=2
++// CHECK-NEXT: i=1 j=0
++// CHECK-NEXT: i=1 j=1
++// CHECK-NEXT: i=1 j=2
++// CHECK-NEXT: i=2 j=0
++// CHECK-NEXT: i=2 j=1
++// CHECK-NEXT: i=2 j=2
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/full_intfor.c b/openmp/runtime/test/transform/unroll/full_intfor.c
+new file mode 100644
+index 0000000000000..0814511091766
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/full_intfor.c
+@@ -0,0 +1,25 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++int main() {
++  printf("do\n");
++#pragma omp unroll full
++  for (int i = 7; i < 19; i += 3)
++    printf("i=%d\n", i);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=7
++// CHECK-NEXT: i=10
++// CHECK-NEXT: i=13
++// CHECK-NEXT: i=16
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/heuristic_intfor.c b/openmp/runtime/test/transform/unroll/heuristic_intfor.c
+new file mode 100644
+index 0000000000000..b07bec7d82f0b
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/heuristic_intfor.c
+@@ -0,0 +1,25 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++int main() {
++  printf("do\n");
++#pragma omp unroll
++  for (int i = 7; i < 19; i += 3)
++    printf("i=%d\n", i);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=7
++// CHECK-NEXT: i=10
++// CHECK-NEXT: i=13
++// CHECK-NEXT: i=16
++// CHECK-NEXT: done
+diff --git a/openmp/runtime/test/transform/unroll/partial_intfor.c b/openmp/runtime/test/transform/unroll/partial_intfor.c
+new file mode 100644
+index 0000000000000..2ede94e70e12d
+--- /dev/null
++++ b/openmp/runtime/test/transform/unroll/partial_intfor.c
+@@ -0,0 +1,25 @@
++// RUN: %libomp-compile-and-run | FileCheck %s --match-full-lines
++
++#ifndef HEADER
++#define HEADER
++
++#include <stdlib.h>
++#include <stdio.h>
++
++int main() {
++  printf("do\n");
++#pragma omp unroll partial
++  for (int i = 7; i < 19; i += 3)
++    printf("i=%d\n", i);
++  printf("done\n");
++  return EXIT_SUCCESS;
++}
++
++#endif /* HEADER */
++
++// CHECK:      do
++// CHECK-NEXT: i=7
++// CHECK-NEXT: i=10
++// CHECK-NEXT: i=13
++// CHECK-NEXT: i=16
++// CHECK-NEXT: done

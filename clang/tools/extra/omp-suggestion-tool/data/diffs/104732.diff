@@ -1,0 +1,479 @@
+diff --git a/flang/docs/OpenMP-declare-target.md b/flang/docs/OpenMP-declare-target.md
+index d29a46807e1ea..45062469007b6 100644
+--- a/flang/docs/OpenMP-declare-target.md
++++ b/flang/docs/OpenMP-declare-target.md
+@@ -149,7 +149,7 @@ flang/lib/Lower/OpenMP.cpp function `genDeclareTargetIntGlobal`.
+ 
+ There are currently two passes within Flang that are related to the processing 
+ of `declare target`:
+-* `OMPMarkDeclareTarget` - This pass is in charge of marking functions captured
++* `MarkDeclareTarget` - This pass is in charge of marking functions captured
+ (called from) in `target` regions or other `declare target` marked functions as
+ `declare target`. It does so recursively, i.e. nested calls will also be 
+ implicitly marked. It currently will try to mark things as conservatively as 
+@@ -157,7 +157,7 @@ possible, e.g. if captured in a `target` region it will apply `nohost`, unless
+ it encounters a `host` `declare target` in which case it will apply the `any` 
+ device type. Functions are handled similarly, except we utilise the parent's 
+ device type where possible.
+-* `OMPFunctionFiltering` - This is executed after the `OMPMarkDeclareTarget`
++* `FunctionFiltering` - This is executed after the `MarkDeclareTarget`
+ pass, and its job is to conservatively remove host functions from
+ the module where possible when compiling for the device. This helps make 
+ sure that most incompatible code for the host is not lowered for the 
+diff --git a/flang/docs/OpenMP-descriptor-management.md b/flang/docs/OpenMP-descriptor-management.md
+index d0eb01b00f9bb..66c153914f70d 100644
+--- a/flang/docs/OpenMP-descriptor-management.md
++++ b/flang/docs/OpenMP-descriptor-management.md
+@@ -44,7 +44,7 @@ Currently, Flang will lower these descriptor types in the OpenMP lowering (lower
+ to all other map types, generating an omp.MapInfoOp containing relevant information required for lowering
+ the OpenMP dialect to LLVM-IR during the final stages of the MLIR lowering. However, after 
+ the lowering to FIR/HLFIR has been performed an OpenMP dialect specific pass for Fortran, 
+-`OMPMapInfoFinalizationPass` (Optimizer/OMPMapInfoFinalization.cpp) will expand the 
++`MapInfoFinalizationPass` (Optimizer/OpenMP/MapInfoFinalization.cpp) will expand the 
+ `omp.MapInfoOp`'s containing descriptors (which currently will be a `BoxType` or `BoxAddrOp`) into multiple 
+ mappings, with one extra per pointer member in the descriptor that is supported on top of the original
+ descriptor map operation. These pointers members are linked to the parent descriptor by adding them to 
+@@ -53,7 +53,7 @@ owning operation's (`omp.TargetOp`, `omp.TargetDataOp` etc.) map operand list an
+ operation is `IsolatedFromAbove`, it also inserts them as `BlockArgs` to canonicalize the mappings and
+ simplify lowering.
+ 
+-An example transformation by the `OMPMapInfoFinalizationPass`:
++An example transformation by the `MapInfoFinalizationPass`:
+ 
+ ```
+ 
+diff --git a/flang/include/flang/Optimizer/CMakeLists.txt b/flang/include/flang/Optimizer/CMakeLists.txt
+index 89e43a9ee8d62..3336ac935e101 100644
+--- a/flang/include/flang/Optimizer/CMakeLists.txt
++++ b/flang/include/flang/Optimizer/CMakeLists.txt
+@@ -2,3 +2,4 @@ add_subdirectory(CodeGen)
+ add_subdirectory(Dialect)
+ add_subdirectory(HLFIR)
+ add_subdirectory(Transforms)
++add_subdirectory(OpenMP)
+diff --git a/flang/include/flang/Optimizer/OpenMP/CMakeLists.txt b/flang/include/flang/Optimizer/OpenMP/CMakeLists.txt
+new file mode 100644
+index 0000000000000..d59573f0f7fd9
+--- /dev/null
++++ b/flang/include/flang/Optimizer/OpenMP/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(LLVM_TARGET_DEFINITIONS Passes.td)
++mlir_tablegen(Passes.h.inc -gen-pass-decls -name FlangOpenMP)
++
++add_public_tablegen_target(FlangOpenMPPassesIncGen)
+diff --git a/flang/include/flang/Optimizer/OpenMP/Passes.h b/flang/include/flang/Optimizer/OpenMP/Passes.h
+new file mode 100644
+index 0000000000000..403d79667bf44
+--- /dev/null
++++ b/flang/include/flang/Optimizer/OpenMP/Passes.h
+@@ -0,0 +1,30 @@
++//===- Passes.h - OpenMP pass entry points ----------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This header declares the flang OpenMP passes.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FORTRAN_OPTIMIZER_OPENMP_PASSES_H
++#define FORTRAN_OPTIMIZER_OPENMP_PASSES_H
++
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Pass/PassRegistry.h"
++
++#include <memory>
++
++namespace flangomp {
++#define GEN_PASS_DECL
++#define GEN_PASS_REGISTRATION
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++
++} // namespace flangomp
++
++#endif // FORTRAN_OPTIMIZER_OPENMP_PASSES_H
+diff --git a/flang/include/flang/Optimizer/OpenMP/Passes.td b/flang/include/flang/Optimizer/OpenMP/Passes.td
+new file mode 100644
+index 0000000000000..395178e26a576
+--- /dev/null
++++ b/flang/include/flang/Optimizer/OpenMP/Passes.td
+@@ -0,0 +1,40 @@
++//===-- Passes.td - flang OpenMP pass definition -----------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FORTRAN_OPTIMIZER_OPENMP_PASSES
++#define FORTRAN_OPTIMIZER_OPENMP_PASSES
++
++include "mlir/Pass/PassBase.td"
++
++def MapInfoFinalizationPass
++    : Pass<"omp-map-info-finalization"> {
++  let summary = "expands OpenMP MapInfo operations containing descriptors";
++  let description = [{
++    Expands MapInfo operations containing descriptor types into multiple
++    MapInfo's for each pointer element in the descriptor that requires
++    explicit individual mapping by the OpenMP runtime.
++  }];
++  let dependentDialects = ["mlir::omp::OpenMPDialect"];
++}
++
++def MarkDeclareTargetPass
++    : Pass<"omp-mark-declare-target", "mlir::ModuleOp"> {
++  let summary = "Marks all functions called by an OpenMP declare target function as declare target";
++  let dependentDialects = ["mlir::omp::OpenMPDialect"];
++}
++
++def FunctionFiltering : Pass<"omp-function-filtering"> {
++  let summary = "Filters out functions intended for the host when compiling "
++                "for the target device.";
++  let dependentDialects = [
++    "mlir::func::FuncDialect",
++    "fir::FIROpsDialect"
++  ];
++}
++
++#endif //FORTRAN_OPTIMIZER_OPENMP_PASSES
+diff --git a/flang/include/flang/Optimizer/Transforms/Passes.td b/flang/include/flang/Optimizer/Transforms/Passes.td
+index 786083f95e15c..3d7a8fc04bb72 100644
+--- a/flang/include/flang/Optimizer/Transforms/Passes.td
++++ b/flang/include/flang/Optimizer/Transforms/Passes.td
+@@ -340,32 +340,6 @@ def LoopVersioning : Pass<"loop-versioning", "mlir::func::FuncOp"> {
+   let dependentDialects = [ "fir::FIROpsDialect" ];
+ }
+ 
+-def OMPMapInfoFinalizationPass
+-    : Pass<"omp-map-info-finalization"> {
+-  let summary = "expands OpenMP MapInfo operations containing descriptors";
+-  let description = [{
+-    Expands MapInfo operations containing descriptor types into multiple 
+-    MapInfo's for each pointer element in the descriptor that requires 
+-    explicit individual mapping by the OpenMP runtime.
+-  }];
+-  let dependentDialects = ["mlir::omp::OpenMPDialect"];
+-}
+-
+-def OMPMarkDeclareTargetPass
+-    : Pass<"omp-mark-declare-target", "mlir::ModuleOp"> {
+-  let summary = "Marks all functions called by an OpenMP declare target function as declare target";
+-  let dependentDialects = ["mlir::omp::OpenMPDialect"];
+-}
+-
+-def OMPFunctionFiltering : Pass<"omp-function-filtering"> {
+-  let summary = "Filters out functions intended for the host when compiling "
+-                "for the target device.";
+-  let dependentDialects = [
+-    "mlir::func::FuncDialect",
+-    "fir::FIROpsDialect"
+-  ];
+-}
+-
+ def VScaleAttr : Pass<"vscale-attr", "mlir::func::FuncOp"> {
+   let summary = "Add vscale_range attribute to functions";
+   let description = [{
+diff --git a/flang/include/flang/Tools/CLOptions.inc b/flang/include/flang/Tools/CLOptions.inc
+index 7df5044949463..05b2f31711add 100644
+--- a/flang/include/flang/Tools/CLOptions.inc
++++ b/flang/include/flang/Tools/CLOptions.inc
+@@ -17,6 +17,7 @@
+ #include "mlir/Transforms/Passes.h"
+ #include "flang/Optimizer/CodeGen/CodeGen.h"
+ #include "flang/Optimizer/HLFIR/Passes.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
+ #include "flang/Optimizer/Transforms/Passes.h"
+ #include "llvm/Passes/OptimizationLevel.h"
+ #include "llvm/Support/CommandLine.h"
+@@ -358,10 +359,10 @@ inline void createHLFIRToFIRPassPipeline(
+ inline void createOpenMPFIRPassPipeline(
+     mlir::PassManager &pm, bool isTargetDevice) {
+   addNestedPassToAllTopLevelOperations(
+-      pm, fir::createOMPMapInfoFinalizationPass);
+-  pm.addPass(fir::createOMPMarkDeclareTargetPass());
++      pm, flangomp::createMapInfoFinalizationPass);
++  pm.addPass(flangomp::createMarkDeclareTargetPass());
+   if (isTargetDevice)
+-    pm.addPass(fir::createOMPFunctionFiltering());
++    pm.addPass(flangomp::createFunctionFiltering());
+ }
+ 
+ #if !defined(FLANG_EXCLUDE_CODEGEN)
+diff --git a/flang/lib/Frontend/CMakeLists.txt b/flang/lib/Frontend/CMakeLists.txt
+index c20b9096aff49..ecdcc73d61ec1 100644
+--- a/flang/lib/Frontend/CMakeLists.txt
++++ b/flang/lib/Frontend/CMakeLists.txt
+@@ -38,6 +38,7 @@ add_flang_library(flangFrontend
+   FIRTransforms
+   HLFIRDialect
+   HLFIRTransforms
++  FlangOpenMPTransforms
+   MLIRTransforms
+   MLIRBuiltinToLLVMIRTranslation
+   MLIRLLVMToLLVMIRTranslation
+diff --git a/flang/lib/Optimizer/CMakeLists.txt b/flang/lib/Optimizer/CMakeLists.txt
+index 4a602162ed2b7..dd153ac33c0fb 100644
+--- a/flang/lib/Optimizer/CMakeLists.txt
++++ b/flang/lib/Optimizer/CMakeLists.txt
+@@ -5,3 +5,4 @@ add_subdirectory(HLFIR)
+ add_subdirectory(Support)
+ add_subdirectory(Transforms)
+ add_subdirectory(Analysis)
++add_subdirectory(OpenMP)
+diff --git a/flang/lib/Optimizer/OpenMP/CMakeLists.txt b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+new file mode 100644
+index 0000000000000..a8984d256b8f6
+--- /dev/null
++++ b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+@@ -0,0 +1,25 @@
++get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
++
++add_flang_library(FlangOpenMPTransforms
++  FunctionFiltering.cpp
++  MapInfoFinalization.cpp
++  MarkDeclareTarget.cpp
++
++  DEPENDS
++  FIRDialect
++  HLFIROpsIncGen
++  FlangOpenMPPassesIncGen
++
++  LINK_LIBS
++  FIRAnalysis
++  FIRBuilder
++  FIRCodeGen
++  FIRDialect
++  FIRDialectSupport
++  FIRSupport
++  FortranCommon
++  MLIRFuncDialect
++  MLIROpenMPDialect
++  HLFIRDialect
++  MLIRIR
++)
+diff --git a/flang/lib/Optimizer/Transforms/OMPFunctionFiltering.cpp b/flang/lib/Optimizer/OpenMP/FunctionFiltering.cpp
+similarity index 90%
+rename from flang/lib/Optimizer/Transforms/OMPFunctionFiltering.cpp
+rename to flang/lib/Optimizer/OpenMP/FunctionFiltering.cpp
+index 0c472246c2a44..bd9005d3e2df6 100644
+--- a/flang/lib/Optimizer/Transforms/OMPFunctionFiltering.cpp
++++ b/flang/lib/Optimizer/OpenMP/FunctionFiltering.cpp
+@@ -1,4 +1,4 @@
+-//===- OMPFunctionFiltering.cpp -------------------------------------------===//
++//===- FunctionFiltering.cpp -------------------------------------------===//
+ //
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+@@ -13,7 +13,7 @@
+ 
+ #include "flang/Optimizer/Dialect/FIRDialect.h"
+ #include "flang/Optimizer/Dialect/FIROpsSupport.h"
+-#include "flang/Optimizer/Transforms/Passes.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
+ 
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+@@ -21,18 +21,18 @@
+ #include "mlir/IR/BuiltinOps.h"
+ #include "llvm/ADT/SmallVector.h"
+ 
+-namespace fir {
+-#define GEN_PASS_DEF_OMPFUNCTIONFILTERING
+-#include "flang/Optimizer/Transforms/Passes.h.inc"
+-} // namespace fir
++namespace flangomp {
++#define GEN_PASS_DEF_FUNCTIONFILTERING
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
+ 
+ using namespace mlir;
+ 
+ namespace {
+-class OMPFunctionFilteringPass
+-    : public fir::impl::OMPFunctionFilteringBase<OMPFunctionFilteringPass> {
++class FunctionFilteringPass
++    : public flangomp::impl::FunctionFilteringBase<FunctionFilteringPass> {
+ public:
+-  OMPFunctionFilteringPass() = default;
++  FunctionFilteringPass() = default;
+ 
+   void runOnOperation() override {
+     MLIRContext *context = &getContext();
+diff --git a/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+similarity index 96%
+rename from flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
+rename to flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index ddaa3c5f404f0..6e9cd03dca8f3 100644
+--- a/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -1,5 +1,4 @@
+-//===- OMPMapInfoFinalization.cpp
+-//---------------------------------------------------===//
++//===- MapInfoFinalization.cpp -----------------------------------------===//
+ //
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+@@ -28,7 +27,7 @@
+ #include "flang/Optimizer/Builder/FIRBuilder.h"
+ #include "flang/Optimizer/Dialect/FIRType.h"
+ #include "flang/Optimizer/Dialect/Support/KindMapping.h"
+-#include "flang/Optimizer/Transforms/Passes.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+ #include "mlir/IR/BuiltinDialect.h"
+@@ -41,15 +40,15 @@
+ #include "llvm/Frontend/OpenMP/OMPConstants.h"
+ #include <iterator>
+ 
+-namespace fir {
+-#define GEN_PASS_DEF_OMPMAPINFOFINALIZATIONPASS
+-#include "flang/Optimizer/Transforms/Passes.h.inc"
+-} // namespace fir
++namespace flangomp {
++#define GEN_PASS_DEF_MAPINFOFINALIZATIONPASS
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
+ 
+ namespace {
+-class OMPMapInfoFinalizationPass
+-    : public fir::impl::OMPMapInfoFinalizationPassBase<
+-          OMPMapInfoFinalizationPass> {
++class MapInfoFinalizationPass
++    : public flangomp::impl::MapInfoFinalizationPassBase<
++          MapInfoFinalizationPass> {
+ 
+   void genDescriptorMemberMaps(mlir::omp::MapInfoOp op,
+                                fir::FirOpBuilder &builder,
+@@ -245,7 +244,7 @@ class OMPMapInfoFinalizationPass
+       // all users appropriately, making sure to only add a single member link
+       // per new generation for the original originating descriptor MapInfoOp.
+       assert(llvm::hasSingleElement(op->getUsers()) &&
+-             "OMPMapInfoFinalization currently only supports single users "
++             "MapInfoFinalization currently only supports single users "
+              "of a MapInfoOp");
+ 
+       if (!op.getMembers().empty()) {
+diff --git a/flang/lib/Optimizer/Transforms/OMPMarkDeclareTarget.cpp b/flang/lib/Optimizer/OpenMP/MarkDeclareTarget.cpp
+similarity index 80%
+rename from flang/lib/Optimizer/Transforms/OMPMarkDeclareTarget.cpp
+rename to flang/lib/Optimizer/OpenMP/MarkDeclareTarget.cpp
+index 4946e13b22865..a7ffd5fda82b7 100644
+--- a/flang/lib/Optimizer/Transforms/OMPMarkDeclareTarget.cpp
++++ b/flang/lib/Optimizer/OpenMP/MarkDeclareTarget.cpp
+@@ -1,4 +1,16 @@
+-#include "flang/Optimizer/Transforms/Passes.h"
++//===- MarkDeclareTarget.cpp -------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Mark functions called from explicit target code as implicitly declare target.
++//
++//===----------------------------------------------------------------------===//
++
++#include "flang/Optimizer/OpenMP/Passes.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+@@ -10,14 +22,14 @@
+ #include "mlir/Support/LLVM.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+ 
+-namespace fir {
+-#define GEN_PASS_DEF_OMPMARKDECLARETARGETPASS
+-#include "flang/Optimizer/Transforms/Passes.h.inc"
+-} // namespace fir
++namespace flangomp {
++#define GEN_PASS_DEF_MARKDECLARETARGETPASS
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
+ 
+ namespace {
+-class OMPMarkDeclareTargetPass
+-    : public fir::impl::OMPMarkDeclareTargetPassBase<OMPMarkDeclareTargetPass> {
++class MarkDeclareTargetPass
++    : public flangomp::impl::MarkDeclareTargetPassBase<MarkDeclareTargetPass> {
+ 
+   void markNestedFuncs(mlir::omp::DeclareTargetDeviceType parentDevTy,
+                        mlir::omp::DeclareTargetCaptureClause parentCapClause,
+diff --git a/flang/lib/Optimizer/Transforms/CMakeLists.txt b/flang/lib/Optimizer/Transforms/CMakeLists.txt
+index 3108304240894..8b8f174f59f4f 100644
+--- a/flang/lib/Optimizer/Transforms/CMakeLists.txt
++++ b/flang/lib/Optimizer/Transforms/CMakeLists.txt
+@@ -20,9 +20,6 @@ add_flang_library(FIRTransforms
+   AddDebugInfo.cpp
+   PolymorphicOpConversion.cpp
+   LoopVersioning.cpp
+-  OMPFunctionFiltering.cpp
+-  OMPMapInfoFinalization.cpp
+-  OMPMarkDeclareTarget.cpp
+   StackReclaim.cpp
+   VScaleAttr.cpp
+   FunctionAttr.cpp
+diff --git a/flang/tools/bbc/CMakeLists.txt b/flang/tools/bbc/CMakeLists.txt
+index 9410fd0056600..69316d4dc61de 100644
+--- a/flang/tools/bbc/CMakeLists.txt
++++ b/flang/tools/bbc/CMakeLists.txt
+@@ -25,6 +25,7 @@ FIRTransforms
+ FIRBuilder
+ HLFIRDialect
+ HLFIRTransforms
++FlangOpenMPTransforms
+ ${dialect_libs}
+ ${extension_libs}
+ MLIRAffineToStandard
+diff --git a/flang/tools/fir-opt/CMakeLists.txt b/flang/tools/fir-opt/CMakeLists.txt
+index 43679a9d53578..4c6dbf7d9c8c3 100644
+--- a/flang/tools/fir-opt/CMakeLists.txt
++++ b/flang/tools/fir-opt/CMakeLists.txt
+@@ -19,6 +19,7 @@ target_link_libraries(fir-opt PRIVATE
+   FIRCodeGen
+   HLFIRDialect
+   HLFIRTransforms
++  FlangOpenMPTransforms
+   FIRAnalysis
+   ${test_libs}
+   ${dialect_libs}
+diff --git a/flang/tools/fir-opt/fir-opt.cpp b/flang/tools/fir-opt/fir-opt.cpp
+index 1846c1b317848..f75fba27c68f0 100644
+--- a/flang/tools/fir-opt/fir-opt.cpp
++++ b/flang/tools/fir-opt/fir-opt.cpp
+@@ -14,6 +14,7 @@
+ #include "mlir/Tools/mlir-opt/MlirOptMain.h"
+ #include "flang/Optimizer/CodeGen/CodeGen.h"
+ #include "flang/Optimizer/HLFIR/Passes.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
+ #include "flang/Optimizer/Support/InitFIR.h"
+ #include "flang/Optimizer/Transforms/Passes.h"
+ 
+@@ -34,6 +35,7 @@ int main(int argc, char **argv) {
+   fir::registerOptCodeGenPasses();
+   fir::registerOptTransformPasses();
+   hlfir::registerHLFIRPasses();
++  flangomp::registerFlangOpenMPPasses();
+ #ifdef FLANG_INCLUDE_TESTS
+   fir::test::registerTestFIRAliasAnalysisPass();
+   mlir::registerSideEffectTestPasses();
+diff --git a/flang/tools/tco/CMakeLists.txt b/flang/tools/tco/CMakeLists.txt
+index 808219ac361f2..698a398547c77 100644
+--- a/flang/tools/tco/CMakeLists.txt
++++ b/flang/tools/tco/CMakeLists.txt
+@@ -17,6 +17,7 @@ target_link_libraries(tco PRIVATE
+   FIRBuilder
+   HLFIRDialect
+   HLFIRTransforms
++  FlangOpenMPTransforms
+   ${dialect_libs}
+   ${extension_libs}
+   MLIRIR

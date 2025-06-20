@@ -1,0 +1,150 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 72121ad4f9e47..6c741cda0ec0f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -636,6 +636,60 @@ def YieldOp : OpenMP_Op<"yield",
+   let assemblyFormat = [{ ( `(` $results^ `:` type($results) `)` )? attr-dict}];
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Distribute construct [2.9.4.1]
++//===----------------------------------------------------------------------===//
++def DistributeOp : OpenMP_Op<"distribute", [AttrSizedOperandSegments,
++                              MemoryEffects<[MemWrite]>]> {
++  let summary = "distribute construct";
++  let description = [{
++    The distribute construct specifies that the iterations of one or more loops
++    (optionally specified using collapse clause) will be executed by the
++    initial teams in the context of their implicit tasks. The loops that the
++    distribute op is associated with starts with the outermost loop enclosed by
++    the distribute op region and going down the loop nest toward the innermost
++    loop. The iterations are distributed across the initial threads of all
++    initial teams that execute the teams region to which the distribute region
++    binds.
++
++    The distribute loop construct specifies that the iterations of the loop(s)
++    will be executed in parallel by threads in the current context. These
++    iterations are spread across threads that already exist in the enclosing
++    region. The lower and upper bounds specify a half-open range: the
++    range includes the lower bound but does not include the upper bound. If the
++    `inclusive` attribute is specified then the upper bound is also included.
++
++    The `dist_schedule_static` attribute specifies the  schedule for this
++    loop, determining how the loop is distributed across the parallel threads.
++    The optional `schedule_chunk` associated with this determines further
++    controls this distribution.
++
++    // TODO: private_var, firstprivate_var, lastprivate_var, collapse
++  }];
++  let arguments = (ins
++             UnitAttr:$dist_schedule_static,
++             Optional<IntLikeType>:$chunk_size,
++             Variadic<AnyType>:$allocate_vars,
++             Variadic<AnyType>:$allocators_vars,
++             OptionalAttr<OrderKindAttr>:$order_val);
++
++  let regions = (region AnyRegion:$region);
++
++  let assemblyFormat = [{
++    oilist(`dist_schedule_static` $dist_schedule_static
++          |`chunk_size` `(` $chunk_size `:` type($chunk_size) `)`
++          |`order` `(` custom<ClauseAttr>($order_val) `)`
++          |`allocate` `(`
++             custom<AllocateAndAllocator>(
++               $allocate_vars, type($allocate_vars),
++               $allocators_vars, type($allocators_vars)
++             ) `)`
++    ) $region attr-dict
++  }];
++
++  let hasVerifier = 1;
++}
++
+ //===----------------------------------------------------------------------===//
+ // 2.10.1 task Construct
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 2bf9355ed6267..3c3fbe2981b01 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1053,6 +1053,22 @@ LogicalResult SimdLoopOp::verify() {
+   return success();
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Verifier for Distribute construct [2.9.4.1]
++//===----------------------------------------------------------------------===//
++
++LogicalResult DistributeOp::verify() {
++  if (this->getChunkSize() && !this->getDistScheduleStatic())
++    return emitOpError() << "chunk size set without "
++                            "dist_schedule_static being present";
++
++  if (getAllocateVars().size() != getAllocatorsVars().size())
++    return emitError(
++        "expected equal sizes for allocate and allocator variables");
++
++  return success();
++}
++
+ //===----------------------------------------------------------------------===//
+ // ReductionOp
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index d4106453f31ed..5f5fb0a0db408 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -1657,3 +1657,12 @@ func.func @omp_target_exit_data(%map1: memref<?xi32>) {
+ }
+ 
+ llvm.mlir.global internal @_QFsubEx() : i32
++
++// -----
++
++func.func @omp_distribute(%data_var : memref<i32>) -> () {
++  // expected-error @below {{expected equal sizes for allocate and allocator variables}}
++  "omp.distribute"(%data_var) <{operandSegmentSizes = array<i32: 0, 1, 0>}> ({
++      "omp.terminator"() : () -> ()
++    }) : (memref<i32>) -> ()
++}
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 47788be6a7b2c..5e8d18adf52c8 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -479,6 +479,36 @@ func.func @omp_simdloop_pretty_multiple(%lb1 : index, %ub1 : index, %step1 : ind
+   return
+ }
+ 
++// CHECK-LABEL: omp_distribute
++func.func @omp_distribute(%chunk_size : i32, %data_var : memref<i32>) -> () {
++  // CHECK: omp.distribute
++  "omp.distribute" () ({
++    omp.terminator
++  }) {} : () -> ()
++  // CHECK: omp.distribute
++  omp.distribute {
++    omp.terminator
++  }
++  // CHECK: omp.distribute dist_schedule_static
++  omp.distribute dist_schedule_static {
++    omp.terminator
++  }
++  // CHECK: omp.distribute dist_schedule_static chunk_size(%{{.+}} : i32)
++  omp.distribute dist_schedule_static chunk_size(%chunk_size : i32) {
++    omp.terminator
++  }
++  // CHECK: omp.distribute order(concurrent)
++  omp.distribute order(concurrent) {
++    omp.terminator
++  }
++  // CHECK: omp.distribute allocate(%{{.+}} : memref<i32> -> %{{.+}} : memref<i32>)
++  omp.distribute allocate(%data_var : memref<i32> -> %data_var : memref<i32>) {
++    omp.terminator
++  }
++return
++}
++
++
+ // CHECK-LABEL: omp_target
+ func.func @omp_target(%if_cond : i1, %device : si32,  %num_threads : i32, %map1: memref<?xi32>, %map2: memref<?xi32>) -> () {
+ 

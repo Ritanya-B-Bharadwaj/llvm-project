@@ -1,0 +1,331 @@
+diff --git a/clang/lib/CodeGen/CGBuiltin.cpp b/clang/lib/CodeGen/CGBuiltin.cpp
+index 0c4d0efb70ea5..f0651c280ff95 100644
+--- a/clang/lib/CodeGen/CGBuiltin.cpp
++++ b/clang/lib/CodeGen/CGBuiltin.cpp
+@@ -5986,8 +5986,6 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
+         getTarget().getTriple().isAMDGCN() ||
+         (getTarget().getTriple().isSPIRV() &&
+          getTarget().getTriple().getVendor() == Triple::VendorType::AMD)) {
+-      if (getLangOpts().OpenMPIsTargetDevice)
+-        return EmitOpenMPDevicePrintfCallExpr(E);
+       if (getTarget().getTriple().isNVPTX())
+         return EmitNVPTXDevicePrintfCallExpr(E);
+       if ((getTarget().getTriple().isAMDGCN() ||
+diff --git a/clang/lib/CodeGen/CGGPUBuiltin.cpp b/clang/lib/CodeGen/CGGPUBuiltin.cpp
+index b2340732afeb5..84adf29e8db87 100644
+--- a/clang/lib/CodeGen/CGGPUBuiltin.cpp
++++ b/clang/lib/CodeGen/CGGPUBuiltin.cpp
+@@ -42,28 +42,6 @@ llvm::Function *GetVprintfDeclaration(llvm::Module &M) {
+       VprintfFuncType, llvm::GlobalVariable::ExternalLinkage, "vprintf", &M);
+ }
+ 
+-llvm::Function *GetOpenMPVprintfDeclaration(CodeGenModule &CGM) {
+-  const char *Name = "__llvm_omp_vprintf";
+-  llvm::Module &M = CGM.getModule();
+-  llvm::Type *ArgTypes[] = {llvm::PointerType::getUnqual(M.getContext()),
+-                            llvm::PointerType::getUnqual(M.getContext()),
+-                            llvm::Type::getInt32Ty(M.getContext())};
+-  llvm::FunctionType *VprintfFuncType = llvm::FunctionType::get(
+-      llvm::Type::getInt32Ty(M.getContext()), ArgTypes, false);
+-
+-  if (auto *F = M.getFunction(Name)) {
+-    if (F->getFunctionType() != VprintfFuncType) {
+-      CGM.Error(SourceLocation(),
+-                "Invalid type declaration for __llvm_omp_vprintf");
+-      return nullptr;
+-    }
+-    return F;
+-  }
+-
+-  return llvm::Function::Create(
+-      VprintfFuncType, llvm::GlobalVariable::ExternalLinkage, Name, &M);
+-}
+-
+ // Transforms a call to printf into a call to the NVPTX vprintf syscall (which
+ // isn't particularly special; it's invoked just like a regular function).
+ // vprintf takes two args: A format string, and a pointer to a buffer containing
+@@ -213,10 +191,3 @@ RValue CodeGenFunction::EmitAMDGPUDevicePrintfCallExpr(const CallExpr *E) {
+   Builder.SetInsertPoint(IRB.GetInsertBlock(), IRB.GetInsertPoint());
+   return RValue::get(Printf);
+ }
+-
+-RValue CodeGenFunction::EmitOpenMPDevicePrintfCallExpr(const CallExpr *E) {
+-  assert(getTarget().getTriple().isNVPTX() ||
+-         getTarget().getTriple().isAMDGCN());
+-  return EmitDevicePrintfCallExpr(E, this, GetOpenMPVprintfDeclaration(CGM),
+-                                  true);
+-}
+diff --git a/clang/lib/CodeGen/CodeGenFunction.h b/clang/lib/CodeGen/CodeGenFunction.h
+index bd62c65d8cce6..89cc819c43bb5 100644
+--- a/clang/lib/CodeGen/CodeGenFunction.h
++++ b/clang/lib/CodeGen/CodeGenFunction.h
+@@ -4536,7 +4536,6 @@ class CodeGenFunction : public CodeGenTypeCache {
+ 
+   RValue EmitNVPTXDevicePrintfCallExpr(const CallExpr *E);
+   RValue EmitAMDGPUDevicePrintfCallExpr(const CallExpr *E);
+-  RValue EmitOpenMPDevicePrintfCallExpr(const CallExpr *E);
+ 
+   RValue EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
+                          const CallExpr *E, ReturnValueSlot ReturnValue);
+diff --git a/libc/config/gpu/entrypoints.txt b/libc/config/gpu/entrypoints.txt
+index df7aa9e319624..157f6f8af00a9 100644
+--- a/libc/config/gpu/entrypoints.txt
++++ b/libc/config/gpu/entrypoints.txt
+@@ -226,7 +226,6 @@ set(TARGET_LIBC_ENTRYPOINTS
+ 
+     # gpu/rpc.h entrypoints
+     libc.src.gpu.rpc_host_call
+-    libc.src.gpu.rpc_fprintf
+ )
+ 
+ set(TARGET_LIBM_ENTRYPOINTS
+diff --git a/libc/spec/gpu_ext.td b/libc/spec/gpu_ext.td
+index 5400e0afa7564..dce81ff778620 100644
+--- a/libc/spec/gpu_ext.td
++++ b/libc/spec/gpu_ext.td
+@@ -10,14 +10,6 @@ def GPUExtensions : StandardSpec<"GPUExtensions"> {
+             RetValSpec<VoidType>,
+             [ArgSpec<VoidPtr>, ArgSpec<VoidPtr>, ArgSpec<SizeTType>]
+         >,
+-        FunctionSpec<
+-            "rpc_fprintf",
+-            RetValSpec<IntType>,
+-            [ArgSpec<FILERestrictedPtr>,
+-             ArgSpec<ConstCharRestrictedPtr>,
+-             ArgSpec<VoidPtr>,
+-             ArgSpec<SizeTType>]
+-        >,
+     ]
+   >;
+   let Headers = [
+diff --git a/libc/src/gpu/CMakeLists.txt b/libc/src/gpu/CMakeLists.txt
+index 4508abea7a888..e20228516b511 100644
+--- a/libc/src/gpu/CMakeLists.txt
++++ b/libc/src/gpu/CMakeLists.txt
+@@ -8,15 +8,3 @@ add_entrypoint_object(
+     libc.src.__support.RPC.rpc_client
+     libc.src.__support.GPU.utils
+ )
+-
+-add_entrypoint_object(
+-  rpc_fprintf
+-  SRCS
+-    rpc_fprintf.cpp
+-  HDRS
+-    rpc_fprintf.h
+-  DEPENDS
+-    libc.src.stdio.gpu.gpu_file
+-    libc.src.__support.RPC.rpc_client
+-    libc.src.__support.GPU.utils
+-)
+diff --git a/libc/src/gpu/rpc_fprintf.cpp b/libc/src/gpu/rpc_fprintf.cpp
+deleted file mode 100644
+index 70056daa25e2e..0000000000000
+--- a/libc/src/gpu/rpc_fprintf.cpp
++++ /dev/null
+@@ -1,75 +0,0 @@
+-//===-- GPU implementation of fprintf -------------------------------------===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#include "rpc_fprintf.h"
+-
+-#include "src/__support/CPP/string_view.h"
+-#include "src/__support/GPU/utils.h"
+-#include "src/__support/RPC/rpc_client.h"
+-#include "src/__support/common.h"
+-#include "src/__support/macros/config.h"
+-#include "src/stdio/gpu/file.h"
+-
+-namespace LIBC_NAMESPACE_DECL {
+-
+-template <uint16_t opcode>
+-int fprintf_impl(::FILE *__restrict file, const char *__restrict format,
+-                 size_t format_size, void *args, size_t args_size) {
+-  uint64_t mask = gpu::get_lane_mask();
+-  rpc::Client::Port port = rpc::client.open<opcode>();
+-
+-  if constexpr (opcode == RPC_PRINTF_TO_STREAM) {
+-    port.send([&](rpc::Buffer *buffer) {
+-      buffer->data[0] = reinterpret_cast<uintptr_t>(file);
+-    });
+-  }
+-
+-  port.send_n(format, format_size);
+-  port.recv([&](rpc::Buffer *buffer) {
+-    args_size = static_cast<size_t>(buffer->data[0]);
+-  });
+-  port.send_n(args, args_size);
+-
+-  uint32_t ret = 0;
+-  for (;;) {
+-    const char *str = nullptr;
+-    port.recv([&](rpc::Buffer *buffer) {
+-      ret = static_cast<uint32_t>(buffer->data[0]);
+-      str = reinterpret_cast<const char *>(buffer->data[1]);
+-    });
+-    // If any lanes have a string argument it needs to be copied back.
+-    if (!gpu::ballot(mask, str))
+-      break;
+-
+-    uint64_t size = str ? internal::string_length(str) + 1 : 0;
+-    port.send_n(str, size);
+-  }
+-
+-  port.close();
+-  return ret;
+-}
+-
+-// TODO: Delete this and port OpenMP to use `printf`.
+-// place of varargs. Once varargs support is added we will use that to
+-// implement the real version.
+-LLVM_LIBC_FUNCTION(int, rpc_fprintf,
+-                   (::FILE *__restrict stream, const char *__restrict format,
+-                    void *args, size_t size)) {
+-  cpp::string_view str(format);
+-  if (stream == stdout)
+-    return fprintf_impl<RPC_PRINTF_TO_STDOUT>(stream, format, str.size() + 1,
+-                                              args, size);
+-  else if (stream == stderr)
+-    return fprintf_impl<RPC_PRINTF_TO_STDERR>(stream, format, str.size() + 1,
+-                                              args, size);
+-  else
+-    return fprintf_impl<RPC_PRINTF_TO_STREAM>(stream, format, str.size() + 1,
+-                                              args, size);
+-}
+-
+-} // namespace LIBC_NAMESPACE_DECL
+diff --git a/libc/src/gpu/rpc_fprintf.h b/libc/src/gpu/rpc_fprintf.h
+deleted file mode 100644
+index 7658b214c07c2..0000000000000
+--- a/libc/src/gpu/rpc_fprintf.h
++++ /dev/null
+@@ -1,23 +0,0 @@
+-//===-- Implementation header for RPC functions -----------------*- C++ -*-===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#ifndef LLVM_LIBC_SRC_GPU_RPC_HOST_CALL_H
+-#define LLVM_LIBC_SRC_GPU_RPC_HOST_CALL_H
+-
+-#include "hdr/types/FILE.h"
+-#include "src/__support/macros/config.h"
+-#include <stddef.h>
+-
+-namespace LIBC_NAMESPACE_DECL {
+-
+-int rpc_fprintf(::FILE *__restrict stream, const char *__restrict format,
+-                void *argc, size_t size);
+-
+-} // namespace LIBC_NAMESPACE_DECL
+-
+-#endif // LLVM_LIBC_SRC_GPU_RPC_HOST_CALL_H
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUPrintfRuntimeBinding.cpp b/llvm/lib/Target/AMDGPU/AMDGPUPrintfRuntimeBinding.cpp
+index 42a6bac4fa6f2..02b0d436451a3 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUPrintfRuntimeBinding.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUPrintfRuntimeBinding.cpp
+@@ -437,7 +437,8 @@ bool AMDGPUPrintfRuntimeBindingImpl::run(Module &M) {
+     return false;
+ 
+   auto PrintfFunction = M.getFunction("printf");
+-  if (!PrintfFunction || !PrintfFunction->isDeclaration())
++  if (!PrintfFunction || !PrintfFunction->isDeclaration() ||
++      M.getModuleFlag("openmp"))
+     return false;
+ 
+   for (auto &U : PrintfFunction->uses()) {
+diff --git a/offload/DeviceRTL/include/LibC.h b/offload/DeviceRTL/include/LibC.h
+index dde86af783af9..59a795cc62e0e 100644
+--- a/offload/DeviceRTL/include/LibC.h
++++ b/offload/DeviceRTL/include/LibC.h
+@@ -18,7 +18,6 @@ extern "C" {
+ 
+ int memcmp(const void *lhs, const void *rhs, size_t count);
+ void memset(void *dst, int C, size_t count);
+-
+ int printf(const char *format, ...);
+ }
+ 
+diff --git a/offload/DeviceRTL/src/LibC.cpp b/offload/DeviceRTL/src/LibC.cpp
+index 4bca5d29643fe..291ceb023a69c 100644
+--- a/offload/DeviceRTL/src/LibC.cpp
++++ b/offload/DeviceRTL/src/LibC.cpp
+@@ -11,44 +11,33 @@
+ #pragma omp begin declare target device_type(nohost)
+ 
+ namespace impl {
+-int32_t omp_vprintf(const char *Format, void *Arguments, uint32_t);
++int32_t omp_vprintf(const char *Format, __builtin_va_list vlist);
+ }
+ 
++#ifndef OMPTARGET_HAS_LIBC
++namespace impl {
+ #pragma omp begin declare variant match(                                       \
+         device = {arch(nvptx, nvptx64)},                                       \
+             implementation = {extension(match_any)})
+-extern "C" int32_t vprintf(const char *, void *);
+-namespace impl {
+-int32_t omp_vprintf(const char *Format, void *Arguments, uint32_t) {
+-  return vprintf(Format, Arguments);
++extern "C" int vprintf(const char *format, ...);
++int omp_vprintf(const char *Format, __builtin_va_list vlist) {
++  return vprintf(Format, vlist);
+ }
+-} // namespace impl
+ #pragma omp end declare variant
+ 
+ #pragma omp begin declare variant match(device = {arch(amdgcn)})
+-
+-#ifdef OMPTARGET_HAS_LIBC
+-// TODO: Remove this handling once we have varargs support.
+-extern "C" struct FILE *stdout;
+-extern "C" int32_t rpc_fprintf(FILE *, const char *, void *, uint64_t);
+-
+-namespace impl {
+-int32_t omp_vprintf(const char *Format, void *Arguments, uint32_t Size) {
+-  return rpc_fprintf(stdout, Format, Arguments, Size);
+-}
++int omp_vprintf(const char *Format, __builtin_va_list) { return -1; }
++#pragma omp end declare variant
+ } // namespace impl
+-#else
+-// We do not have a vprintf implementation for AMD GPU so we use a stub.
+-namespace impl {
+-int32_t omp_vprintf(const char *Format, void *Arguments, uint32_t) {
+-  return -1;
++
++extern "C" int printf(const char *Format, ...) {
++  __builtin_va_list vlist;
++  __builtin_va_start(vlist, Format);
++  return impl::omp_vprintf(Format, vlist);
+ }
+-} // namespace impl
+-#endif
+-#pragma omp end declare variant
++#endif // OMPTARGET_HAS_LIBC
+ 
+ extern "C" {
+-
+ [[gnu::weak]] int memcmp(const void *lhs, const void *rhs, size_t count) {
+   auto *L = reinterpret_cast<const unsigned char *>(lhs);
+   auto *R = reinterpret_cast<const unsigned char *>(rhs);
+@@ -65,11 +54,6 @@ extern "C" {
+   for (size_t I = 0; I < count; ++I)
+     dstc[I] = C;
+ }
+-
+-/// printf() calls are rewritten by CGGPUBuiltin to __llvm_omp_vprintf
+-int32_t __llvm_omp_vprintf(const char *Format, void *Arguments, uint32_t Size) {
+-  return impl::omp_vprintf(Format, Arguments, Size);
+-}
+ }
+ 
+ #pragma omp end declare target

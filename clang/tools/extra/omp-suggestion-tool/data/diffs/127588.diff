@@ -1,0 +1,166 @@
+diff --git a/flang/lib/Optimizer/OpenMP/GenericLoopConversion.cpp b/flang/lib/Optimizer/OpenMP/GenericLoopConversion.cpp
+index d3aece73b274f..bf94166edc079 100644
+--- a/flang/lib/Optimizer/OpenMP/GenericLoopConversion.cpp
++++ b/flang/lib/Optimizer/OpenMP/GenericLoopConversion.cpp
+@@ -52,8 +52,7 @@ class GenericLoopConversionPattern
+       rewriteStandaloneLoop(loopOp, rewriter);
+       break;
+     case GenericLoopCombinedInfo::ParallelLoop:
+-      llvm_unreachable(
+-          "not yet implemented: Combined `parallel loop` directive");
++      rewriteToWsloop(loopOp, rewriter);
+       break;
+     case GenericLoopCombinedInfo::TeamsLoop:
+       if (teamsLoopCanBeParallelFor(loopOp))
+@@ -69,31 +68,12 @@ class GenericLoopConversionPattern
+ 
+   static mlir::LogicalResult
+   checkLoopConversionSupportStatus(mlir::omp::LoopOp loopOp) {
+-    GenericLoopCombinedInfo combinedInfo = findGenericLoopCombineInfo(loopOp);
+-
+-    switch (combinedInfo) {
+-    case GenericLoopCombinedInfo::Standalone:
+-      break;
+-    case GenericLoopCombinedInfo::ParallelLoop:
+-      return loopOp.emitError(
+-          "not yet implemented: Combined `parallel loop` directive");
+-    case GenericLoopCombinedInfo::TeamsLoop:
+-      break;
+-    }
+-
+     auto todo = [&loopOp](mlir::StringRef clauseName) {
+       return loopOp.emitError()
+              << "not yet implemented: Unhandled clause " << clauseName << " in "
+              << loopOp->getName() << " operation";
+     };
+ 
+-    // For `loop` and `teams loop` directives, `bind` is supported.
+-    // Additionally, for `teams loop`, semantic checking verifies that the
+-    // `bind` clause modifier is `teams`, so no need to check this here again.
+-    if (combinedInfo == GenericLoopCombinedInfo::ParallelLoop &&
+-        loopOp.getBindKind())
+-      return todo("bind");
+-
+     if (loopOp.getOrder())
+       return todo("order");
+ 
+@@ -147,8 +127,9 @@ class GenericLoopConversionPattern
+                          mlir::omp::ClauseBindKind::Parallel)
+                    return mlir::WalkResult::interrupt();
+ 
+-                 // TODO check for combined `parallel loop` when we support
+-                 // it.
++                 if (combinedInfo == GenericLoopCombinedInfo::ParallelLoop)
++                   return mlir::WalkResult::interrupt();
++
+                } else if (auto callOp =
+                               mlir::dyn_cast<mlir::CallOpInterface>(nestedOp)) {
+                  // Calls to non-OpenMP API runtime functions inhibits
+diff --git a/flang/test/Lower/OpenMP/loop-directive.f90 b/flang/test/Lower/OpenMP/loop-directive.f90
+index 13cf2bfd15135..ffa4a6ff24f24 100644
+--- a/flang/test/Lower/OpenMP/loop-directive.f90
++++ b/flang/test/Lower/OpenMP/loop-directive.f90
+@@ -261,3 +261,36 @@ subroutine teams_loop_can_be_parallel_for
+     tid = omp_get_thread_num()
+   END DO
+ end subroutine
++
++! CHECK-LABEL: func.func @_QPteams_loop_cannot_be_parallel_for_4
++subroutine teams_loop_cannot_be_parallel_for_4
++  implicit none
++  integer :: iter, iter2, tid, val(20)
++
++  ! CHECK: omp.teams {
++
++  ! Verify the outer `loop` directive was mapped to only `distribute`.
++  ! CHECK-NOT: omp.parallel {{.*}}
++  ! CHECK:     omp.distribute {{.*}} {
++  ! CHECK-NEXT:  omp.loop_nest {{.*}} {
++
++  ! Verify the inner `loop` directive was mapped to a worksharing loop.
++  ! CHECK:         omp.wsloop {{.*}} {
++  ! CHECK:           omp.loop_nest {{.*}} {
++  ! CHECK:           }
++  ! CHECK:         }
++
++  ! CHECK:       }
++  ! CHECK:     }
++
++  ! CHECK: }
++  !$omp target teams loop map(tofrom:val)
++  DO iter = 1, 5
++    !$omp parallel
++    !$omp loop
++    DO iter2 = 1, 5
++      val(iter+iter2) = iter+iter2
++    END DO
++    !$omp end parallel
++  END DO
++end subroutine
+diff --git a/flang/test/Transforms/generic-loop-rewriting-todo.mlir b/flang/test/Transforms/generic-loop-rewriting-todo.mlir
+index 25baffe34e394..e992296c9a837 100644
+--- a/flang/test/Transforms/generic-loop-rewriting-todo.mlir
++++ b/flang/test/Transforms/generic-loop-rewriting-todo.mlir
+@@ -1,21 +1,5 @@
+ // RUN: fir-opt --omp-generic-loop-conversion -verify-diagnostics %s
+ 
+-func.func @_QPparallel_loop() {
+-  omp.parallel {
+-    %c0 = arith.constant 0 : i32
+-    %c10 = arith.constant 10 : i32
+-    %c1 = arith.constant 1 : i32
+-    // expected-error@below {{not yet implemented: Combined `parallel loop` directive}}
+-    omp.loop {
+-      omp.loop_nest (%arg3) : i32 = (%c0) to (%c10) inclusive step (%c1) {
+-        omp.yield
+-      }
+-    }
+-    omp.terminator
+-  }
+-  return
+-}
+-
+ omp.declare_reduction @add_reduction_i32 : i32 init {
+   ^bb0(%arg0: i32):
+     %c0_i32 = arith.constant 0 : i32
+diff --git a/flang/test/Transforms/generic-loop-rewriting.mlir b/flang/test/Transforms/generic-loop-rewriting.mlir
+index 49caf242fe324..6996beeb9f430 100644
+--- a/flang/test/Transforms/generic-loop-rewriting.mlir
++++ b/flang/test/Transforms/generic-loop-rewriting.mlir
+@@ -45,3 +45,36 @@ func.func @_QPteams_loop() {
+ // CHECK:             }
+ // CHECK:           }
+ // CHECK:         }
++
++func.func @_QPparallel_loop() {
++  %i = fir.alloca i32
++  omp.parallel {
++    %c0 = arith.constant 0 : i32
++    %c10 = arith.constant 10 : i32
++    %c1 = arith.constant 1 : i32
++    omp.loop private(@_QFteams_loopEi_private_i32 %i -> %arg2 : !fir.ref<i32>) {
++      omp.loop_nest (%arg3) : i32 = (%c0) to (%c10) inclusive step (%c1) {
++        fir.store %arg3 to %arg2 : !fir.ref<i32>
++        omp.yield
++      }
++    }
++    omp.terminator
++  }
++  return
++}
++
++// CHECK-LABEL: func.func @_QPparallel_loop
++// CHECK:         %[[I:.*]] = fir.alloca i32
++// CHECK:         omp.parallel {
++
++// CHECK:           %[[LB:.*]] = arith.constant 0 : i32
++// CHECK:           %[[UB:.*]] = arith.constant 10 : i32
++// CHECK:           %[[STEP:.*]] = arith.constant 1 : i32
++// CHECK:           omp.wsloop private(@{{.*}} %[[I]]
++// CHECK-SAME:        -> %[[I_PRIV_ARG:[^[:space:]]+]] : !fir.ref<i32>) {
++// CHECK:              omp.loop_nest (%{{.*}}) : i32 =
++// CHECK-SAME:           (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++// CHECK:                fir.store %{{.*}} to %[[I_PRIV_ARG]] : !fir.ref<i32>
++// CHECK:              }
++// CHECK:           }
++// CHECK:         }

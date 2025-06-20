@@ -1,0 +1,183 @@
+diff --git a/flang/include/flang/Lower/AbstractConverter.h b/flang/include/flang/Lower/AbstractConverter.h
+index f43dfd8343ece..daded9091780e 100644
+--- a/flang/include/flang/Lower/AbstractConverter.h
++++ b/flang/include/flang/Lower/AbstractConverter.h
+@@ -17,6 +17,7 @@
+ #include "flang/Lower/LoweringOptions.h"
+ #include "flang/Lower/PFTDefs.h"
+ #include "flang/Optimizer/Builder/BoxValue.h"
++#include "flang/Optimizer/Dialect/FIRAttr.h"
+ #include "flang/Semantics/symbol.h"
+ #include "mlir/IR/Builders.h"
+ #include "mlir/IR/BuiltinOps.h"
+@@ -126,8 +127,8 @@ class AbstractConverter {
+       const Fortran::semantics::Symbol &sym,
+       mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr) = 0;
+ 
+-  virtual void copyVar(mlir::Location loc, mlir::Value dst,
+-                       mlir::Value src) = 0;
++  virtual void copyVar(mlir::Location loc, mlir::Value dst, mlir::Value src,
++                       fir::FortranVariableFlagsEnum attrs) = 0;
+ 
+   /// For a given symbol, check if it is present in the inner-most
+   /// level of the symbol map.
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index 202efa57d4a36..a63350d0cf64f 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -751,10 +751,16 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+         });
+   }
+ 
+-  void copyVar(mlir::Location loc, mlir::Value dst,
+-               mlir::Value src) override final {
++  void copyVar(mlir::Location loc, mlir::Value dst, mlir::Value src,
++               fir::FortranVariableFlagsEnum attrs) override final {
++    bool isAllocatable =
++        bitEnumContainsAny(attrs, fir::FortranVariableFlagsEnum::allocatable);
++    bool isPointer =
++        bitEnumContainsAny(attrs, fir::FortranVariableFlagsEnum::pointer);
++
+     copyVarHLFIR(loc, Fortran::lower::SymbolBox::Intrinsic{dst},
+-                 Fortran::lower::SymbolBox::Intrinsic{src});
++                 Fortran::lower::SymbolBox::Intrinsic{src}, isAllocatable,
++                 isPointer);
+   }
+ 
+   void copyHostAssociateVar(
+@@ -1083,6 +1089,28 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+   void copyVarHLFIR(mlir::Location loc, Fortran::lower::SymbolBox dst,
+                     Fortran::lower::SymbolBox src) {
+     assert(lowerToHighLevelFIR());
++
++    bool isBoxAllocatable = dst.match(
++        [](const fir::MutableBoxValue &box) { return box.isAllocatable(); },
++        [](const fir::FortranVariableOpInterface &box) {
++          return fir::FortranVariableOpInterface(box).isAllocatable();
++        },
++        [](const auto &box) { return false; });
++
++    bool isBoxPointer = dst.match(
++        [](const fir::MutableBoxValue &box) { return box.isPointer(); },
++        [](const fir::FortranVariableOpInterface &box) {
++          return fir::FortranVariableOpInterface(box).isPointer();
++        },
++        [](const auto &box) { return false; });
++
++    copyVarHLFIR(loc, dst, src, isBoxAllocatable, isBoxPointer);
++  }
++
++  void copyVarHLFIR(mlir::Location loc, Fortran::lower::SymbolBox dst,
++                    Fortran::lower::SymbolBox src, bool isAllocatable,
++                    bool isPointer) {
++    assert(lowerToHighLevelFIR());
+     hlfir::Entity lhs{dst.getAddr()};
+     hlfir::Entity rhs{src.getAddr()};
+     // Temporary_lhs is set to true in hlfir.assign below to avoid user
+@@ -1099,21 +1127,7 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+           /*temporary_lhs=*/true);
+     };
+ 
+-    bool isBoxAllocatable = dst.match(
+-        [](const fir::MutableBoxValue &box) { return box.isAllocatable(); },
+-        [](const fir::FortranVariableOpInterface &box) {
+-          return fir::FortranVariableOpInterface(box).isAllocatable();
+-        },
+-        [](const auto &box) { return false; });
+-
+-    bool isBoxPointer = dst.match(
+-        [](const fir::MutableBoxValue &box) { return box.isPointer(); },
+-        [](const fir::FortranVariableOpInterface &box) {
+-          return fir::FortranVariableOpInterface(box).isPointer();
+-        },
+-        [](const auto &box) { return false; });
+-
+-    if (isBoxAllocatable) {
++    if (isAllocatable) {
+       // Deep copy allocatable if it is allocated.
+       // Note that when allocated, the RHS is already allocated with the LHS
+       // shape for copy on entry in createHostAssociateVarClone.
+@@ -1128,7 +1142,7 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+             copyData(lhs, rhs);
+           })
+           .end();
+-    } else if (isBoxPointer) {
++    } else if (isPointer) {
+       // Set LHS target to the target of RHS (do not copy the RHS
+       // target data into the LHS target storage).
+       auto loadVal = builder->create<fir::LoadOp>(loc, rhs);
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 371fe6db01255..5a4325495b948 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -669,7 +669,7 @@ createCopyFunc(mlir::Location loc, lower::AbstractConverter &converter,
+   auto declSrc = builder.create<hlfir::DeclareOp>(
+       loc, funcOp.getArgument(1), copyFuncName + "_src", shape, typeparams,
+       /*dummy_scope=*/nullptr, attrs);
+-  converter.copyVar(loc, declDst.getBase(), declSrc.getBase());
++  converter.copyVar(loc, declDst.getBase(), declSrc.getBase(), varAttrs);
+   builder.create<mlir::func::ReturnOp>(loc);
+   return funcOp;
+ }
+diff --git a/flang/test/Lower/OpenMP/copyprivate2.f90 b/flang/test/Lower/OpenMP/copyprivate2.f90
+new file mode 100644
+index 0000000000000..f10d509d805e2
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/copyprivate2.f90
+@@ -0,0 +1,56 @@
++! Test lowering of COPYPRIVATE with allocatable/pointer variables.
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++!CHECK-LABEL: func private @_copy_box_ptr_i32(
++!CHECK-SAME:                  %[[ARG0:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>,
++!CHECK-SAME:                  %[[ARG1:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++!CHECK-NEXT:    %[[DST:.*]]:2 = hlfir.declare %[[ARG0]] {fortran_attrs = #fir.var_attrs<pointer>,
++!CHECK-SAME:      uniq_name = "_copy_box_ptr_i32_dst"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) ->
++!CHECK-SAME:      (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK-NEXT:    %[[SRC:.*]]:2 = hlfir.declare %[[ARG1]] {fortran_attrs = #fir.var_attrs<pointer>,
++!CHECK-SAME:      uniq_name = "_copy_box_ptr_i32_src"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) ->
++!CHECK-SAME:      (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK-NEXT:    %[[SRC_VAL:.*]] = fir.load %[[SRC]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK-NEXT:    fir.store %[[SRC_VAL]] to %[[DST]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK-NEXT:    return
++!CHECK-NEXT:  }
++
++!CHECK-LABEL: func private @_copy_box_heap_Uxi32(
++!CHECK-SAME:        %[[ARG0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>,
++!CHECK-SAME:        %[[ARG1:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) {
++!CHECK-NEXT:    %[[DST:.*]]:2 = hlfir.declare %[[ARG0]] {fortran_attrs = #fir.var_attrs<allocatable>,
++!CHECK-SAME:      uniq_name = "_copy_box_heap_Uxi32_dst"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
++!CHECK-SAME:      (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++!CHECK-NEXT:    %[[SRC:.*]]:2 = hlfir.declare %[[ARG1]] {fortran_attrs = #fir.var_attrs<allocatable>,
++!CHECK-SAME:      uniq_name = "_copy_box_heap_Uxi32_src"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
++!CHECK-SAME:      (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++!CHECK-NEXT:    %[[DST_BOX:.*]] = fir.load %[[DST]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!CHECK:         fir.if %{{.*}} {
++!CHECK-NEXT:      %[[SRC_BOX:.*]] = fir.load %[[SRC]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!CHECK-NEXT:      hlfir.assign %[[SRC_BOX]] to %[[DST_BOX]] temporary_lhs : !fir.box<!fir.heap<!fir.array<?xi32>>>,
++!CHECK-SAME:        !fir.box<!fir.heap<!fir.array<?xi32>>>
++!CHECK-NEXT:    }
++!CHECK-NEXT:    return
++!CHECK-NEXT:  }
++
++!CHECK-LABEL: func @_QPtest_alloc_ptr
++!CHECK:         omp.parallel {
++!CHECK:           %[[A:.*]]:2 = hlfir.declare %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>,
++!CHECK-SAME:        uniq_name = "_QFtest_alloc_ptrEa"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
++!CHECK-SAME:        (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++!CHECK:           %[[P:.*]]:2 = hlfir.declare %{{.*}} {fortran_attrs = #fir.var_attrs<pointer>,
++!CHECK-SAME:        uniq_name = "_QFtest_alloc_ptrEp"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) ->
++!CHECK-SAME:        (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK:           omp.single copyprivate(
++!CHECK-SAME:        %[[A]]#0 -> @_copy_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>,
++!CHECK-SAME:        %[[P]]#0 -> @_copy_box_ptr_i32 : !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHEK:          }
++subroutine test_alloc_ptr()
++  integer, allocatable :: a(:)
++  integer, pointer :: p
++
++  !$omp parallel private(a, p)
++  !$omp single
++  !$omp end single copyprivate(a, p)
++  !$omp end parallel
++end subroutine

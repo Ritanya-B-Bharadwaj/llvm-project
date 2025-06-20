@@ -1,0 +1,131 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 44796994b244c..cce6dc32bad4b 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -889,13 +889,62 @@ bool ClauseProcessor::processDepend(lower::SymMap &symMap,
+       } else if (evaluate::IsArrayElement(*object.ref())) {
+         // Array Section
+         SomeExpr expr = *object.ref();
+-        if (isVectorSubscript(expr))
+-          TODO(converter.getCurrentLocation(),
+-               "Vector subscripted array section for task dependency");
+ 
+-        hlfir::EntityWithAttributes entity = convertExprToHLFIR(
+-            converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);
+-        dependVar = entity.getBase();
++        if (isVectorSubscript(expr)) {
++          // OpenMP needs the address of the first indexed element (required by
++          // the standard to be the lowest index) to identify the dependency. We
++          // don't need an accurate length for the array section because the
++          // OpenMP standard forbids overlapping array sections.
++
++          // Get a hlfir.elemental_addr op describing the address of the value
++          // indexed from the original array.
++          // Note: the hlfir.elemental_addr op verifier requires it to be inside
++          // of a hlfir.region_assign op. This is because the only place in base
++          // Fortran where you need the address of a vector subscript would be
++          // in an assignment operation. We are not doing an assignment here
++          // but we do want the address (without having to duplicate all of
++          // Fortran designation lowering!). This operation is never seen by the
++          // verifier because it is immediately inlined.
++          hlfir::ElementalAddrOp addrOp =
++              convertVectorSubscriptedExprToElementalAddr(
++                  converter.getCurrentLocation(), converter, expr, symMap,
++                  stmtCtx);
++          if (!addrOp.getCleanup().empty())
++            TODO(converter.getCurrentLocation(),
++                 "Vector subscript in DEPEND clause requring a cleanup region");
++
++          // hlfir.elemental_addr doesn't have a normal lowering because it
++          // can't return a value. Instead we need to inline it here using
++          // values for the first element. Similar to hlfir::inlineElementalOp.
++
++          mlir::Value one = builder.createIntegerConstant(
++              converter.getCurrentLocation(), builder.getIndexType(), 1);
++          mlir::SmallVector<mlir::Value> oneBasedIndices;
++          oneBasedIndices.resize(addrOp.getIndices().size(), one);
++
++          mlir::IRMapping mapper;
++          mapper.map(addrOp.getIndices(), oneBasedIndices);
++          assert(addrOp.getElementalRegion().hasOneBlock());
++          mlir::Operation *newOp;
++          for (mlir::Operation &op :
++               addrOp.getElementalRegion().back().getOperations())
++            newOp = builder.clone(op, mapper);
++          auto yield = mlir::cast<hlfir::YieldOp>(newOp);
++
++          addrOp->erase();
++
++          if (!yield.getCleanup().empty())
++            TODO(converter.getCurrentLocation(),
++                 "Vector subscript in DEPEND clause requring element cleanup");
++
++          dependVar = yield.getEntity();
++          yield->erase();
++        } else {
++          // Ordinary array section e.g. A(1:512:2)
++          hlfir::EntityWithAttributes entity = convertExprToHLFIR(
++              converter.getCurrentLocation(), converter, expr, symMap, stmtCtx);
++          dependVar = entity.getBase();
++        }
+       } else {
+         semantics::Symbol *sym = object.sym();
+         dependVar = converter.getSymbolAddress(*sym);
+diff --git a/flang/test/Lower/OpenMP/Todo/depend-clause-vector-subscript-array-section.f90 b/flang/test/Lower/OpenMP/Todo/depend-clause-vector-subscript-array-section.f90
+deleted file mode 100644
+index f3bd58c8c559a..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/depend-clause-vector-subscript-array-section.f90
++++ /dev/null
+@@ -1,11 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-! CHECK: Vector subscripted array section for task dependency
+-subroutine vectorSubscriptArraySection(array, indices)
+-  integer :: array(:)
+-  integer :: indices(:)
+-
+-  !$omp task depend (in: array(indices))
+-  !$omp end task
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/task-depend-array-section.f90 b/flang/test/Lower/OpenMP/task-depend-array-section.f90
+index b364a5e06a29c..4033b8ed1abf3 100644
+--- a/flang/test/Lower/OpenMP/task-depend-array-section.f90
++++ b/flang/test/Lower/OpenMP/task-depend-array-section.f90
+@@ -49,3 +49,36 @@ subroutine assumedShape(array)
+ ! CHECK:           }
+ ! CHECK:           return
+ ! CHECK:         }
++
++subroutine vectorSubscriptArraySection(array, indices)
++  integer :: array(:)
++  integer :: indices(:)
++
++  !$omp task depend (in: array(indices))
++  !$omp end task
++end subroutine
++! CHECK-LABEL:   func.func @_QPvectorsubscriptarraysection(
++! CHECK-SAME:                                              %[[VAL_0:[0-9]+|[a-zA-Z$._-][a-zA-Z0-9$._-]*]]: !fir.box<!fir.array<?xi32>> {fir.bindc_name = "array"},
++! CHECK-SAME:                                              %[[VAL_1:[0-9]+|[a-zA-Z$._-][a-zA-Z0-9$._-]*]]: !fir.box<!fir.array<?xi32>> {fir.bindc_name = "indices"}) {
++! CHECK:           %[[VAL_2:.*]] = fir.dummy_scope : !fir.dscope
++! CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_0]] dummy_scope %[[VAL_2]] {uniq_name = "_QFvectorsubscriptarraysectionEarray"} : (!fir.box<!fir.array<?xi32>>, !fir.dscope) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
++! CHECK:           %[[VAL_4:.*]]:2 = hlfir.declare %[[VAL_1]] dummy_scope %[[VAL_2]] {uniq_name = "_QFvectorsubscriptarraysectionEindices"} : (!fir.box<!fir.array<?xi32>>, !fir.dscope) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
++! CHECK:           %[[VAL_5:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_6:.*]]:3 = fir.box_dims %[[VAL_4]]#0, %[[VAL_5]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_7:.*]] = fir.shape %[[VAL_6]]#1 : (index) -> !fir.shape<1>
++! CHECK:           %[[VAL_8:.*]] = hlfir.elemental %[[VAL_7]] unordered : (!fir.shape<1>) -> !hlfir.expr<?xi64> {
++! CHECK:           ^bb0(%[[VAL_9:.*]]: index):
++! CHECK:             %[[VAL_10:.*]] = hlfir.designate %[[VAL_4]]#0 (%[[VAL_9]])  : (!fir.box<!fir.array<?xi32>>, index) -> !fir.ref<i32>
++! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_10]] : !fir.ref<i32>
++! CHECK:             %[[VAL_12:.*]] = fir.convert %[[VAL_11]] : (i32) -> i64
++! CHECK:             hlfir.yield_element %[[VAL_12]] : i64
++! CHECK:           }
++! CHECK:           %[[VAL_13:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_14:.*]] = hlfir.apply %[[VAL_8]], %[[VAL_13]] : (!hlfir.expr<?xi64>, index) -> i64
++! CHECK:           %[[VAL_15:.*]] = hlfir.designate %[[VAL_3]]#0 (%[[VAL_14]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
++! CHECK:           omp.task depend(taskdependin -> %[[VAL_15]] : !fir.ref<i32>) {
++! CHECK:             omp.terminator
++! CHECK:           }
++! CHECK:           hlfir.destroy %[[VAL_8]] : !hlfir.expr<?xi64>
++! CHECK:           return
++! CHECK:         }

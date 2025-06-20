@@ -1,0 +1,167 @@
+diff --git a/offload/DeviceRTL/include/Utils.h b/offload/DeviceRTL/include/Utils.h
+index 4ab0aea46eea1..d43b7f5c95de1 100644
+--- a/offload/DeviceRTL/include/Utils.h
++++ b/offload/DeviceRTL/include/Utils.h
+@@ -25,6 +25,8 @@ int32_t shuffle(uint64_t Mask, int32_t Var, int32_t SrcLane);
+ 
+ int32_t shuffleDown(uint64_t Mask, int32_t Var, uint32_t Delta, int32_t Width);
+ 
++uint64_t ballotSync(uint64_t Mask, int32_t Pred);
++
+ /// Return \p LowBits and \p HighBits packed into a single 64 bit value.
+ uint64_t pack(uint32_t LowBits, uint32_t HighBits);
+ 
+diff --git a/offload/DeviceRTL/src/Mapping.cpp b/offload/DeviceRTL/src/Mapping.cpp
+index b2028a8fb4f50..4f39d2a299ee6 100644
+--- a/offload/DeviceRTL/src/Mapping.cpp
++++ b/offload/DeviceRTL/src/Mapping.cpp
+@@ -364,4 +364,8 @@ _TGT_KERNEL_LANGUAGE(block_id, getBlockIdInKernel)
+ _TGT_KERNEL_LANGUAGE(block_dim, getNumberOfThreadsInBlock)
+ _TGT_KERNEL_LANGUAGE(grid_dim, getNumberOfBlocksInKernel)
+ 
++extern "C" uint64_t ompx_ballot_sync(uint64_t mask, int pred) {
++  return utils::ballotSync(mask, pred);
++}
++
+ #pragma omp end declare target
+diff --git a/offload/DeviceRTL/src/Utils.cpp b/offload/DeviceRTL/src/Utils.cpp
+index d07ac0fb499c9..606e3bec0d33c 100644
+--- a/offload/DeviceRTL/src/Utils.cpp
++++ b/offload/DeviceRTL/src/Utils.cpp
+@@ -37,6 +37,8 @@ int32_t shuffle(uint64_t Mask, int32_t Var, int32_t SrcLane);
+ int32_t shuffleDown(uint64_t Mask, int32_t Var, uint32_t LaneDelta,
+                     int32_t Width);
+ 
++uint64_t ballotSync(uint64_t Mask, int32_t Pred);
++
+ /// AMDGCN Implementation
+ ///
+ ///{
+@@ -57,6 +59,10 @@ int32_t shuffleDown(uint64_t Mask, int32_t Var, uint32_t LaneDelta,
+   return __builtin_amdgcn_ds_bpermute(Index << 2, Var);
+ }
+ 
++uint64_t ballotSync(uint64_t Mask, int32_t Pred) {
++  return Mask & __builtin_amdgcn_ballot_w64(Pred);
++}
++
+ bool isSharedMemPtr(const void *Ptr) {
+   return __builtin_amdgcn_is_shared(
+       (const __attribute__((address_space(0))) void *)Ptr);
+@@ -80,6 +86,10 @@ int32_t shuffleDown(uint64_t Mask, int32_t Var, uint32_t Delta, int32_t Width) {
+   return __nvvm_shfl_sync_down_i32(Mask, Var, Delta, T);
+ }
+ 
++uint64_t ballotSync(uint64_t Mask, int32_t Pred) {
++  return __nvvm_vote_ballot_sync(static_cast<uint32_t>(Mask), Pred);
++}
++
+ bool isSharedMemPtr(const void *Ptr) { return __nvvm_isspacep_shared(Ptr); }
+ 
+ #pragma omp end declare variant
+@@ -103,6 +113,10 @@ int32_t utils::shuffleDown(uint64_t Mask, int32_t Var, uint32_t Delta,
+   return impl::shuffleDown(Mask, Var, Delta, Width);
+ }
+ 
++uint64_t utils::ballotSync(uint64_t Mask, int32_t Pred) {
++  return impl::ballotSync(Mask, Pred);
++}
++
+ bool utils::isSharedMemPtr(void *Ptr) { return impl::isSharedMemPtr(Ptr); }
+ 
+ extern "C" {
+diff --git a/offload/test/offloading/ompx_bare_ballot_sync.c b/offload/test/offloading/ompx_bare_ballot_sync.c
+new file mode 100644
+index 0000000000000..d8e17691bf9c7
+--- /dev/null
++++ b/offload/test/offloading/ompx_bare_ballot_sync.c
+@@ -0,0 +1,45 @@
++// RUN: %libomptarget-compilexx-run-and-check-generic
++//
++// UNSUPPORTED: x86_64-pc-linux-gnu
++// UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++// UNSUPPORTED: aarch64-unknown-linux-gnu
++// UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++// UNSUPPORTED: s390x-ibm-linux-gnu
++// UNSUPPORTED: s390x-ibm-linux-gnu-LTO
++
++#if defined __AMDGCN_WAVEFRONT_SIZE && __AMDGCN_WAVEFRONT_SIZE == 64
++#define MASK 0xaaaaaaaaaaaaaaaa
++#else
++#define MASK 0xaaaaaaaa
++#endif
++
++#include <assert.h>
++#include <ompx.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++int main(int argc, char *argv[]) {
++  const int num_blocks = 1;
++  const int block_size = 256;
++  const int N = num_blocks * block_size;
++  uint64_t *data = (uint64_t *)malloc(N * sizeof(uint64_t));
++
++  for (int i = 0; i < N; ++i)
++    data[i] = i & 0x1;
++
++#pragma omp target teams ompx_bare num_teams(num_blocks) thread_limit(block_size) map(tofrom: data[0:N])
++  {
++    int tid = ompx_thread_id_x();
++    uint64_t mask = ompx_ballot_sync(~0U, data[tid]);
++    data[tid] += mask;
++  }
++
++  for (int i = 0; i < N; ++i)
++    assert(data[i] == ((i & 0x1) + MASK));
++
++  // CHECK: PASS
++  printf("PASS\n");
++
++  return 0;
++}
+diff --git a/openmp/runtime/src/include/ompx.h.var b/openmp/runtime/src/include/ompx.h.var
+index 579d31aa98c54..19851880c3ac3 100644
+--- a/openmp/runtime/src/include/ompx.h.var
++++ b/openmp/runtime/src/include/ompx.h.var
+@@ -9,6 +9,8 @@
+ #ifndef __OMPX_H
+ #define __OMPX_H
+ 
++typedef unsigned long uint64_t;
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -81,6 +83,10 @@ _TGT_KERNEL_LANGUAGE_HOST_IMPL_SYNC_C(void, sync_block_divergent, int Ordering,
+ #undef _TGT_KERNEL_LANGUAGE_HOST_IMPL_SYNC_C
+ ///}
+ 
++static inline uint64_t ompx_ballot_sync(uint64_t mask, int pred) {
++  __builtin_trap();
++}
++
+ #pragma omp end declare variant
+ 
+ /// ompx_{sync_block}_{,divergent}
+@@ -109,6 +115,8 @@ _TGT_KERNEL_LANGUAGE_DECL_GRID_C(grid_dim)
+ #undef _TGT_KERNEL_LANGUAGE_DECL_GRID_C
+ ///}
+ 
++uint64_t ompx_ballot_sync(uint64_t mask, int pred);
++
+ #ifdef __cplusplus
+ }
+ #endif
+@@ -160,6 +168,10 @@ _TGT_KERNEL_LANGUAGE_HOST_IMPL_SYNC_CXX(void, sync_block_divergent,
+ #undef _TGT_KERNEL_LANGUAGE_HOST_IMPL_SYNC_CXX
+ ///}
+ 
++static inline uint64_t ballot_sync(uint64_t mask, int pred) {
++  return ompx_ballot_sync(mask, pred);
++}
++
+ } // namespace ompx
+ #endif
+ 

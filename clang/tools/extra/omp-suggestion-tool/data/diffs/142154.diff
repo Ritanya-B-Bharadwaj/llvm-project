@@ -1,0 +1,1259 @@
+diff --git a/flang/include/flang/Semantics/openmp-dsa.h b/flang/include/flang/Semantics/openmp-dsa.h
+new file mode 100644
+index 0000000000000..4b94a679f29ef
+--- /dev/null
++++ b/flang/include/flang/Semantics/openmp-dsa.h
+@@ -0,0 +1,20 @@
++//===-- include/flang/Semantics/openmp-dsa.h --------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FORTRAN_SEMANTICS_OPENMP_DSA_H_
++#define FORTRAN_SEMANTICS_OPENMP_DSA_H_
++
++#include "flang/Semantics/symbol.h"
++
++namespace Fortran::semantics {
++
++Symbol::Flags GetSymbolDSA(const Symbol &symbol);
++
++} // namespace Fortran::semantics
++
++#endif // FORTRAN_SEMANTICS_OPENMP_DSA_H_
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index 9ebdd3a8081ed..cec212f0eae37 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -785,8 +785,9 @@ class Symbol {
+       OmpAllocate, OmpDeclarativeAllocateDirective,
+       OmpExecutableAllocateDirective, OmpDeclareSimd, OmpDeclareTarget,
+       OmpThreadprivate, OmpDeclareReduction, OmpFlushed, OmpCriticalLock,
+-      OmpIfSpecified, OmpNone, OmpPreDetermined, OmpImplicit, OmpDependObject,
+-      OmpInclusiveScan, OmpExclusiveScan, OmpInScanReduction, OmpUniform);
++      OmpIfSpecified, OmpNone, OmpPreDetermined, OmpExplicit, OmpImplicit,
++      OmpDependObject, OmpInclusiveScan, OmpExclusiveScan, OmpInScanReduction,
++      OmpUniform);
+   using Flags = common::EnumSet<Flag, Flag_enumSize>;
+ 
+   const Scope &owner() const { return *owner_; }
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index 4e6db3eaa990d..1970c2263f318 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -59,6 +59,7 @@
+ #include "flang/Optimizer/Transforms/Passes.h"
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Runtime/iostat-consts.h"
++#include "flang/Semantics/openmp-dsa.h"
+ #include "flang/Semantics/runtime-type-info.h"
+ #include "flang/Semantics/symbol.h"
+ #include "flang/Semantics/tools.h"
+@@ -1387,7 +1388,8 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+     if (isUnordered || sym.has<Fortran::semantics::HostAssocDetails>() ||
+         sym.has<Fortran::semantics::UseDetails>()) {
+       if (!shallowLookupSymbol(sym) &&
+-          !sym.test(Fortran::semantics::Symbol::Flag::OmpShared)) {
++          !GetSymbolDSA(sym).test(
++              Fortran::semantics::Symbol::Flag::OmpShared)) {
+         // Do concurrent loop variables are not mapped yet since they are local
+         // to the Do concurrent scope (same for OpenMP loops).
+         mlir::OpBuilder::InsertPoint insPt = builder->saveInsertionPoint();
+diff --git a/flang/lib/Semantics/CMakeLists.txt b/flang/lib/Semantics/CMakeLists.txt
+index bd8cc47365f06..18c89587843a9 100644
+--- a/flang/lib/Semantics/CMakeLists.txt
++++ b/flang/lib/Semantics/CMakeLists.txt
+@@ -32,6 +32,7 @@ add_flang_library(FortranSemantics
+   dump-expr.cpp
+   expression.cpp
+   mod-file.cpp
++  openmp-dsa.cpp
+   openmp-modifiers.cpp
+   pointer-assignment.cpp
+   program-tree.cpp
+diff --git a/flang/lib/Semantics/openmp-dsa.cpp b/flang/lib/Semantics/openmp-dsa.cpp
+new file mode 100644
+index 0000000000000..48aa36febe5c5
+--- /dev/null
++++ b/flang/lib/Semantics/openmp-dsa.cpp
+@@ -0,0 +1,29 @@
++//===-- flang/lib/Semantics/openmp-dsa.cpp ----------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "flang/Semantics/openmp-dsa.h"
++
++namespace Fortran::semantics {
++
++Symbol::Flags GetSymbolDSA(const Symbol &symbol) {
++  Symbol::Flags dsaFlags{Symbol::Flag::OmpPrivate,
++      Symbol::Flag::OmpFirstPrivate, Symbol::Flag::OmpLastPrivate,
++      Symbol::Flag::OmpShared, Symbol::Flag::OmpLinear,
++      Symbol::Flag::OmpReduction};
++  Symbol::Flags dsa{symbol.flags() & dsaFlags};
++  if (dsa.any()) {
++    return dsa;
++  }
++  // If no DSA are set use those from the host associated symbol, if any.
++  if (const auto *details{symbol.detailsIf<HostAssocDetails>()}) {
++    return GetSymbolDSA(details->symbol());
++  }
++  return {};
++}
++
++} // namespace Fortran::semantics
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 6884607edebb3..c62a2b9d1310f 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -19,9 +19,11 @@
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Parser/tools.h"
+ #include "flang/Semantics/expression.h"
++#include "flang/Semantics/openmp-dsa.h"
+ #include "flang/Semantics/openmp-modifiers.h"
+ #include "flang/Semantics/symbol.h"
+ #include "flang/Semantics/tools.h"
++#include "llvm/Support/Debug.h"
+ #include <list>
+ #include <map>
+ #include <sstream>
+@@ -111,10 +113,9 @@ template <typename T> class DirectiveAttributeVisitor {
+   const parser::Name *GetLoopIndex(const parser::DoConstruct &);
+   const parser::DoConstruct *GetDoConstructIf(
+       const parser::ExecutionPartConstruct &);
+-  Symbol *DeclareNewPrivateAccessEntity(const Symbol &, Symbol::Flag, Scope &);
+-  Symbol *DeclarePrivateAccessEntity(
+-      const parser::Name &, Symbol::Flag, Scope &);
+-  Symbol *DeclarePrivateAccessEntity(Symbol &, Symbol::Flag, Scope &);
++  Symbol *DeclareNewAccessEntity(const Symbol &, Symbol::Flag, Scope &);
++  Symbol *DeclareAccessEntity(const parser::Name &, Symbol::Flag, Scope &);
++  Symbol *DeclareAccessEntity(Symbol &, Symbol::Flag, Scope &);
+   Symbol *DeclareOrMarkOtherAccessEntity(const parser::Name &, Symbol::Flag);
+ 
+   UnorderedSymbolSet dataSharingAttributeObjects_; // on one directive
+@@ -754,11 +755,11 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+ 
+   Symbol::Flags ompFlagsRequireNewSymbol{Symbol::Flag::OmpPrivate,
+       Symbol::Flag::OmpLinear, Symbol::Flag::OmpFirstPrivate,
+-      Symbol::Flag::OmpLastPrivate, Symbol::Flag::OmpReduction,
+-      Symbol::Flag::OmpCriticalLock, Symbol::Flag::OmpCopyIn,
+-      Symbol::Flag::OmpUseDevicePtr, Symbol::Flag::OmpUseDeviceAddr,
+-      Symbol::Flag::OmpIsDevicePtr, Symbol::Flag::OmpHasDeviceAddr,
+-      Symbol::Flag::OmpUniform};
++      Symbol::Flag::OmpLastPrivate, Symbol::Flag::OmpShared,
++      Symbol::Flag::OmpReduction, Symbol::Flag::OmpCriticalLock,
++      Symbol::Flag::OmpCopyIn, Symbol::Flag::OmpUseDevicePtr,
++      Symbol::Flag::OmpUseDeviceAddr, Symbol::Flag::OmpIsDevicePtr,
++      Symbol::Flag::OmpHasDeviceAddr, Symbol::Flag::OmpUniform};
+ 
+   Symbol::Flags ompFlagsRequireMark{Symbol::Flag::OmpThreadprivate,
+       Symbol::Flag::OmpDeclareTarget, Symbol::Flag::OmpExclusiveScan,
+@@ -835,8 +836,24 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+   void IssueNonConformanceWarning(
+       llvm::omp::Directive D, parser::CharBlock source);
+ 
+-  void CreateImplicitSymbols(
+-      const Symbol *symbol, std::optional<Symbol::Flag> setFlag = std::nullopt);
++  void CreateImplicitSymbols(const Symbol *symbol);
++
++  void AddToContextObjectWithExplicitDSA(Symbol &symbol, Symbol::Flag flag) {
++    AddToContextObjectWithDSA(symbol, flag);
++    if (dataSharingAttributeFlags.test(flag)) {
++      symbol.set(Symbol::Flag::OmpExplicit);
++    }
++  }
++
++  // Clear any previous data-sharing attribute flags and set the new ones.
++  // Needed when setting PreDetermined DSAs, that take precedence over
++  // Implicit ones.
++  void SetSymbolDSA(Symbol &symbol, Symbol::Flags flags) {
++    symbol.flags() &= ~(dataSharingAttributeFlags |
++        Symbol::Flags{Symbol::Flag::OmpExplicit, Symbol::Flag::OmpImplicit,
++            Symbol::Flag::OmpPreDetermined});
++    symbol.flags() |= flags;
++  }
+ };
+ 
+ template <typename T>
+@@ -873,7 +890,7 @@ const parser::DoConstruct *DirectiveAttributeVisitor<T>::GetDoConstructIf(
+ }
+ 
+ template <typename T>
+-Symbol *DirectiveAttributeVisitor<T>::DeclareNewPrivateAccessEntity(
++Symbol *DirectiveAttributeVisitor<T>::DeclareNewAccessEntity(
+     const Symbol &object, Symbol::Flag flag, Scope &scope) {
+   assert(object.owner() != currScope());
+   auto &symbol{MakeAssocSymbol(object.name(), object, scope)};
+@@ -886,20 +903,20 @@ Symbol *DirectiveAttributeVisitor<T>::DeclareNewPrivateAccessEntity(
+ }
+ 
+ template <typename T>
+-Symbol *DirectiveAttributeVisitor<T>::DeclarePrivateAccessEntity(
++Symbol *DirectiveAttributeVisitor<T>::DeclareAccessEntity(
+     const parser::Name &name, Symbol::Flag flag, Scope &scope) {
+   if (!name.symbol) {
+     return nullptr; // not resolved by Name Resolution step, do nothing
+   }
+-  name.symbol = DeclarePrivateAccessEntity(*name.symbol, flag, scope);
++  name.symbol = DeclareAccessEntity(*name.symbol, flag, scope);
+   return name.symbol;
+ }
+ 
+ template <typename T>
+-Symbol *DirectiveAttributeVisitor<T>::DeclarePrivateAccessEntity(
++Symbol *DirectiveAttributeVisitor<T>::DeclareAccessEntity(
+     Symbol &object, Symbol::Flag flag, Scope &scope) {
+   if (object.owner() != currScope()) {
+-    return DeclareNewPrivateAccessEntity(object, flag, scope);
++    return DeclareNewAccessEntity(object, flag, scope);
+   } else {
+     object.set(flag);
+     return &object;
+@@ -1606,6 +1623,20 @@ void AccAttributeVisitor::CheckMultipleAppearances(
+   }
+ }
+ 
++#ifndef NDEBUG
++
++#define DEBUG_TYPE "omp"
++
++static llvm::raw_ostream &operator<<(
++    llvm::raw_ostream &os, const Symbol::Flags &flags);
++
++namespace dbg {
++static void DumpAssocSymbols(llvm::raw_ostream &os, const Symbol &sym);
++static std::string ScopeSourcePos(const Fortran::semantics::Scope &scope);
++} // namespace dbg
++
++#endif
++
+ bool OmpAttributeVisitor::Pre(const parser::OpenMPBlockConstruct &x) {
+   const auto &beginBlockDir{std::get<parser::OmpBeginBlockDirective>(x.t)};
+   const auto &beginDir{std::get<parser::OmpBlockDirective>(beginBlockDir.t)};
+@@ -1798,12 +1829,12 @@ void OmpAttributeVisitor::ResolveSeqLoopIndexInParallelOrTaskConstruct(
+       }
+     }
+   }
+-  // If this symbol is already Private or Firstprivate in the enclosing
+-  // OpenMP parallel or task then there is nothing to do here.
++  // If this symbol already has an explicit data-sharing attribute in the
++  // enclosing OpenMP parallel or task then there is nothing to do here.
+   if (auto *symbol{targetIt->scope.FindSymbol(iv.source)}) {
+     if (symbol->owner() == targetIt->scope) {
+-      if (symbol->test(Symbol::Flag::OmpPrivate) ||
+-          symbol->test(Symbol::Flag::OmpFirstPrivate)) {
++      if (symbol->test(Symbol::Flag::OmpExplicit) &&
++          (symbol->flags() & dataSharingAttributeFlags).any()) {
+         return;
+       }
+     }
+@@ -1812,7 +1843,8 @@ void OmpAttributeVisitor::ResolveSeqLoopIndexInParallelOrTaskConstruct(
+   // parallel or task
+   if (auto *symbol{ResolveOmp(iv, Symbol::Flag::OmpPrivate, targetIt->scope)}) {
+     targetIt++;
+-    symbol->set(Symbol::Flag::OmpPreDetermined);
++    SetSymbolDSA(
++        *symbol, {Symbol::Flag::OmpPreDetermined, Symbol::Flag::OmpPrivate});
+     iv.symbol = symbol; // adjust the symbol within region
+     for (auto it{dirContext_.rbegin()}; it != targetIt; ++it) {
+       AddToContextObjectWithDSA(*symbol, Symbol::Flag::OmpPrivate, *it);
+@@ -1924,7 +1956,7 @@ void OmpAttributeVisitor::PrivatizeAssociatedLoopIndexAndCheckLoopLevel(
+       const parser::Name *iv{GetLoopIndex(*loop)};
+       if (iv) {
+         if (auto *symbol{ResolveOmp(*iv, ivDSA, currScope())}) {
+-          symbol->set(Symbol::Flag::OmpPreDetermined);
++          SetSymbolDSA(*symbol, {Symbol::Flag::OmpPreDetermined, ivDSA});
+           iv->symbol = symbol; // adjust the symbol within region
+           AddToContextObjectWithDSA(*symbol, ivDSA);
+         }
+@@ -2184,42 +2216,48 @@ static bool IsPrivatizable(const Symbol *sym) {
+               misc->kind() != MiscDetails::Kind::ConstructName));
+ }
+ 
+-void OmpAttributeVisitor::CreateImplicitSymbols(
+-    const Symbol *symbol, std::optional<Symbol::Flag> setFlag) {
++void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
+   if (!IsPrivatizable(symbol)) {
+     return;
+   }
+ 
++  LLVM_DEBUG(llvm::dbgs() << "CreateImplicitSymbols: " << *symbol << '\n');
++
+   // Implicitly determined DSAs
+   // OMP 5.2 5.1.1 - Variables Referenced in a Construct
+   Symbol *lastDeclSymbol = nullptr;
+-  std::optional<Symbol::Flag> prevDSA;
++  Symbol::Flags prevDSA;
+   for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
+     DirContext &dirContext = dirContext_[dirDepth];
+-    std::optional<Symbol::Flag> dsa;
++    Symbol::Flags dsa;
+ 
+-    for (auto symMap : dirContext.objectWithDSA) {
+-      // if the `symbol` already has a data-sharing attribute
+-      if (symMap.first->name() == symbol->name()) {
+-        dsa = symMap.second;
+-        break;
++    Scope &scope{context_.FindScope(dirContext.directiveSource)};
++    auto it{scope.find(symbol->name())};
++    if (it != scope.end()) {
++      // There is already a symbol in the current scope, use its DSA.
++      dsa = GetSymbolDSA(*it->second);
++    } else {
++      for (auto symMap : dirContext.objectWithDSA) {
++        if (symMap.first->name() == symbol->name()) {
++          // `symbol` already has a data-sharing attribute in the current
++          // context, use it.
++          dsa.set(symMap.second);
++          break;
++        }
+       }
+     }
+ 
+     // When handling each implicit rule for a given symbol, one of the
+-    // following 3 actions may be taken:
+-    // 1. Declare a new private symbol.
+-    // 2. Create a new association symbol with no flags, that will represent
+-    //    a shared symbol in the current scope. Note that symbols without
+-    //    any private flags are considered as shared.
+-    // 3. Use the last declared private symbol, by inserting a new symbol
+-    //    in the scope being processed, associated with it.
+-    //    If no private symbol was declared previously, then no association
+-    //    is needed and the symbol from the enclosing scope will be
+-    //    inherited by the current one.
++    // following actions may be taken:
++    // 1. Declare a new private or shared symbol.
++    // 2. Use the last declared symbol, by inserting a new symbol in the
++    //    scope being processed, associated with it.
++    //    If no symbol was declared previously, then no association is needed
++    //    and the symbol from the enclosing scope will be inherited by the
++    //    current one.
+     //
+     // Because of how symbols are collected in lowering, not inserting a new
+-    // symbol in the last case could lead to the conclusion that a symbol
++    // symbol in the second case could lead to the conclusion that a symbol
+     // from an enclosing construct was declared in the current construct,
+     // which would result in wrong privatization code being generated.
+     // Consider the following example:
+@@ -2237,46 +2275,71 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
+     // it would have the private flag set.
+     // This would make x appear to be defined in p2, causing it to be
+     // privatized in p2 and its privatization in p1 to be skipped.
+-    auto makePrivateSymbol = [&](Symbol::Flag flag) {
++    auto makeSymbol = [&](Symbol::Flags flags) {
+       const Symbol *hostSymbol =
+           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
+-      lastDeclSymbol = DeclareNewPrivateAccessEntity(
++      assert(flags.LeastElement());
++      Symbol::Flag flag = *flags.LeastElement();
++      lastDeclSymbol = DeclareNewAccessEntity(
+           *hostSymbol, flag, context_.FindScope(dirContext.directiveSource));
+-      if (setFlag) {
+-        lastDeclSymbol->set(*setFlag);
+-      }
++      lastDeclSymbol->flags() |= flags;
+       return lastDeclSymbol;
+     };
+-    auto makeSharedSymbol = [&](std::optional<Symbol::Flag> flag = {}) {
+-      const Symbol *hostSymbol =
+-          lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
+-      Symbol &assocSymbol = MakeAssocSymbol(symbol->name(), *hostSymbol,
+-          context_.FindScope(dirContext.directiveSource));
+-      if (flag) {
+-        assocSymbol.set(*flag);
+-      }
+-    };
+     auto useLastDeclSymbol = [&]() {
+       if (lastDeclSymbol) {
+-        makeSharedSymbol();
++        const Symbol *hostSymbol =
++            lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
++        MakeAssocSymbol(symbol->name(), *hostSymbol,
++            context_.FindScope(dirContext.directiveSource));
+       }
+     };
+ 
++#ifndef NDEBUG
++    auto printImplicitRule = [&](const char *id) {
++      LLVM_DEBUG(llvm::dbgs() << "\t" << id << ": dsa: " << dsa << '\n');
++      LLVM_DEBUG(
++          llvm::dbgs() << "\t\tScope: " << dbg::ScopeSourcePos(scope) << '\n');
++    };
++#define PRINT_IMPLICIT_RULE(id) printImplicitRule(id)
++#else
++#define PRINT_IMPLICIT_RULE(id)
++#endif
++
+     bool taskGenDir = llvm::omp::taskGeneratingSet.test(dirContext.directive);
+     bool targetDir = llvm::omp::allTargetSet.test(dirContext.directive);
+     bool parallelDir = llvm::omp::allParallelSet.test(dirContext.directive);
+     bool teamsDir = llvm::omp::allTeamsSet.test(dirContext.directive);
+ 
+-    if (dsa.has_value()) {
+-      if (dsa.value() == Symbol::Flag::OmpShared &&
+-          (parallelDir || taskGenDir || teamsDir)) {
+-        makeSharedSymbol(Symbol::Flag::OmpShared);
++    if (dsa.any()) {
++      if (parallelDir || taskGenDir || teamsDir) {
++        Symbol *prevDeclSymbol{lastDeclSymbol};
++        // NOTE As `dsa` will match that of the symbol in the current scope
++        //      (if any), we won't override the DSA of any existing symbol.
++        if ((dsa & dataSharingAttributeFlags).any()) {
++          makeSymbol(dsa);
++        }
++        // Fix host association of explicit symbols, as they can be created
++        // before implicit ones in enclosing scope.
++        if (prevDeclSymbol && prevDeclSymbol != lastDeclSymbol &&
++            lastDeclSymbol->test(Symbol::Flag::OmpExplicit)) {
++          const auto *hostAssoc{lastDeclSymbol->detailsIf<HostAssocDetails>()};
++          if (hostAssoc && hostAssoc->symbol() != *prevDeclSymbol) {
++            lastDeclSymbol->set_details(HostAssocDetails{*prevDeclSymbol});
++          }
++        }
+       }
+-      // Private symbols will have been declared already.
+       prevDSA = dsa;
++      PRINT_IMPLICIT_RULE("0) already has DSA");
+       continue;
+     }
+ 
++    // NOTE Because of how lowering uses OmpImplicit flag, we can only set it
++    //      for symbols with private DSA.
++    //      Also, as the default clause is handled separately in lowering,
++    //      don't mark its symbols with OmpImplicit either.
++    //      Ideally, lowering should be changed and all implicit symbols
++    //      should be marked with OmpImplicit.
++
+     if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
+         dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
+         dirContext.defaultDSA == Symbol::Flag::OmpShared) {
+@@ -2285,33 +2348,34 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
+       if (!parallelDir && !taskGenDir && !teamsDir) {
+         return;
+       }
+-      if (dirContext.defaultDSA != Symbol::Flag::OmpShared) {
+-        makePrivateSymbol(dirContext.defaultDSA);
+-      } else {
+-        makeSharedSymbol();
+-      }
+-      dsa = dirContext.defaultDSA;
++      dsa = {dirContext.defaultDSA};
++      makeSymbol(dsa);
++      PRINT_IMPLICIT_RULE("1) default");
+     } else if (parallelDir) {
+       // 2) parallel -> shared
+-      makeSharedSymbol();
+-      dsa = Symbol::Flag::OmpShared;
++      dsa = {Symbol::Flag::OmpShared};
++      makeSymbol(dsa);
++      PRINT_IMPLICIT_RULE("2) parallel");
+     } else if (!taskGenDir && !targetDir) {
+       // 3) enclosing context
+-      useLastDeclSymbol();
+       dsa = prevDSA;
++      useLastDeclSymbol();
++      PRINT_IMPLICIT_RULE("3) enclosing context");
+     } else if (targetDir) {
+       // TODO 4) not mapped target variable -> firstprivate
+       dsa = prevDSA;
+     } else if (taskGenDir) {
+       // TODO 5) dummy arg in orphaned taskgen construct -> firstprivate
+-      if (prevDSA == Symbol::Flag::OmpShared) {
++      if (prevDSA.test(Symbol::Flag::OmpShared)) {
+         // 6) shared in enclosing context -> shared
+-        makeSharedSymbol();
+-        dsa = Symbol::Flag::OmpShared;
++        dsa = {Symbol::Flag::OmpShared};
++        makeSymbol(dsa);
++        PRINT_IMPLICIT_RULE("6) taskgen: shared");
+       } else {
+         // 7) firstprivate
+-        dsa = Symbol::Flag::OmpFirstPrivate;
+-        makePrivateSymbol(*dsa)->set(Symbol::Flag::OmpImplicit);
++        dsa = {Symbol::Flag::OmpFirstPrivate};
++        makeSymbol(dsa)->set(Symbol::Flag::OmpImplicit);
++        PRINT_IMPLICIT_RULE("7) taskgen: firstprivate");
+       }
+     }
+     prevDSA = dsa;
+@@ -2377,7 +2441,7 @@ void OmpAttributeVisitor::ResolveOmpName(
+   if (ResolveName(&name)) {
+     if (auto *resolvedSymbol{ResolveOmp(name, ompFlag, currScope())}) {
+       if (dataSharingAttributeFlags.test(ompFlag)) {
+-        AddToContextObjectWithDSA(*resolvedSymbol, ompFlag);
++        AddToContextObjectWithExplicitDSA(*resolvedSymbol, ompFlag);
+       }
+     }
+   } else if (ompFlag == Symbol::Flag::OmpCriticalLock) {
+@@ -2490,7 +2554,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                 if (dataCopyingAttributeFlags.test(ompFlag)) {
+                   CheckDataCopyingClause(*name, *symbol, ompFlag);
+                 } else {
+-                  AddToContextObjectWithDSA(*symbol, ompFlag);
++                  AddToContextObjectWithExplicitDSA(*symbol, ompFlag);
+                   if (dataSharingAttributeFlags.test(ompFlag)) {
+                     CheckMultipleAppearances(*name, *symbol, ompFlag);
+                   }
+@@ -2594,8 +2658,14 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                               GetContext().directive))) {
+                     for (Symbol::Flag ompFlag1 : dataMappingAttributeFlags) {
+                       for (Symbol::Flag ompFlag2 : dataSharingAttributeFlags) {
+-                        checkExclusivelists(
+-                            hostAssocSym, ompFlag1, symbol, ompFlag2);
++                        if ((hostAssocSym->test(ompFlag2) &&
++                                hostAssocSym->test(
++                                    Symbol::Flag::OmpExplicit)) ||
++                            (symbol->test(ompFlag2) &&
++                                symbol->test(Symbol::Flag::OmpExplicit))) {
++                          checkExclusivelists(
++                              hostAssocSym, ompFlag1, symbol, ompFlag2);
++                        }
+                       }
+                     }
+                   }
+@@ -2630,7 +2700,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                   if (dataCopyingAttributeFlags.test(ompFlag)) {
+                     CheckDataCopyingClause(name, *resolvedObject, ompFlag);
+                   } else {
+-                    AddToContextObjectWithDSA(*resolvedObject, ompFlag);
++                    AddToContextObjectWithExplicitDSA(*resolvedObject, ompFlag);
+                   }
+                   details.replace_object(*resolvedObject, index);
+                 }
+@@ -2649,7 +2719,7 @@ void OmpAttributeVisitor::ResolveOmpObject(
+ Symbol *OmpAttributeVisitor::ResolveOmp(
+     const parser::Name &name, Symbol::Flag ompFlag, Scope &scope) {
+   if (ompFlagsRequireNewSymbol.test(ompFlag)) {
+-    return DeclarePrivateAccessEntity(name, ompFlag, scope);
++    return DeclareAccessEntity(name, ompFlag, scope);
+   } else {
+     return DeclareOrMarkOtherAccessEntity(name, ompFlag);
+   }
+@@ -2658,7 +2728,7 @@ Symbol *OmpAttributeVisitor::ResolveOmp(
+ Symbol *OmpAttributeVisitor::ResolveOmp(
+     Symbol &symbol, Symbol::Flag ompFlag, Scope &scope) {
+   if (ompFlagsRequireNewSymbol.test(ompFlag)) {
+-    return DeclarePrivateAccessEntity(symbol, ompFlag, scope);
++    return DeclareAccessEntity(symbol, ompFlag, scope);
+   } else {
+     return DeclareOrMarkOtherAccessEntity(symbol, ompFlag);
+   }
+@@ -2837,10 +2907,16 @@ static bool IsSymbolThreadprivate(const Symbol &symbol) {
+ }
+ 
+ static bool IsSymbolPrivate(const Symbol &symbol) {
+-  if (symbol.test(Symbol::Flag::OmpPrivate) ||
+-      symbol.test(Symbol::Flag::OmpFirstPrivate)) {
++  LLVM_DEBUG(llvm::dbgs() << "IsSymbolPrivate(" << symbol.name() << "):\n");
++  LLVM_DEBUG(dbg::DumpAssocSymbols(llvm::dbgs(), symbol));
++
++  if (Symbol::Flags dsa{GetSymbolDSA(symbol)}; dsa.any()) {
++    if (dsa.test(Symbol::Flag::OmpShared)) {
++      return false;
++    }
+     return true;
+   }
++
+   // A symbol that has not gone through constructs that may privatize the
+   // original symbol may be predetermined as private.
+   // (OMP 5.2 5.1.1 - Variables Referenced in a Construct)
+@@ -3086,4 +3162,60 @@ void OmpAttributeVisitor::IssueNonConformanceWarning(
+   context_.Warn(common::UsageWarning::OpenMPUsage, source, "%s"_warn_en_US,
+       warnStrOS.str());
+ }
++
++#ifndef NDEBUG
++
++static llvm::raw_ostream &operator<<(
++    llvm::raw_ostream &os, const Symbol::Flags &flags) {
++  flags.Dump(os, Symbol::EnumToString);
++  return os;
++}
++
++namespace dbg {
++
++static llvm::raw_ostream &operator<<(
++    llvm::raw_ostream &os, std::optional<parser::SourcePosition> srcPos) {
++  if (srcPos) {
++    os << *srcPos.value().path << ":" << srcPos.value().line << ": ";
++  }
++  return os;
++}
++
++static std::optional<parser::SourcePosition> GetSourcePosition(
++    const Fortran::semantics::Scope &scope,
++    const Fortran::parser::CharBlock &src) {
++  parser::AllCookedSources &allCookedSources{
++      scope.context().allCookedSources()};
++  if (std::optional<parser::ProvenanceRange> prange{
++          allCookedSources.GetProvenanceRange(src)}) {
++    return allCookedSources.allSources().GetSourcePosition(prange->start());
++  }
++  return std::nullopt;
++}
++
++// Returns a string containing the source location of `scope` followed by
++// its first source line.
++static std::string ScopeSourcePos(const Fortran::semantics::Scope &scope) {
++  const parser::CharBlock &sourceRange{scope.sourceRange()};
++  std::string src{sourceRange.ToString()};
++  size_t nl{src.find('\n')};
++  std::string str;
++  llvm::raw_string_ostream ss{str};
++
++  ss << GetSourcePosition(scope, sourceRange) << src.substr(0, nl);
++  return str;
++}
++
++static void DumpAssocSymbols(llvm::raw_ostream &os, const Symbol &sym) {
++  os << '\t' << sym << '\n';
++  os << "\t\tOwner: " << ScopeSourcePos(sym.owner()) << '\n';
++  if (const auto *details{sym.detailsIf<HostAssocDetails>()}) {
++    DumpAssocSymbols(os, details->symbol());
++  }
++}
++
++} // namespace dbg
++
++#endif
++
+ } // namespace Fortran::semantics
+diff --git a/flang/test/Semantics/OpenMP/common-block.f90 b/flang/test/Semantics/OpenMP/common-block.f90
+index e1ddd120da857..93f29b12eacae 100644
+--- a/flang/test/Semantics/OpenMP/common-block.f90
++++ b/flang/test/Semantics/OpenMP/common-block.f90
+@@ -10,9 +10,9 @@ program main
+   common /blk/ a, b, c
+   !$omp parallel private(/blk/)
+     !CHECK: OtherConstruct scope: size=0 alignment=1
+-    !CHECK:   a (OmpPrivate): HostAssoc
+-    !CHECK:   b (OmpPrivate): HostAssoc
+-    !CHECK:   c (OmpPrivate): HostAssoc
++    !CHECK:   a (OmpPrivate, OmpExplicit): HostAssoc
++    !CHECK:   b (OmpPrivate, OmpExplicit): HostAssoc
++    !CHECK:   c (OmpPrivate, OmpExplicit): HostAssoc
+     call sub(a, b, c)
+   !$omp end parallel
+ end program
+diff --git a/flang/test/Semantics/OpenMP/copyprivate03.f90 b/flang/test/Semantics/OpenMP/copyprivate03.f90
+index 9d39fdb6b13c8..249b27e4b2b86 100644
+--- a/flang/test/Semantics/OpenMP/copyprivate03.f90
++++ b/flang/test/Semantics/OpenMP/copyprivate03.f90
+@@ -6,6 +6,8 @@
+ 
+ program omp_copyprivate
+   integer :: a(10), b(10)
++  real, dimension(:), allocatable :: c
++  real, dimension(:), pointer :: d
+   integer, save :: k
+ 
+   !$omp threadprivate(k)
+@@ -43,4 +45,16 @@ program omp_copyprivate
+ 
+   print *, a, b
+ 
++  !$omp task
++    !$omp parallel private(c, d)
++      allocate(c(5))
++      allocate(d(10))
++      !$omp single
++        c = 22
++        d = 33
++      !Check that 'c' and 'd' inherit PRIVATE DSA from the enclosing PARALLEL
++      !and no error occurs.
++      !$omp end single copyprivate(c, d)
++    !$omp end parallel
++  !$omp end task
+ end program omp_copyprivate
+diff --git a/flang/test/Semantics/OpenMP/default-clause.f90 b/flang/test/Semantics/OpenMP/default-clause.f90
+index 9cde77be2babe..d4c38ea56de53 100644
+--- a/flang/test/Semantics/OpenMP/default-clause.f90
++++ b/flang/test/Semantics/OpenMP/default-clause.f90
+@@ -15,8 +15,8 @@ program sample
+         !CHECK: OtherConstruct scope: size=0 alignment=1
+         !CHECK: a (OmpPrivate): HostAssoc
+         !CHECK: k (OmpPrivate): HostAssoc
+-        !CHECK: x (OmpFirstPrivate): HostAssoc
+-        !CHECK: y (OmpPrivate): HostAssoc
++        !CHECK: x (OmpFirstPrivate, OmpExplicit): HostAssoc
++        !CHECK: y (OmpPrivate, OmpExplicit): HostAssoc
+         !CHECK: z (OmpPrivate): HostAssoc
+         !$omp parallel default(private)
+             !CHECK: OtherConstruct scope: size=0 alignment=1
+@@ -34,7 +34,7 @@ program sample
+         !$omp parallel default(firstprivate) shared(y) private(w)
+             !CHECK: OtherConstruct scope: size=0 alignment=1
+             !CHECK: k (OmpFirstPrivate): HostAssoc
+-            !CHECK: w (OmpPrivate): HostAssoc
++            !CHECK: w (OmpPrivate, OmpExplicit): HostAssoc
+             !CHECK: z (OmpFirstPrivate): HostAssoc
+             y = 30
+             w = 40 
+diff --git a/flang/test/Semantics/OpenMP/do05-positivecase.f90 b/flang/test/Semantics/OpenMP/do05-positivecase.f90
+index 5e1b1b86f72f6..8481cb2fc2ca0 100644
+--- a/flang/test/Semantics/OpenMP/do05-positivecase.f90
++++ b/flang/test/Semantics/OpenMP/do05-positivecase.f90
+@@ -20,12 +20,12 @@ program omp_do
+   !$omp parallel  default(shared)
+   !$omp do
+   !DEF: /omp_do/OtherConstruct2/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+-  !DEF: /omp_do/OtherConstruct2/n HostAssoc INTEGER(4)
++  !DEF: /omp_do/OtherConstruct2/OtherConstruct1/n HostAssoc INTEGER(4)
+   do i=1,n
+     !$omp parallel
+     !$omp single
+     !DEF: /work EXTERNAL (Subroutine) ProcEntity
+-    !DEF: /omp_do/OtherConstruct2/OtherConstruct1/OtherConstruct1/i HostAssoc INTEGER(4)
++    !DEF: /omp_do/OtherConstruct2/OtherConstruct1/OtherConstruct1/OtherConstruct1/i HostAssoc INTEGER(4)
+     call work(i, 1)
+     !$omp end single
+     !$omp end parallel
+@@ -34,7 +34,7 @@ program omp_do
+   !$omp end parallel
+ 
+   !$omp parallel private(i)
+-  !DEF: /omp_do/OtherConstruct3/i (OmpPrivate) HostAssoc INTEGER(4)
++  !DEF: /omp_do/OtherConstruct3/i (OmpPrivate, OmpExplicit) HostAssoc INTEGER(4)
+   do i=1,10
+      !$omp single
+      print *, "hello"
+diff --git a/flang/test/Semantics/OpenMP/do20.f90 b/flang/test/Semantics/OpenMP/do20.f90
+index 040a82079590f..ee305ad1a34cf 100644
+--- a/flang/test/Semantics/OpenMP/do20.f90
++++ b/flang/test/Semantics/OpenMP/do20.f90
+@@ -10,7 +10,7 @@ subroutine shared_iv
+ 
+   !$omp parallel shared(i)
+     !$omp single
+-      !DEF: /shared_iv/OtherConstruct1/i (OmpShared) HostAssoc INTEGER(4)
++      !DEF: /shared_iv/OtherConstruct1/OtherConstruct1/i HostAssoc INTEGER(4)
+       do i = 0, 1
+       end do
+     !$omp end single
+diff --git a/flang/test/Semantics/OpenMP/forall.f90 b/flang/test/Semantics/OpenMP/forall.f90
+index 58492664a4e85..b862b4b27641b 100644
+--- a/flang/test/Semantics/OpenMP/forall.f90
++++ b/flang/test/Semantics/OpenMP/forall.f90
+@@ -18,8 +18,8 @@
+ 
+   !$omp parallel
+     !DEF: /MainProgram1/OtherConstruct1/Forall1/i (Implicit) ObjectEntity INTEGER(4)
+-    !DEF: /MainProgram1/OtherConstruct1/a HostAssoc INTEGER(4)
+-    !DEF: /MainProgram1/OtherConstruct1/b HostAssoc INTEGER(4)
++    !DEF: /MainProgram1/OtherConstruct1/a (OmpShared) HostAssoc INTEGER(4)
++    !DEF: /MainProgram1/OtherConstruct1/b (OmpShared) HostAssoc INTEGER(4)
+     forall(i = 1:5) a(i) = b(i) * 2
+   !$omp end parallel
+ 
+diff --git a/flang/test/Semantics/OpenMP/implicit-dsa.f90 b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+index a7ed834b0f1c6..7e38435274b7b 100644
+--- a/flang/test/Semantics/OpenMP/implicit-dsa.f90
++++ b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+@@ -14,15 +14,15 @@ subroutine implicit_dsa_test1
+ 
+   !$omp task private(y) shared(z)
+     !DEF: /implicit_dsa_test1/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
+-    !DEF: /implicit_dsa_test1/OtherConstruct1/y (OmpPrivate) HostAssoc INTEGER(4)
+-    !DEF: /implicit_dsa_test1/OtherConstruct1/z (OmpShared) HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct1/y (OmpPrivate, OmpExplicit) HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct1/z (OmpShared, OmpExplicit) HostAssoc INTEGER(4)
+     x = y + z
+   !$omp end task
+ 
+   !$omp task default(shared)
+-    !DEF: /implicit_dsa_test1/OtherConstruct2/x HostAssoc INTEGER(4)
+-    !DEF: /implicit_dsa_test1/OtherConstruct2/y HostAssoc INTEGER(4)
+-    !DEF: /implicit_dsa_test1/OtherConstruct2/z HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct2/x (OmpShared) HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct2/y (OmpShared) HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct2/z (OmpShared) HostAssoc INTEGER(4)
+     x = y + z
+   !$omp end task
+ 
+@@ -61,16 +61,16 @@ subroutine implicit_dsa_test3
+ 
+   !$omp parallel
+     !$omp task
+-      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct1/x HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct1/x (OmpShared) HostAssoc INTEGER(4)
+       x = 1
+-      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct1/y HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct1/y (OmpShared) HostAssoc INTEGER(4)
+       y = 1
+     !$omp end task
+ 
+     !$omp task firstprivate(x)
+-      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate) HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate, OmpExplicit) HostAssoc INTEGER(4)
+       x = 1
+-      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct2/z HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct2/z (OmpShared) HostAssoc INTEGER(4)
+       z = 1
+     !$omp end task
+   !$omp end parallel
+@@ -110,7 +110,7 @@ subroutine implicit_dsa_test5
+   !$omp parallel default(private)
+     !$omp task
+       !$omp parallel
+-        !DEF: /implicit_dsa_test5/OtherConstruct1/OtherConstruct1/OtherConstruct1/x HostAssoc INTEGER(4)
++        !DEF: /implicit_dsa_test5/OtherConstruct1/OtherConstruct1/OtherConstruct1/x (OmpShared) HostAssoc INTEGER(4)
+         x = 1
+       !$omp end parallel
+     !$omp end task
+@@ -133,7 +133,7 @@ subroutine implicit_dsa_test6
+     !$omp end parallel
+ 
+     !$omp parallel default(firstprivate) shared(y)
+-      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/y (OmpShared) HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/y (OmpShared, OmpExplicit) HostAssoc INTEGER(4)
+       !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate) HostAssocINTEGER(4)
+       !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/z (OmpFirstPrivate) HostAssocINTEGER(4)
+       y = x + z
+@@ -156,3 +156,16 @@ subroutine implicit_dsa_test7
+     !$omp end taskgroup
+   !$omp end task
+ end subroutine
++
++! Predetermined loop iteration variable.
++!DEF: /implicit_dsa_test8 (Subroutine) Subprogram
++subroutine implicit_dsa_test8
++  !DEF: /implicit_dsa_test8/i ObjectEntity INTEGER(4)
++  integer i
++
++  !$omp task
++    !DEF: /implicit_dsa_test8/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
++    do i = 1, 10
++    end do
++  !$omp end task
++end subroutine
+diff --git a/flang/test/Semantics/OpenMP/reduction08.f90 b/flang/test/Semantics/OpenMP/reduction08.f90
+index 9442fbd4d5978..01a06eb7d7414 100644
+--- a/flang/test/Semantics/OpenMP/reduction08.f90
++++ b/flang/test/Semantics/OpenMP/reduction08.f90
+@@ -13,9 +13,9 @@ program omp_reduction
+   !$omp parallel do  reduction(max:k)
+   !DEF: /omp_reduction/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct1/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct1/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     !DEF: /omp_reduction/max ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-    !DEF: /omp_reduction/OtherConstruct1/m HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct1/m (OmpShared) HostAssoc INTEGER(4)
+     k = max(k, m)
+   end do
+   !$omp end parallel do
+@@ -23,9 +23,9 @@ program omp_reduction
+   !$omp parallel do  reduction(min:k)
+   !DEF: /omp_reduction/OtherConstruct2/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct2/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct2/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     !DEF: /omp_reduction/min ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-    !DEF: /omp_reduction/OtherConstruct2/m HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct2/m (OmpShared) HostAssoc INTEGER(4)
+     k = min(k, m)
+   end do
+   !$omp end parallel do
+@@ -33,9 +33,9 @@ program omp_reduction
+   !$omp parallel do  reduction(iand:k)
+   !DEF: /omp_reduction/OtherConstruct3/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct3/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct3/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     !DEF: /omp_reduction/iand ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-    !DEF: /omp_reduction/OtherConstruct3/m HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct3/m (OmpShared) HostAssoc INTEGER(4)
+     k = iand(k, m)
+   end do
+   !$omp end parallel do
+@@ -43,9 +43,9 @@ program omp_reduction
+   !$omp parallel do  reduction(ior:k)
+   !DEF: /omp_reduction/OtherConstruct4/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct4/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct4/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     !DEF: /omp_reduction/ior ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-    !DEF: /omp_reduction/OtherConstruct4/m HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct4/m (OmpShared) HostAssoc INTEGER(4)
+     k = ior(k, m)
+   end do
+   !$omp end parallel do
+@@ -53,9 +53,9 @@ program omp_reduction
+   !$omp parallel do  reduction(ieor:k)
+   !DEF: /omp_reduction/OtherConstruct5/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct5/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct5/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     !DEF: /omp_reduction/ieor ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-    !DEF: /omp_reduction/OtherConstruct5/m HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct5/m (OmpShared) HostAssoc INTEGER(4)
+     k = ieor(k,m)
+   end do
+   !$omp end parallel do
+diff --git a/flang/test/Semantics/OpenMP/reduction09.f90 b/flang/test/Semantics/OpenMP/reduction09.f90
+index 1af2fc4fd9691..d6c71c30d2834 100644
+--- a/flang/test/Semantics/OpenMP/reduction09.f90
++++ b/flang/test/Semantics/OpenMP/reduction09.f90
+@@ -16,7 +16,7 @@ program omp_reduction
+   !$omp do  reduction(+:k)
+   !DEF: /omp_reduction/OtherConstruct1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct1/OtherConstruct1/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct1/OtherConstruct1/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end do
+@@ -26,7 +26,7 @@ program omp_reduction
+   !$omp parallel do  reduction(+:a(10))
+   !DEF: /omp_reduction/OtherConstruct2/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct2/k HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct2/k (OmpShared) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end parallel do
+@@ -35,7 +35,7 @@ program omp_reduction
+   !$omp parallel do  reduction(+:a(1:10:1))
+   !DEF: /omp_reduction/OtherConstruct3/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct3/k HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct3/k (OmpShared) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end parallel do
+@@ -43,7 +43,7 @@ program omp_reduction
+   !$omp parallel do  reduction(+:b(1:10:1,1:5,2))
+   !DEF: /omp_reduction/OtherConstruct4/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct4/k HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct4/k (OmpShared) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end parallel do
+@@ -51,7 +51,7 @@ program omp_reduction
+   !$omp parallel do  reduction(+:b(1:10:1,1:5,2:5:1))
+   !DEF: /omp_reduction/OtherConstruct5/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct5/k HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct5/k (OmpShared) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end parallel do
+@@ -60,7 +60,7 @@ program omp_reduction
+   !$omp do reduction(+:k) reduction(+:j)
+   !DEF: /omp_reduction/OtherConstruct6/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct6/OtherConstruct1/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct6/OtherConstruct1/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end do
+@@ -69,7 +69,7 @@ program omp_reduction
+   !$omp do reduction(+:k) reduction(*:j) reduction(+:l)
+   !DEF: /omp_reduction/OtherConstruct7/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-    !DEF: /omp_reduction/OtherConstruct7/k (OmpReduction) HostAssoc INTEGER(4)
++    !DEF: /omp_reduction/OtherConstruct7/k (OmpReduction, OmpExplicit) HostAssoc INTEGER(4)
+     k = k+1
+   end do
+   !$omp end do
+diff --git a/flang/test/Semantics/OpenMP/reduction11.f90 b/flang/test/Semantics/OpenMP/reduction11.f90
+index 3893fe70b407f..b2ad0f6a6ee11 100644
+--- a/flang/test/Semantics/OpenMP/reduction11.f90
++++ b/flang/test/Semantics/OpenMP/reduction11.f90
+@@ -12,7 +12,7 @@ program omp_reduction
+ 
+   ! CHECK: OtherConstruct scope
+   ! CHECK: i (OmpPrivate, OmpPreDetermined): HostAssoc
+-  ! CHECK: k (OmpReduction): HostAssoc
++  ! CHECK: k (OmpReduction, OmpExplicit): HostAssoc
+   ! CHECK: max, INTRINSIC: ProcEntity
+   !$omp parallel do  reduction(max:k)
+   do i=1,10
+diff --git a/flang/test/Semantics/OpenMP/scan2.f90 b/flang/test/Semantics/OpenMP/scan2.f90
+index 5232e63aa6b4f..ffe84910f88a2 100644
+--- a/flang/test/Semantics/OpenMP/scan2.f90
++++ b/flang/test/Semantics/OpenMP/scan2.f90
+@@ -12,13 +12,13 @@ program omp_reduction
+ 
+   ! CHECK: OtherConstruct scope
+   ! CHECK: i (OmpPrivate, OmpPreDetermined): HostAssoc
+-  ! CHECK: k (OmpReduction, OmpInclusiveScan, OmpInScanReduction): HostAssoc
++  ! CHECK: k (OmpReduction, OmpExplicit, OmpInclusiveScan, OmpInScanReduction): HostAssoc
+   !$omp parallel do  reduction(inscan, +:k)
+   do i=1,10
+    !$omp scan inclusive(k)
+   end do
+   !$omp end parallel do
+-  ! CHECK: m (OmpReduction, OmpExclusiveScan, OmpInScanReduction): HostAssoc
++  ! CHECK: m (OmpReduction, OmpExplicit, OmpExclusiveScan, OmpInScanReduction): HostAssoc
+   !$omp parallel do  reduction(inscan, +:m)
+   do i=1,10
+    !$omp scan exclusive(m)
+diff --git a/flang/test/Semantics/OpenMP/symbol01.f90 b/flang/test/Semantics/OpenMP/symbol01.f90
+index a40a8563fde1f..595b6b89c84fd 100644
+--- a/flang/test/Semantics/OpenMP/symbol01.f90
++++ b/flang/test/Semantics/OpenMP/symbol01.f90
+@@ -47,22 +47,22 @@ program mm
+ !$omp parallel do  private(a,t,/c/) shared(c)
+  !DEF: /mm/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+  do i=1,10
+-  !DEF: /mm/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
+-  !DEF: /mm/OtherConstruct1/b HostAssoc INTEGER(4)
++  !DEF: /mm/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
++  !DEF: /mm/OtherConstruct1/b (OmpShared) HostAssoc INTEGER(4)
+   !REF: /mm/OtherConstruct1/i
+   a = a+b(i)
+-  !DEF: /mm/OtherConstruct1/t (OmpPrivate) HostAssoc TYPE(myty)
++  !DEF: /mm/OtherConstruct1/t (OmpPrivate, OmpExplicit) HostAssoc TYPE(myty)
+   !REF: /md/myty/a
+   !REF: /mm/OtherConstruct1/i
+   t%a = i
+-  !DEF: /mm/OtherConstruct1/y (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /mm/OtherConstruct1/y (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   y = 0.
+-  !DEF: /mm/OtherConstruct1/x (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /mm/OtherConstruct1/x (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   !REF: /mm/OtherConstruct1/a
+   !REF: /mm/OtherConstruct1/i
+   !REF: /mm/OtherConstruct1/y
+   x = a+i+y
+-  !DEF: /mm/OtherConstruct1/c (OmpShared) HostAssoc REAL(4)
++  !DEF: /mm/OtherConstruct1/c (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   c = 3.0
+  end do
+ end program
+diff --git a/flang/test/Semantics/OpenMP/symbol02.f90 b/flang/test/Semantics/OpenMP/symbol02.f90
+index 31d9cb2e46ba8..9007da042845a 100644
+--- a/flang/test/Semantics/OpenMP/symbol02.f90
++++ b/flang/test/Semantics/OpenMP/symbol02.f90
+@@ -11,13 +11,13 @@
+   !DEF: /MainProgram1/c (Implicit) ObjectEntity REAL(4)
+   c = 0
+   !$omp parallel  private(a,b) shared(c,d)
+-  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   a = 3.
+-  !DEF: /MainProgram1/OtherConstruct1/b (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/b (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   b = 4
+-  !DEF: /MainProgram1/OtherConstruct1/c (OmpShared) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/c (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   c = 5
+-  !DEF: /MainProgram1/OtherConstruct1/d (OmpShared) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/d (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   d = 6
+   !$omp end parallel
+   !DEF: /MainProgram1/a (Implicit) ObjectEntity REAL(4)
+diff --git a/flang/test/Semantics/OpenMP/symbol03.f90 b/flang/test/Semantics/OpenMP/symbol03.f90
+index 08defb40e56a7..d67c1fdf333c4 100644
+--- a/flang/test/Semantics/OpenMP/symbol03.f90
++++ b/flang/test/Semantics/OpenMP/symbol03.f90
+@@ -7,14 +7,14 @@
+   !DEF: /MainProgram1/b (Implicit) ObjectEntity REAL(4)
+   b = 2
+   !$omp parallel  private(a) shared(b)
+-  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   a = 3.
+-  !DEF: /MainProgram1/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/b (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   b = 4
+   !$omp parallel  private(b) shared(a)
+-  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a (OmpShared) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   a = 5.
+-  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/b (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/b (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   b = 6
+   !$omp end parallel
+   !$omp end parallel
+diff --git a/flang/test/Semantics/OpenMP/symbol04.f90 b/flang/test/Semantics/OpenMP/symbol04.f90
+index 808d1e0dd09be..834b166266376 100644
+--- a/flang/test/Semantics/OpenMP/symbol04.f90
++++ b/flang/test/Semantics/OpenMP/symbol04.f90
+@@ -9,12 +9,12 @@
+   !REF: /MainProgram1/a
+   a = 3.14
+   !$omp parallel  private(a)
+-  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(8)
++  !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(8)
+   a = 2.
+   !$omp do  private(a)
+   !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-     !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(8)
++     !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(8)
+      a = 1.
+   end do
+   !$omp end parallel
+diff --git a/flang/test/Semantics/OpenMP/symbol05.f90 b/flang/test/Semantics/OpenMP/symbol05.f90
+index 1ad0c10a40135..fe01f15d20aa3 100644
+--- a/flang/test/Semantics/OpenMP/symbol05.f90
++++ b/flang/test/Semantics/OpenMP/symbol05.f90
+@@ -15,7 +15,7 @@ subroutine foo
+     !DEF: /mm/foo/a ObjectEntity INTEGER(4)
+     integer :: a = 3
+     !$omp parallel
+-    !DEF: /mm/foo/OtherConstruct1/a HostAssoc INTEGER(4)
++    !DEF: /mm/foo/OtherConstruct1/a (OmpShared) HostAssoc INTEGER(4)
+     a = 1
+     !DEF: /mm/i PUBLIC (Implicit, OmpThreadprivate) ObjectEntity INTEGER(4)
+     !REF: /mm/foo/OtherConstruct1/a
+diff --git a/flang/test/Semantics/OpenMP/symbol06.f90 b/flang/test/Semantics/OpenMP/symbol06.f90
+index 906264eb12642..daf3874b79af6 100644
+--- a/flang/test/Semantics/OpenMP/symbol06.f90
++++ b/flang/test/Semantics/OpenMP/symbol06.f90
+@@ -10,7 +10,7 @@
+   !$omp parallel do  firstprivate(a) lastprivate(a)
+   !DEF: /MainProgram1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do i=1,10
+-     !DEF: /MainProgram1/OtherConstruct1/a (OmpFirstPrivate, OmpLastPrivate) HostAssoc REAL(4)
++     !DEF: /MainProgram1/OtherConstruct1/a (OmpFirstPrivate, OmpLastPrivate, OmpExplicit) HostAssoc REAL(4)
+      a = 2.
+   end do
+ end program
+diff --git a/flang/test/Semantics/OpenMP/symbol07.f90 b/flang/test/Semantics/OpenMP/symbol07.f90
+index a375942ebb1d9..86b7305411347 100644
+--- a/flang/test/Semantics/OpenMP/symbol07.f90
++++ b/flang/test/Semantics/OpenMP/symbol07.f90
+@@ -21,9 +21,9 @@ subroutine function_call_in_region
+   !DEF: /function_call_in_region/b ObjectEntity REAL(4)
+   real :: b = 5.
+   !$omp parallel  default(none) private(a) shared(b)
+-  !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   !REF: /function_call_in_region/foo
+-  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   a = foo(b)
+   !$omp end parallel
+   !REF: /function_call_in_region/a
+diff --git a/flang/test/Semantics/OpenMP/symbol08.f90 b/flang/test/Semantics/OpenMP/symbol08.f90
+index 80ae1c6d2242b..545bccc86b068 100644
+--- a/flang/test/Semantics/OpenMP/symbol08.f90
++++ b/flang/test/Semantics/OpenMP/symbol08.f90
+@@ -28,19 +28,19 @@ subroutine test_do
+  !DEF: /test_do/k ObjectEntity INTEGER(4)
+  integer i, j, k
+ !$omp parallel
+- !DEF: /test_do/OtherConstruct1/i HostAssoc INTEGER(4)
++ !DEF: /test_do/OtherConstruct1/i (OmpShared) HostAssoc INTEGER(4)
+  i = 99
+ !$omp do  collapse(2)
+  !DEF: /test_do/OtherConstruct1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+  do i=1,5
+   !DEF: /test_do/OtherConstruct1/OtherConstruct1/j (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   do j=6,10
+-   !DEF: /test_do/OtherConstruct1/a HostAssoc REAL(4)
++   !DEF: /test_do/OtherConstruct1/OtherConstruct1/a HostAssoc REAL(4)
+    a(1,1,1) = 0.
+    !DEF: /test_do/OtherConstruct1/k (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+    do k=11,15
+-    !REF: /test_do/OtherConstruct1/a
+-    !REF: /test_do/OtherConstruct1/k
++    !REF: /test_do/OtherConstruct1/OtherConstruct1/a
++    !DEF: /test_do/OtherConstruct1/OtherConstruct1/k HostAssoc INTEGER(4)
+     !REF: /test_do/OtherConstruct1/OtherConstruct1/j
+     !REF: /test_do/OtherConstruct1/OtherConstruct1/i
+     a(k,j,i) = 1.
+@@ -65,9 +65,9 @@ subroutine test_pardo
+  do i=1,5
+    !DEF: /test_pardo/OtherConstruct1/j (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+     do j=6,10
+-   !DEF: /test_pardo/OtherConstruct1/a HostAssoc REAL(4)
++   !DEF: /test_pardo/OtherConstruct1/a (OmpShared) HostAssoc REAL(4)
+    a(1,1,1) = 0.
+-   !DEF: /test_pardo/OtherConstruct1/k (OmpPrivate) HostAssoc INTEGER(4)
++   !DEF: /test_pardo/OtherConstruct1/k (OmpPrivate, OmpExplicit) HostAssoc INTEGER(4)
+    do k=11,15
+     !REF: /test_pardo/OtherConstruct1/a
+     !REF: /test_pardo/OtherConstruct1/k
+@@ -91,7 +91,7 @@ subroutine test_taskloop
+ !$omp taskloop  private(j)
+  !DEF: /test_taskloop/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+  do i=1,5
+-  !DEF: /test_taskloop/OtherConstruct1/j (OmpPrivate) HostAssoc INTEGER(4)
++  !DEF: /test_taskloop/OtherConstruct1/j (OmpPrivate, OmpExplicit) HostAssoc INTEGER(4)
+   !REF: /test_taskloop/OtherConstruct1/i
+   do j=1,i
+    !DEF: /test_taskloop/OtherConstruct1/a (OmpFirstPrivate, OmpImplicit) HostAssoc REAL(4)
+@@ -139,15 +139,15 @@ subroutine dotprod (b, c, n, block_size, num_teams, block_threads)
+  do i0=1,n,block_size
+ !$omp parallel do  reduction(+: sum)
+   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+-  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i0 HostAssoc INTEGER(4)
++  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i0 (OmpShared) HostAssoc INTEGER(4)
+   !DEF: /dotprod/min ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+-  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/block_size HostAssoc INTEGER(4)
+-  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/n HostAssoc INTEGER(4)
++  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/block_size (OmpShared) HostAssoc INTEGER(4)
++  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/n (OmpShared) HostAssoc INTEGER(4)
+   do i=i0,min(i0+block_size, n)
+-   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/sum (OmpReduction) HostAssoc REAL(4)
+-   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/b HostAssoc REAL(4)
++   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/sum (OmpReduction, OmpExplicit) HostAssoc REAL(4)
++   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
+    !REF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i
+-   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/c HostAssoc REAL(4)
++   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/c (OmpShared) HostAssoc REAL(4)
+    sum = sum+b(i)*c(i)
+   end do
+  end do
+@@ -175,7 +175,7 @@ subroutine test_simd
+   do j=6,10
+    !DEF: /test_simd/OtherConstruct1/k (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+    do k=11,15
+-    !DEF: /test_simd/OtherConstruct1/a HostAssoc REAL(4)
++    !DEF: /test_simd/OtherConstruct1/a (OmpShared) HostAssoc REAL(4)
+     !REF: /test_simd/OtherConstruct1/k
+     !REF: /test_simd/OtherConstruct1/j
+     !REF: /test_simd/OtherConstruct1/i
+@@ -202,7 +202,7 @@ subroutine test_simd_multi
+   do j=6,10
+    !DEF: /test_simd_multi/OtherConstruct1/k (OmpLastPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+    do k=11,15
+-    !DEF: /test_simd_multi/OtherConstruct1/a HostAssoc REAL(4)
++    !DEF: /test_simd_multi/OtherConstruct1/a (OmpShared) HostAssoc REAL(4)
+     !REF: /test_simd_multi/OtherConstruct1/k
+     !REF: /test_simd_multi/OtherConstruct1/j
+     !REF: /test_simd_multi/OtherConstruct1/i
+@@ -224,11 +224,11 @@ subroutine test_seq_loop
+   !REF: /test_seq_loop/j
+   j = -1
+   !$omp parallel
+-  !DEF: /test_seq_loop/OtherConstruct1/i HostAssoc INTEGER(4)
+-  !DEF: /test_seq_loop/OtherConstruct1/j HostAssoc INTEGER(4)
++  !DEF: /test_seq_loop/OtherConstruct1/i (OmpShared) HostAssoc INTEGER(4)
++  !DEF: /test_seq_loop/OtherConstruct1/j (OmpShared) HostAssoc INTEGER(4)
+   print *, i, j
+   !$omp parallel
+-  !DEF: /test_seq_loop/OtherConstruct1/OtherConstruct1/i HostAssoc INTEGER(4)
++  !DEF: /test_seq_loop/OtherConstruct1/OtherConstruct1/i (OmpShared) HostAssoc INTEGER(4)
+   !DEF: /test_seq_loop/OtherConstruct1/OtherConstruct1/j (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   print *, i, j
+   !$omp do
+diff --git a/flang/test/Semantics/OpenMP/symbol09.f90 b/flang/test/Semantics/OpenMP/symbol09.f90
+index a375942ebb1d9..86b7305411347 100644
+--- a/flang/test/Semantics/OpenMP/symbol09.f90
++++ b/flang/test/Semantics/OpenMP/symbol09.f90
+@@ -21,9 +21,9 @@ subroutine function_call_in_region
+   !DEF: /function_call_in_region/b ObjectEntity REAL(4)
+   real :: b = 5.
+   !$omp parallel  default(none) private(a) shared(b)
+-  !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate, OmpExplicit) HostAssoc REAL(4)
+   !REF: /function_call_in_region/foo
+-  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared, OmpExplicit) HostAssoc REAL(4)
+   a = foo(b)
+   !$omp end parallel
+   !REF: /function_call_in_region/a

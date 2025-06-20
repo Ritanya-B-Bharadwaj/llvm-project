@@ -1,0 +1,103 @@
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 0254ac4309ee5..52d3a5844c969 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -98,10 +98,12 @@ struct OmpDirectiveNameParser {
+   using Token = TokenStringMatch<false, false>;
+ 
+   std::optional<resultType> Parse(ParseState &state) const {
++    auto begin{state.GetLocation()};
+     for (const NameWithId &nid : directives()) {
+       if (attempt(Token(nid.first.data())).Parse(state)) {
+         OmpDirectiveName n;
+         n.v = nid.second;
++        n.source = parser::CharBlock(begin, state.GetLocation());
+         return n;
+       }
+     }
+@@ -1104,18 +1106,8 @@ TYPE_PARSER( //
+     "WHEN" >> construct<OmpClause>(construct<OmpClause::When>(
+                   parenthesized(Parser<OmpWhenClause>{}))) ||
+     // Cancellable constructs
+-    "DO"_id >=
+-        construct<OmpClause>(construct<OmpClause::CancellationConstructType>(
+-            Parser<OmpCancellationConstructTypeClause>{})) ||
+-    "PARALLEL"_id >=
+-        construct<OmpClause>(construct<OmpClause::CancellationConstructType>(
+-            Parser<OmpCancellationConstructTypeClause>{})) ||
+-    "SECTIONS"_id >=
+-        construct<OmpClause>(construct<OmpClause::CancellationConstructType>(
+-            Parser<OmpCancellationConstructTypeClause>{})) ||
+-    "TASKGROUP"_id >=
+-        construct<OmpClause>(construct<OmpClause::CancellationConstructType>(
+-            Parser<OmpCancellationConstructTypeClause>{})))
++    construct<OmpClause>(construct<OmpClause::CancellationConstructType>(
++        Parser<OmpCancellationConstructTypeClause>{})))
+ 
+ // [Clause, [Clause], ...]
+ TYPE_PARSER(sourced(construct<OmpClauseList>(
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 8f6a623508aa7..1ddc55d64270d 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2422,20 +2422,30 @@ void OmpStructureChecker::Leave(const parser::OpenMPCriticalConstruct &) {
+ 
+ void OmpStructureChecker::Enter(
+     const parser::OmpClause::CancellationConstructType &x) {
+-  // Do not call CheckAllowed/CheckAllowedClause, because in case of an error
+-  // it will print "CANCELLATION_CONSTRUCT_TYPE" as the clause name instead of
+-  // the contained construct name.
++  llvm::omp::Directive dir{GetContext().directive};
+   auto &dirName{std::get<parser::OmpDirectiveName>(x.v.t)};
+-  switch (dirName.v) {
+-  case llvm::omp::Directive::OMPD_do:
+-  case llvm::omp::Directive::OMPD_parallel:
+-  case llvm::omp::Directive::OMPD_sections:
+-  case llvm::omp::Directive::OMPD_taskgroup:
+-    break;
+-  default:
+-    context_.Say(dirName.source, "%s is not a cancellable construct"_err_en_US,
+-        parser::ToUpperCaseLetters(getDirectiveName(dirName.v).str()));
+-    break;
++
++  if (dir != llvm::omp::Directive::OMPD_cancel &&
++      dir != llvm::omp::Directive::OMPD_cancellation_point) {
++    // Do not call CheckAllowed/CheckAllowedClause, because in case of an error
++    // it will print "CANCELLATION_CONSTRUCT_TYPE" as the clause name instead
++    // of the contained construct name.
++    context_.Say(dirName.source, "%s cannot follow %s"_err_en_US,
++        parser::ToUpperCaseLetters(getDirectiveName(dirName.v)),
++        parser::ToUpperCaseLetters(getDirectiveName(dir)));
++  } else {
++    switch (dirName.v) {
++    case llvm::omp::Directive::OMPD_do:
++    case llvm::omp::Directive::OMPD_parallel:
++    case llvm::omp::Directive::OMPD_sections:
++    case llvm::omp::Directive::OMPD_taskgroup:
++      break;
++    default:
++      context_.Say(dirName.source,
++          "%s is not a cancellable construct"_err_en_US,
++          parser::ToUpperCaseLetters(getDirectiveName(dirName.v)));
++      break;
++    }
+   }
+ }
+ 
+diff --git a/flang/test/Semantics/OpenMP/cancellation-construct-type.f90 b/flang/test/Semantics/OpenMP/cancellation-construct-type.f90
+new file mode 100644
+index 0000000000000..c9d1408fd83ef
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/cancellation-construct-type.f90
+@@ -0,0 +1,11 @@
++!RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags
++
++subroutine f(x)
++  integer :: x
++!ERROR: PARALLEL cannot follow SECTIONS
++!$omp sections parallel
++!$omp section
++  x = x + 1
++!$omp end sections
++end
++end

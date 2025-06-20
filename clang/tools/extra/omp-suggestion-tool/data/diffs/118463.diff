@@ -1,0 +1,464 @@
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 063055f8015b8..9d5483275a4ee 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -268,7 +268,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+         checkAllocate(op, result);
+         checkLinear(op, result);
+         checkOrder(op, result);
+-        checkPrivate(op, result);
+       })
+       .Case([&](omp::ParallelOp op) { checkAllocate(op, result); })
+       .Case([&](omp::SimdOp op) {
+@@ -1302,6 +1301,7 @@ allocatePrivateVars(llvm::IRBuilderBase &builder,
+                     MutableArrayRef<mlir::Value> mlirPrivateVars,
+                     llvm::SmallVectorImpl<llvm::Value *> &llvmPrivateVars,
+                     const llvm::OpenMPIRBuilder::InsertPointTy &allocaIP) {
++  llvm::IRBuilderBase::InsertPointGuard guard(builder);
+   // Allocate private vars
+   llvm::BranchInst *allocaTerminator =
+       llvm::cast<llvm::BranchInst>(allocaIP.getBlock()->getTerminator());
+@@ -1363,6 +1363,86 @@ allocatePrivateVars(llvm::IRBuilderBase &builder,
+   return afterAllocas;
+ }
+ 
++static LogicalResult
++initFirstPrivateVars(llvm::IRBuilderBase &builder,
++                     LLVM::ModuleTranslation &moduleTranslation,
++                     SmallVectorImpl<mlir::Value> &mlirPrivateVars,
++                     SmallVectorImpl<llvm::Value *> &llvmPrivateVars,
++                     SmallVectorImpl<omp::PrivateClauseOp> &privateDecls,
++                     llvm::BasicBlock *afterAllocas) {
++  llvm::IRBuilderBase::InsertPointGuard guard(builder);
++  // Apply copy region for firstprivate.
++  bool needsFirstprivate =
++      llvm::any_of(privateDecls, [](omp::PrivateClauseOp &privOp) {
++        return privOp.getDataSharingType() ==
++               omp::DataSharingClauseType::FirstPrivate;
++      });
++
++  if (!needsFirstprivate)
++    return success();
++
++  assert(afterAllocas->getSinglePredecessor());
++
++  // Find the end of the allocation blocks
++  builder.SetInsertPoint(afterAllocas->getSinglePredecessor()->getTerminator());
++  llvm::BasicBlock *copyBlock =
++      splitBB(builder, /*CreateBranch=*/true, "omp.private.copy");
++  builder.SetInsertPoint(copyBlock->getFirstNonPHIOrDbgOrAlloca());
++
++  for (auto [decl, mlirVar, llvmVar] :
++       llvm::zip_equal(privateDecls, mlirPrivateVars, llvmPrivateVars)) {
++    if (decl.getDataSharingType() != omp::DataSharingClauseType::FirstPrivate)
++      continue;
++
++    // copyRegion implements `lhs = rhs`
++    Region &copyRegion = decl.getCopyRegion();
++
++    // map copyRegion rhs arg
++    llvm::Value *nonPrivateVar = moduleTranslation.lookupValue(mlirVar);
++    assert(nonPrivateVar);
++    moduleTranslation.mapValue(decl.getCopyMoldArg(), nonPrivateVar);
++
++    // map copyRegion lhs arg
++    moduleTranslation.mapValue(decl.getCopyPrivateArg(), llvmVar);
++
++    // in-place convert copy region
++    builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
++    if (failed(inlineConvertOmpRegions(copyRegion, "omp.private.copy", builder,
++                                       moduleTranslation)))
++      return decl.emitError("failed to inline `copy` region of `omp.private`");
++
++    // ignore unused value yielded from copy region
++
++    // clear copy region block argument mapping in case it needs to be
++    // re-created with different sources for reuse of the same reduction
++    // decl
++    moduleTranslation.forgetMapping(copyRegion);
++  }
++
++  return success();
++}
++
++static LogicalResult
++cleanupPrivateVars(llvm::IRBuilderBase &builder,
++                   LLVM::ModuleTranslation &moduleTranslation, Location loc,
++                   SmallVectorImpl<llvm::Value *> &llvmPrivateVars,
++                   SmallVectorImpl<omp::PrivateClauseOp> &privateDecls) {
++  // private variable deallocation
++  SmallVector<Region *> privateCleanupRegions;
++  llvm::transform(privateDecls, std::back_inserter(privateCleanupRegions),
++                  [](omp::PrivateClauseOp privatizer) {
++                    return &privatizer.getDeallocRegion();
++                  });
++
++  if (failed(inlineOmpRegionCleanup(
++          privateCleanupRegions, llvmPrivateVars, moduleTranslation, builder,
++          "omp.private.dealloc", /*shouldLoadCleanupRegionArg=*/false)))
++    return mlir::emitError(loc, "failed to inline `dealloc` region of an "
++                                "`omp.private` op in");
++
++  return success();
++}
++
+ static LogicalResult
+ convertOmpSections(Operation &opInst, llvm::IRBuilderBase &builder,
+                    LLVM::ModuleTranslation &moduleTranslation) {
+@@ -1622,50 +1702,10 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
+     if (handleError(afterAllocas, *taskOp).failed())
+       return llvm::make_error<PreviouslyReportedError>();
+ 
+-    // Apply copy region for firstprivate
+-    bool needsFirstPrivate =
+-        llvm::any_of(privateDecls, [](omp::PrivateClauseOp &privOp) {
+-          return privOp.getDataSharingType() ==
+-                 omp::DataSharingClauseType::FirstPrivate;
+-        });
+-    if (needsFirstPrivate) {
+-      // Find the end of the allocation blocks
+-      assert(afterAllocas.get()->getSinglePredecessor());
+-      builder.SetInsertPoint(
+-          afterAllocas.get()->getSinglePredecessor()->getTerminator());
+-      llvm::BasicBlock *copyBlock =
+-          splitBB(builder, /*CreateBranch=*/true, "omp.private.copy");
+-      builder.SetInsertPoint(copyBlock->getFirstNonPHIOrDbgOrAlloca());
+-    }
+-    for (auto [decl, mlirVar, llvmVar] :
+-         llvm::zip_equal(privateDecls, mlirPrivateVars, llvmPrivateVars)) {
+-      if (decl.getDataSharingType() != omp::DataSharingClauseType::FirstPrivate)
+-        continue;
+-
+-      // copyRegion implements `lhs = rhs`
+-      Region &copyRegion = decl.getCopyRegion();
+-
+-      // map copyRegion rhs arg
+-      llvm::Value *nonPrivateVar = moduleTranslation.lookupValue(mlirVar);
+-      assert(nonPrivateVar);
+-      moduleTranslation.mapValue(decl.getCopyMoldArg(), nonPrivateVar);
+-
+-      // map copyRegion lhs arg
+-      moduleTranslation.mapValue(decl.getCopyPrivateArg(), llvmVar);
+-
+-      // in-place convert copy region
+-      builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
+-      if (failed(inlineConvertOmpRegions(copyRegion, "omp.private.copy",
+-                                         builder, moduleTranslation)))
+-        return llvm::createStringError(
+-            "failed to inline `copy` region of an `omp.private` op in taskOp");
+-
+-      // ignore unused value yielded from copy region
+-
+-      // clear copy region block argument mapping in case it needs to be
+-      // re-created with different source for reuse of the same reduction decl
+-      moduleTranslation.forgetMapping(copyRegion);
+-    }
++    if (failed(initFirstPrivateVars(builder, moduleTranslation, mlirPrivateVars,
++                                    llvmPrivateVars, privateDecls,
++                                    afterAllocas.get())))
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     // translate the body of the task:
+     builder.restoreIP(codegenIP);
+@@ -1674,19 +1714,11 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
+     if (failed(handleError(continuationBlockOrError, *taskOp)))
+       return llvm::make_error<PreviouslyReportedError>();
+ 
+-    // private variable deallocation
+-    SmallVector<Region *> privateCleanupRegions;
+-    llvm::transform(privateDecls, std::back_inserter(privateCleanupRegions),
+-                    [](omp::PrivateClauseOp privatizer) {
+-                      return &privatizer.getDeallocRegion();
+-                    });
+-
+     builder.SetInsertPoint(continuationBlockOrError.get()->getTerminator());
+-    if (failed(inlineOmpRegionCleanup(
+-            privateCleanupRegions, llvmPrivateVars, moduleTranslation, builder,
+-            "omp.private.dealloc", /*shouldLoadCleanupRegionArg=*/false)))
+-      return llvm::createStringError("failed to inline `dealloc` region of an "
+-                                     "`omp.private` op in an omp.task");
++
++    if (failed(cleanupPrivateVars(builder, moduleTranslation, taskOp.getLoc(),
++                                  llvmPrivateVars, privateDecls)))
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     return llvm::Error::success();
+   };
+@@ -1777,6 +1809,18 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+     chunk = builder.CreateSExtOrTrunc(chunkVar, ivType);
+   }
+ 
++  MutableArrayRef<BlockArgument> privateBlockArgs =
++      cast<omp::BlockArgOpenMPOpInterface>(*wsloopOp).getPrivateBlockArgs();
++  SmallVector<mlir::Value> mlirPrivateVars;
++  SmallVector<llvm::Value *> llvmPrivateVars;
++  SmallVector<omp::PrivateClauseOp> privateDecls;
++  mlirPrivateVars.reserve(privateBlockArgs.size());
++  llvmPrivateVars.reserve(privateBlockArgs.size());
++  collectPrivatizationDecls(wsloopOp, privateDecls);
++
++  for (mlir::Value privateVar : wsloopOp.getPrivateVars())
++    mlirPrivateVars.push_back(privateVar);
++
+   SmallVector<omp::DeclareReductionOp> reductionDecls;
+   collectReductionDecls(wsloopOp, reductionDecls);
+   llvm::OpenMPIRBuilder::InsertPointTy allocaIP =
+@@ -1784,15 +1828,37 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   SmallVector<llvm::Value *> privateReductionVariables(
+       wsloopOp.getNumReductionVars());
++
++  llvm::Expected<llvm::BasicBlock *> afterAllocas = allocatePrivateVars(
++      builder, moduleTranslation, privateBlockArgs, privateDecls,
++      mlirPrivateVars, llvmPrivateVars, allocaIP);
++  if (handleError(afterAllocas, opInst).failed())
++    return failure();
++
+   DenseMap<Value, llvm::Value *> reductionVariableMap;
+ 
+   MutableArrayRef<BlockArgument> reductionArgs =
+       cast<omp::BlockArgOpenMPOpInterface>(opInst).getReductionBlockArgs();
+ 
+-  if (failed(allocAndInitializeReductionVars(
+-          wsloopOp, reductionArgs, builder, moduleTranslation, allocaIP,
+-          reductionDecls, privateReductionVariables, reductionVariableMap,
+-          isByRef)))
++  SmallVector<DeferredStore> deferredStores;
++
++  if (failed(allocReductionVars(wsloopOp, reductionArgs, builder,
++                                moduleTranslation, allocaIP, reductionDecls,
++                                privateReductionVariables, reductionVariableMap,
++                                deferredStores, isByRef)))
++    return failure();
++
++  if (failed(initFirstPrivateVars(builder, moduleTranslation, mlirPrivateVars,
++                                  llvmPrivateVars, privateDecls,
++                                  afterAllocas.get())))
++    return failure();
++
++  assert(afterAllocas.get()->getSinglePredecessor());
++  if (failed(initReductionVars(wsloopOp, reductionArgs, builder,
++                               moduleTranslation,
++                               afterAllocas.get()->getSinglePredecessor(),
++                               reductionDecls, privateReductionVariables,
++                               reductionVariableMap, isByRef, deferredStores)))
+     return failure();
+ 
+   // TODO: Replace this with proper composite translation support.
+@@ -1899,9 +1965,13 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+   builder.restoreIP(afterIP);
+ 
+   // Process the reductions if required.
+-  return createReductionsAndCleanup(wsloopOp, builder, moduleTranslation,
+-                                    allocaIP, reductionDecls,
+-                                    privateReductionVariables, isByRef);
++  if (failed(createReductionsAndCleanup(wsloopOp, builder, moduleTranslation,
++                                        allocaIP, reductionDecls,
++                                        privateReductionVariables, isByRef)))
++    return failure();
++
++  return cleanupPrivateVars(builder, moduleTranslation, wsloopOp.getLoc(),
++                            llvmPrivateVars, privateDecls);
+ }
+ 
+ /// Converts the OpenMP parallel operation to LLVM IR.
+@@ -1959,52 +2029,12 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+             deferredStores, isByRef)))
+       return llvm::make_error<PreviouslyReportedError>();
+ 
+-    // Apply copy region for firstprivate.
+-    bool needsFirstprivate =
+-        llvm::any_of(privateDecls, [](omp::PrivateClauseOp &privOp) {
+-          return privOp.getDataSharingType() ==
+-                 omp::DataSharingClauseType::FirstPrivate;
+-        });
+-    if (needsFirstprivate) {
+-      // Find the end of the allocation blocks
+-      assert(afterAllocas.get()->getSinglePredecessor());
+-      builder.SetInsertPoint(
+-          afterAllocas.get()->getSinglePredecessor()->getTerminator());
+-      llvm::BasicBlock *copyBlock =
+-          splitBB(builder, /*CreateBranch=*/true, "omp.private.copy");
+-      builder.SetInsertPoint(copyBlock->getFirstNonPHIOrDbgOrAlloca());
+-    }
+-    for (auto [decl, mlirVar, llvmVar] :
+-         llvm::zip_equal(privateDecls, mlirPrivateVars, llvmPrivateVars)) {
+-      if (decl.getDataSharingType() != omp::DataSharingClauseType::FirstPrivate)
+-        continue;
+-
+-      // copyRegion implements `lhs = rhs`
+-      Region &copyRegion = decl.getCopyRegion();
+-
+-      // map copyRegion rhs arg
+-      llvm::Value *nonPrivateVar = moduleTranslation.lookupValue(mlirVar);
+-      assert(nonPrivateVar);
+-      moduleTranslation.mapValue(decl.getCopyMoldArg(), nonPrivateVar);
+-
+-      // map copyRegion lhs arg
+-      moduleTranslation.mapValue(decl.getCopyPrivateArg(), llvmVar);
+-
+-      // in-place convert copy region
+-      builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
+-      if (failed(inlineConvertOmpRegions(copyRegion, "omp.private.copy",
+-                                         builder, moduleTranslation)))
+-        return llvm::createStringError(
+-            "failed to inline `copy` region of `omp.private`");
+-
+-      // ignore unused value yielded from copy region
+-
+-      // clear copy region block argument mapping in case it needs to be
+-      // re-created with different sources for reuse of the same reduction
+-      // decl
+-      moduleTranslation.forgetMapping(copyRegion);
+-    }
++    if (failed(initFirstPrivateVars(builder, moduleTranslation, mlirPrivateVars,
++                                    llvmPrivateVars, privateDecls,
++                                    afterAllocas.get())))
++      return llvm::make_error<PreviouslyReportedError>();
+ 
++    assert(afterAllocas.get()->getSinglePredecessor());
+     if (failed(
+             initReductionVars(opInst, reductionArgs, builder, moduleTranslation,
+                               afterAllocas.get()->getSinglePredecessor(),
+@@ -2089,17 +2119,9 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+       return llvm::createStringError(
+           "failed to inline `cleanup` region of `omp.declare_reduction`");
+ 
+-    SmallVector<Region *> privateCleanupRegions;
+-    llvm::transform(privateDecls, std::back_inserter(privateCleanupRegions),
+-                    [](omp::PrivateClauseOp privatizer) {
+-                      return &privatizer.getDeallocRegion();
+-                    });
+-
+-    if (failed(inlineOmpRegionCleanup(
+-            privateCleanupRegions, llvmPrivateVars, moduleTranslation, builder,
+-            "omp.private.dealloc", /*shouldLoadCleanupRegionArg=*/false)))
+-      return llvm::createStringError(
+-          "failed to inline `dealloc` region of `omp.private`");
++    if (failed(cleanupPrivateVars(builder, moduleTranslation, opInst.getLoc(),
++                                  llvmPrivateVars, privateDecls)))
++      return llvm::make_error<PreviouslyReportedError>();
+ 
+     builder.restoreIP(oldIP);
+     return llvm::Error::success();
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index de797ea2aa364..c1e0014d1f571 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -635,22 +635,3 @@ llvm.func @wsloop_order(%lb : i32, %ub : i32, %step : i32) {
+   }
+   llvm.return
+ }
+-
+-// -----
+-
+-omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
+-^bb0(%arg0: !llvm.ptr):
+-  %0 = llvm.mlir.constant(1 : i32) : i32
+-  %1 = llvm.alloca %0 x i32 : (i32) -> !llvm.ptr
+-  omp.yield(%1 : !llvm.ptr)
+-}
+-llvm.func @wsloop_private(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
+-  // expected-error@below {{not yet implemented: Unhandled clause privatization in omp.wsloop operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.wsloop}}
+-  omp.wsloop private(@x.privatizer %x -> %arg0 : !llvm.ptr) {
+-    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+-      omp.yield
+-    }
+-  }
+-  llvm.return
+-}
+diff --git a/mlir/test/Target/LLVMIR/openmp-wsloop-private.mlir b/mlir/test/Target/LLVMIR/openmp-wsloop-private.mlir
+new file mode 100644
+index 0000000000000..db67bb5fae58b
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-wsloop-private.mlir
+@@ -0,0 +1,88 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
++
++// tests a wsloop private + firstprivate + reduction to make sure block structure
++// is handled properly.
++
++omp.private {type = private} @_QFwsloop_privateEi_private_ref_i32 : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x i32 {bindc_name = "i", pinned} : (i64) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++}
++
++llvm.func @foo_free(!llvm.ptr)
++
++omp.private {type = firstprivate} @_QFwsloop_privateEc_firstprivate_ref_c8 : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x !llvm.array<1 x i8> {bindc_name = "c", pinned} : (i64) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++} copy {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %0 = llvm.load %arg0 : !llvm.ptr -> !llvm.array<1 x i8>
++  llvm.store %0, %arg1 : !llvm.array<1 x i8>, !llvm.ptr
++  omp.yield(%arg1 : !llvm.ptr)
++} dealloc {
++^bb0(%arg0: !llvm.ptr):
++  llvm.call @foo_free(%arg0) : (!llvm.ptr) -> ()
++  omp.yield
++}
++
++omp.declare_reduction @max_f32 : f32 init {
++^bb0(%arg0: f32):
++  %0 = llvm.mlir.constant(-3.40282347E+38 : f32) : f32
++  omp.yield(%0 : f32)
++} combiner {
++^bb0(%arg0: f32, %arg1: f32):
++  %0 = llvm.intr.maxnum(%arg0, %arg1) {fastmathFlags = #llvm.fastmath<contract>} : (f32, f32) -> f32
++  omp.yield(%0 : f32)
++}
++
++llvm.func @wsloop_private_(%arg0: !llvm.ptr {fir.bindc_name = "y"}) attributes {fir.internal_name = "_QPwsloop_private", frame_pointer = #llvm.framePointerKind<all>, target_cpu = "x86-64"} {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x f32 {bindc_name = "x"} : (i64) -> !llvm.ptr
++  %3 = llvm.alloca %0 x i32 {bindc_name = "i"} : (i64) -> !llvm.ptr
++  %5 = llvm.alloca %0 x !llvm.array<1 x i8> {bindc_name = "c"} : (i64) -> !llvm.ptr
++  %6 = llvm.mlir.constant(1 : i32) : i32
++  %7 = llvm.mlir.constant(10 : i32) : i32
++  %8 = llvm.mlir.constant(0 : i32) : i32
++  omp.parallel {
++    omp.wsloop private(@_QFwsloop_privateEc_firstprivate_ref_c8 %5 -> %arg1, @_QFwsloop_privateEi_private_ref_i32 %3 -> %arg2 : !llvm.ptr, !llvm.ptr) reduction(@max_f32 %1 -> %arg3 : !llvm.ptr) {
++      omp.loop_nest (%arg4) : i32 = (%8) to (%7) inclusive step (%6) {
++        omp.yield
++      }
++    }
++    omp.terminator
++  }
++  llvm.return
++}
++
++// CHECK: call void {{.*}} @__kmpc_fork_call(ptr @1, i32 1, ptr @[[OUTLINED:.*]], ptr %{{.*}})
++
++// CHECK: define internal void @[[OUTLINED:.*]]{{.*}} {
++
++// First, check that all memory for privates and reductions is allocated.
++// CHECK: omp.par.entry:
++// CHECK:   %[[CHR:.*]] = alloca [1 x i8], i64 1, align 1
++// CHECK:   %[[INT:.*]] = alloca i32, i64 1, align 4
++// CHECK:   %[[FLT:.*]] = alloca float, align 4
++// CHECK:   %[[RED_ARR:.*]] = alloca [1 x ptr], align 8
++// CHECK:   br label %[[LATE_ALLOC_BB:.*]]
++
++// CHECK: [[LATE_ALLOC_BB]]:
++// CHECK:   br label %[[PRIVATE_CPY_BB:.*]]
++
++// Second, check that first private was properly copied.
++// CHECK: [[PRIVATE_CPY_BB:.*]]:
++// CHECK:   %[[CHR_VAL:.*]] = load [1 x i8], ptr %{{.*}}, align 1
++// CHECK:   store [1 x i8] %[[CHR_VAL]], ptr %[[CHR]], align 1
++// CHECK:   br label %[[RED_INIT_BB:.*]]
++
++// Third, check that reduction init took place.
++// CHECK: [[RED_INIT_BB]]:
++// CHECK:   store float 0x{{.*}}, ptr %[[FLT]], align 4
++
++// Finally, check for the private dealloc region
++// CHECK:   call void @foo_free(ptr %[[CHR]])
++
++// CHECK: }
