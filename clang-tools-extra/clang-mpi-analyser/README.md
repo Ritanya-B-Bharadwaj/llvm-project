@@ -10,10 +10,6 @@
   - [Basic Usage](#basic-usage)
   - [Scatter/Gather Analysis](#scattergather-analysis)
   - [Understanding the Output](#understanding-the-output)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
-- [Acknowledgements](#acknowledgements)
 
 ## Introduction
 
@@ -81,7 +77,7 @@ This project is built as a Clang tool within the LLVM ecosystem. The standard wa
     In llvm-project folder do cd build or create one
     ```bash
     cd build
-    cmake -G "Unix Makefiles" -DLLVM_ENABLE_PROJECTS="clang" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../install ../llvm #or use ninja
+    cmake -G "Unix Makefiles" -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../install ../llvm #or use ninja
     #To build the project do
     make -j 12 #use the number acoording to your system compatibility
     make -j 12 install
@@ -331,7 +327,7 @@ int main(int argc, char** argv) {
 }
 ```
 
-##Sample output
+## Sample output
 ```bash
 =============================================================
 Analysis of manual_allgather Function
