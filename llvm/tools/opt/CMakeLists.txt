@@ -48,6 +48,9 @@ add_llvm_tool(opt
 
   EXPORT_SYMBOLS
   )
-target_link_libraries(opt PRIVATE LLVMOptDriver)
+target_link_libraries(opt PRIVATE
+LLVMOptDriver
+LLVMComputationalIntensityPass
+)
 
 setup_host_tool(opt OPT opt_exe opt_target)

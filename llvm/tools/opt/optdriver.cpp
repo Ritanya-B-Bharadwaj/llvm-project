@@ -57,12 +57,16 @@
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Debugify.h"
+#include "llvm/Transforms/ComputationalIntensity/ComputationalIntensityPass.h"
+#include "llvm/Passes/PassBuilder.h"
 #include <algorithm>
 #include <memory>
 #include <optional>
 using namespace llvm;
 using namespace opt_tool;
 
+
+extern "C" void registerComputationalIntensityPass(llvm::PassBuilder &);
 static codegen::RegisterCodeGenFlags CFG;
 
 // The OptimizationList is automatically populated with registered Passes by the
