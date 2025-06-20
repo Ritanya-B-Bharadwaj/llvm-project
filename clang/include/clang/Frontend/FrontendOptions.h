@@ -279,6 +279,9 @@ public:
   LLVM_PREFERRED_TYPE(bool)
   unsigned DisableFree : 1;
 
+  /// Dump Function Extents Variable 
+  bool DumpFunctionExtents = false;
+
   /// When generating PCH files, instruct the AST writer to create relocatable
   /// PCH files.
   LLVM_PREFERRED_TYPE(bool)

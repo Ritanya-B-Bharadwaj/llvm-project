@@ -9313,3 +9313,6 @@ def wasm_opt : Flag<["--"], "wasm-opt">,
   Group<m_Group>,
   HelpText<"Enable the wasm-opt optimizer (default)">,
   MarshallingInfoNegativeFlag<LangOpts<"NoWasmOpt">>;
+def fdump_function_extents : Flag<["-"], "fdump-function-extents">,
+  HelpText<"Dump function extents">,
+  Visibility<[CC1Option]>;
