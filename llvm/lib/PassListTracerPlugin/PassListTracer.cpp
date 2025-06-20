@@ -21,7 +21,7 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
             PassID.contains("Correlated") || PassID.contains("ConstraintElimination") ||
             PassID.contains("DivRemPairs") || PassID.contains("CallSiteSplitting") ||
             PassID.contains("Float2Int") || PassID.contains("ADCE")) {
-            errs() << "Optimization pass: " << PassID << "\n";
+            outs() << "Optimization pass: " << PassID << "\n";
         }
                     });
             }
