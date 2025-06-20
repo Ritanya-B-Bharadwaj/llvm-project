@@ -10,7 +10,7 @@ from pdfminer.high_level import extract_text
 REPO = "llvm/llvm-project"
 MODEL_NAME = "llama3-70b-8192"
 PDF_PATH = "OpenMPSpec.pdf"
-# API = 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
+
 # ============================
 client = Groq()
 
