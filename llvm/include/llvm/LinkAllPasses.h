@@ -45,6 +45,7 @@
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
+#include "llvm/Transforms/ComputationalIntensity/ComputationalIntensityPass.h"
 #include <cstdlib>
 
 namespace {
