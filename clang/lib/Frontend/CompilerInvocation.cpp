@@ -2976,6 +2976,14 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
 
   FrontendOptions &FrontendOpts = Opts;
 
+  if (Args.hasArg(OPT_fdump_function_extents)) {
+    Opts.DumpFunctionExtents = true;
+  }
+
+  if (Opts.DumpFunctionExtents){
+    Opts.AddPluginActions.push_back("dump-function-extents");
+  }
+
 #define FRONTEND_OPTION_WITH_MARSHALLING(...)                                  \
   PARSE_OPTION_WITH_MARSHALLING(Args, Diags, __VA_ARGS__)
 #include "clang/Driver/Options.inc"

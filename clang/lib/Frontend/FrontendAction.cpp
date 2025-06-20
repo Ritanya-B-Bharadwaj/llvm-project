@@ -28,6 +28,7 @@
 #include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Frontend/SARIFDiagnosticPrinter.h"
 #include "clang/Frontend/Utils.h"
+#include "clang/Frontend/FunctionExtentConsumer.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Lex/Preprocessor.h"
@@ -302,6 +303,11 @@ FrontendAction::CreateWrappedASTConsumer(CompilerInstance &CI,
     return nullptr;
 
   std::vector<std::unique_ptr<ASTConsumer>> Consumers;
+
+  if (CI.getFrontendOpts().DumpFunctionExtents) {
+    Consumers.push_back(std::make_unique<FunctionExtentConsumer>());
+  }
+
   llvm::StringRef DumpDeserializedDeclarationRangesPath =
       CI.getFrontendOpts().DumpMinimizationHintsPath;
   if (!DumpDeserializedDeclarationRangesPath.empty()) {
