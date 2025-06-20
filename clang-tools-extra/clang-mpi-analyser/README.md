@@ -45,6 +45,7 @@ This tool aims to automatically identify such opportunities for optimization, gu
 ## Installation
 
 This project is built as a Clang tool within the LLVM ecosystem. The standard way to build it is as part of `clang-tools-extra`.
+**Please Note:** All the changes to the project have been made on the mp-mpi-analyser-changes branch
 
 ### Prerequisites
 
@@ -61,6 +62,23 @@ This project is built as a Clang tool within the LLVM ecosystem. The standard wa
     # For Fedora/RHEL
     sudo dnf install @development-tools cmake python3 python3-pip openmpi-devel
     ```
+    ###  Project Structure
+
+```text
+llvm-project/
+├── clang-tools-extra/
+│   └── clang-mpi-analyser/
+│       ├── CMakeLists.txt
+│       └── tool/
+│           ├── main.cpp
+│           ├── MPIAction.h
+│           ├── MPIConsumer.h
+│           ├── MPIAnalyser.h
+│           ├── MPIAnalysisHelperFuncs.h.
+│           ├── MPIAnalyzer.cpp
+│           ├── MPIAction.cpp
+│           └── MPIAnalysisHelperFuncs.cpp
+```
 
 ### Building the Project
 
@@ -102,16 +120,10 @@ The `clang-mpi-analyser` tool operates on C/C++ source files. You need to provid
 
 ## Sample Input and output
 ```bash
-// File: test.cpp
 #include <mpi.h>
 #include <stdio.h>
-#include <stdlib.h> // For malloc/free
+#include <stdlib.h>
 
-// --- Manual Allgather Implementation ---
-// Simulates MPI_Allgather using point-to-point communication.
-// Each process sends its local data to every other process, and
-// receives data from every other process into its portion of the global buffer.
-// This pattern should be flagged by your analyzer as a candidate for MPI_Allgather.
 void manual_allgather(int* sendbuf, int sendcount, MPI_Datatype sendtype,
                       int* recvbuf, int recvcount, MPI_Datatype recvtype,
                       MPI_Comm comm) {
@@ -119,25 +131,12 @@ void manual_allgather(int* sendbuf, int sendcount, MPI_Datatype sendtype,
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &num_procs);
 
-    // Each process iterates through all other processes (including itself).
-    // For each 'i', it sends its local data to 'i' and receives data from 'i'.
-    // The received data from rank 'i' goes into the i-th block of the recvbuf.
     for (int i = 0; i < num_procs; ++i) {
-        // Each process sends its local 'sendbuf' to process 'i'
         MPI_Send(sendbuf, sendcount, sendtype, i, 0, comm);
-
-        // Each process receives data from process 'i'
-        // The received data from rank 'i' is placed into the 'i'-th block of the 'recvbuf'.
         MPI_Recv(recvbuf + i * recvcount, recvcount, recvtype, i, 0, comm, MPI_STATUS_IGNORE);
-        // printf("Rank %d: Sent to %d, Received from %d\n", rank, i, i); // For verbose debug
     }
 }
 
-// --- Manual Alltoall Implementation ---
-// Simulates MPI_Alltoall using point-to-point communication.
-// Each process sends a different chunk of its data to each other process, and
-// receives a different chunk from each other process.
-// This pattern should be flagged by your analyzer as a candidate for MPI_Alltoall.
 void manual_alltoall(int* sendbuf, int sendcount, MPI_Datatype sendtype,
                      int* recvbuf, int recvcount, MPI_Datatype recvtype,
                      MPI_Comm comm) {
@@ -145,74 +144,49 @@ void manual_alltoall(int* sendbuf, int sendcount, MPI_Datatype sendtype,
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &num_procs);
 
-    // Each process iterates through all other processes (including itself).
-    // For each 'i', it sends its 'i'-th chunk to process 'i', and
-    // receives its 'i'-th chunk from process 'i'.
     for (int i = 0; i < num_procs; ++i) {
-        // Send the (i)-th chunk of local 'sendbuf' to process 'i'
         MPI_Send(sendbuf + i * sendcount, sendcount, sendtype, i, 0, comm);
-
-        // Receive data from process 'i' into the (i)-th chunk of local 'recvbuf'
         MPI_Recv(recvbuf + i * recvcount, recvcount, recvtype, i, 0, comm, MPI_STATUS_IGNORE);
-        // printf("Rank %d: Sent chunk %d to %d, Received chunk from %d\n", rank, i, i, i); // For verbose debug
     }
 }
 
-// --- Previous Manual Gather (Root-based) ---
-// This should still be detected as Manual Gather by your analyzer.
 void manual_gather_root_based(int* sendbuf, int sendcount, MPI_Datatype sendtype,
-                         int* recvbuf, int recvcount, MPI_Datatype recvtype,
-                         int root_rank_val, MPI_Comm comm) {
+                              int* recvbuf, int recvcount, MPI_Datatype recvtype,
+                              int root_rank_val, MPI_Comm comm) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
 
     if (rank == root_rank_val) {
-        // Root process gathers data
-        // Copy its own data first (or receive from self, less common but possible)
         MPI_Recv(recvbuf + rank * recvcount, recvcount, recvtype,
-                 rank, 0, comm, MPI_STATUS_IGNORE); // Receiving from self for gather
-
+                 rank, 0, comm, MPI_STATUS_IGNORE);
         for (int i = 0; i < size; ++i) {
-            if (i == rank) continue; // Skip self
-
-            // Root receives from process 'i'
+            if (i == rank) continue;
             MPI_Recv(recvbuf + i * recvcount, recvcount, recvtype,
                      i, 0, comm, MPI_STATUS_IGNORE);
-            // printf("Root %d received from rank %d\n", rank, i);
         }
     } else {
-        // Non-root processes send their data to the root
         MPI_Send(sendbuf, sendcount, sendtype, root_rank_val, 0, comm);
-        // printf("Rank %d sent to root %d\n", rank, root_rank_val);
     }
 }
 
-// --- Previous Manual Scatter (Root-based) ---
-// This should still be detected as Manual Scatter by your analyzer.
 void manual_scatter_root_based(int* sendbuf, int sendcount, MPI_Datatype sendtype,
-                           int* recvbuf, int recvcount, MPI_Datatype recvType,
-                           int root_rank_val, MPI_Comm comm) {
+                               int* recvbuf, int recvcount, MPI_Datatype recvType,
+                               int root_rank_val, MPI_Comm comm) {
     int rank, size;
     MPI_Comm_rank(comm, &rank);
     MPI_Comm_size(comm, &size);
 
     if (rank == root_rank_val) {
-        // Root process scatters data
         for (int i = 0; i < size; ++i) {
-            // Root sends a chunk of data to each process 'i'
             MPI_Send(sendbuf + i * sendcount, sendcount, sendtype,
                      i, 0, comm);
-            // printf("Root %d sent to rank %d\n", rank, i);
         }
     } else {
-        // Non-root processes receive their portion from the root
         MPI_Recv(recvbuf, recvcount, recvType,
                  root_rank_val, 0, comm, MPI_STATUS_IGNORE);
-        // printf("Rank %d received from root %d\n", rank, root_rank_val);
     }
 }
-
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
@@ -228,13 +202,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const int DATA_COUNT = 2; // Data elements per process for each operation
+    const int DATA_COUNT = 2;
 
-    // --- Test Manual Allgather ---
     printf("--- Rank %d: Testing Manual Allgather ---\n", rank);
     int* allgather_send_data = (int*)malloc(DATA_COUNT * sizeof(int));
     for (int i = 0; i < DATA_COUNT; ++i) {
-        allgather_send_data[i] = rank * 10 + i; // e.g., Rank 0 sends [0,1], Rank 1 sends [10,11]
+        allgather_send_data[i] = rank * 10 + i;
     }
     int* allgather_recv_data = (int*)malloc(num_procs * DATA_COUNT * sizeof(int));
 
@@ -252,14 +225,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("-----------------------------------------\n\n");
 
-
-    // --- Test Manual Alltoall ---
     printf("--- Rank %d: Testing Manual Alltoall ---\n", rank);
     int* alltoall_send_data = (int*)malloc(num_procs * DATA_COUNT * sizeof(int));
-    // Each rank prepares data specifically for each other rank
     for (int i = 0; i < num_procs; ++i) {
         for (int j = 0; j < DATA_COUNT; ++j) {
-            // Data for rank 'i' from this process 'rank'
             alltoall_send_data[i * DATA_COUNT + j] = rank * 100 + i * 10 + j;
         }
     }
@@ -279,8 +248,6 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("-----------------------------------------\n\n");
 
-
-    // --- Test Manual Gather (Root 0) ---
     printf("--- Rank %d: Testing Manual Gather (Root 0) ---\n", rank);
     int gather_my_val = rank + 1;
     int *gather_all_vals = NULL;
@@ -301,7 +268,6 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("-----------------------------------------\n\n");
 
-    // --- Test Manual Scatter (Root 0) ---
     printf("--- Rank %d: Testing Manual Scatter (Root 0) ---\n", rank);
     int *scatter_send_vals = NULL;
     if (rank == 0) {
@@ -321,10 +287,10 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("-----------------------------------------\n\n");
 
-
     MPI_Finalize();
     return 0;
 }
+
 ```
 
 ## Sample output
