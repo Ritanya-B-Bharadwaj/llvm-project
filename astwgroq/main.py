@@ -6,7 +6,7 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 # ==== CONFIG ====
-GROQ_API_KEY = "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"
+GROQ_API_KEY = ""
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = "llama3-70b-8192"
 OUTPUT_FILE = "output.txt"
