@@ -104,7 +104,13 @@ make -j$(nproc)
 
 ![Demo SS](https://github.com/AnanyaBhatblr/llvm-project/blob/main/clang/tools/ai-powered-reviewer-suggestion-tool/demo_ss.png)
 
-![Demo GIF]("/ai-powered-reviewer-suggestion-tool/media/demo.gif")
+
+![Demo SS](https://github.com/AnanyaBhatblr/llvm-project/blob/main/clang/tools/ai-powered-reviewer-suggestion-tool/img1.jpeg)
+
+
+![Demo SS](https://github.com/AnanyaBhatblr/llvm-project/blob/main/clang/tools/ai-powered-reviewer-suggestion-tool/img2.jpeg)
+
+
 
 
 ### Advanced Options
