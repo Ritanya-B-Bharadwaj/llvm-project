@@ -5,27 +5,28 @@ This tool statically analyzes LLVM IR code to identify **opportunities for MPI r
 ## 📁 Project Structure
 
 MPIReduction/
-├── build/ # Build directory (CMake output + binary)
-│ └── mpi_reduction_analyzer
-├── include/ # Header files
-│ ├── MPIReductionAnalyzer.h
-│ ├── MPIReductionPass.h
-│ ├── ReductionDetector.h
-│ └── Utils.h
-├── src/ # Source files (main logic)
-│ ├── main.cpp
-│ ├── MPIReductionAnalyzer.cpp
-│ ├── MPIReductionPass.cpp
-│ ├── ReductionDetector.cpp
-│ └── Utils.cpp
-├── test/ # Test files
-│ ├── mpi.h
-│ ├── test_reduction.ll # LLVM IR for testing
-│ ├── testit.c # Optional C file to generate IR
-│ └── testit.ll
-├── CMakeLists.txt # CMake configuration
-├── build.md # (Optional) Build documentation
-└── README.md # 📄 You're reading it!
+├── build/                     # Build directory (CMake output + binary)
+│   └── mpi_reduction_analyzer
+├── include/                   # Header files
+│   ├── MPIReductionAnalyzer.h
+│   ├── MPIReductionPass.h
+│   ├── ReductionDetector.h
+│   └── Utils.h
+├── src/                       # Source files (main logic)
+│   ├── main.cpp
+│   ├── MPIReductionAnalyzer.cpp
+│   ├── MPIReductionPass.cpp
+│   ├── ReductionDetector.cpp
+│   └── Utils.cpp
+├── test/                      # Test files
+│   ├── mpi.h
+│   ├── test_reduction.ll      # LLVM IR for testing
+│   ├── testit.c               # Optional C file to generate IR
+│   └── testit.ll
+├── CMakeLists.txt             # CMake configuration
+├── build.md                   # (Optional) Build documentation
+└── README.md                  # 📄 You're reading it!
+
 
 ## ⚙️ Prerequisites
 
