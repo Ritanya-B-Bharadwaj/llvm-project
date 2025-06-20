@@ -9,7 +9,7 @@ from pdfminer.high_level import extract_text
 # ========== CONFIG ==========
 REPO = "llvm/llvm-project"
 MODEL_NAME = "llama3-70b-8192"
-PDF_PATH = "OpenMPSpec.pdf"
+#PDF_PATH = "OpenMPSpec.pdf"  The file OpenMPSpec.pdf should be included in the directory.
 
 # ============================
 client = Groq()
