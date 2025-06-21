@@ -174,8 +174,7 @@ def main():
             json.dump(structured_mapping(directives, mapping), f, indent=2)
 
     if args.explain:
-        # Default hardcoded API key
-        default_api_key = 'AIzaSyAlxhw27XZXOHVrufhs_KrwR40Td8dyoCw'
+        
         api_key = args.api_key or os.getenv('GOOGLE_API_KEY') or default_api_key
         if not api_key:
             print('No API key provided for Gemini explanations.')
