@@ -2807,6 +2807,13 @@ def ffreestanding : Flag<["-"], "ffreestanding">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Assert that the compilation takes place in a freestanding environment">,
   MarshallingInfoFlag<LangOpts<"Freestanding">>;
+
+def symbolic_map : Flag<["-"], "symbolic-map">,
+  Group<f_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Automatically generate a map of symbolic names for enumerators">,
+  MarshallingInfoFlag<LangOpts<"SymbolicMap">>;
+
 def fgnuc_version_EQ : Joined<["-"], "fgnuc-version=">, Group<f_Group>,
   HelpText<"Sets various macros to claim compatibility with the given GCC version (default is 4.2.1)">,
   Visibility<[ClangOption, CC1Option, CLOption]>;
