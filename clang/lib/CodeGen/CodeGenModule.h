@@ -1820,6 +1820,9 @@ public:
   }
 
 private:
+  /// Emit the symbolic map for an enum declaration.
+  void EmitEnumSymbolicMap(const EnumDecl *ED);
+
   bool shouldDropDLLAttribute(const Decl *D, const llvm::GlobalValue *GV) const;
 
   llvm::Constant *GetOrCreateLLVMFunction(

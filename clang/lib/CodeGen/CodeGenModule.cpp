@@ -7372,11 +7372,22 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
         DI->EmitAndRetainType(getContext().getRecordType(cast<RecordDecl>(D)));
     break;
 
-  case Decl::Enum:
-    if (CGDebugInfo *DI = getModuleDebugInfo())
-      if (cast<EnumDecl>(D)->getDefinition())
-        DI->EmitAndRetainType(getContext().getEnumType(cast<EnumDecl>(D)));
-    break;
+  case Decl::Enum: {
+      // Cast the declaration to the specific Enum type
+      auto *ED = cast<EnumDecl>(D);
+
+      // Call the symbolic map emitter if the option is enabled.
+      if (getLangOpts().SymbolicMap) {
+        EmitEnumSymbolicMap(ED);
+      }
+
+      // Handle debug info, which is standard for enums
+      if (CGDebugInfo *DI = getModuleDebugInfo())
+        if (ED->getDefinition())
+          DI->EmitAndRetainType(getContext().getEnumType(ED));
+
+      break;
+    }
 
   case Decl::HLSLBuffer:
     getHLSLRuntime().addBuffer(cast<HLSLBufferDecl>(D));
@@ -7474,6 +7485,50 @@ void CodeGenModule::EmitDeferredUnusedCoverageMappings() {
       break;
     };
   }
+}
+
+// Additions to support symbolic maps for enums.
+void CodeGenModule::EmitEnumSymbolicMap(const EnumDecl *ED) {
+  // Skip anonymous or unnamed enums.
+  if (!ED->getDeclName() || ED->getName().empty()) {
+    return;
+  }
+
+  // Skip empty enums.
+  if (ED->enumerator_begin() == ED->enumerator_end()) {
+    return;
+  }
+
+  // Only handle definitions, not forward declarations.
+  if (!ED->isThisDeclarationADefinition()) {
+    return;
+  }
+
+  std::vector<llvm::Constant *> EnumeratorNames;
+
+  for (const EnumConstantDecl *ECD : ED->enumerators()) {
+    EnumeratorNames.push_back(
+        GetAddrOfConstantCString(ECD->getName().str()).getPointer());
+  }
+
+  llvm::Type *I8Ty = llvm::Type::getInt8Ty(getLLVMContext());
+  llvm::PointerType *CharPtrTy = llvm::PointerType::get(I8Ty, 0);
+
+  llvm::ArrayType *ArrayTy = llvm::ArrayType::get(CharPtrTy, EnumeratorNames.size());
+  llvm::Constant *Initializer = llvm::ConstantArray::get(ArrayTy, EnumeratorNames);
+
+  std::string VarName = "__nameof_" + ED->getNameAsString();
+
+  auto *GV = new llvm::GlobalVariable(
+      getModule(),
+      ArrayTy,
+      true,
+      llvm::GlobalValue::WeakODRLinkage,
+      Initializer,
+      VarName
+  );
+
+  GV->setAlignment(llvm::MaybeAlign(getDataLayout().getPointerABIAlignment(0)));
 }
 
 void CodeGenModule::EmitMainVoidAlias() {
