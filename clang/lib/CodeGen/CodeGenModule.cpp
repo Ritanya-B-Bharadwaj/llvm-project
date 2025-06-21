@@ -7376,7 +7376,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
       // Cast the declaration to the specific Enum type
       auto *ED = cast<EnumDecl>(D);
 
-      // Call your function *only if* the command-line flag was used
+      // Call the symbolic map emitter if the option is enabled.
       if (getLangOpts().SymbolicMap) {
         EmitEnumSymbolicMap(ED);
       }
@@ -7407,60 +7407,6 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     assert(isa<TypeDecl>(D) && "Unsupported decl kind");
     break;
   }
-}
-
-void CodeGenModule::EmitEnumSymbolicMap(const EnumDecl *ED) {
-  // We can't generate a map for an anonymous enum, as it has no name
-  // to derive our variable name from. e.g., enum { A, B };
-  if (!ED->getDeclName() || ED->getName().empty()) {
-    return;
-  }
-
-  // Also, don't generate a map for an empty enum.
-  if (ED->enumerator_begin() == ED->enumerator_end()) {
-    return;
-  }
-
-  // We only want to emit this for the definition of the enum, not for
-  // forward declarations.
-  if (!ED->isThisDeclarationADefinition()) {
-    return;
-  }
-
-  // Collect the enumerator names.
-  std::vector<llvm::Constant *> EnumeratorNames;
-
-  for (const EnumConstantDecl *ECD : ED->enumerators()) {
-    // FIX #1 & #2: Use the correct function 'GetAddrOfConstantCString'
-    // and convert the StringRef from getName() to a std::string using .str().
-    EnumeratorNames.push_back(
-        GetAddrOfConstantCString(ECD->getName().str()).getPointer());
-  }
-
-  // FIX #3: Get the 'i8*' type using the fundamental, two-step method.
-  llvm::Type *I8Ty = llvm::Type::getInt8Ty(getLLVMContext());
-  llvm::PointerType *CharPtrTy = llvm::PointerType::get(I8Ty, 0);
-
-  llvm::ArrayType *ArrayTy = llvm::ArrayType::get(CharPtrTy, EnumeratorNames.size());
-
-  // Create the constant array initializer with the collected string pointers.
-  llvm::Constant *Initializer = llvm::ConstantArray::get(ArrayTy, EnumeratorNames);
-
-  // Construct the name for our global variable, e.g., "__nameof_Day".
-  std::string VarName = "__nameof_" + ED->getNameAsString();
-
-  // Create the global variable in the LLVM Module.
-  auto *GV = new llvm::GlobalVariable(
-      getModule(),
-      ArrayTy,
-      true, // isConstant
-      llvm::GlobalValue::WeakODRLinkage,
-      Initializer,
-      VarName
-  );
-
-  // Pass the required address space argument (0 for the default).
-  GV->setAlignment(llvm::MaybeAlign(getDataLayout().getPointerABIAlignment(0)));
 }
 
 void CodeGenModule::AddDeferredUnusedCoverageMapping(Decl *D) {
@@ -7539,6 +7485,50 @@ void CodeGenModule::EmitDeferredUnusedCoverageMappings() {
       break;
     };
   }
+}
+
+// Additions to support symbolic maps for enums.
+void CodeGenModule::EmitEnumSymbolicMap(const EnumDecl *ED) {
+  // Skip anonymous or unnamed enums.
+  if (!ED->getDeclName() || ED->getName().empty()) {
+    return;
+  }
+
+  // Skip empty enums.
+  if (ED->enumerator_begin() == ED->enumerator_end()) {
+    return;
+  }
+
+  // Only handle definitions, not forward declarations.
+  if (!ED->isThisDeclarationADefinition()) {
+    return;
+  }
+
+  std::vector<llvm::Constant *> EnumeratorNames;
+
+  for (const EnumConstantDecl *ECD : ED->enumerators()) {
+    EnumeratorNames.push_back(
+        GetAddrOfConstantCString(ECD->getName().str()).getPointer());
+  }
+
+  llvm::Type *I8Ty = llvm::Type::getInt8Ty(getLLVMContext());
+  llvm::PointerType *CharPtrTy = llvm::PointerType::get(I8Ty, 0);
+
+  llvm::ArrayType *ArrayTy = llvm::ArrayType::get(CharPtrTy, EnumeratorNames.size());
+  llvm::Constant *Initializer = llvm::ConstantArray::get(ArrayTy, EnumeratorNames);
+
+  std::string VarName = "__nameof_" + ED->getNameAsString();
+
+  auto *GV = new llvm::GlobalVariable(
+      getModule(),
+      ArrayTy,
+      true,
+      llvm::GlobalValue::WeakODRLinkage,
+      Initializer,
+      VarName
+  );
+
+  GV->setAlignment(llvm::MaybeAlign(getDataLayout().getPointerABIAlignment(0)));
 }
 
 void CodeGenModule::EmitMainVoidAlias() {

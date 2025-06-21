@@ -1820,8 +1820,7 @@ public:
   }
 
 private:
-  /// Emits a global array of C-string pointers for the symbolic
-  /// names of an enumeration's members.
+  /// Emit the symbolic map for an enum declaration.
   void EmitEnumSymbolicMap(const EnumDecl *ED);
 
   bool shouldDropDLLAttribute(const Decl *D, const llvm::GlobalValue *GV) const;

@@ -2808,6 +2808,7 @@ def ffreestanding : Flag<["-"], "ffreestanding">, Group<f_Group>,
   HelpText<"Assert that the compilation takes place in a freestanding environment">,
   MarshallingInfoFlag<LangOpts<"Freestanding">>;
 
+// Changes made for symbolic map
 def symbolic_map : Flag<["-"], "symbolic-map">,
   Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
