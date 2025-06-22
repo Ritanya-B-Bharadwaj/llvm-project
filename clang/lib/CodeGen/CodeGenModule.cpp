@@ -458,6 +458,34 @@ CodeGenModule::CodeGenModule(ASTContext &C,
   if (Context.getTargetInfo().getTriple().getArch() == llvm::Triple::x86)
     getModule().addModuleFlag(llvm::Module::Error, "NumRegisterParameters",
                               CodeGenOpts.NumRegisterParameters);
+
+  // Add a global variable for the source file name.
+  if (!TheModule.getSourceFileName().empty()) {
+    llvm::SmallString<256> MangledNameBuffer;
+    llvm::raw_svector_ostream Out(MangledNameBuffer);
+    Out << "__cli_";
+    // Manually replace non-alphanumeric characters with underscores.
+    for (char C : TheModule.getSourceFileName()) {
+      if (llvm::isAlnum(C)) {
+        Out << C;
+      } else if (C == '.') {
+        Out << '_';
+      } else {
+        Out << '_'; // Replace other special characters with underscore
+      }
+    }
+
+    llvm::Constant *SourceFileNameConstant =
+        llvm::ConstantDataArray::getString(LLVMContext, TheModule.getSourceFileName());
+
+    new llvm::GlobalVariable(
+        TheModule,
+        SourceFileNameConstant->getType(),
+        true,
+        llvm::GlobalValue::ExternalLinkage,
+        SourceFileNameConstant,
+        MangledNameBuffer.str());
+  }
 }
 
 CodeGenModule::~CodeGenModule() {}
@@ -2542,8 +2570,8 @@ void CodeGenModule::SetLLVMFunctionAttributesForDefinition(const Decl *D,
     if (getLangOpts().HLSL && !F->hasFnAttribute(llvm::Attribute::NoInline))
       B.addAttribute(llvm::Attribute::AlwaysInline);
     // If we don't have a declaration to control inlining, the function isn't
-    // explicitly marked as alwaysinline for semantic reasons, and inlining is
-    // disabled, mark the function as noinline.
+    // explicitly marked as alwaysinline for semantic reasons, and inlining
+    // is disabled, mark the function as noinline.
     else if (!F->hasFnAttribute(llvm::Attribute::AlwaysInline) &&
              CodeGenOpts.getInlining() == CodeGenOptions::OnlyAlwaysInlining)
       B.addAttribute(llvm::Attribute::NoInline);
@@ -4900,6 +4928,9 @@ llvm::Constant *CodeGenModule::GetOrCreateLLVMFunction(
 /// GetAddrOfFunction - Return the address of the given function.  If Ty is
 /// non-null, then this function will use the specified type if it has to
 /// create it (this occurs when we see a definition of the function).
+///
+/// If D is non-null, it specifies a decl that correspond to this.  This is used
+/// to set the attributes on the function when it is first created.
 llvm::Constant *
 CodeGenModule::GetAddrOfFunction(GlobalDecl GD, llvm::Type *Ty, bool ForVTable,
                                  bool DontDefer,
@@ -6874,7 +6905,7 @@ ConstantAddress CodeGenModule::GetAddrOfGlobalTemporary(
                                                MaterializedType);
     Constant =
         MaterializedType.isConstantStorage(getContext(), /*ExcludeCtor*/ Value,
-                                           /*ExcludeDtor*/ false);
+                                          /*ExcludeDtor*/ false);
     Type = InitialValue->getType();
   } else {
     // No initializer, the initialization will be provided when we
@@ -6995,7 +7026,7 @@ void CodeGenModule::EmitObjCIvarInitializations(ObjCImplementationDecl *D) {
         getContext().VoidTy, nullptr, D,
         /*isInstance=*/true, /*isVariadic=*/false,
         /*isPropertyAccessor=*/true, /*isSynthesizedAccessorStub=*/false,
-        /*isImplicitlyDeclared=*/true,
+        /*isImmediateFunction=*/true,
         /*isDefined=*/false, ObjCImplementationControl::Required);
     D->addInstanceMethod(DTORMethod);
     CodeGenFunction(*this).GenerateObjCCtorDtorMethod(D, DTORMethod, false);
@@ -7016,7 +7047,7 @@ void CodeGenModule::EmitObjCIvarInitializations(ObjCImplementationDecl *D) {
       getContext().getObjCIdType(), nullptr, D, /*isInstance=*/true,
       /*isVariadic=*/false,
       /*isPropertyAccessor=*/true, /*isSynthesizedAccessorStub=*/false,
-      /*isImplicitlyDeclared=*/true,
+      /*isImmediateFunction=*/true,
       /*isDefined=*/false, ObjCImplementationControl::Required);
   D->addInstanceMethod(CTORMethod);
   CodeGenFunction(*this).GenerateObjCCtorDtorMethod(D, CTORMethod, true);
