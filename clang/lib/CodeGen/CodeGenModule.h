@@ -38,6 +38,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
+#include "llvm/ADT/SmallString.h"
 #include <optional>
 
 namespace llvm {
