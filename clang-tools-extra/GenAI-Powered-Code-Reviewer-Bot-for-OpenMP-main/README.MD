@@ -184,7 +184,7 @@ This will:
 - Load the FAISS index + metadata
 - Fetch diffs and generate Gemini-powered suggestions
 
-![cli_output](cli_output.png)
+![cli_output](cli_output.jpeg)
 
 ---
 
