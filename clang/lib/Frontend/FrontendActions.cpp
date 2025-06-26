@@ -6,6 +6,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
@@ -336,8 +339,64 @@ GenerateHeaderUnitAction::CreateOutputFile(CompilerInstance &CI,
 SyntaxOnlyAction::~SyntaxOnlyAction() {
 }
 
+namespace {
+class FunctionExtentsDumper : public clang::ASTConsumer,
+                              public clang::RecursiveASTVisitor<FunctionExtentsDumper> {
+private:
+  clang::SourceManager &SM;
+  llvm::raw_ostream &OS;
+
+public:
+  FunctionExtentsDumper(clang::SourceManager &SM, llvm::raw_ostream &OS)
+      : SM(SM), OS(OS) {}
+
+  void HandleTranslationUnit(clang::ASTContext &Context) override {
+    TraverseDecl(Context.getTranslationUnitDecl());
+  }
+
+  bool VisitFunctionDecl(clang::FunctionDecl *FD) {
+    if (!FD->hasBody() || !FD->isThisDeclarationADefinition())
+      return true;
+
+    clang::SourceLocation StartLoc = FD->getBeginLoc();
+    clang::SourceLocation EndLoc = FD->getEndLoc();
+
+    if (SM.isInSystemHeader(StartLoc) || StartLoc.isInvalid() || EndLoc.isInvalid())
+      return true;
+
+    llvm::StringRef FileName = SM.getFilename(StartLoc);
+    if (FileName.empty())
+      return true;
+
+    unsigned StartLine = SM.getExpansionLineNumber(StartLoc);
+    unsigned EndLine = SM.getExpansionLineNumber(EndLoc);
+
+    std::string FunctionName;
+    if (const auto *MD = llvm::dyn_cast<clang::CXXMethodDecl>(FD)) {
+      if (const auto *RD = MD->getParent())
+        FunctionName = RD->getNameAsString() + "::" + MD->getNameAsString();
+    } else {
+      FunctionName = FD->getNameAsString();
+    }
+
+    OS << FunctionName << ":" << llvm::sys::path::filename(FileName)
+       << ":" << StartLine << "-" << EndLine << "\n";
+
+    return true;
+  }
+};
+} // anonymous namespace
+
+
 std::unique_ptr<ASTConsumer>
 SyntaxOnlyAction::CreateASTConsumer(CompilerInstance &CI, StringRef InFile) {
+  if (CI.getFrontendOpts().DumpFunctionExtents) {
+    std::vector<std::unique_ptr<ASTConsumer>> Consumers;
+    Consumers.push_back(std::make_unique<ASTConsumer>());
+    Consumers.push_back(std::make_unique<FunctionExtentsDumper>(
+        CI.getSourceManager(), llvm::outs()));
+    return std::make_unique<MultiplexConsumer>(std::move(Consumers));
+  }
   return std::make_unique<ASTConsumer>();
 }
 

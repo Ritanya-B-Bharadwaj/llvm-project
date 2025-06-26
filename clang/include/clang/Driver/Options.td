@@ -7601,6 +7601,10 @@ def no_implicit_float : Flag<["-"], "no-implicit-float">,
 def fdump_vtable_layouts : Flag<["-"], "fdump-vtable-layouts">,
   HelpText<"Dump the layouts of all vtables that will be emitted in a translation unit">,
   MarshallingInfoFlag<LangOpts<"DumpVTableLayouts">>;
+
+def fdump_function_extents : Flag<["-"], "fdump-function-extents">, Group<f_clang_Group>,
+  HelpText<"Dump lexical extents of all functions (file:start_line-end_line)">;
+
 def fmerge_functions : Flag<["-"], "fmerge-functions">,
   HelpText<"Permit merging of identical functions when optimizing.">,
   MarshallingInfoFlag<CodeGenOpts<"MergeFunctions">>;
