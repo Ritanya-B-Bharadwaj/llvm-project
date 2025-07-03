@@ -28,6 +28,7 @@ add_subdirectory(clang-query)
 add_subdirectory(include-cleaner)
 add_subdirectory(pp-trace)
 add_subdirectory(tool-template)
+add_subdirectory(clang-mpi-analyser)
 
 option(CLANG_TOOLS_EXTRA_INCLUDE_DOCS "Generate build targets for the Clang Extra Tools docs."
   ${LLVM_INCLUDE_DOCS})
@@ -48,3 +49,5 @@ if(CLANG_INCLUDE_TESTS)
   add_subdirectory(unittests)
   umbrella_lit_testsuite_end(check-clang-tools)
 endif()
+
+
