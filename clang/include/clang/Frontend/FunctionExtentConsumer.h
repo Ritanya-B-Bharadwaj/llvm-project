@@ -24,4 +24,4 @@ protected:
 
 } // namespace clang
 
-#endif // LLVM_CLANG_FRONTEND_FUNCTIONEXTENTPLUGIN_H
+#endif

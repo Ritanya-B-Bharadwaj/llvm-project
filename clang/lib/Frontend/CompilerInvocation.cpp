@@ -24,20 +24,24 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/TargetOptions.h"
 #include "clang/Basic/Version.h"
+#include "clang/Basic/Visibility.h"
 #include "clang/Basic/XRayInstr.h"
 #include "clang/Config/config.h"
 #include "clang/Driver/Driver.h"
+#include "clang/Driver/DriverDiagnostic.h"
 #include "clang/Driver/Options.h"
 #include "clang/Frontend/CommandLineSourceLoc.h"
 #include "clang/Frontend/DependencyOutputOptions.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
 #include "clang/Frontend/FrontendOptions.h"
+#include "clang/Frontend/FrontendPluginRegistry.h"
 #include "clang/Frontend/MigratorOptions.h"
 #include "clang/Frontend/PreprocessorOutputOptions.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/HeaderSearchOptions.h"
 #include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Sema/CodeCompleteOptions.h"
 #include "clang/Serialization/ASTBitCodes.h"
 #include "clang/Serialization/ModuleFileExtension.h"
 #include "clang/StaticAnalyzer/Core/AnalyzerOptions.h"
@@ -45,7 +49,9 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/FloatingPointMode.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -81,6 +87,7 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -1492,11 +1499,11 @@ static void setPGOUseInstrumentor(CodeGenOptions &Opts,
   // which is available (might be one or both).
   if (PGOReader->isIRLevelProfile() || PGOReader->hasMemoryProfile()) {
     if (PGOReader->hasCSIRLevelProfile())
-      Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileCSIRInstr);
+      Opts.setProfileUse(CodeGenOptions::ProfileCSIRInstr);
     else
-      Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileIRInstr);
+      Opts.setProfileUse(CodeGenOptions::ProfileIRInstr);
   } else
-    Opts.setProfileUse(llvm::driver::ProfileInstrKind::ProfileClangInstr);
+    Opts.setProfileUse(CodeGenOptions::ProfileClangInstr);
 }
 
 void CompilerInvocation::setDefaultPointerAuthOptions(
@@ -2976,13 +2983,25 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
 
   FrontendOptions &FrontendOpts = Opts;
 
-  if (Args.hasArg(OPT_fdump_function_extents)) {
-    Opts.DumpFunctionExtents = true;
-  }
+// For function extents dumping
 
-  if (Opts.DumpFunctionExtents){
-    Opts.AddPluginActions.push_back("dump-function-extents");
-  }
+if (Args.hasArg(OPT_fdump_function_extents)) {
+  Opts.DumpFunctionExtents = true;
+}
+
+if (Opts.DumpFunctionExtents){
+  Opts.AddPluginActions.push_back("dump-function-extents");
+}
+
+// For class extents dumping
+
+if (Args.hasArg(OPT_fdump_class_extents)) {
+  Opts.DumpClassExtents = true;
+}
+
+if (Opts.DumpClassExtents){
+  Opts.AddPluginActions.push_back("dump-class-extents");
+}
 
 #define FRONTEND_OPTION_WITH_MARSHALLING(...)                                  \
   PARSE_OPTION_WITH_MARSHALLING(Args, Diags, __VA_ARGS__)

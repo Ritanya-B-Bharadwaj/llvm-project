@@ -28,7 +28,6 @@
 #include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Frontend/SARIFDiagnosticPrinter.h"
 #include "clang/Frontend/Utils.h"
-#include "clang/Frontend/FunctionExtentConsumer.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Lex/Preprocessor.h"
@@ -49,6 +48,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include <memory>
 #include <system_error>
+#include "clang/Frontend/FunctionExtentConsumer.h"
+#include "clang/Frontend/ClassExtentConsumer.h"
+
 using namespace clang;
 
 LLVM_INSTANTIATE_REGISTRY(FrontendPluginRegistry)
@@ -182,7 +184,7 @@ public:
         if (MergedRanges.back().second < It->second)
           MergedRanges.back().second = It->second;
       }
-      Result.push_back({Data.Ref->getName(), std::move(MergedRanges)});
+      Result.push_back({Data.Ref->getName(), MergedRanges});
     }
     printJson(Result);
   }
@@ -304,8 +306,14 @@ FrontendAction::CreateWrappedASTConsumer(CompilerInstance &CI,
 
   std::vector<std::unique_ptr<ASTConsumer>> Consumers;
 
+  // For Function extent Dumping
   if (CI.getFrontendOpts().DumpFunctionExtents) {
     Consumers.push_back(std::make_unique<FunctionExtentConsumer>());
+  }
+
+  // For Class extent Dumping
+  if (CI.getFrontendOpts().DumpClassExtents) {
+    Consumers.push_back(std::make_unique<ClassExtentConsumer>(CI.getASTContext()));
   }
 
   llvm::StringRef DumpDeserializedDeclarationRangesPath =
@@ -391,9 +399,11 @@ FrontendAction::CreateWrappedASTConsumer(CompilerInstance &CI,
       Consumers.push_back(std::move(C));
   }
 
+
   assert(Consumers.size() >= 1 && "should have added the main consumer");
   if (Consumers.size() == 1)
     return std::move(Consumers.front());
+
   return std::make_unique<MultiplexConsumer>(std::move(Consumers));
 }
 

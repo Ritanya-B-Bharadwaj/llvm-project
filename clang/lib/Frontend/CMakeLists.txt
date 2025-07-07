@@ -15,6 +15,7 @@ add_clang_library(clangFrontend
   ASTUnit.cpp
   ChainedDiagnosticConsumer.cpp
   ChainedIncludesSource.cpp
+  ClassExtentConsumer.cpp
   CompilerInstance.cpp
   CompilerInvocation.cpp
   CreateInvocationFromCommandLine.cpp
@@ -23,6 +24,7 @@ add_clang_library(clangFrontend
   DiagnosticRenderer.cpp
   FrontendAction.cpp
   FrontendActions.cpp
+  FunctionExtentConsumer.cpp
   FrontendOptions.cpp
   HeaderIncludeGen.cpp
   InitPreprocessor.cpp
