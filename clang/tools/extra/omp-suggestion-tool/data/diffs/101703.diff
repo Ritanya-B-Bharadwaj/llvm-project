@@ -1,0 +1,776 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index dd6068ba048cc..6dee31ddb6963 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -887,13 +887,64 @@ bool ClauseProcessor::processLink(
+       });
+ }
+ 
++void ClauseProcessor::processMapObjects(
++    lower::StatementContext &stmtCtx, mlir::Location clauseLocation,
++    const omp::ObjectList &objects,
++    llvm::omp::OpenMPOffloadMappingFlags mapTypeBits,
++    std::map<const semantics::Symbol *,
++             llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++    llvm::SmallVectorImpl<mlir::Value> &mapVars,
++    llvm::SmallVectorImpl<const semantics::Symbol *> *mapSyms,
++    llvm::SmallVectorImpl<mlir::Location> *mapSymLocs,
++    llvm::SmallVectorImpl<mlir::Type> *mapSymTypes) const {
++  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
++  for (const omp::Object &object : objects) {
++    llvm::SmallVector<mlir::Value> bounds;
++    std::stringstream asFortran;
++
++    lower::AddrAndBoundsInfo info =
++        lower::gatherDataOperandAddrAndBounds<mlir::omp::MapBoundsOp,
++                                              mlir::omp::MapBoundsType>(
++            converter, firOpBuilder, semaCtx, stmtCtx, *object.sym(),
++            object.ref(), clauseLocation, asFortran, bounds,
++            treatIndexAsSection);
++
++    // Explicit map captures are captured ByRef by default,
++    // optimisation passes may alter this to ByCopy or other capture
++    // types to optimise
++    mlir::Value baseOp = info.rawInput;
++    auto location = mlir::NameLoc::get(
++        mlir::StringAttr::get(firOpBuilder.getContext(), asFortran.str()),
++        baseOp.getLoc());
++    mlir::omp::MapInfoOp mapOp = createMapInfoOp(
++        firOpBuilder, location, baseOp,
++        /*varPtrPtr=*/mlir::Value{}, asFortran.str(), bounds,
++        /*members=*/{}, /*membersIndex=*/mlir::DenseIntElementsAttr{},
++        static_cast<
++            std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
++            mapTypeBits),
++        mlir::omp::VariableCaptureKind::ByRef, baseOp.getType());
++
++    if (object.sym()->owner().IsDerivedType()) {
++      addChildIndexAndMapToParent(object, parentMemberIndices, mapOp, semaCtx);
++    } else {
++      mapVars.push_back(mapOp);
++      if (mapSyms)
++        mapSyms->push_back(object.sym());
++      if (mapSymTypes)
++        mapSymTypes->push_back(baseOp.getType());
++      if (mapSymLocs)
++        mapSymLocs->push_back(baseOp.getLoc());
++    }
++  }
++}
++
+ bool ClauseProcessor::processMap(
+     mlir::Location currentLocation, lower::StatementContext &stmtCtx,
+     mlir::omp::MapClauseOps &result,
+     llvm::SmallVectorImpl<const semantics::Symbol *> *mapSyms,
+     llvm::SmallVectorImpl<mlir::Location> *mapSymLocs,
+     llvm::SmallVectorImpl<mlir::Type> *mapSymTypes) const {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   // We always require tracking of symbols, even if the caller does not,
+   // so we create an optionally used local set of symbols when the mapSyms
+   // argument is not present.
+@@ -948,46 +999,10 @@ bool ClauseProcessor::processMap(
+           mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+                          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+         }
+-
+-        for (const omp::Object &object : std::get<omp::ObjectList>(clause.t)) {
+-          llvm::SmallVector<mlir::Value> bounds;
+-          std::stringstream asFortran;
+-
+-          lower::AddrAndBoundsInfo info =
+-              lower::gatherDataOperandAddrAndBounds<mlir::omp::MapBoundsOp,
+-                                                    mlir::omp::MapBoundsType>(
+-                  converter, firOpBuilder, semaCtx, stmtCtx, *object.sym(),
+-                  object.ref(), clauseLocation, asFortran, bounds,
+-                  treatIndexAsSection);
+-
+-          // Explicit map captures are captured ByRef by default,
+-          // optimisation passes may alter this to ByCopy or other capture
+-          // types to optimise
+-          mlir::Value baseOp = info.rawInput;
+-          auto location = mlir::NameLoc::get(
+-              mlir::StringAttr::get(firOpBuilder.getContext(), asFortran.str()),
+-              baseOp.getLoc());
+-          mlir::omp::MapInfoOp mapOp = createMapInfoOp(
+-              firOpBuilder, location, baseOp,
+-              /*varPtrPtr=*/mlir::Value{}, asFortran.str(), bounds,
+-              /*members=*/{}, /*membersIndex=*/mlir::DenseIntElementsAttr{},
+-              static_cast<
+-                  std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+-                  mapTypeBits),
+-              mlir::omp::VariableCaptureKind::ByRef, baseOp.getType());
+-
+-          if (object.sym()->owner().IsDerivedType()) {
+-            addChildIndexAndMapToParent(object, parentMemberIndices, mapOp,
+-                                        semaCtx);
+-          } else {
+-            result.mapVars.push_back(mapOp);
+-            ptrMapSyms->push_back(object.sym());
+-            if (mapSymTypes)
+-              mapSymTypes->push_back(baseOp.getType());
+-            if (mapSymLocs)
+-              mapSymLocs->push_back(baseOp.getLoc());
+-          }
+-        }
++        processMapObjects(stmtCtx, clauseLocation,
++                          std::get<omp::ObjectList>(clause.t), mapTypeBits,
++                          parentMemberIndices, result.mapVars, ptrMapSyms,
++                          mapSymLocs, mapSymTypes);
+       });
+ 
+   insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
+@@ -1050,27 +1065,55 @@ bool ClauseProcessor::processEnter(
+ }
+ 
+ bool ClauseProcessor::processUseDeviceAddr(
+-    mlir::omp::UseDeviceAddrClauseOps &result,
++    lower::StatementContext &stmtCtx, mlir::omp::UseDeviceAddrClauseOps &result,
+     llvm::SmallVectorImpl<mlir::Type> &useDeviceTypes,
+     llvm::SmallVectorImpl<mlir::Location> &useDeviceLocs,
+     llvm::SmallVectorImpl<const semantics::Symbol *> &useDeviceSyms) const {
+-  return findRepeatableClause<omp::clause::UseDeviceAddr>(
+-      [&](const omp::clause::UseDeviceAddr &clause, const parser::CharBlock &) {
+-        addUseDeviceClause(converter, clause.v, result.useDeviceAddrVars,
+-                           useDeviceTypes, useDeviceLocs, useDeviceSyms);
++  std::map<const semantics::Symbol *,
++           llvm::SmallVector<OmpMapMemberIndicesData>>
++      parentMemberIndices;
++  bool clauseFound = findRepeatableClause<omp::clause::UseDeviceAddr>(
++      [&](const omp::clause::UseDeviceAddr &clause,
++          const parser::CharBlock &source) {
++        mlir::Location location = converter.genLocation(source);
++        llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
++        processMapObjects(stmtCtx, location, clause.v, mapTypeBits,
++                          parentMemberIndices, result.useDeviceAddrVars,
++                          &useDeviceSyms, &useDeviceLocs, &useDeviceTypes);
+       });
++
++  insertChildMapInfoIntoParent(converter, parentMemberIndices,
++                               result.useDeviceAddrVars, useDeviceSyms,
++                               &useDeviceTypes, &useDeviceLocs);
++  return clauseFound;
+ }
+ 
+ bool ClauseProcessor::processUseDevicePtr(
+-    mlir::omp::UseDevicePtrClauseOps &result,
++    lower::StatementContext &stmtCtx, mlir::omp::UseDevicePtrClauseOps &result,
+     llvm::SmallVectorImpl<mlir::Type> &useDeviceTypes,
+     llvm::SmallVectorImpl<mlir::Location> &useDeviceLocs,
+     llvm::SmallVectorImpl<const semantics::Symbol *> &useDeviceSyms) const {
+-  return findRepeatableClause<omp::clause::UseDevicePtr>(
+-      [&](const omp::clause::UseDevicePtr &clause, const parser::CharBlock &) {
+-        addUseDeviceClause(converter, clause.v, result.useDevicePtrVars,
+-                           useDeviceTypes, useDeviceLocs, useDeviceSyms);
++  std::map<const semantics::Symbol *,
++           llvm::SmallVector<OmpMapMemberIndicesData>>
++      parentMemberIndices;
++  bool clauseFound = findRepeatableClause<omp::clause::UseDevicePtr>(
++      [&](const omp::clause::UseDevicePtr &clause,
++          const parser::CharBlock &source) {
++        mlir::Location location = converter.genLocation(source);
++        llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
++        processMapObjects(stmtCtx, location, clause.v, mapTypeBits,
++                          parentMemberIndices, result.useDevicePtrVars,
++                          &useDeviceSyms, &useDeviceLocs, &useDeviceTypes);
+       });
++
++  insertChildMapInfoIntoParent(converter, parentMemberIndices,
++                               result.useDevicePtrVars, useDeviceSyms,
++                               &useDeviceTypes, &useDeviceLocs);
++  return clauseFound;
+ }
+ 
+ } // namespace omp
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index 4a90f667c7248..f6b319c726a2d 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -128,11 +128,13 @@ class ClauseProcessor {
+           nullptr) const;
+   bool processTo(llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const;
+   bool processUseDeviceAddr(
++      lower::StatementContext &stmtCtx,
+       mlir::omp::UseDeviceAddrClauseOps &result,
+       llvm::SmallVectorImpl<mlir::Type> &useDeviceTypes,
+       llvm::SmallVectorImpl<mlir::Location> &useDeviceLocs,
+       llvm::SmallVectorImpl<const semantics::Symbol *> &useDeviceSyms) const;
+   bool processUseDevicePtr(
++      lower::StatementContext &stmtCtx,
+       mlir::omp::UseDevicePtrClauseOps &result,
+       llvm::SmallVectorImpl<mlir::Type> &useDeviceTypes,
+       llvm::SmallVectorImpl<mlir::Location> &useDeviceLocs,
+@@ -172,6 +174,17 @@ class ClauseProcessor {
+   template <typename T>
+   bool markClauseOccurrence(mlir::UnitAttr &result) const;
+ 
++  void processMapObjects(
++      lower::StatementContext &stmtCtx, mlir::Location clauseLocation,
++      const omp::ObjectList &objects,
++      llvm::omp::OpenMPOffloadMappingFlags mapTypeBits,
++      std::map<const semantics::Symbol *,
++               llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++      llvm::SmallVectorImpl<mlir::Value> &mapVars,
++      llvm::SmallVectorImpl<const semantics::Symbol *> *mapSyms,
++      llvm::SmallVectorImpl<mlir::Location> *mapSymLocs = nullptr,
++      llvm::SmallVectorImpl<mlir::Type> *mapSymTypes = nullptr) const;
++
+   lower::AbstractConverter &converter;
+   semantics::SemanticsContext &semaCtx;
+   List<Clause> clauses;
+@@ -188,7 +201,6 @@ bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
+   bool clauseFound = findRepeatableClause<T>(
+       [&](const T &clause, const parser::CharBlock &source) {
+         mlir::Location clauseLocation = converter.genLocation(source);
+-        fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+ 
+         static_assert(std::is_same_v<T, omp::clause::To> ||
+                       std::is_same_v<T, omp::clause::From>);
+@@ -199,39 +211,9 @@ bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
+                 ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
+                 : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+ 
+-        auto &objects = std::get<ObjectList>(clause.t);
+-        for (const omp::Object &object : objects) {
+-          llvm::SmallVector<mlir::Value> bounds;
+-          std::stringstream asFortran;
+-
+-          lower::AddrAndBoundsInfo info =
+-              lower::gatherDataOperandAddrAndBounds<mlir::omp::MapBoundsOp,
+-                                                    mlir::omp::MapBoundsType>(
+-                  converter, firOpBuilder, semaCtx, stmtCtx, *object.sym(),
+-                  object.ref(), clauseLocation, asFortran, bounds,
+-                  treatIndexAsSection);
+-
+-          // Explicit map captures are captured ByRef by default,
+-          // optimisation passes may alter this to ByCopy or other capture
+-          // types to optimise
+-          mlir::Value baseOp = info.rawInput;
+-          mlir::omp::MapInfoOp mapOp = createMapInfoOp(
+-              firOpBuilder, clauseLocation, baseOp,
+-              /*varPtrPtr=*/mlir::Value{}, asFortran.str(), bounds,
+-              /*members=*/{}, /*membersIndex=*/mlir::DenseIntElementsAttr{},
+-              static_cast<
+-                  std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+-                  mapTypeBits),
+-              mlir::omp::VariableCaptureKind::ByRef, baseOp.getType());
+-
+-          if (object.sym()->owner().IsDerivedType()) {
+-            addChildIndexAndMapToParent(object, parentMemberIndices, mapOp,
+-                                        semaCtx);
+-          } else {
+-            result.mapVars.push_back(mapOp);
+-            mapSymbols.push_back(object.sym());
+-          }
+-        }
++        processMapObjects(stmtCtx, clauseLocation,
++                          std::get<ObjectList>(clause.t), mapTypeBits,
++                          parentMemberIndices, result.mapVars, &mapSymbols);
+       });
+ 
+   insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 2fd5d4b33074e..8b77f1ac6b4ff 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -702,45 +702,94 @@ static void createBodyOfOp(mlir::Operation &op, const OpWithBodyGenInfo &info,
+   marker->erase();
+ }
+ 
++void mapBodySymbols(lower::AbstractConverter &converter, mlir::Region &region,
++                    llvm::ArrayRef<const semantics::Symbol *> mapSyms) {
++  assert(region.hasOneBlock() && "target must have single region");
++  mlir::Block &regionBlock = region.front();
++  // Clones the `bounds` placing them inside the target region and returns them.
++  auto cloneBound = [&](mlir::Value bound) {
++    if (mlir::isMemoryEffectFree(bound.getDefiningOp())) {
++      mlir::Operation *clonedOp = bound.getDefiningOp()->clone();
++      regionBlock.push_back(clonedOp);
++      return clonedOp->getResult(0);
++    }
++    TODO(converter.getCurrentLocation(),
++         "target map clause operand unsupported bound type");
++  };
++
++  auto cloneBounds = [cloneBound](llvm::ArrayRef<mlir::Value> bounds) {
++    llvm::SmallVector<mlir::Value> clonedBounds;
++    for (mlir::Value bound : bounds)
++      clonedBounds.emplace_back(cloneBound(bound));
++    return clonedBounds;
++  };
++
++  // Bind the symbols to their corresponding block arguments.
++  for (auto [argIndex, argSymbol] : llvm::enumerate(mapSyms)) {
++    const mlir::BlockArgument &arg = region.getArgument(argIndex);
++    // Avoid capture of a reference to a structured binding.
++    const semantics::Symbol *sym = argSymbol;
++    // Structure component symbols don't have bindings.
++    if (sym->owner().IsDerivedType())
++      continue;
++    fir::ExtendedValue extVal = converter.getSymbolExtendedValue(*sym);
++    auto refType = mlir::dyn_cast<fir::ReferenceType>(arg.getType());
++    if (refType && fir::isa_builtin_cptr_type(refType.getElementType())) {
++      converter.bindSymbol(*argSymbol, arg);
++    } else {
++      extVal.match(
++          [&](const fir::BoxValue &v) {
++            converter.bindSymbol(*sym,
++                                 fir::BoxValue(arg, cloneBounds(v.getLBounds()),
++                                               v.getExplicitParameters(),
++                                               v.getExplicitExtents()));
++          },
++          [&](const fir::MutableBoxValue &v) {
++            converter.bindSymbol(
++                *sym, fir::MutableBoxValue(arg, cloneBounds(v.getLBounds()),
++                                           v.getMutableProperties()));
++          },
++          [&](const fir::ArrayBoxValue &v) {
++            converter.bindSymbol(
++                *sym, fir::ArrayBoxValue(arg, cloneBounds(v.getExtents()),
++                                         cloneBounds(v.getLBounds()),
++                                         v.getSourceBox()));
++          },
++          [&](const fir::CharArrayBoxValue &v) {
++            converter.bindSymbol(
++                *sym, fir::CharArrayBoxValue(arg, cloneBound(v.getLen()),
++                                             cloneBounds(v.getExtents()),
++                                             cloneBounds(v.getLBounds())));
++          },
++          [&](const fir::CharBoxValue &v) {
++            converter.bindSymbol(
++                *sym, fir::CharBoxValue(arg, cloneBound(v.getLen())));
++          },
++          [&](const fir::UnboxedValue &v) { converter.bindSymbol(*sym, arg); },
++          [&](const auto &) {
++            TODO(converter.getCurrentLocation(),
++                 "target map clause operand unsupported type");
++          });
++    }
++  }
++}
++
+ static void genBodyOfTargetDataOp(
+     lower::AbstractConverter &converter, lower::SymMap &symTable,
+     semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+-    mlir::omp::TargetDataOp &dataOp, llvm::ArrayRef<mlir::Type> useDeviceTypes,
+-    llvm::ArrayRef<mlir::Location> useDeviceLocs,
++    mlir::omp::TargetDataOp &dataOp,
+     llvm::ArrayRef<const semantics::Symbol *> useDeviceSymbols,
++    llvm::ArrayRef<mlir::Location> useDeviceLocs,
++    llvm::ArrayRef<mlir::Type> useDeviceTypes,
+     const mlir::Location &currentLocation, const ConstructQueue &queue,
+     ConstructQueue::const_iterator item) {
++  assert(useDeviceTypes.size() == useDeviceLocs.size());
++
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::Region &region = dataOp.getRegion();
+-
+   firOpBuilder.createBlock(&region, {}, useDeviceTypes, useDeviceLocs);
+ 
+-  for (auto [argIndex, argSymbol] : llvm::enumerate(useDeviceSymbols)) {
+-    const mlir::BlockArgument &arg = region.front().getArgument(argIndex);
+-    fir::ExtendedValue extVal = converter.getSymbolExtendedValue(*argSymbol);
+-    if (auto refType = mlir::dyn_cast<fir::ReferenceType>(arg.getType())) {
+-      if (fir::isa_builtin_cptr_type(refType.getElementType())) {
+-        converter.bindSymbol(*argSymbol, arg);
+-      } else {
+-        // Avoid capture of a reference to a structured binding.
+-        const semantics::Symbol *sym = argSymbol;
+-        extVal.match(
+-            [&](const fir::MutableBoxValue &mbv) {
+-              converter.bindSymbol(
+-                  *sym,
+-                  fir::MutableBoxValue(
+-                      arg, fir::factory::getNonDeferredLenParams(extVal), {}));
+-            },
+-            [&](const auto &) {
+-              TODO(converter.getCurrentLocation(),
+-                   "use_device clause operand unsupported type");
+-            });
+-      }
+-    } else {
+-      TODO(converter.getCurrentLocation(),
+-           "use_device clause operand unsupported type");
+-    }
+-  }
++  mapBodySymbols(converter, region, useDeviceSymbols);
+ 
+   // Insert dummy instruction to remember the insertion position. The
+   // marker will be deleted by clean up passes since there are no uses.
+@@ -748,7 +797,7 @@ static void genBodyOfTargetDataOp(
+   // there are hlfir.declares inserted above while setting block arguments
+   // and new code from the body should be inserted after that.
+   mlir::Value undefMarker = firOpBuilder.create<fir::UndefOp>(
+-      dataOp.getOperation()->getLoc(), firOpBuilder.getIndexType());
++      dataOp.getLoc(), firOpBuilder.getIndexType());
+ 
+   // Create blocks for unstructured regions. This has to be done since
+   // blocks are initially allocated with the function as the parent region.
+@@ -806,93 +855,33 @@ static void genBodyOfTargetOp(
+     mlir::omp::TargetOp &targetOp,
+     llvm::ArrayRef<const semantics::Symbol *> mapSyms,
+     llvm::ArrayRef<mlir::Location> mapSymLocs,
+-    llvm::ArrayRef<mlir::Type> mapSymTypes, DataSharingProcessor &dsp,
++    llvm::ArrayRef<mlir::Type> mapSymTypes,
+     const mlir::Location &currentLocation, const ConstructQueue &queue,
+-    ConstructQueue::const_iterator item) {
++    ConstructQueue::const_iterator item, DataSharingProcessor &dsp) {
+   assert(mapSymTypes.size() == mapSymLocs.size());
+ 
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::Region &region = targetOp.getRegion();
+ 
+   llvm::SmallVector<mlir::Type> allRegionArgTypes;
++  llvm::SmallVector<mlir::Location> allRegionArgLocs;
+   mergePrivateVarsInfo(targetOp, mapSymTypes,
+                        llvm::function_ref<mlir::Type(mlir::Value)>{
+                            [](mlir::Value v) { return v.getType(); }},
+                        allRegionArgTypes);
+ 
+-  llvm::SmallVector<mlir::Location> allRegionArgLocs;
+   mergePrivateVarsInfo(targetOp, mapSymLocs,
+                        llvm::function_ref<mlir::Location(mlir::Value)>{
+                            [](mlir::Value v) { return v.getLoc(); }},
+                        allRegionArgLocs);
+ 
+-  auto *regionBlock = firOpBuilder.createBlock(&region, {}, allRegionArgTypes,
+-                                               allRegionArgLocs);
++  mlir::Block *regionBlock = firOpBuilder.createBlock(
++      &region, {}, allRegionArgTypes, allRegionArgLocs);
+ 
+-  // Clones the `bounds` placing them inside the target region and returns them.
+-  auto cloneBound = [&](mlir::Value bound) {
+-    if (mlir::isMemoryEffectFree(bound.getDefiningOp())) {
+-      mlir::Operation *clonedOp = bound.getDefiningOp()->clone();
+-      regionBlock->push_back(clonedOp);
+-      return clonedOp->getResult(0);
+-    }
+-    TODO(converter.getCurrentLocation(),
+-         "target map clause operand unsupported bound type");
+-  };
+-
+-  auto cloneBounds = [cloneBound](llvm::ArrayRef<mlir::Value> bounds) {
+-    llvm::SmallVector<mlir::Value> clonedBounds;
+-    for (mlir::Value bound : bounds)
+-      clonedBounds.emplace_back(cloneBound(bound));
+-    return clonedBounds;
+-  };
+-
+-  // Bind the symbols to their corresponding block arguments.
+-  for (auto [argIndex, argSymbol] : llvm::enumerate(mapSyms)) {
+-    const mlir::BlockArgument &arg = region.getArgument(argIndex);
+-    // Avoid capture of a reference to a structured binding.
+-    const semantics::Symbol *sym = argSymbol;
+-    // Structure component symbols don't have bindings.
+-    if (sym->owner().IsDerivedType())
+-      continue;
+-    fir::ExtendedValue extVal = converter.getSymbolExtendedValue(*sym);
+-    extVal.match(
+-        [&](const fir::BoxValue &v) {
+-          converter.bindSymbol(*sym,
+-                               fir::BoxValue(arg, cloneBounds(v.getLBounds()),
+-                                             v.getExplicitParameters(),
+-                                             v.getExplicitExtents()));
+-        },
+-        [&](const fir::MutableBoxValue &v) {
+-          converter.bindSymbol(
+-              *sym, fir::MutableBoxValue(arg, cloneBounds(v.getLBounds()),
+-                                         v.getMutableProperties()));
+-        },
+-        [&](const fir::ArrayBoxValue &v) {
+-          converter.bindSymbol(
+-              *sym, fir::ArrayBoxValue(arg, cloneBounds(v.getExtents()),
+-                                       cloneBounds(v.getLBounds()),
+-                                       v.getSourceBox()));
+-        },
+-        [&](const fir::CharArrayBoxValue &v) {
+-          converter.bindSymbol(
+-              *sym, fir::CharArrayBoxValue(arg, cloneBound(v.getLen()),
+-                                           cloneBounds(v.getExtents()),
+-                                           cloneBounds(v.getLBounds())));
+-        },
+-        [&](const fir::CharBoxValue &v) {
+-          converter.bindSymbol(*sym,
+-                               fir::CharBoxValue(arg, cloneBound(v.getLen())));
+-        },
+-        [&](const fir::UnboxedValue &v) { converter.bindSymbol(*sym, arg); },
+-        [&](const auto &) {
+-          TODO(converter.getCurrentLocation(),
+-               "target map clause operand unsupported type");
+-        });
+-  }
++  mapBodySymbols(converter, region, mapSyms);
+ 
+   for (auto [argIndex, argSymbol] :
+-       llvm::enumerate(dsp.getDelayedPrivSymbols())) {
++       llvm::enumerate(dsp.getAllSymbolsToPrivatize())) {
+     argIndex = mapSyms.size() + argIndex;
+ 
+     const mlir::BlockArgument &arg = region.getArgument(argIndex);
+@@ -940,7 +929,9 @@ static void genBodyOfTargetOp(
+                 std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+                 llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT),
+             mlir::omp::VariableCaptureKind::ByCopy, copyVal.getType());
++
+         targetOp.getMapVarsMutable().append(mapOp);
++
+         mlir::Value clonedValArg =
+             region.addArgument(copyVal.getType(), copyVal.getLoc());
+         firOpBuilder.setInsertionPointToStart(regionBlock);
+@@ -962,7 +953,7 @@ static void genBodyOfTargetOp(
+   // In the HLFIR flow there are hlfir.declares inserted above while
+   // setting block arguments.
+   mlir::Value undefMarker = firOpBuilder.create<fir::UndefOp>(
+-      targetOp.getOperation()->getLoc(), firOpBuilder.getIndexType());
++      targetOp.getLoc(), firOpBuilder.getIndexType());
+ 
+   // Create blocks for unstructured regions. This has to be done since
+   // blocks are initially allocated with the function as the parent region.
+@@ -1201,9 +1192,9 @@ static void genTargetDataClauses(
+   cp.processDevice(stmtCtx, clauseOps);
+   cp.processIf(llvm::omp::Directive::OMPD_target_data, clauseOps);
+   cp.processMap(loc, stmtCtx, clauseOps);
+-  cp.processUseDeviceAddr(clauseOps, useDeviceTypes, useDeviceLocs,
++  cp.processUseDeviceAddr(stmtCtx, clauseOps, useDeviceTypes, useDeviceLocs,
+                           useDeviceSyms);
+-  cp.processUseDevicePtr(clauseOps, useDeviceTypes, useDeviceLocs,
++  cp.processUseDevicePtr(stmtCtx, clauseOps, useDeviceTypes, useDeviceLocs,
+                          useDeviceSyms);
+ 
+   // This function implements the deprecated functionality of use_device_ptr
+@@ -1807,7 +1798,7 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ 
+   auto targetOp = firOpBuilder.create<mlir::omp::TargetOp>(loc, clauseOps);
+   genBodyOfTargetOp(converter, symTable, semaCtx, eval, targetOp, mapSyms,
+-                    mapLocs, mapTypes, dsp, loc, queue, item);
++                    mapLocs, mapTypes, loc, queue, item, dsp);
+   return targetOp;
+ }
+ 
+@@ -1829,7 +1820,7 @@ genTargetDataOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       converter.getFirOpBuilder().create<mlir::omp::TargetDataOp>(loc,
+                                                                   clauseOps);
+   genBodyOfTargetDataOp(converter, symTable, semaCtx, eval, targetDataOp,
+-                        useDeviceTypes, useDeviceLocs, useDeviceSyms, loc,
++                        useDeviceSyms, useDeviceLocs, useDeviceTypes, loc,
+                         queue, item);
+   return targetDataOp;
+ }
+diff --git a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index 04a11a52dbd04..7ebeb51cf3dec 100644
+--- a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -125,13 +125,12 @@ class MapInfoFinalizationPass
+     // TODO: map the addendum segment of the descriptor, similarly to the
+     // above base address/data pointer member.
+ 
+-    if (auto mapClauseOwner =
+-            llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
++    auto addOperands = [&](mlir::OperandRange &operandsArr,
++                           mlir::MutableOperandRange &mutableOpRange,
++                           auto directiveOp) {
+       llvm::SmallVector<mlir::Value> newMapOps;
+-      mlir::OperandRange mapVarsArr = mapClauseOwner.getMapVars();
+-
+-      for (size_t i = 0; i < mapVarsArr.size(); ++i) {
+-        if (mapVarsArr[i] == op) {
++      for (size_t i = 0; i < operandsArr.size(); ++i) {
++        if (operandsArr[i] == op) {
+           // Push new implicit maps generated for the descriptor.
+           newMapOps.push_back(baseAddr);
+ 
+@@ -139,13 +138,29 @@ class MapInfoFinalizationPass
+           // new additional map operand with an appropriate BlockArgument,
+           // as the printing and later processing currently requires a 1:1
+           // mapping of BlockArgs to MapInfoOp's at the same placement in
+-          // each array (BlockArgs and MapVars).
+-          if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target))
+-            targetOp.getRegion().insertArgument(i, baseAddr.getType(), loc);
++          // each array (BlockArgs and MapOperands).
++          if (directiveOp) {
++            directiveOp.getRegion().insertArgument(i, baseAddr.getType(), loc);
++          }
+         }
+-        newMapOps.push_back(mapVarsArr[i]);
++        newMapOps.push_back(operandsArr[i]);
+       }
+-      mapClauseOwner.getMapVarsMutable().assign(newMapOps);
++      mutableOpRange.assign(newMapOps);
++    };
++    if (auto mapClauseOwner =
++            llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
++      mlir::OperandRange mapOperandsArr = mapClauseOwner.getMapVars();
++      mlir::MutableOperandRange mapMutableOpRange =
++          mapClauseOwner.getMapVarsMutable();
++      mlir::omp::TargetOp targetOp =
++          llvm::dyn_cast<mlir::omp::TargetOp>(target);
++      addOperands(mapOperandsArr, mapMutableOpRange, targetOp);
++    }
++    if (auto targetDataOp = llvm::dyn_cast<mlir::omp::TargetDataOp>(target)) {
++      mlir::OperandRange useDevAddrArr = targetDataOp.getUseDeviceAddrVars();
++      mlir::MutableOperandRange useDevAddrMutableOpRange =
++          targetDataOp.getUseDeviceAddrVarsMutable();
++      addOperands(useDevAddrArr, useDevAddrMutableOpRange, targetDataOp);
+     }
+ 
+     mlir::Value newDescParentMapOp = builder.create<mlir::omp::MapInfoOp>(
+diff --git a/flang/test/Lower/OpenMP/target.f90 b/flang/test/Lower/OpenMP/target.f90
+index 1d5ab6942dfa3..e86a2f9b6098d 100644
+--- a/flang/test/Lower/OpenMP/target.f90
++++ b/flang/test/Lower/OpenMP/target.f90
+@@ -526,21 +526,23 @@ end subroutine omp_target_device_ptr
+  !===============================================================================
+ 
+  !CHECK-LABEL: func.func @_QPomp_target_device_addr() {
+- subroutine omp_target_device_addr
++subroutine omp_target_device_addr
+    integer, pointer :: a
+    !CHECK: %[[VAL_0:.*]] = fir.alloca !fir.box<!fir.ptr<i32>> {bindc_name = "a", uniq_name = "_QFomp_target_device_addrEa"}
+    !CHECK: %[[VAL_0_DECL:.*]]:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+    !CHECK: %[[MAP_MEMBERS:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr({{.*}} : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+    !CHECK: %[[MAP:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBERS]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
+-   !CHECK: omp.target_data map_entries(%[[MAP_MEMBERS]], %[[MAP]] : {{.*}}) use_device_addr(%[[VAL_0_DECL]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++   !CHECK: %[[DEV_ADDR_MEMBERS:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr({{.*}} : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
++   !CHECK: %[[DEV_ADDR:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[DEV_ADDR_MEMBERS]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
++   !CHECK: omp.target_data map_entries(%[[MAP_MEMBERS]], %[[MAP]] : {{.*}}) use_device_addr(%[[DEV_ADDR_MEMBERS]], %[[DEV_ADDR]] : {{.*}}) {
+    !$omp target data map(tofrom: a) use_device_addr(a)
+-   !CHECK: ^bb0(%[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>):
+-   !CHECK: %[[VAL_1_DECL:.*]]:2 = hlfir.declare %[[VAL_1]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++   !CHECK: ^bb0(%[[ARG_0:.*]]: !fir.llvm_ptr<!fir.ref<i32>>, %[[ARG_1:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>):
++   !CHECK: %[[VAL_1_DECL:.*]]:2 = hlfir.declare %[[ARG_1]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+    !CHECK: %[[C10:.*]] = arith.constant 10 : i32
+    !CHECK: %[[A_BOX:.*]] = fir.load %[[VAL_1_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+    !CHECK: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+    !CHECK: hlfir.assign %[[C10]] to %[[A_ADDR]] : i32, !fir.ptr<i32>
+-      a = 10
++   a = 10
+    !CHECK: omp.terminator
+    !$omp end target data
+    !CHECK: }
+diff --git a/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90 b/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
+index acb5f533b619e..085f5419fa7f8 100644
+--- a/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
++++ b/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
+@@ -2,72 +2,70 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %s -o - | FileCheck %s
+ ! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 %s -o - | FileCheck %s
+ 
+-! This tests primary goal is to check the promotion of 
+-! non-CPTR arguments from use_device_ptr to 
+-! use_device_addr works, without breaking any 
+-! functionality 
++! This tests primary goal is to check the promotion of non-CPTR arguments from
++! use_device_ptr to use_device_addr works, without breaking any functionality.
+ 
+ !CHECK: func.func @{{.*}}only_use_device_ptr()
+-!CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+-subroutine only_use_device_ptr 
++!CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++!CHECK: ^bb0(%{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++subroutine only_use_device_ptr
+     use iso_c_binding
+     integer, pointer, dimension(:) :: array
+     real, pointer :: pa(:)
+     type(c_ptr) :: cptr
+ 
+-   !$omp target data use_device_ptr(pa, cptr, array)
+-   !$omp end target data 
+-end subroutine
++       !$omp target data use_device_ptr(pa, cptr, array)
++       !$omp end target data
++     end subroutine
+ 
+ !CHECK: func.func @{{.*}}mix_use_device_ptr_and_addr()
+-!CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr({{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+-subroutine mix_use_device_ptr_and_addr 
++!CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr({{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++!CHECK: ^bb0(%{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++subroutine mix_use_device_ptr_and_addr
+     use iso_c_binding
+     integer, pointer, dimension(:) :: array
+     real, pointer :: pa(:)
+     type(c_ptr) :: cptr
+ 
+-   !$omp target data use_device_ptr(pa, cptr) use_device_addr(array)
+-   !$omp end target data 
+-end subroutine
++       !$omp target data use_device_ptr(pa, cptr) use_device_addr(array)
++       !$omp end target data
++     end subroutine
+ 
+-!CHECK: func.func @{{.*}}only_use_device_addr()
+-!CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}}, %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+-subroutine only_use_device_addr 
+-    use iso_c_binding
+-    integer, pointer, dimension(:) :: array
+-    real, pointer :: pa(:)
+-    type(c_ptr) :: cptr
++     !CHECK: func.func @{{.*}}only_use_device_addr()
++     !CHECK: omp.target_data use_device_addr(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
++     !CHECK: ^bb0(%{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++     subroutine only_use_device_addr
++        use iso_c_binding
++        integer, pointer, dimension(:) :: array
++        real, pointer :: pa(:)
++        type(c_ptr) :: cptr
+ 
+-   !$omp target data use_device_addr(pa, cptr, array)
+-   !$omp end target data 
+-end subroutine
++       !$omp target data use_device_addr(pa, cptr, array)
++       !$omp end target data
++     end subroutine
+ 
+-!CHECK: func.func @{{.*}}mix_use_device_ptr_and_addr_and_map()
+-!CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}} : !fir.ref<i32>, !fir.ref<i32>) use_device_addr(%{{.*}}, %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+-subroutine mix_use_device_ptr_and_addr_and_map
+-    use iso_c_binding
+-    integer :: i, j
+-    integer, pointer, dimension(:) :: array
+-    real, pointer :: pa(:)
+-    type(c_ptr) :: cptr
++     !CHECK: func.func @{{.*}}mix_use_device_ptr_and_addr_and_map()
++     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}} : !fir.ref<i32>, !fir.ref<i32>) use_device_addr(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++     !CHECK: ^bb0(%{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, %{{.*}}: !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, %{{.*}}: !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, %{{.*}}: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++     subroutine mix_use_device_ptr_and_addr_and_map
++        use iso_c_binding
++        integer :: i, j
++        integer, pointer, dimension(:) :: array
++        real, pointer :: pa(:)
++        type(c_ptr) :: cptr
+ 
+-   !$omp target data use_device_ptr(pa, cptr) use_device_addr(array) map(tofrom: i, j)
+-   !$omp end target data 
+-end subroutine
++       !$omp target data use_device_ptr(pa, cptr) use_device_addr(array) map(tofrom: i, j)
++       !$omp end target data
++     end subroutine
+ 
+-!CHECK: func.func @{{.*}}only_use_map()
+-!CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
+-subroutine only_use_map
+-    use iso_c_binding
+-    integer, pointer, dimension(:) :: array
+-    real, pointer :: pa(:)
+-    type(c_ptr) :: cptr
++     !CHECK: func.func @{{.*}}only_use_map()
++     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
++     subroutine only_use_map
++        use iso_c_binding
++        integer, pointer, dimension(:) :: array
++        real, pointer :: pa(:)
++        type(c_ptr) :: cptr
+ 
+-   !$omp target data map(pa, cptr, array)
+-   !$omp end target data 
+-end subroutine
++       !$omp target data map(pa, cptr, array)
++       !$omp end target data
++     end subroutine

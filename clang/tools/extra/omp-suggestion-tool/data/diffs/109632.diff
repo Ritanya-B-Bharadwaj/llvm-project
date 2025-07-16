@@ -1,0 +1,138 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 960286732c90c..d528772f28724 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1681,7 +1681,6 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    mapTypes, deviceAddrSyms, deviceAddrLocs, deviceAddrTypes,
+                    devicePtrSyms, devicePtrLocs, devicePtrTypes);
+ 
+-  llvm::SmallVector<const semantics::Symbol *> privateSyms;
+   DataSharingProcessor dsp(converter, semaCtx, item->clauses, eval,
+                            /*shouldCollectPreDeterminedSymbols=*/
+                            lower::omp::isLastItemInQueue(item, queue),
+@@ -1936,24 +1935,26 @@ static void genStandaloneDistribute(lower::AbstractConverter &converter,
+   genDistributeClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
+                        distributeClauseOps);
+ 
+-  // TODO: Support delayed privatization.
+   DataSharingProcessor dsp(converter, semaCtx, item->clauses, eval,
+                            /*shouldCollectPreDeterminedSymbols=*/true,
+-                           /*useDelayedPrivatization=*/false, &symTable);
+-  dsp.processStep1();
++                           enableDelayedPrivatizationStaging, &symTable);
++  dsp.processStep1(&distributeClauseOps);
++  llvm::SmallVector<mlir::Type> privateVarTypes{};
++
++  for (mlir::Value privateVar : distributeClauseOps.privateVars)
++    privateVarTypes.push_back(privateVar.getType());
+ 
+   mlir::omp::LoopNestOperands loopNestClauseOps;
+   llvm::SmallVector<const semantics::Symbol *> iv;
+   genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
+                      loopNestClauseOps, iv);
+ 
+-  // TODO: Populate entry block arguments with private variables.
+   auto distributeOp = genWrapperOp<mlir::omp::DistributeOp>(
+-      converter, loc, distributeClauseOps, /*blockArgTypes=*/{});
++      converter, loc, distributeClauseOps, privateVarTypes);
+ 
+   genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
+-                loopNestClauseOps, iv,
+-                /*wrapperSyms=*/{}, distributeOp.getRegion().getArguments(),
++                loopNestClauseOps, iv, dsp.getDelayedPrivSymbols(),
++                distributeOp.getRegion().getArguments(),
+                 llvm::omp::Directive::OMPD_distribute, dsp);
+ }
+ 
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90
+new file mode 100644
+index 0000000000000..eb60e7ff9858c
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90
+@@ -0,0 +1,42 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization-staging \
++! RUN:   -o - %s 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization-staging -o - %s 2>&1 \
++! RUN:   | FileCheck %s
++
++subroutine standalone_distribute
++    implicit none
++    integer :: simple_var, i
++
++    !$omp teams
++    !$omp distribute private(simple_var)
++    do i = 1, 10
++      simple_var = simple_var + i
++    end do
++    !$omp end distribute
++    !$omp end teams
++end subroutine standalone_distribute
++
++! CHECK: omp.private {type = private} @[[I_PRIVATIZER_SYM:.*]] : !fir.ref<i32>
++! CHECK: omp.private {type = private} @[[VAR_PRIVATIZER_SYM:.*]] : !fir.ref<i32>
++
++
++! CHECK-LABEL: func.func @_QPstandalone_distribute() {
++! CHECK:         %[[I_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFstandalone_distributeEi"}
++! CHECK:         %[[VAR_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFstandalone_distributeEsimple_var"}
++! CHECK:         omp.teams {
++! CHECK:           omp.distribute
++! CHECK-SAME:        private(@[[VAR_PRIVATIZER_SYM]] %[[VAR_DECL]]#0 -> %[[VAR_ARG:.*]] : !fir.ref<i32>,
++! CHECK-SAME:                @[[I_PRIVATIZER_SYM]] %[[I_DECL]]#0 -> %[[I_ARG:.*]] : !fir.ref<i32>) {
++! CHECK:             omp.loop_nest {{.*}} {
++! CHECK:               %[[VAR_PRIV_DECL:.*]]:2 = hlfir.declare %[[VAR_ARG]]
++! CHECK:               %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_ARG]]
++
++! CHECK:               fir.store %{{.*}} to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:               %{{.*}} = fir.load %[[VAR_PRIV_DECL]]#0 : !fir.ref<i32>
++! CHECK:               %{{.*}} = fir.load %[[I_PRIV_DECL]]#0 : !fir.ref<i32>
++! CHECK:               arith.addi %{{.*}}, %{{.*}} : i32
++! CHECK:               hlfir.assign %{{.*}} to %[[VAR_PRIV_DECL]]#0 : i32, !fir.ref<i32>
++! CHECK:             }
++! CHECK:           }
++! CHECK:         }
++! CHECK:       }
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index db47276dcefe9..90bf5df67b03b 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1225,17 +1225,13 @@ parsePrivateList(OpAsmParser &parser,
+ }
+ 
+ static void printPrivateList(OpAsmPrinter &p, Operation *op,
+-                             ValueRange privateVars, TypeRange privateTypes,
+-                             ArrayAttr privateSyms) {
+-  // TODO: Remove target-specific logic from this function.
+-  auto targetOp = mlir::dyn_cast<mlir::omp::TargetOp>(op);
+-  assert(targetOp);
+-
++                             Operation::operand_range privateVars,
++                             TypeRange privateTypes, ArrayAttr privateSyms) {
+   auto &region = op->getRegion(0);
+   auto *argsBegin = region.front().getArguments().begin();
+-  MutableArrayRef argsSubrange(argsBegin + targetOp.getMapVars().size(),
+-                               argsBegin + targetOp.getMapVars().size() +
+-                                   privateTypes.size());
++  MutableArrayRef argsSubrange(argsBegin + privateVars.getBeginOperandIndex(),
++                               argsBegin + privateVars.getBeginOperandIndex() +
++                                   privateVars.size());
+   mlir::SmallVector<bool> isByRefVec;
+   isByRefVec.resize(privateTypes.size(), false);
+   DenseBoolArrayAttr isByRef =
+@@ -1859,11 +1855,11 @@ LogicalResult SimdOp::verify() {
+ 
+ void DistributeOp::build(OpBuilder &builder, OperationState &state,
+                          const DistributeOperands &clauses) {
+-  // TODO Store clauses in op: privateVars, privateSyms.
+-  DistributeOp::build(
+-      builder, state, clauses.allocateVars, clauses.allocatorVars,
+-      clauses.distScheduleStatic, clauses.distScheduleChunkSize, clauses.order,
+-      clauses.orderMod, /*private_vars=*/{}, /*private_syms=*/nullptr);
++  DistributeOp::build(builder, state, clauses.allocateVars,
++                      clauses.allocatorVars, clauses.distScheduleStatic,
++                      clauses.distScheduleChunkSize, clauses.order,
++                      clauses.orderMod, clauses.privateVars,
++                      makeArrayAttr(builder.getContext(), clauses.privateSyms));
+ }
+ 
+ LogicalResult DistributeOp::verify() {

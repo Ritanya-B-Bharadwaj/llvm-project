@@ -1,0 +1,163 @@
+diff --git a/clang/lib/CodeGen/CGOpenMPRuntime.cpp b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+index f6d12d46cfc07..8563015127221 100644
+--- a/clang/lib/CodeGen/CGOpenMPRuntime.cpp
++++ b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+@@ -8025,6 +8025,21 @@ class MappableExprsHandler {
+       MapCombinedInfoTy StructBaseCurInfo;
+       const Decl *D = Data.first;
+       const ValueDecl *VD = cast_or_null<ValueDecl>(D);
++      bool HasMapBasePtr = false;
++      bool HasMapArraySec = false;
++      if (VD && VD->getType()->isAnyPointerType()) {
++        for (const auto &M : Data.second) {
++          HasMapBasePtr = any_of(M, [](const MapInfo &L) {
++            return isa_and_present<DeclRefExpr>(L.VarRef);
++          });
++          HasMapArraySec = any_of(M, [](const MapInfo &L) {
++            return isa_and_present<ArraySectionExpr, ArraySubscriptExpr>(
++                L.VarRef);
++          });
++          if (HasMapBasePtr && HasMapArraySec)
++            break;
++        }
++      }
+       for (const auto &M : Data.second) {
+         for (const MapInfo &L : M) {
+           assert(!L.Components.empty() &&
+@@ -8041,7 +8056,8 @@ class MappableExprsHandler {
+               CurInfo, StructBaseCurInfo, PartialStruct,
+               /*IsFirstComponentList=*/false, L.IsImplicit,
+               /*GenerateAllInfoForClauses*/ true, L.Mapper, L.ForDeviceAddr, VD,
+-              L.VarRef);
++              L.VarRef, /*OverlappedElements*/ std::nullopt,
++              HasMapBasePtr && HasMapArraySec);
+ 
+           // If this entry relates to a device pointer, set the relevant
+           // declaration and add the 'return pointer' flag.
+diff --git a/clang/test/OpenMP/target_data_use_device_addr_codegen.cpp b/clang/test/OpenMP/target_data_use_device_addr_codegen.cpp
+index ae0653d0585d4..7c4b96971ae70 100644
+--- a/clang/test/OpenMP/target_data_use_device_addr_codegen.cpp
++++ b/clang/test/OpenMP/target_data_use_device_addr_codegen.cpp
+@@ -13,7 +13,7 @@
+ 
+ // CHECK-DAG: [[SIZES1:@.+]] = private unnamed_addr constant [6 x i64] [i64 4, i64 16, i64 4, i64 4, i64 0, i64 4]
+ // 64 = 0x40 = OMP_MAP_RETURN_PARAM
+-// CHECK-DAG: [[MAPTYPES1:@.+]] = private unnamed_addr constant [6 x i64] [i64 67, i64 67, i64 3, i64 67, i64 67, i64 67]
++// CHECK-DAG: [[MAPTYPES1:@.+]] = private unnamed_addr constant [6 x i64] [i64 67, i64 115, i64 51, i64 67, i64 67, i64 67]
+ // CHECK-DAG: [[SIZES2:@.+]] = private unnamed_addr constant [6 x i64] [i64 0, i64 4, i64 16, i64 4, i64 4, i64 0]
+ // 0 = OMP_MAP_NONE
+ // 281474976710720 = 0x1000000000040 = OMP_MAP_MEMBER_OF | OMP_MAP_RETURN_PARAM
+@@ -54,11 +54,9 @@ int main() {
+ // CHECK: [[SIZES:%.+]] = alloca [6 x i64],
+ // CHECK: [[VLA_ADDR:%.+]] = alloca float, i64 %{{.+}},
+ // CHECK: [[PTR:%.+]] = load ptr, ptr [[PTR_ADDR]],
+-// CHECK-NEXT: [[P4:%.+]] = load ptr, ptr [[PTR_ADDR]], align 8
+-// CHECK-NEXT: [[ARR_IDX:%.+]] = getelementptr inbounds float, ptr [[P4]], i64 3
++// CHECK-NEXT: [[ARR_IDX:%.+]] = getelementptr inbounds float, ptr [[PTR]], i64 3
+ // CHECK: [[P5:%.+]] = load ptr, ptr [[PTR_ADDR]], align 8
+-// CHECK-NEXT: [[P6:%.+]] = load ptr, ptr [[PTR_ADDR]], align 8
+-// CHECK-NEXT: [[ARR_IDX1:%.+]] = getelementptr inbounds float, ptr [[P6]], i64 0
++// CHECK-NEXT: [[ARR_IDX1:%.+]] = getelementptr inbounds float, ptr [[P5]], i64 0
+ // CHECK: [[P7:%.+]] = load ptr, ptr [[REF_ADDR]],
+ // CHECK-NEXT: [[REF:%.+]] = load ptr, ptr [[REF_ADDR]],
+ // CHECK-NEXT: [[ARR_IDX2:%.+]] = getelementptr inbounds [4 x float], ptr [[ARR_ADDR]], i64 0, i64 0
+@@ -70,11 +68,11 @@ int main() {
+ // CHECK: [[PTR0:%.+]] = getelementptr inbounds [6 x ptr], ptr [[PTRS]], i32 0, i32 0
+ // CHECK: store ptr [[A_ADDR]], ptr [[PTR0]],
+ // CHECK: [[BPTR1:%.+]] = getelementptr inbounds [6 x ptr], ptr [[BPTRS]], i32 0, i32 1
+-// CHECK: store ptr [[PTR]], ptr [[BPTR1]],
++// CHECK: store ptr [[PTR_ADDR]], ptr [[BPTR1]],
+ // CHECK: [[PTR1:%.+]] = getelementptr inbounds [6 x ptr], ptr [[PTRS]], i32 0, i32 1
+ // CHECK: store ptr [[ARR_IDX]], ptr [[PTR1]],
+ // CHECK: [[BPTR2:%.+]] = getelementptr inbounds [6 x ptr], ptr [[BPTRS]], i32 0, i32 2
+-// CHECK: store ptr [[P5]], ptr [[BPTR2]],
++// CHECK: store ptr [[PTR_ADDR]], ptr [[BPTR2]],
+ // CHECK: [[PTR2:%.+]] = getelementptr inbounds [6 x ptr], ptr [[PTRS]], i32 0, i32 2
+ // CHECK: store ptr [[ARR_IDX1]], ptr [[PTR2]],
+ // CHECK: [[BPTR3:%.+]] = getelementptr inbounds [6 x ptr], ptr [[BPTRS]], i32 0, i32 3
+diff --git a/clang/test/OpenMP/target_map_both_pointer_pointee_codegen.cpp b/clang/test/OpenMP/target_map_both_pointer_pointee_codegen.cpp
+index e2c27f37f5b9d..1562aaa2760f2 100644
+--- a/clang/test/OpenMP/target_map_both_pointer_pointee_codegen.cpp
++++ b/clang/test/OpenMP/target_map_both_pointer_pointee_codegen.cpp
+@@ -20,6 +20,10 @@ void foo() {
+   {
+     ptr[2] = 8;
+   }
++  #pragma omp target data map(ptr, ptr[2])
++  {
++    ptr[2] = 9;
++  }
+ }
+ #endif
+ // CHECK-LABEL: define {{[^@]+}}@_Z3foov
+@@ -34,6 +38,9 @@ void foo() {
+ // CHECK-NEXT:    [[DOTOFFLOAD_PTRS3:%.*]] = alloca [1 x ptr], align 8
+ // CHECK-NEXT:    [[DOTOFFLOAD_MAPPERS4:%.*]] = alloca [1 x ptr], align 8
+ // CHECK-NEXT:    [[KERNEL_ARGS5:%.*]] = alloca [[STRUCT___TGT_KERNEL_ARGUMENTS]], align 8
++// CHECK-NEXT:    [[DOTOFFLOAD_BASEPTRS9:%.*]] = alloca [1 x ptr], align 8
++// CHECK-NEXT:    [[DOTOFFLOAD_PTRS10:%.*]] = alloca [1 x ptr], align 8
++// CHECK-NEXT:    [[DOTOFFLOAD_MAPPERS11:%.*]] = alloca [1 x ptr], align 8
+ // CHECK-NEXT:    [[CALL:%.*]] = call noalias noundef ptr @_Z6malloci(i32 noundef signext 12) #[[ATTR3:[0-9]+]]
+ // CHECK-NEXT:    store ptr [[CALL]], ptr [[PTR]], align 8
+ // CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[PTR]], align 8
+@@ -124,6 +131,23 @@ void foo() {
+ // CHECK-NEXT:    call void @{{__omp_offloading_[0-9a-z]+_[0-9a-z]+}}__Z3foov_l19(ptr [[TMP22]]) #[[ATTR3]]
+ // CHECK-NEXT:    br label [[OMP_OFFLOAD_CONT7]]
+ // CHECK:       omp_offload.cont7:
++// CHECK-NEXT:    [[TMP44:%.*]] = load ptr, ptr [[PTR]], align 8
++// CHECK-NEXT:    [[ARRAYIDX8:%.*]] = getelementptr inbounds i32, ptr [[TMP44]], i64 2
++// CHECK-NEXT:    [[TMP45:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_BASEPTRS9]], i32 0, i32 0
++// CHECK-NEXT:    store ptr [[PTR]], ptr [[TMP45]], align 8
++// CHECK-NEXT:    [[TMP46:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_PTRS10]], i32 0, i32 0
++// CHECK-NEXT:    store ptr [[ARRAYIDX8]], ptr [[TMP46]], align 8
++// CHECK-NEXT:    [[TMP47:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_MAPPERS11]], i64 0, i64 0
++// CHECK-NEXT:    store ptr null, ptr [[TMP47]], align 8
++// CHECK-NEXT:    [[TMP48:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_BASEPTRS9]], i32 0, i32 0
++// CHECK-NEXT:    [[TMP49:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_PTRS10]], i32 0, i32 0
++// CHECK-NEXT:    call void @__tgt_target_data_begin_mapper(ptr @[[GLOB1]], i64 -1, i32 1, ptr [[TMP48]], ptr [[TMP49]], ptr @.offload_sizes.3, ptr @.offload_maptypes.4, ptr null, ptr null)
++// CHECK-NEXT:    [[TMP50:%.*]] = load ptr, ptr [[PTR]], align 8
++// CHECK-NEXT:    [[ARRAYIDX12:%.*]] = getelementptr inbounds i32, ptr [[TMP50]], i64 2
++// CHECK-NEXT:    store i32 9, ptr [[ARRAYIDX12]], align 4
++// CHECK-NEXT:    [[TMP51:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_BASEPTRS9]], i32 0, i32 0
++// CHECK-NEXT:    [[TMP52:%.*]] = getelementptr inbounds [1 x ptr], ptr [[DOTOFFLOAD_PTRS10]], i32 0, i32 0
++// CHECK-NEXT:    call void @__tgt_target_data_end_mapper(ptr @[[GLOB1]], i64 -1, i32 1, ptr [[TMP51]], ptr [[TMP52]], ptr @.offload_sizes.3, ptr @.offload_maptypes.4, ptr null, ptr null)
+ // CHECK-NEXT:    ret void
+ //
+ //
+diff --git a/offload/test/mapping/map_both_pointer_pointee.c b/offload/test/mapping/map_both_pointer_pointee.c
+index 4b724823e7a40..65d7d3d4d2bff 100644
+--- a/offload/test/mapping/map_both_pointer_pointee.c
++++ b/offload/test/mapping/map_both_pointer_pointee.c
+@@ -10,6 +10,7 @@
+ #pragma omp declare target
+ int *ptr1;
+ #pragma omp end declare target
++int a[10];
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -38,5 +39,24 @@ int main() {
+   // CHECK: 6
+   printf(" %d \n", ptr2[1]);
+   free(ptr2);
++
++  a[1] = 111;
++  int *p = &a[0];
++  // CHECK: 111
++  printf("%d %p %p\n", p[1], p, &p); // 111 hst_p1 hst_p2
++#pragma omp target data map(to : p[1 : 3]) map(p)
++#pragma omp target data use_device_addr(p)
++  {
++#pragma omp target has_device_addr(p)
++    {
++      // CHECK: 111
++      printf("%d %p %p\n", p[1], p, &p); // 111 dev_p1 dev_p2
++      p[1] = 222;
++      // CHECK: 222
++      printf("%d %p %p\n", p[1], p, &p); // 222 dev_p1 dev_p2
++    }
++  }
++  // CHECK: 111
++  printf("%d %p %p\n", p[1], p, &p); // 111 hst_p1 hst_p2
+   return 0;
+ }

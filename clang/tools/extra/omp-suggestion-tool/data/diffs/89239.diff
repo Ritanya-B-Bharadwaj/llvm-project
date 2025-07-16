@@ -1,0 +1,110 @@
+diff --git a/offload/plugins-nextgen/common/include/PluginInterface.h b/offload/plugins-nextgen/common/include/PluginInterface.h
+index 79e8464bfda5c..1b7a0ca2136e3 100644
+--- a/offload/plugins-nextgen/common/include/PluginInterface.h
++++ b/offload/plugins-nextgen/common/include/PluginInterface.h
+@@ -829,6 +829,12 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
+     return OMPX_MinThreadsForLowTripCount;
+   }
+ 
++  /// Whether or not to reuse blocks for high trip count loops.
++  /// @see OMPX_ReuseBlocksForHighTripCount
++  bool getReuseBlocksForHighTripCount() {
++    return OMPX_ReuseBlocksForHighTripCount;
++  }
++
+   /// Get the total amount of hardware parallelism supported by the target
+   /// device. This is the total amount of warps or wavefronts that can be
+   /// resident on the device simultaneously.
+@@ -904,6 +910,9 @@ struct GenericDeviceTy : public DeviceAllocatorTy {
+   UInt32Envar OMPX_MinThreadsForLowTripCount =
+       UInt32Envar("LIBOMPTARGET_MIN_THREADS_FOR_LOW_TRIP_COUNT", 32);
+ 
++  BoolEnvar OMPX_ReuseBlocksForHighTripCount =
++      BoolEnvar("LIBOMPTARGET_REUSE_BLOCKS_FOR_HIGH_TRIP_COUNT", true);
++
+ protected:
+   /// Environment variables defined by the LLVM OpenMP implementation
+   /// regarding the initial number of streams and events.
+diff --git a/offload/plugins-nextgen/common/src/PluginInterface.cpp b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+index b5f3c45c835fd..d88ba8a47d270 100644
+--- a/offload/plugins-nextgen/common/src/PluginInterface.cpp
++++ b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+@@ -705,8 +705,11 @@ uint64_t GenericKernelTy::getNumBlocks(GenericDeviceTy &GenericDevice,
+       TripCountNumBlocks = LoopTripCount;
+     }
+   }
++
++  uint32_t PreferredNumBlocks = TripCountNumBlocks;
+   // If the loops are long running we rather reuse blocks than spawn too many.
+-  uint32_t PreferredNumBlocks = std::min(TripCountNumBlocks, DefaultNumBlocks);
++  if (GenericDevice.getReuseBlocksForHighTripCount())
++    PreferredNumBlocks = std::min(TripCountNumBlocks, DefaultNumBlocks);
+   return std::min(PreferredNumBlocks, GenericDevice.getBlockLimit());
+ }
+ 
+diff --git a/offload/test/offloading/high_trip_count_block_limit.cpp b/offload/test/offloading/high_trip_count_block_limit.cpp
+new file mode 100644
+index 0000000000000..d0e39274e27d6
+--- /dev/null
++++ b/offload/test/offloading/high_trip_count_block_limit.cpp
+@@ -0,0 +1,35 @@
++// clang-format off
++// RUN: %libomptarget-compilexx-generic && env LIBOMPTARGET_REUSE_BLOCKS_FOR_HIGH_TRIP_COUNT=False %libomptarget-run-generic 2>&1 | %fcheck-generic
++// RUN: %libomptarget-compilexx-generic && %libomptarget-run-generic 2>&1 | %fcheck-generic --check-prefix=DEFAULT
++
++// UNSUPPORTED: aarch64-unknown-linux-gnu 
++// UNSUPPORTED: aarch64-unknown-linux-gnu-LTO 
++// UNSUPPORTED: x86_64-pc-linux-gnu 
++// UNSUPPORTED: x86_64-pc-linux-gnu-LTO 
++// UNSUPPORTED: s390x-ibm-linux-gnu 
++// UNSUPPORTED: s390x-ibm-linux-gnu-LTO
++// clang-format on
++
++/*
++  Check if there is a thread for each loop iteration
++*/
++#include <omp.h>
++#include <stdio.h>
++
++int main() {
++  int N = 819200;
++  int num_threads[N];
++
++#pragma omp target teams distribute parallel for
++  for (int j = 0; j < N; j++) {
++    num_threads[j] = omp_get_num_threads() * omp_get_num_teams();
++  }
++
++  if (num_threads[0] == N)
++    // CHECK: PASS
++    printf("PASS\n");
++  else
++    // DEFAULT: FAIL
++    printf("FAIL: num_threads: %d\n != N: %d", num_threads[0], N);
++  return 0;
++}
+diff --git a/openmp/docs/design/Runtimes.rst b/openmp/docs/design/Runtimes.rst
+index f8a8cb87e83e6..98dd984fd4b0c 100644
+--- a/openmp/docs/design/Runtimes.rst
++++ b/openmp/docs/design/Runtimes.rst
+@@ -742,6 +742,7 @@ variables is defined below.
+     * ``LIBOMPTARGET_JIT_PRE_OPT_IR_MODULE=<out:Filename> (LLVM-IR file)``
+     * ``LIBOMPTARGET_JIT_POST_OPT_IR_MODULE=<out:Filename> (LLVM-IR file)``
+     * ``LIBOMPTARGET_MIN_THREADS_FOR_LOW_TRIP_COUNT=<Num> (default: 32)``
++    * ``LIBOMPTARGET_REUSE_BLOCKS_FOR_HIGH_TRIP_COUNT=[TRUE/FALSE] (default TRUE)``
+ 
+ LIBOMPTARGET_DEBUG
+ """"""""""""""""""
+@@ -1162,6 +1163,12 @@ of threads possible times the number of teams (aka. blocks) the device prefers
+ count to increase outer (team/block) parallelism. The thread count will never
+ be reduced below the value passed for this environment variable though.
+ 
++LIBOMPTARGET_REUSE_BLOCKS_FOR_HIGH_TRIP_COUNT
++"""""""""""""""""""""""""""""""""""""""""""""
++
++This environment variable can be used to control how the OpenMP runtime assigns
++blocks to loops with high trip counts. By default we reuse existing blocks
++rather than spawning new blocks.
+ 
+ 
+ .. _libomptarget_plugin:

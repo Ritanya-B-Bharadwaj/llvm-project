@@ -1,0 +1,2078 @@
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index c3c1f363033c2..c87182abe3d18 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -489,23 +489,57 @@ static mlir::Type unwrapSeqOrBoxedType(mlir::Type ty) {
+   return ty;
+ }
+ 
+-static mlir::Value
+-createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+-                          mlir::omp::DeclareReductionOp &reductionDecl,
+-                          const ReductionProcessor::ReductionIdentifier redId,
+-                          mlir::Type type, bool isByRef) {
++static void createReductionAllocAndInitRegions(
++    fir::FirOpBuilder &builder, mlir::Location loc,
++    mlir::omp::DeclareReductionOp &reductionDecl,
++    const ReductionProcessor::ReductionIdentifier redId, mlir::Type type,
++    bool isByRef) {
++  auto yield = [&](mlir::Value ret) {
++    builder.create<mlir::omp::YieldOp>(loc, ret);
++  };
++
++  mlir::Block *allocBlock = nullptr;
++  mlir::Block *initBlock = nullptr;
++  if (isByRef) {
++    allocBlock =
++        builder.createBlock(&reductionDecl.getAllocRegion(),
++                            reductionDecl.getAllocRegion().end(), {}, {});
++    initBlock = builder.createBlock(&reductionDecl.getInitializerRegion(),
++                                    reductionDecl.getInitializerRegion().end(),
++                                    {type, type}, {loc, loc});
++  } else {
++    initBlock = builder.createBlock(&reductionDecl.getInitializerRegion(),
++                                    reductionDecl.getInitializerRegion().end(),
++                                    {type}, {loc});
++  }
++
+   mlir::Type ty = fir::unwrapRefType(type);
++  builder.setInsertionPointToEnd(initBlock);
+   mlir::Value initValue = ReductionProcessor::getReductionInitValue(
+       loc, unwrapSeqOrBoxedType(ty), redId, builder);
+ 
+   if (fir::isa_trivial(ty)) {
+     if (isByRef) {
+-      mlir::Value alloca = builder.create<fir::AllocaOp>(loc, ty);
+-      builder.createStoreWithConvert(loc, initValue, alloca);
+-      return alloca;
++      // alloc region
++      {
++        builder.setInsertionPointToEnd(allocBlock);
++        mlir::Value alloca = builder.create<fir::AllocaOp>(loc, ty);
++        yield(alloca);
++      }
++
++      // init region
++      {
++        builder.setInsertionPointToEnd(initBlock);
++        // block arg is mapped to the alloca yielded from the alloc region
++        mlir::Value alloc = reductionDecl.getInitializerAllocArg();
++        builder.createStoreWithConvert(loc, initValue, alloc);
++        yield(alloc);
++      }
++      return;
+     }
+     // by val
+-    return initValue;
++    yield(initValue);
++    return;
+   }
+ 
+   // check if an allocatable box is unallocated. If so, initialize the boxAlloca
+@@ -520,10 +554,10 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+   //   fir.store %something to %box_alloca
+   // }
+   // omp.yield %box_alloca
+-  mlir::Value blockArg =
+-      builder.loadIfRef(loc, builder.getBlock()->getArgument(0));
++  mlir::Value moldArg =
++      builder.loadIfRef(loc, reductionDecl.getInitializerMoldArg());
+   auto handleNullAllocatable = [&](mlir::Value boxAlloca) -> fir::IfOp {
+-    mlir::Value addr = builder.create<fir::BoxAddrOp>(loc, blockArg);
++    mlir::Value addr = builder.create<fir::BoxAddrOp>(loc, moldArg);
+     mlir::Value isNotAllocated = builder.genIsNullAddr(loc, addr);
+     fir::IfOp ifOp = builder.create<fir::IfOp>(loc, isNotAllocated,
+                                                /*withElseRegion=*/true);
+@@ -539,7 +573,17 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+     assert(isByRef && "passing boxes by value is unsupported");
+     bool isAllocatableOrPointer =
+         mlir::isa<fir::HeapType, fir::PointerType>(boxTy.getEleTy());
+-    mlir::Value boxAlloca = builder.create<fir::AllocaOp>(loc, ty);
++
++    // alloc region
++    {
++      builder.setInsertionPointToEnd(allocBlock);
++      mlir::Value boxAlloca = builder.create<fir::AllocaOp>(loc, ty);
++      yield(boxAlloca);
++    }
++
++    // init region
++    builder.setInsertionPointToEnd(initBlock);
++    mlir::Value boxAlloca = reductionDecl.getInitializerAllocArg();
+     mlir::Type innerTy = fir::unwrapRefType(boxTy.getEleTy());
+     if (fir::isa_trivial(innerTy)) {
+       // boxed non-sequence value e.g. !fir.box<!fir.heap<i32>>
+@@ -558,7 +602,8 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+       createReductionCleanupRegion(builder, loc, reductionDecl);
+       builder.restoreInsertionPoint(insPt);
+       builder.setInsertionPointAfter(ifUnallocated);
+-      return boxAlloca;
++      yield(boxAlloca);
++      return;
+     }
+     innerTy = fir::extractSequenceType(boxTy);
+     if (!mlir::isa<fir::SequenceType>(innerTy))
+@@ -571,7 +616,7 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+     }
+ 
+     // Create the private copy from the initial fir.box:
+-    mlir::Value loadedBox = builder.loadIfRef(loc, blockArg);
++    mlir::Value loadedBox = builder.loadIfRef(loc, moldArg);
+     hlfir::Entity source = hlfir::Entity{loadedBox};
+ 
+     // Allocating on the heap in case the whole reduction is nested inside of a
+@@ -616,7 +661,8 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+     builder.create<fir::StoreOp>(loc, box, boxAlloca);
+     if (ifUnallocated)
+       builder.setInsertionPointAfter(ifUnallocated);
+-    return boxAlloca;
++    yield(boxAlloca);
++    return;
+   }
+ 
+   TODO(loc, "createReductionInitRegion for unsupported type");
+@@ -643,13 +689,7 @@ mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
+ 
+   decl = modBuilder.create<mlir::omp::DeclareReductionOp>(loc, reductionOpName,
+                                                           type);
+-  builder.createBlock(&decl.getInitializerRegion(),
+-                      decl.getInitializerRegion().end(), {type}, {loc});
+-  builder.setInsertionPointToEnd(&decl.getInitializerRegion().back());
+-
+-  mlir::Value init =
+-      createReductionInitRegion(builder, loc, decl, redId, type, isByRef);
+-  builder.create<mlir::omp::YieldOp>(loc, init);
++  createReductionAllocAndInitRegions(builder, loc, decl, redId, type, isByRef);
+ 
+   builder.createBlock(&decl.getReductionRegion(),
+                       decl.getReductionRegion().end(), {type, type},
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90 b/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
+index 72e91680a4310..2943957117932 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-reduction-byref.f90
+@@ -22,7 +22,7 @@ subroutine red_and_delayed_private
+ ! CHECK-SAME: @[[PRIVATIZER_SYM:.*]] : !fir.ref<i32> alloc {
+ 
+ ! CHECK-LABEL: omp.declare_reduction
+-! CHECK-SAME: @[[REDUCTION_SYM:.*]] : !fir.ref<i32> init
++! CHECK-SAME: @[[REDUCTION_SYM:.*]] : !fir.ref<i32> alloc
+ 
+ ! CHECK-LABEL: _QPred_and_delayed_private
+ ! CHECK: omp.parallel
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
+index 7347d9324feac..ad97b17d6857d 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-add-byref.f90
+@@ -3,12 +3,14 @@
+ 
+ !CHECK-LABEL: omp.declare_reduction
+ !CHECK-SAME: @[[RED_F32_NAME:.*]] : !fir.ref<f32>
+-!CHECK-SAME: init {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<f32>):
+-!CHECK:  %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
++!CHECK-SAME: alloc {
+ !CHECK:  %[[REF:.*]] = fir.alloca f32
+-!CHECKL  fir.store [[%C0_1]] to %[[REF]] : !fir.ref<f32>
+ !CHECK:  omp.yield(%[[REF]] : !fir.ref<f32>)
++!CHECK-LABEL: } init {
++!CHECK: ^bb0(%{{.*}}: !fir.ref<f32>, %[[ALLOC:.*]]: !fir.ref<f32>):
++!CHECK:  %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
++!CHECKL  fir.store [[%C0_1]] to %[[ALLOC]] : !fir.ref<f32>
++!CHECK:  omp.yield(%[[ALLOC]] : !fir.ref<f32>)
+ !CHECK: } combiner {
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<f32>, %[[ARG1:.*]]: !fir.ref<f32>):
+ !CHECK:  %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<f32>
+@@ -20,12 +22,14 @@
+ 
+ !CHECK-LABEL: omp.declare_reduction
+ !CHECK-SAME: @[[RED_I32_NAME:.*]] : !fir.ref<i32>
+-!CHECK-SAME: init {
+-!CHECK: ^bb0(%{{.*}}: !fir.ref<i32>):
+-!CHECK:  %[[C0_1:.*]] = arith.constant 0 : i32
++!CHECK-SAME: alloc {
+ !CHECK:  %[[REF:.*]] = fir.alloca i32
+-!CHECK:  fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
+ !CHECK:  omp.yield(%[[REF]] : !fir.ref<i32>)
++!CHECK-LABEL: } init {
++!CHECK: ^bb0(%{{.*}}: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++!CHECK:  %[[C0_1:.*]] = arith.constant 0 : i32
++!CHECK:  fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i32>
++!CHECK:  omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ !CHECK: } combiner {
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+ !CHECK:  %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+index fdb7e974f1c5c..7a2db3299784c 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+@@ -18,18 +18,20 @@ program reduce
+ 
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> alloc {
++! CHECK:           %[[VAL_10:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-! CHECK:           %[[VAL_10:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:           %[[ADDR:.*]] = fir.box_addr %[[VAL_2]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
+ ! CHECK:           %[[ADDRI:.*]] = fir.convert %[[ADDR]] : (!fir.heap<!fir.array<?xi32>>) -> i64
+ ! CHECK:           %[[C0_I64:.*]] = arith.constant 0 : i64
+ ! CHECK:           %[[IS_NULL:.*]] = arith.cmpi eq, %[[ADDRI]], %[[C0_I64]] : i64
+ ! CHECK:           fir.if %[[IS_NULL]] {
+ ! CHECK:             %[[NULL_BOX:.*]] = fir.embox %[[ADDR]] : (!fir.heap<!fir.array<?xi32>>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[NULL_BOX]] to %[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[NULL_BOX]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           } else {
+ ! CHECK:             %[[VAL_3:.*]] = arith.constant 0 : index
+ ! CHECK:             %[[VAL_4:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_3]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+@@ -42,9 +44,9 @@ program reduce
+ ! CHECK:             %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:             %[[REBOX:.*]] = fir.rebox %[[VAL_8]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:             hlfir.assign %[[VAL_1]] to %[[REBOX]] : i32, !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[REBOX]] to %[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[REBOX]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           }
+-! CHECK:           omp.yield(%[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+index b44fe4c1f4cc2..59902bd13a1c2 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+@@ -12,11 +12,13 @@ program reduce
+ 
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x2xi32 : !fir.ref<!fir.box<!fir.array<3x2xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x2xi32 : !fir.ref<!fir.box<!fir.array<3x2xi32>>> alloc {
++! CHECK:           %[[VAL_15:.*]] = fir.alloca !fir.box<!fir.array<3x2xi32>>
++! CHECK:           omp.yield(%[[VAL_15]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+-! CHECK:           %[[VAL_15:.*]] = fir.alloca !fir.box<!fir.array<3x2xi32>>
+ ! CHECK:           %[[VAL_3:.*]] = arith.constant 3 : index
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 2 : index
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_3]], %[[VAL_4]] : (index, index) -> !fir.shape<2>
+@@ -30,8 +32,8 @@ program reduce
+ ! CHECK:           %[[VAL_13:.*]] = fir.shape_shift %[[VAL_10]]#0, %[[VAL_10]]#1, %[[VAL_12]]#0, %[[VAL_12]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
+ ! CHECK:           %[[VAL_14:.*]] = fir.embox %[[VAL_8]]#0(%[[VAL_13]]) : (!fir.heap<!fir.array<3x2xi32>>, !fir.shapeshift<2>) -> !fir.box<!fir.array<3x2xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_14]] : i32, !fir.box<!fir.array<3x2xi32>>
+-! CHECK:           fir.store %[[VAL_14]] to %[[VAL_15]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+-! CHECK:           omp.yield(%[[VAL_15]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
++! CHECK:           fir.store %[[VAL_14]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+index 60b21c9b1ebbe..8835c1f5b5e18 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+@@ -13,11 +13,13 @@ program reduce
+ print *,i
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 3 : index
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]] : (index) -> !fir.shape<1>
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<3xi32> {bindc_name = ".tmp", uniq_name = ""}
+@@ -29,8 +31,8 @@ program reduce
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<3xi32>>
+-! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
++! CHECK:           fir.store %[[VAL_7]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+index 5d4c86d1d76e8..2d4c0239b5d2e 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+@@ -13,11 +13,13 @@ program reduce
+ print *,i
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 3 : index
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]] : (index) -> !fir.shape<1>
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<3xi32>
+@@ -28,8 +30,8 @@ program reduce
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<3xi32>>
+-! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
++! CHECK:           fir.store %[[VAL_7]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-byref.f90 b/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
+index 5685e2c584ace..596276a99cafc 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-byref.f90
+@@ -2,12 +2,14 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ 
+ !CHECK:  omp.declare_reduction @[[REDUCTION_DECLARE:[_a-z0-9]+]] : !fir.ref<i32>
+-!CHECK-SAME: init {
+-!CHECK:  ^bb0(%{{.*}}: !fir.ref<i32>):
+-!CHECK:    %[[I0:[_a-z0-9]+]] = arith.constant 0 : i32
+-!CHECK:  %[[REF:.*]] = fir.alloca i32
+-!CHECKL  fir.store [[%I0]] to %[[REF]] : !fir.ref<i32>
++!CHECK-SAME: alloc {
++!CHECK:    %[[REF:.*]] = fir.alloca i32
+ !CHECK:    omp.yield(%[[REF]] : !fir.ref<i32>)
++!CHECK-LABEL: } init {
++!CHECK:  ^bb0(%{{.*}}: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++!CHECK:    %[[I0:[_a-z0-9]+]] = arith.constant 0 : i32
++!CHECKL    fir.store [[%I0]] to %[[ALLOC]] : !fir.ref<i32>
++!CHECK:    omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ !CHECK:  } combiner {
+ !CHECK:  ^bb0(%[[C0:[_a-z0-9]+]]: !fir.ref<i32>, %[[C1:[_a-z0-9]+]]: !fir.ref<i32>):
+ !CHECK:    %[[LD0:.*]] = fir.load %[[C0]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90 b/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
+index 6a2eacaaf7bd1..1457be05ca102 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-mixed.f90
+@@ -24,11 +24,11 @@ end subroutine proc
+ !CHECK:  %[[TID_LOCAL:.*]] = alloca i32
+ !CHECK:  %[[TID:.*]] = load i32, ptr %[[TID_ADDR]]
+ !CHECK:  store i32 %[[TID]], ptr %[[TID_LOCAL]]
+-!CHECK:  %[[I_priv:.*]] = alloca i32
+ !CHECK:  %[[F_priv:.*]] = alloca ptr
++!CHECK:  %[[I_priv:.*]] = alloca i32
++!CHECK:  store ptr %{{.*}}, ptr %[[F_priv]]
+ 
+ !CHECK: omp.reduction.init:
+-!CHECK: store ptr %{{.*}}, ptr %[[F_priv]]
+ !CHECK: store i32 0, ptr %[[I_priv]]
+ 
+ !CHECK: omp.par.region:
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+index 2c2f60cb72c9a..1273b250117da 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+@@ -19,18 +19,20 @@ program reduce
+ 
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_ptr_Uxi32 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_ptr_Uxi32 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.ptr<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.ptr<!fir.array<?xi32>>>
+ ! CHECK:           %[[VAL_4:.*]] = fir.box_addr %[[VAL_2]] : (!fir.box<!fir.ptr<!fir.array<?xi32>>>) -> !fir.ptr<!fir.array<?xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.convert %[[VAL_4]] : (!fir.ptr<!fir.array<?xi32>>) -> i64
+ ! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i64
+ ! CHECK:           %[[VAL_7:.*]] = arith.cmpi eq, %[[VAL_5]], %[[VAL_6]] : i64
+ ! CHECK:           fir.if %[[VAL_7]] {
+ ! CHECK:             %[[VAL_8:.*]] = fir.embox %[[VAL_4]] : (!fir.ptr<!fir.array<?xi32>>) -> !fir.box<!fir.ptr<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_8]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+ ! CHECK:           } else {
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 0 : index
+ ! CHECK:             %[[VAL_10:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_9]] : (!fir.box<!fir.ptr<!fir.array<?xi32>>>, index) -> (index, index, index)
+@@ -43,9 +45,9 @@ program reduce
+ ! CHECK:             %[[VAL_17:.*]] = fir.shape_shift %[[VAL_16]]#0, %[[VAL_16]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:             %[[VAL_18:.*]] = fir.rebox %[[VAL_14]]#0(%[[VAL_17]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.ptr<!fir.array<?xi32>>>
+ ! CHECK:             hlfir.assign %[[VAL_1]] to %[[VAL_18]] : i32, !fir.box<!fir.ptr<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_18]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_18]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+ ! CHECK:           }
+-! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 669d528a8ae14..441dff34553d4 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -1,11 +1,13 @@
+ ! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxi32 : !fir.ref<!fir.box<!fir.array<?xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxi32 : !fir.ref<!fir.box<!fir.array<?xi32>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
+ ! CHECK:           %[[VAL_3:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_4:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_3]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]]#1 : (index) -> !fir.shape<1>
+@@ -17,8 +19,8 @@
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[REBOX:.*]] = fir.rebox %[[VAL_7]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<?xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_1]] to %[[REBOX]] : i32, !fir.box<!fir.array<?xi32>>
+-! CHECK:           fir.store %[[REBOX]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
++! CHECK:           fir.store %[[REBOX]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+diff --git a/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90 b/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
+index 208cda28a3e59..d7af34923827c 100644
+--- a/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
++++ b/flang/test/Lower/OpenMP/reduction-array-intrinsic.f90
+@@ -9,11 +9,13 @@ subroutine max_array_reduction(l, r)
+   !$omp end parallel
+ end subroutine
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_byref_box_Uxi32 : !fir.ref<!fir.box<!fir.array<?xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
++! CHECK-LABEL:   omp.declare_reduction @max_byref_box_Uxi32 : !fir.ref<!fir.box<!fir.array<?xi32>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
+ ! CHECK:           %[[VAL_6:.*]] = fir.shape %[[VAL_5]]#1 : (index) -> !fir.shape<1>
+@@ -25,8 +27,8 @@ subroutine max_array_reduction(l, r)
+ ! CHECK:           %[[VAL_12:.*]] = fir.shape_shift %[[VAL_11]]#0, %[[VAL_11]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_13:.*]] = fir.rebox %[[VAL_9]]#0(%[[VAL_12]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<?xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_13]] : i32, !fir.box<!fir.array<?xi32>>
+-! CHECK:           fir.store %[[VAL_13]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
++! CHECK:           fir.store %[[VAL_13]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+diff --git a/flang/test/Lower/OpenMP/sections-array-reduction.f90 b/flang/test/Lower/OpenMP/sections-array-reduction.f90
+index 709d4c444dd0f..e5319e8d6bcc7 100644
+--- a/flang/test/Lower/OpenMP/sections-array-reduction.f90
++++ b/flang/test/Lower/OpenMP/sections-array-reduction.f90
+@@ -14,7 +14,10 @@ subroutine sectionsReduction(x)
+ end subroutine
+ 
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxf32 : !fir.ref<!fir.box<!fir.array<?xf32>>> init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxf32 : !fir.ref<!fir.box<!fir.array<?xf32>>> alloc {
++! [...]
++! CHECK:           omp.yield
++! CHECK-LABEL:   } init {
+ ! [...]
+ ! CHECK:           omp.yield
+ ! CHECK-LABEL:   } combiner {
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+index 8dc2b43ad56a3..67d8964622275 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+@@ -2,12 +2,14 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f64 : !fir.ref<f64>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK-SAME:    alloc {
+ ! CHECK:            %[[REF:.*]] = fir.alloca f64
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<f64>
+-! CHECK:           omp.yield(%[[REF]] : !fir.ref<f64>)
++! CHECK:            omp.yield(%[[REF:.*]] : !fir.ref<f64>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>, %[[ALLOC:.*]]: !fir.ref<f64>):
++! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f64
++! CHECK:            fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<f64>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<f64>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<f64>, %[[ARG1:.*]]: !fir.ref<f64>):
+@@ -19,12 +21,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i64 : !fir.ref<i64>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i64
++! CHECK-SAME:    alloc {
+ ! CHECK:            %[[REF:.*]] = fir.alloca i64
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i64>
+-! CHECK:            omp.yield(%[[REF]] : !fir.ref<i64>)
++! CHECK:            omp.yield(%[[REF:.*]] : !fir.ref<i64>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>, %[[ALLOC:.*]]: !fir.ref<i64>):
++! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i64
++! CHECK:            fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i64>
++! CHECK:            omp.yield(%[[ALLOC]] : !fir.ref<i64>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i64>, %[[ARG1:.*]]: !fir.ref<i64>):
+@@ -36,12 +40,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f32 : !fir.ref<f32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
+-! CHECK:            %[[REF:.*]] = fir.alloca f32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<f32>
++! CHECK-SAME:    alloc {
++! CHECK:           %[[REF:.*]] = fir.alloca f32
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<f32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>, %[[ALLOC:.*]]: !fir.ref<f32>):
++! CHECK:           %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
++! CHECK:           fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<f32>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<f32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<f32>, %[[ARG1:.*]]: !fir.ref<f32>):
+@@ -53,12 +59,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+-! CHECK:            %[[REF:.*]] = fir.alloca i32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
++! CHECK-SAME:    alloc {
++! CHECK:           %[[REF:.*]] = fir.alloca i32
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<i32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++! CHECK:           %[[C0_1:.*]] = arith.constant 0 : i32
++! CHECK:           fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i32>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
+deleted file mode 100644
+index cef86d1c1bd49..0000000000000
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
++++ /dev/null
+@@ -1,58 +0,0 @@
+-! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+-! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+-
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+-! CHECK:            %[[REF:.*]] = fir.alloca i32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
+-! CHECK:           omp.yield(%[[REF]] : !fir.ref<i32>)
+-
+-! CHECK-LABEL:   } combiner {
+-! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+-! CHECK:           %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<i32>
+-! CHECK:           %[[LD1:.*]] = fir.load %[[ARG1]] : !fir.ref<i32>
+-! CHECK:           %[[RES:.*]] = arith.addi %[[LD0]], %[[LD1]] : i32
+-! CHECK:           fir.store %[[RES]] to %[[ARG0]] : !fir.ref<i32>
+-! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<i32>)
+-! CHECK:         }
+-
+-! CHECK-LABEL:   func.func @_QPsimple_int_reduction()
+-! CHECK:           %[[VAL_0:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimple_int_reductionEi"}
+-! CHECK:           %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_2:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFsimple_int_reductionEx"}
+-! CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_2]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i32
+-! CHECK:           hlfir.assign %[[VAL_4]] to %[[VAL_3]]#0 : i32, !fir.ref<i32>
+-! CHECK:           omp.parallel {
+-! CHECK:             %[[VAL_5:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+-! CHECK:             %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+-! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+-! CHECK:                 hlfir.assign %[[VAL_15]] to %[[VAL_12]]#0 : i32, !fir.ref<i32>
+-! CHECK:                 omp.yield
+-! CHECK:               omp.terminator
+-! CHECK:             omp.terminator
+-! CHECK:           return
+-
+-
+-subroutine simple_int_reduction
+-  integer :: x
+-  x = 0
+-  !$omp parallel
+-  !$omp do reduction(+:x)
+-  do i=1, 100
+-    x = x + i
+-  end do
+-  !$omp end do
+-  !$omp end parallel
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90
+deleted file mode 100644
+index d0ba2cdff8174..0000000000000
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90
++++ /dev/null
+@@ -1,54 +0,0 @@
+-! RUN: bbc -emit-hlfir -fopenmp %s -o - | FileCheck %s
+-! RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
+-
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i32 : i32 init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+-! CHECK:           omp.yield(%[[VAL_1]] : i32)
+-
+-! CHECK-LABEL:   } combiner {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: i32, %[[VAL_1:.*]]: i32):
+-! CHECK:           %[[VAL_2:.*]] = arith.addi %[[VAL_0]], %[[VAL_1]] : i32
+-! CHECK:           omp.yield(%[[VAL_2]] : i32)
+-! CHECK:         }
+-
+-! CHECK-LABEL:   func.func @_QPsimple_int_reduction()
+-! CHECK:           %[[VAL_0:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimple_int_reductionEi"}
+-! CHECK:           %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_2:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFsimple_int_reductionEx"}
+-! CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_2]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i32
+-! CHECK:           hlfir.assign %[[VAL_4]] to %[[VAL_3]]#0 : i32, !fir.ref<i32>
+-! CHECK:           omp.parallel {
+-! CHECK:             %[[VAL_5:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+-! CHECK:             %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+-! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+-! CHECK:                 hlfir.assign %[[VAL_15]] to %[[VAL_12]]#0 : i32, !fir.ref<i32>
+-! CHECK:                 omp.yield
+-! CHECK:               omp.terminator
+-! CHECK:             omp.terminator
+-! CHECK:           return
+-
+-
+-subroutine simple_int_reduction
+-  integer :: x
+-  x = 0
+-  !$omp parallel
+-  !$omp do reduction(+:x)
+-  do i=1, 100
+-    x = x + i
+-  end do
+-  !$omp end do
+-  !$omp end parallel
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+index cda7593b217ab..6b901bae539ff 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+@@ -32,18 +32,20 @@ program reduce15
+   print *,"min: ", mins
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @min_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
++! CHECK-LABEL:   omp.declare_reduction @min_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 2147483647 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:           %[[VAL_4:.*]] = fir.box_addr %[[VAL_2]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.convert %[[VAL_4]] : (!fir.heap<!fir.array<?xi32>>) -> i64
+ ! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i64
+ ! CHECK:           %[[VAL_7:.*]] = arith.cmpi eq, %[[VAL_5]], %[[VAL_6]] : i64
+ ! CHECK:           fir.if %[[VAL_7]] {
+ ! CHECK:             %[[VAL_8:.*]] = fir.embox %[[VAL_4]] : (!fir.heap<!fir.array<?xi32>>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_8]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           } else {
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 0 : index
+ ! CHECK:             %[[VAL_10:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_9]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+@@ -56,9 +58,9 @@ program reduce15
+ ! CHECK:             %[[VAL_17:.*]] = fir.shape_shift %[[VAL_16]]#0, %[[VAL_16]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:             %[[VAL_18:.*]] = fir.rebox %[[VAL_14]]#0(%[[VAL_17]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:             hlfir.assign %[[VAL_1]] to %[[VAL_18]] : i32, !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_18]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_18]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           }
+-! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+@@ -89,18 +91,20 @@ program reduce15
+ ! CHECK:           omp.yield
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
++! CHECK-LABEL:   omp.declare_reduction @max_byref_box_heap_Uxi32 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:           %[[VAL_4:.*]] = fir.box_addr %[[VAL_2]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.convert %[[VAL_4]] : (!fir.heap<!fir.array<?xi32>>) -> i64
+ ! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i64
+ ! CHECK:           %[[VAL_7:.*]] = arith.cmpi eq, %[[VAL_5]], %[[VAL_6]] : i64
+ ! CHECK:           fir.if %[[VAL_7]] {
+ ! CHECK:             %[[VAL_8:.*]] = fir.embox %[[VAL_4]] : (!fir.heap<!fir.array<?xi32>>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_8]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           } else {
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 0 : index
+ ! CHECK:             %[[VAL_10:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_9]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+@@ -113,9 +117,9 @@ program reduce15
+ ! CHECK:             %[[VAL_17:.*]] = fir.shape_shift %[[VAL_16]]#0, %[[VAL_16]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:             %[[VAL_18:.*]] = fir.rebox %[[VAL_14]]#0(%[[VAL_17]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+ ! CHECK:             hlfir.assign %[[VAL_1]] to %[[VAL_18]] : i32, !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_18]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             fir.store %[[VAL_18]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           }
+-! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+index 3c5388b7e5d90..66db62a36bc17 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+@@ -18,25 +18,27 @@ program reduce
+ 
+ end program
+ 
+-! CHECK:         omp.declare_reduction @add_reduction_byref_box_heap_i32 : !fir.ref<!fir.box<!fir.heap<i32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<i32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_heap_i32 : !fir.ref<!fir.box<!fir.heap<i32>>> alloc {
++! CHECK:           %[[VAL_2:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
++! CHECK:           omp.yield(%[[VAL_2]] : !fir.ref<!fir.box<!fir.heap<i32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<i32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.heap<i32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[LOAD:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<i32>>>
+-! CHECK:           %[[VAL_2:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
+ ! CHECK:           %[[ADDR:.*]] = fir.box_addr %[[LOAD]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
+ ! CHECK:           %[[ADDRI:.*]] = fir.convert %[[ADDR]] : (!fir.heap<i32>) -> i64
+ ! CHECK:           %[[C0_I64:.*]] = arith.constant 0 : i64
+ ! CHECK:           %[[IS_NULL:.*]] = arith.cmpi eq, %[[ADDRI]], %[[C0_I64]] : i64
+ ! CHECK:           fir.if %[[IS_NULL]] {
+ ! CHECK:             %[[NULL_BOX:.*]] = fir.embox %[[ADDR]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
+-! CHECK:             fir.store %[[NULL_BOX]] to %[[VAL_2]] : !fir.ref<!fir.box<!fir.heap<i32>>
++! CHECK:             fir.store %[[NULL_BOX]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>
+ ! CHECK:           } else {
+ ! CHECK:             %[[VAL_3:.*]] = fir.allocmem i32
+ ! CHECK:             fir.store %[[VAL_1]] to %[[VAL_3]] : !fir.heap<i32>
+ ! CHECK:             %[[VAL_4:.*]] = fir.embox %[[VAL_3]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
+-! CHECK:             fir.store %[[VAL_4]] to %[[VAL_2]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK:             fir.store %[[VAL_4]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>
+ ! CHECK:           }
+-! CHECK:           omp.yield(%[[VAL_2]] : !fir.ref<!fir.box<!fir.heap<i32>>>)
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.heap<i32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.heap<i32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<i32>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index b79c3b4f749d2..c984ab61bedb3 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -22,11 +22,13 @@ subroutine reduce(r)
+ end subroutine
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxf64 : !fir.ref<!fir.box<!fir.array<?xf64>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_Uxf64 : !fir.ref<!fir.box<!fir.array<?xf64>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<?xf64>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<?xf64>>
+ ! CHECK:           %[[VAL_3:.*]] = arith.constant 0 : index
+ ! CHECK:           %[[VAL_4:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_3]] : (!fir.box<!fir.array<?xf64>>, index) -> (index, index, index)
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]]#1 : (index) -> !fir.shape<1>
+@@ -38,8 +40,8 @@ subroutine reduce(r)
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[REBOX:.*]] = fir.rebox %[[VAL_7]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xf64>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<?xf64>
+ ! CHECK:           hlfir.assign %[[VAL_1]] to %[[REBOX]] : f64, !fir.box<!fir.array<?xf64>>
+-! CHECK:           fir.store %[[REBOX]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>)
++! CHECK:           fir.store %[[REBOX]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<?xf64>>>)
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index b92a096de4e1c..43e4c86b6bade 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -14,11 +14,13 @@ program reduce
+ print *,r
+ end program
+ 
+-! CHECK-LABEL   omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
++! CHECK-LABEL:  omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
++! CHECK-LABEL:  } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 2 : index
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]] : (index) -> !fir.shape<1>
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<2xi32> {bindc_name = ".tmp", uniq_name = ""}
+@@ -29,8 +31,8 @@ program reduce
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<2xi32>>
+-! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
++! CHECK:           fir.store %[[VAL_7]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ 
+ ! CHECK-LABEL   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index 9105a76ec6e97..be5273ea36c99 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -14,11 +14,13 @@ program reduce
+ print *,r
+ end program
+ 
+-! CHECK-LABEL   omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
++! CHECK-LABEL:  omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> alloc {
++! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
++! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
++! CHECK-LABEL:  } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           %[[VAL_8:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 2 : index
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]] : (index) -> !fir.shape<1>
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<2xi32> {bindc_name = ".tmp", uniq_name = ""}
+@@ -29,8 +31,8 @@ program reduce
+ ! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
+ ! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<2xi32>>
+-! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
++! CHECK:           fir.store %[[VAL_7]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ 
+ ! CHECK:        } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+index 8eb4f4c6eb4c7..0696236e8f073 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+@@ -4,12 +4,14 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @iand_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant -1 : i32
++! CHECK-SAME:    alloc {
+ ! CHECK:            %[[REF:.*]] = fir.alloca i32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
+ ! CHECK:            omp.yield(%[[REF]] : !fir.ref<i32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++! CHECK:            %[[C0_1:.*]] = arith.constant -1 : i32
++! CHECK:            fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i32>
++! CHECK:            omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+index 6a5d942cb74e9..5b0758ac3fcc1 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+@@ -2,12 +2,14 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @ieor_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
++! CHECK-SAME:    alloc {
+ ! CHECK:            %[[REF:.*]] = fir.alloca i32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
+ ! CHECK:            omp.yield(%[[REF]] : !fir.ref<i32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
++! CHECK:            fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i32>
++! CHECK:            omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+index 2956cd9ef53c3..8604a274a659f 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+@@ -2,12 +2,14 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @ior_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
++! CHECK-SAME:    alloc {
+ ! CHECK:            %[[REF:.*]] = fir.alloca i32
+-! CHECK:            fir.store %[[C0_1]] to %[[REF]] : !fir.ref<i32>
+ ! CHECK:            omp.yield(%[[REF]] : !fir.ref<i32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
++! CHECK:            fir.store %[[C0_1]] to %[[ALLOC]] : !fir.ref<i32>
++! CHECK:            omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+index b505585e5cb0e..ed89ee1fade8e 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+@@ -4,13 +4,15 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @and_reduction : !fir.ref<!fir.logical<4>>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant true
+-! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca !fir.logical<4>
+-! CHECK:           fir.store %[[VAL_2]] to %[[REF]] : !fir.ref<!fir.logical<4>>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<!fir.logical<4>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>, %[[ALLOC:.*]]: !fir.ref<!fir.logical<4>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant true
++! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK:           fir.store %[[VAL_2]] to %[[ALLOC]] : !fir.ref<!fir.logical<4>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.logical<4>>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.logical<4>>, %[[ARG1:.*]]: !fir.ref<!fir.logical<4>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+index a103bf58e16b9..dd2176e4f2de1 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+@@ -4,13 +4,15 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @eqv_reduction : !fir.ref<!fir.logical<4>>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant true
+-! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca !fir.logical<4>
+-! CHECK:           fir.store %[[VAL_2]] to %[[REF]] : !fir.ref<!fir.logical<4>>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<!fir.logical<4>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>, %[[ALLOC:.*]]: !fir.ref<!fir.logical<4>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant true
++! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK:           fir.store %[[VAL_2]] to %[[ALLOC]] : !fir.ref<!fir.logical<4>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.logical<4>>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.logical<4>>, %[[ARG1:.*]]: !fir.ref<!fir.logical<4>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+index 8abc9b61c42e5..4ce4f258f5ec1 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+@@ -4,13 +4,15 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @neqv_reduction : !fir.ref<!fir.logical<4>>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant false
+-! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca !fir.logical<4>
+-! CHECK:           fir.store %[[VAL_2]] to %[[REF]] : !fir.ref<!fir.logical<4>>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<!fir.logical<4>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>, %[[ALLOC:.*]]: !fir.ref<!fir.logical<4>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant false
++! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK:           fir.store %[[VAL_2]] to %[[ALLOC]] : !fir.ref<!fir.logical<4>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.logical<4>>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.logical<4>>, %[[ARG1:.*]]: !fir.ref<!fir.logical<4>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+index e6def280cf70d..2b750605519cf 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+@@ -4,13 +4,15 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @or_reduction : !fir.ref<!fir.logical<4>>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant false
+-! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca !fir.logical<4>
+-! CHECK:           fir.store %[[VAL_2]] to %[[REF]] : !fir.ref<!fir.logical<4>>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<!fir.logical<4>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.logical<4>>, %[[ALLOC:.*]]: !fir.ref<!fir.logical<4>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant false
++! CHECK:           %[[VAL_2:.*]] = fir.convert %[[VAL_1]] : (i1) -> !fir.logical<4>
++! CHECK:           fir.store %[[VAL_2]] to %[[ALLOC]] : !fir.ref<!fir.logical<4>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.logical<4>>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<!fir.logical<4>>, %[[ARG1:.*]]: !fir.ref<!fir.logical<4>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+index 018fb28c6f68a..7e4890dd00fea 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+@@ -3,12 +3,14 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-!CHECK: omp.declare_reduction @max_byref_f32 : !fir.ref<f32>
+-!CHECK-SAME: init {
+-!CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -3.40282347E+38 : f32
++!CHECK-LABEL: omp.declare_reduction @max_byref_f32 : !fir.ref<f32>
++!CHECK-SAME: alloc {
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+-!CHECK:   fir.store %[[MINIMUM_VAL]] to %[[REF]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[REF]] : !fir.ref<f32>)
++!CHECK-LABEL: } init {
++!CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -3.40282347E+38 : f32
++!CHECK:   fir.store %[[MINIMUM_VAL]] to %[[ALLOC:.*]] : !fir.ref<f32>
++!CHECK:   omp.yield(%[[ALLOC]] : !fir.ref<f32>)
+ !CHECK: combiner
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<f32>, %[[ARG1:.*]]: !fir.ref<f32>):
+ !CHECK:   %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<f32>
+@@ -18,11 +20,13 @@
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+ !CHECK-LABEL: omp.declare_reduction @max_byref_i32 : !fir.ref<i32>
+-!CHECK-SAME: init {
+-!CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
++!CHECK-SAME: alloc {
+ !CHECK:   %[[REF:.*]] = fir.alloca i32
+-!CHECK:   fir.store %[[MINIMUM_VAL]] to %[[REF]] : !fir.ref<i32>
+ !CHECK:   omp.yield(%[[REF]] : !fir.ref<i32>)
++!CHECK-LABEL: } init {
++!CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
++!CHECK:   fir.store %[[MINIMUM_VAL]] to %[[ALLOC:.*]] : !fir.ref<i32>
++!CHECK:   omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ !CHECK: combiner
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+ !CHECK:   %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
+deleted file mode 100644
+index 130a580cd6851..0000000000000
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
++++ /dev/null
+@@ -1,64 +0,0 @@
+-! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+-! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+-
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! CHECK-LABEL:  omp.declare_reduction @max_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:   init {
+-! CHECK:        ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:          %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
+-! CHECK:          %[[REF:.*]] = fir.alloca i32
+-! CHECK:          fir.store %[[MINIMUM_VAL]] to %[[REF]] : !fir.ref<i32>
+-! CHECK:          omp.yield(%[[REF]] : !fir.ref<i32>)
+-! CHECK:        combiner
+-! CHECK:        ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+-! CHECK:          %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<i32>
+-! CHECK:          %[[LD1:.*]] = fir.load %[[ARG1]] : !fir.ref<i32>
+-! CHECK:          %[[RES:.*]] = arith.maxsi %[[LD0]], %[[LD1]] : i32
+-! CHECK:          fir.store %[[RES]] to %[[ARG0]] : !fir.ref<i32>
+-! CHECK:          omp.yield(%[[ARG0]] : !fir.ref<i32>)
+-
+-! CHECK-LABEL:   func.func @_QPreduction_max_int(
+-! CHECK-SAME:                                    %[[VAL_0:.*]]: !fir.box<!fir.array<?xi32>> {fir.bindc_name = "y"}) {
+-! CHECK:           %[[VAL_1:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFreduction_max_intEi"}
+-! CHECK:           %[[VAL_2:.*]]:2 = hlfir.declare %[[VAL_1]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_max_intEx"}
+-! CHECK:           %[[VAL_4:.*]]:2 = hlfir.declare %[[VAL_3]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFreduction_max_intEy"} : (!fir.box<!fir.array<?xi32>>, !fir.dscope) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
+-! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i32
+-! CHECK:           hlfir.assign %[[VAL_6]] to %[[VAL_4]]#0 : i32, !fir.ref<i32>
+-! CHECK:           omp.parallel {
+-! CHECK:             %[[VAL_7:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+-! CHECK:             %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+-! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(byref @max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+-! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+-! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+-! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_14]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_17]] : !fir.ref<i32>
+-! CHECK:                 %[[VAL_20:.*]] = arith.cmpi sgt, %[[VAL_18]], %[[VAL_19]] : i32
+-! CHECK:                 %[[VAL_21:.*]] = arith.select %[[VAL_20]], %[[VAL_18]], %[[VAL_19]] : i32
+-! CHECK:                 hlfir.assign %[[VAL_21]] to %[[VAL_14]]#0 : i32, !fir.ref<i32>
+-! CHECK:                 omp.yield
+-! CHECK:               omp.terminator
+-! CHECK:             omp.terminator
+-
+-
+-subroutine reduction_max_int(y)
+-  integer :: x, y(:)
+-  x = 0
+-  !$omp parallel
+-  !$omp do reduction(max:x)
+-  do i=1, 100
+-    x = max(x, y(i))
+-  end do
+-  !$omp end do
+-  !$omp end parallel
+-  print *, x
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90
+deleted file mode 100644
+index 23e2ae98a0278..0000000000000
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90
++++ /dev/null
+@@ -1,60 +0,0 @@
+-! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! CHECK-LABEL:   omp.declare_reduction @max_i32 : i32 init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+-! CHECK:           omp.yield(%[[VAL_1]] : i32)
+-
+-! CHECK-LABEL:   } combiner {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: i32, %[[VAL_1:.*]]: i32):
+-! CHECK:           %[[VAL_2:.*]] = arith.maxsi %[[VAL_0]], %[[VAL_1]] : i32
+-! CHECK:           omp.yield(%[[VAL_2]] : i32)
+-! CHECK:         }
+-
+-! CHECK-LABEL:   func.func @_QPreduction_max_int(
+-! CHECK-SAME:                                    %[[VAL_0:.*]]: !fir.box<!fir.array<?xi32>> {fir.bindc_name = "y"}) {
+-! CHECK:           %[[VAL_1:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFreduction_max_intEi"}
+-! CHECK:           %[[VAL_2:.*]]:2 = hlfir.declare %[[VAL_1]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_max_intEx"}
+-! CHECK:           %[[VAL_4:.*]]:2 = hlfir.declare %[[VAL_3]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:           %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFreduction_max_intEy"} : (!fir.box<!fir.array<?xi32>>, !fir.dscope) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
+-! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i32
+-! CHECK:           hlfir.assign %[[VAL_6]] to %[[VAL_4]]#0 : i32, !fir.ref<i32>
+-! CHECK:           omp.parallel {
+-! CHECK:             %[[VAL_7:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+-! CHECK:             %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+-! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@max_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+-! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+-! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+-! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_14]]#0 : !fir.ref<i32>
+-! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_17]] : !fir.ref<i32>
+-! CHECK:                 %[[VAL_20:.*]] = arith.cmpi sgt, %[[VAL_18]], %[[VAL_19]] : i32
+-! CHECK:                 %[[VAL_21:.*]] = arith.select %[[VAL_20]], %[[VAL_18]], %[[VAL_19]] : i32
+-! CHECK:                 hlfir.assign %[[VAL_21]] to %[[VAL_14]]#0 : i32, !fir.ref<i32>
+-! CHECK:                 omp.yield
+-! CHECK:               omp.terminator
+-! CHECK:             omp.terminator
+-
+-
+-subroutine reduction_max_int(y)
+-  integer :: x, y(:)
+-  x = 0
+-  !$omp parallel
+-  !$omp do reduction(max:x)
+-  do i=1, 100
+-    x = max(x, y(i))
+-  end do
+-  !$omp end do
+-  !$omp end parallel
+-  print *, x
+-end subroutine
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+index 754b3fd400d37..41fcc979cdc9d 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+@@ -3,12 +3,14 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-!CHECK: omp.declare_reduction @min_byref_f32 : !fir.ref<f32>
+-!CHECK-SAME: init {
+-!CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 3.40282347E+38 : f32
++!CHECK-LABEL: omp.declare_reduction @min_byref_f32 : !fir.ref<f32>
++!CHECK-SAME: alloc {
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+-!CHECK:   fir.store %[[MAXIMUM_VAL]] to %[[REF]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[REF]] : !fir.ref<f32>)
++!CHECK-LABEL: } init {
++!CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 3.40282347E+38 : f32
++!CHECK:   fir.store %[[MAXIMUM_VAL]] to %[[ALLOC:.*]] : !fir.ref<f32>
++!CHECK:   omp.yield(%[[ALLOC]] : !fir.ref<f32>)
+ !CHECK: combiner
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<f32>, %[[ARG1:.*]]: !fir.ref<f32>):
+ !CHECK:   %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<f32>
+@@ -18,11 +20,13 @@
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+ !CHECK-LABEL: omp.declare_reduction @min_byref_i32 : !fir.ref<i32>
+-!CHECK-SAME: init {
+-!CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 2147483647 : i32
++!CHECK-SAME: alloc {
+ !CHECK:   %[[REF:.*]] = fir.alloca i32
+-!CHECK:   fir.store %[[MAXIMUM_VAL]] to %[[REF]] : !fir.ref<i32>
+ !CHECK:   omp.yield(%[[REF]] : !fir.ref<i32>)
++!CHECK-LABEL: } init {
++!CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 2147483647 : i32
++!CHECK:   fir.store %[[MAXIMUM_VAL]] to %[[ALLOC:.*]] : !fir.ref<i32>
++!CHECK:   omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ !CHECK: combiner
+ !CHECK: ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+ !CHECK:   %[[LD0:.*]] = fir.load %[[ARG0]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+index eddb9112d3b0c..28b78e41be2a0 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+@@ -5,12 +5,14 @@
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_f64 : !fir.ref<f64>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f64
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca f64
+-! CHECK:           fir.store %[[VAL_1]] to %[[REF]] : !fir.ref<f64>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<f64>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>, %[[ALLOC:.*]]: !fir.ref<f64>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f64
++! CHECK:           fir.store %[[VAL_1]] to %[[ALLOC]] : !fir.ref<f64>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<f64>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<f64>, %[[ARG1:.*]]: !fir.ref<f64>):
+@@ -22,12 +24,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_i64 : !fir.ref<i64>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i64
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca i64
+-! CHECK:           fir.store %[[VAL_1]] to %[[REF]] : !fir.ref<i64>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<i64>)
++! CHECK-LABE:    } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>, %[[ALLOC:.*]]: !fir.ref<i64>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i64
++! CHECK:           fir.store %[[VAL_1]] to %[[ALLOC]] : !fir.ref<i64>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<i64>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:          ^bb0(%[[ARG0:.*]]: !fir.ref<i64>, %[[ARG1:.*]]: !fir.ref<i64>):
+@@ -39,12 +43,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_f32 : !fir.ref<f32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca f32
+-! CHECK:           fir.store %[[VAL_1]] to %[[REF]] : !fir.ref<f32>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<f32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>, %[[ALLOC:.*]]: !fir.ref<f32>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
++! CHECK:           fir.store %[[VAL_1]] to %[[ALLOC]] : !fir.ref<f32>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<f32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<f32>, %[[ARG1:.*]]: !fir.ref<f32>):
+@@ -56,12 +62,14 @@
+ ! CHECK:         }
+ 
+ ! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_i32 : !fir.ref<i32>
+-! CHECK-SAME:    init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+-! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i32
++! CHECK-SAME:    alloc {
+ ! CHECK:           %[[REF:.*]] = fir.alloca i32
+-! CHECK:           fir.store %[[VAL_1]] to %[[REF]] : !fir.ref<i32>
+ ! CHECK:           omp.yield(%[[REF]] : !fir.ref<i32>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>, %[[ALLOC:.*]]: !fir.ref<i32>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i32
++! CHECK:           fir.store %[[VAL_1]] to %[[ALLOC]] : !fir.ref<i32>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<i32>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.ref<i32>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+index eb7f7a59d5d52..db4b4d33da757 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+@@ -24,11 +24,13 @@ program main
+ 
+ endprogram
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x3xf64 : !fir.ref<!fir.box<!fir.array<3x3xf64>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x3xf64 : !fir.ref<!fir.box<!fir.array<3x3xf64>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>, %[[ALLOC:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
+ ! CHECK:           %[[VAL_4:.*]] = arith.constant 3 : index
+ ! CHECK:           %[[VAL_5:.*]] = arith.constant 3 : index
+ ! CHECK:           %[[VAL_6:.*]] = fir.shape %[[VAL_4]], %[[VAL_5]] : (index, index) -> !fir.shape<2>
+@@ -42,8 +44,8 @@ program main
+ ! CHECK:           %[[VAL_14:.*]] = fir.shape_shift %[[VAL_11]]#0, %[[VAL_11]]#1, %[[VAL_13]]#0, %[[VAL_13]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
+ ! CHECK:           %[[VAL_15:.*]] = fir.embox %[[VAL_9]]#0(%[[VAL_14]]) : (!fir.heap<!fir.array<3x3xf64>>, !fir.shapeshift<2>) -> !fir.box<!fir.array<3x3xf64>>
+ ! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_15]] : f64, !fir.box<!fir.array<3x3xf64>>
+-! CHECK:           fir.store %[[VAL_15]] to %[[VAL_3]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+-! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
++! CHECK:           fir.store %[[VAL_15]] to %[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
++! CHECK:           omp.yield(%[[ALLOC]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
+ 
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x3xf64>>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
+index aab6efbcbc5fe..8d4aa8cd83038 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
+@@ -18,11 +18,13 @@ program reduce_pointer
+   deallocate(v)
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_ptr_i32 : !fir.ref<!fir.box<!fir.ptr<i32>>> init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>):
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_ptr_i32 : !fir.ref<!fir.box<!fir.ptr<i32>>> alloc {
++! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.ptr<i32>>
++! CHECK:           omp.yield(%[[VAL_3]] : !fir.ref<!fir.box<!fir.ptr<i32>>>)
++! CHECK-LABEL:   } init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>, %[[VAL_3:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.ptr<i32>>>
+-! CHECK:           %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.ptr<i32>>
+ ! CHECK:           %[[VAL_4:.*]] = fir.box_addr %[[VAL_2]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+ ! CHECK:           %[[VAL_5:.*]] = fir.convert %[[VAL_4]] : (!fir.ptr<i32>) -> i64
+ ! CHECK:           %[[VAL_6:.*]] = arith.constant 0 : i64
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index d63fdd88f7910..739b1f67be7cb 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -1528,21 +1528,32 @@ def DeclareReductionOp : OpenMP_Op<"declare_reduction", [IsolatedFromAbove,
+                                                          Symbol]> {
+   let summary = "declares a reduction kind";
+   let description = [{
+-    Declares an OpenMP reduction kind. This requires two mandatory and two
++    Declares an OpenMP reduction kind. This requires two mandatory and three
+     optional regions.
+ 
+-      1. The initializer region specifies how to initialize the thread-local
++      1. The optional alloc region specifies how to allocate the thread-local
++         reduction value. This region should not contain control flow and all
++         IR should be suitable for inlining straight into an entry block. In
++         the common case this is expected to contain only allocas. It is
++         expected to `omp.yield` the allocated value on all control paths.
++         If allocation is conditional (e.g. only allocate if the mold is
++         allocated), this should be done in the initilizer region and this
++         region not included. The alloc region is not used for by-value
++         reductions (where allocation is implicit).
++      2. The initializer region specifies how to initialize the thread-local
+          reduction value. This is usually the neutral element of the reduction.
+          For convenience, the region has an argument that contains the value
+-         of the reduction accumulator at the start of the reduction. It is
+-         expected to `omp.yield` the new value on all control flow paths.
+-      2. The reduction region specifies how to combine two values into one, i.e.
++         of the reduction accumulator at the start of the reduction. If an alloc
++         region is specified, there is a second block argument containing the
++         address of the allocated memory. The initializer region is expected to
++         `omp.yield` the new value on all control flow paths.
++      3. The reduction region specifies how to combine two values into one, i.e.
+          the reduction operator. It accepts the two values as arguments and is
+          expected to `omp.yield` the combined value on all control flow paths.
+-      3. The atomic reduction region is optional and specifies how two values
++      4. The atomic reduction region is optional and specifies how two values
+          can be combined atomically given local accumulator variables. It is
+          expected to store the combined value in the first accumulator variable.
+-      4. The cleanup region is optional and specifies how to clean up any memory
++      5. The cleanup region is optional and specifies how to clean up any memory
+          allocated by the initializer region. The region has an argument that
+          contains the value of the thread-local reduction accumulator. This will
+          be executed after the reduction has completed.
+@@ -1558,12 +1569,14 @@ def DeclareReductionOp : OpenMP_Op<"declare_reduction", [IsolatedFromAbove,
+   let arguments = (ins SymbolNameAttr:$sym_name,
+                        TypeAttr:$type);
+ 
+-  let regions = (region AnyRegion:$initializerRegion,
++  let regions = (region MaxSizedRegion<1>:$allocRegion,
++                        AnyRegion:$initializerRegion,
+                         AnyRegion:$reductionRegion,
+                         AnyRegion:$atomicReductionRegion,
+                         AnyRegion:$cleanupRegion);
+ 
+   let assemblyFormat = "$sym_name `:` $type attr-dict-with-keyword "
++                       "custom<AllocReductionRegion>($allocRegion) "
+                        "`init` $initializerRegion "
+                        "`combiner` $reductionRegion "
+                        "custom<AtomicReductionRegion>($atomicReductionRegion) "
+@@ -1576,6 +1589,17 @@ def DeclareReductionOp : OpenMP_Op<"declare_reduction", [IsolatedFromAbove,
+ 
+       return cast<PointerLikeType>(getAtomicReductionRegion().front().getArgument(0).getType());
+     }
++
++    Value getInitializerMoldArg() {
++      return getInitializerRegion().front().getArgument(0);
++    }
++
++    Value getInitializerAllocArg() {
++      if (getAllocRegion().empty() ||
++          getInitializerRegion().front().getNumArguments() != 2)
++        return {nullptr};
++      return getInitializerRegion().front().getArgument(1);
++    }
+   }];
+   let hasRegionVerifier = 1;
+ }
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 4c943ebbe3144..273f49b8b12b6 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1883,46 +1883,84 @@ LogicalResult DistributeOp::verify() {
+ // DeclareReductionOp
+ //===----------------------------------------------------------------------===//
+ 
+-static ParseResult parseAtomicReductionRegion(OpAsmParser &parser,
+-                                              Region &region) {
+-  if (parser.parseOptionalKeyword("atomic"))
++static ParseResult parseOptionalReductionRegion(OpAsmParser &parser,
++                                                Region &region,
++                                                StringRef keyword) {
++  if (parser.parseOptionalKeyword(keyword))
+     return success();
+   return parser.parseRegion(region);
+ }
+ 
+-static void printAtomicReductionRegion(OpAsmPrinter &printer,
+-                                       DeclareReductionOp op, Region &region) {
++static void printOptionalReductionRegion(OpAsmPrinter &printer, Region &region,
++                                         StringRef keyword) {
+   if (region.empty())
+     return;
+-  printer << "atomic ";
++  printer << keyword << " ";
+   printer.printRegion(region);
+ }
+ 
++static ParseResult parseAllocReductionRegion(OpAsmParser &parser,
++                                             Region &region) {
++  return parseOptionalReductionRegion(parser, region, "alloc");
++}
++
++static void printAllocReductionRegion(OpAsmPrinter &printer,
++                                      DeclareReductionOp op, Region &region) {
++  printOptionalReductionRegion(printer, region, "alloc");
++}
++
++static ParseResult parseAtomicReductionRegion(OpAsmParser &parser,
++                                              Region &region) {
++  return parseOptionalReductionRegion(parser, region, "atomic");
++}
++
++static void printAtomicReductionRegion(OpAsmPrinter &printer,
++                                       DeclareReductionOp op, Region &region) {
++  printOptionalReductionRegion(printer, region, "atomic");
++}
++
+ static ParseResult parseCleanupReductionRegion(OpAsmParser &parser,
+                                                Region &region) {
+-  if (parser.parseOptionalKeyword("cleanup"))
+-    return success();
+-  return parser.parseRegion(region);
++  return parseOptionalReductionRegion(parser, region, "cleanup");
+ }
+ 
+ static void printCleanupReductionRegion(OpAsmPrinter &printer,
+                                         DeclareReductionOp op, Region &region) {
+-  if (region.empty())
+-    return;
+-  printer << "cleanup ";
+-  printer.printRegion(region);
++  printOptionalReductionRegion(printer, region, "cleanup");
+ }
+ 
+ LogicalResult DeclareReductionOp::verifyRegions() {
++  if (!getAllocRegion().empty()) {
++    for (YieldOp yieldOp : getAllocRegion().getOps<YieldOp>()) {
++      if (yieldOp.getResults().size() != 1 ||
++          yieldOp.getResults().getTypes()[0] != getType())
++        return emitOpError() << "expects alloc region to yield a value "
++                                "of the reduction type";
++    }
++  }
++
+   if (getInitializerRegion().empty())
+     return emitOpError() << "expects non-empty initializer region";
+   Block &initializerEntryBlock = getInitializerRegion().front();
+-  if (initializerEntryBlock.getNumArguments() != 1 ||
+-      initializerEntryBlock.getArgument(0).getType() != getType()) {
+-    return emitOpError() << "expects initializer region with one argument "
+-                            "of the reduction type";
++
++  if (initializerEntryBlock.getNumArguments() == 1) {
++    if (!getAllocRegion().empty())
++      return emitOpError() << "expects two arguments to the initializer region "
++                              "when an allocation region is used";
++  } else if (initializerEntryBlock.getNumArguments() == 2) {
++    if (getAllocRegion().empty())
++      return emitOpError() << "expects one argument to the initializer region "
++                              "when no allocation region is used";
++  } else {
++    return emitOpError()
++           << "expects one or two arguments to the initializer region";
+   }
+ 
++  for (mlir::Value arg : initializerEntryBlock.getArguments())
++    if (arg.getType() != getType())
++      return emitOpError() << "expects initializer region argument to match "
++                              "the reduction type";
++
+   for (YieldOp yieldOp : getInitializerRegion().getOps<YieldOp>()) {
+     if (yieldOp.getResults().size() != 1 ||
+         yieldOp.getResults().getTypes()[0] != getType())
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 1f3fb95c339c7..6d14d77c440e6 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -594,45 +594,85 @@ convertOmpOrderedRegion(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+ /// Allocate space for privatized reduction variables.
+ template <typename T>
+-static void allocByValReductionVars(
+-    T loop, ArrayRef<BlockArgument> reductionArgs, llvm::IRBuilderBase &builder,
+-    LLVM::ModuleTranslation &moduleTranslation,
+-    llvm::OpenMPIRBuilder::InsertPointTy &allocaIP,
+-    SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
+-    SmallVectorImpl<llvm::Value *> &privateReductionVariables,
+-    DenseMap<Value, llvm::Value *> &reductionVariableMap,
+-    llvm::ArrayRef<bool> isByRefs) {
++static LogicalResult
++allocReductionVars(T loop, ArrayRef<BlockArgument> reductionArgs,
++                   llvm::IRBuilderBase &builder,
++                   LLVM::ModuleTranslation &moduleTranslation,
++                   llvm::OpenMPIRBuilder::InsertPointTy &allocaIP,
++                   SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
++                   SmallVectorImpl<llvm::Value *> &privateReductionVariables,
++                   DenseMap<Value, llvm::Value *> &reductionVariableMap,
++                   llvm::ArrayRef<bool> isByRefs) {
+   llvm::IRBuilderBase::InsertPointGuard guard(builder);
+   builder.SetInsertPoint(allocaIP.getBlock()->getTerminator());
+ 
++  // delay creating stores until after all allocas
++  SmallVector<std::pair<llvm::Value *, llvm::Value *>> storesToCreate;
++  storesToCreate.reserve(loop.getNumReductionVars());
++
+   for (std::size_t i = 0; i < loop.getNumReductionVars(); ++i) {
+-    if (isByRefs[i])
+-      continue;
+-    llvm::Value *var = builder.CreateAlloca(
+-        moduleTranslation.convertType(reductionDecls[i].getType()));
+-    moduleTranslation.mapValue(reductionArgs[i], var);
+-    privateReductionVariables[i] = var;
+-    reductionVariableMap.try_emplace(loop.getReductionVars()[i], var);
++    Region &allocRegion = reductionDecls[i].getAllocRegion();
++    if (isByRefs[i]) {
++      if (allocRegion.empty())
++        continue;
++
++      SmallVector<llvm::Value *, 1> phis;
++      if (failed(inlineConvertOmpRegions(allocRegion, "omp.reduction.alloc",
++                                         builder, moduleTranslation, &phis)))
++        return failure();
++      assert(phis.size() == 1 && "expected one allocation to be yielded");
++
++      builder.SetInsertPoint(allocaIP.getBlock()->getTerminator());
++
++      // Allocate reduction variable (which is a pointer to the real reduction
++      // variable allocated in the inlined region)
++      llvm::Value *var = builder.CreateAlloca(
++          moduleTranslation.convertType(reductionDecls[i].getType()));
++      storesToCreate.emplace_back(phis[0], var);
++
++      privateReductionVariables[i] = var;
++      moduleTranslation.mapValue(reductionArgs[i], phis[0]);
++      reductionVariableMap.try_emplace(loop.getReductionVars()[i], phis[0]);
++    } else {
++      assert(allocRegion.empty() &&
++             "allocaction is implicit for by-val reduction");
++      llvm::Value *var = builder.CreateAlloca(
++          moduleTranslation.convertType(reductionDecls[i].getType()));
++      moduleTranslation.mapValue(reductionArgs[i], var);
++      privateReductionVariables[i] = var;
++      reductionVariableMap.try_emplace(loop.getReductionVars()[i], var);
++    }
+   }
++
++  // TODO: further delay this so it doesn't come in the entry block at all
++  for (auto [data, addr] : storesToCreate)
++    builder.CreateStore(data, addr);
++
++  return success();
+ }
+ 
+-/// Map input argument to all reduction initialization regions
++/// Map input arguments to reduction initialization region
+ template <typename T>
+ static void
+-mapInitializationArg(T loop, LLVM::ModuleTranslation &moduleTranslation,
+-                     SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
+-                     unsigned i) {
++mapInitializationArgs(T loop, LLVM::ModuleTranslation &moduleTranslation,
++                      SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
++                      DenseMap<Value, llvm::Value *> &reductionVariableMap,
++                      unsigned i) {
+   // map input argument to the initialization region
+   mlir::omp::DeclareReductionOp &reduction = reductionDecls[i];
+   Region &initializerRegion = reduction.getInitializerRegion();
+   Block &entry = initializerRegion.front();
+-  assert(entry.getNumArguments() == 1 &&
+-         "the initialization region has one argument");
+ 
+   mlir::Value mlirSource = loop.getReductionVars()[i];
+   llvm::Value *llvmSource = moduleTranslation.lookupValue(mlirSource);
+   assert(llvmSource && "lookup reduction var");
+-  moduleTranslation.mapValue(entry.getArgument(0), llvmSource);
++  moduleTranslation.mapValue(reduction.getInitializerMoldArg(), llvmSource);
++
++  if (entry.getNumArguments() > 1) {
++    llvm::Value *allocation =
++        reductionVariableMap.lookup(loop.getReductionVars()[i]);
++    moduleTranslation.mapValue(reduction.getInitializerAllocArg(), allocation);
++  }
+ }
+ 
+ /// Collect reduction info
+@@ -779,18 +819,21 @@ static LogicalResult allocAndInitializeReductionVars(
+   if (op.getNumReductionVars() == 0)
+     return success();
+ 
+-  allocByValReductionVars(op, reductionArgs, builder, moduleTranslation,
+-                          allocaIP, reductionDecls, privateReductionVariables,
+-                          reductionVariableMap, isByRef);
++  if (failed(allocReductionVars(op, reductionArgs, builder, moduleTranslation,
++                                allocaIP, reductionDecls,
++                                privateReductionVariables, reductionVariableMap,
++                                isByRef)))
++    return failure();
+ 
+   // Before the loop, store the initial values of reductions into reduction
+   // variables. Although this could be done after allocas, we don't want to mess
+   // up with the alloca insertion point.
+   for (unsigned i = 0; i < op.getNumReductionVars(); ++i) {
+-    SmallVector<llvm::Value *> phis;
++    SmallVector<llvm::Value *, 1> phis;
+ 
+     // map block argument to initializer region
+-    mapInitializationArg(op, moduleTranslation, reductionDecls, i);
++    mapInitializationArgs(op, moduleTranslation, reductionDecls,
++                          reductionVariableMap, i);
+ 
+     if (failed(inlineConvertOmpRegions(reductionDecls[i].getInitializerRegion(),
+                                        "omp.reduction.neutral", builder,
+@@ -799,6 +842,13 @@ static LogicalResult allocAndInitializeReductionVars(
+     assert(phis.size() == 1 && "expected one value to be yielded from the "
+                                "reduction neutral element declaration region");
+     if (isByRef[i]) {
++      if (!reductionDecls[i].getAllocRegion().empty())
++        // done in allocReductionVars
++        continue;
++
++      // TODO: this path can be removed once all users of by-ref are updated to
++      // use an alloc region
++
+       // Allocate reduction variable (which is a pointer to the real reduction
+       // variable allocated in the inlined region)
+       llvm::Value *var = builder.CreateAlloca(
+@@ -1319,9 +1369,15 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+             opInst.getNumAllocateVars() + opInst.getNumAllocatorsVars(),
+             opInst.getNumReductionVars());
+ 
+-    allocByValReductionVars(opInst, reductionArgs, builder, moduleTranslation,
+-                            allocaIP, reductionDecls, privateReductionVariables,
+-                            reductionVariableMap, isByRef);
++    allocaIP =
++        InsertPointTy(allocaIP.getBlock(),
++                      allocaIP.getBlock()->getTerminator()->getIterator());
++
++    if (failed(allocReductionVars(opInst, reductionArgs, builder,
++                                  moduleTranslation, allocaIP, reductionDecls,
++                                  privateReductionVariables,
++                                  reductionVariableMap, isByRef)))
++      bodyGenStatus = failure();
+ 
+     // Initialize reduction vars
+     builder.restoreIP(allocaIP);
+@@ -1332,8 +1388,12 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+     SmallVector<llvm::Value *> byRefVars(opInst.getNumReductionVars());
+     for (unsigned i = 0; i < opInst.getNumReductionVars(); ++i) {
+       if (isByRef[i]) {
+-        // Allocate reduction variable (which is a pointer to the real reduciton
+-        // variable allocated in the inlined region)
++        if (!reductionDecls[i].getAllocRegion().empty())
++          continue;
++
++        // TODO: remove after all users of by-ref are updated to use the alloc
++        // region: Allocate reduction variable (which is a pointer to the real
++        // reduciton variable allocated in the inlined region)
+         byRefVars[i] = builder.CreateAlloca(
+             moduleTranslation.convertType(reductionDecls[i].getType()));
+       }
+@@ -1345,7 +1405,8 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+       SmallVector<llvm::Value *> phis;
+ 
+       // map the block argument
+-      mapInitializationArg(opInst, moduleTranslation, reductionDecls, i);
++      mapInitializationArgs(opInst, moduleTranslation, reductionDecls,
++                            reductionVariableMap, i);
+       if (failed(inlineConvertOmpRegions(
+               reductionDecls[i].getInitializerRegion(), "omp.reduction.neutral",
+               builder, moduleTranslation, &phis)))
+@@ -1354,11 +1415,14 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+              "expected one value to be yielded from the "
+              "reduction neutral element declaration region");
+ 
+-      // mapInitializationArg finishes its block with a terminator. We need to
+-      // insert before that terminator.
+       builder.SetInsertPoint(builder.GetInsertBlock()->getTerminator());
+ 
+       if (isByRef[i]) {
++        if (!reductionDecls[i].getAllocRegion().empty())
++          continue;
++
++        // TODO: remove after all users of by-ref are updated to use the alloc
++
+         // Store the result of the inlined region to the allocated reduction var
+         // ptr
+         builder.CreateStore(phis[0], byRefVars[i]);
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index c76b07ec94a59..332d22fc2c642 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -565,7 +565,63 @@ func.func @omp_simd_pretty_simdlen_safelen(%lb : index, %ub : index, %step : ind
+ 
+ // -----
+ 
+-// expected-error @below {{op expects initializer region with one argument of the reduction type}}
++// expected-error @below {{op expects alloc region to yield a value of the reduction type}}
++omp.declare_reduction @add_f32 : f32
++alloc {
++^bb0(%arg: f32):
++// nonsense test code
++  %0 = arith.constant 0.0 : f64
++  omp.yield (%0 : f64)
++}
++init {
++^bb0(%arg0: f32, %arg1: f32):
++  %0 = arith.constant 0.0 : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = arith.addf %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++
++// -----
++
++// expected-error @below {{op expects two arguments to the initializer region when an allocation region is used}}
++omp.declare_reduction @add_f32 : f32
++alloc {
++^bb0(%arg: f32):
++// nonsense test code
++  omp.yield (%arg : f32)
++}
++init {
++^bb0(%arg0: f32):
++  %0 = arith.constant 0.0 : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = arith.addf %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++
++// -----
++
++// expected-error @below {{op expects one argument to the initializer region when no allocation region is used}}
++omp.declare_reduction @add_f32 : f32
++init {
++^bb0(%arg: f32, %arg2: f32):
++  %0 = arith.constant 0.0 : f32
++  omp.yield (%0 : f32)
++}
++combiner {
++^bb1(%arg0: f32, %arg1: f32):
++  %1 = arith.addf %arg0, %arg1 : f32
++  omp.yield (%1 : f32)
++}
++
++// -----
++
++// expected-error @below {{op expects initializer region argument to match the reduction type}}
+ omp.declare_reduction @add_f32 : f64
+ init {
+ ^bb0(%arg: f32):
+@@ -683,6 +739,33 @@ cleanup {
+ 
+ // -----
+ 
++// expected-error @below {{op region #0 ('allocRegion') failed to verify constraint: region with at most 1 blocks}}
++omp.declare_reduction @alloc_reduction : !llvm.ptr
++alloc {
++^bb0(%arg: !llvm.ptr):
++  %c1 = arith.constant 1 : i32
++  %0 = llvm.alloca %c1 x f32 : (i32) -> !llvm.ptr
++  cf.br ^bb1(%0: !llvm.ptr)
++^bb1(%ret: !llvm.ptr):
++  omp.yield (%ret : !llvm.ptr)
++}
++init {
++^bb0(%arg: !llvm.ptr):
++  %cst = arith.constant 1.0 : f32
++  llvm.store %cst, %arg : f32, !llvm.ptr
++  omp.yield (%arg : !llvm.ptr)
++}
++combiner {
++^bb1(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %0 = llvm.load %arg0 : !llvm.ptr -> f32
++  %1 = llvm.load %arg1 : !llvm.ptr -> f32
++  %2 = arith.addf %0, %1 : f32
++  llvm.store %2, %arg0 : f32, !llvm.ptr
++  omp.yield (%arg0 : !llvm.ptr)
++}
++
++// -----
++
+ func.func @foo(%lb : index, %ub : index, %step : index) {
+   %c1 = arith.constant 1 : i32
+   %0 = llvm.alloca %c1 x i32 : (i32) -> !llvm.ptr
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 9ac97e069addd..9c308cc010849 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -2541,6 +2541,36 @@ atomic {
+   omp.yield
+ }
+ 
++// CHECK-LABEL: @alloc_reduction
++// CHECK-SAME:  alloc {
++// CHECK-NEXT:  ^bb0(%[[ARG0:.*]]: !llvm.ptr):
++// ...
++// CHECK:         omp.yield
++// CHECK-NEXT:  } init {
++// CHECK:       } combiner {
++// CHECK:       }
++omp.declare_reduction @alloc_reduction : !llvm.ptr
++alloc {
++^bb0(%arg: !llvm.ptr):
++  %c1 = arith.constant 1 : i32
++  %0 = llvm.alloca %c1 x f32 : (i32) -> !llvm.ptr
++  omp.yield (%0 : !llvm.ptr)
++}
++init {
++^bb0(%mold: !llvm.ptr, %alloc: !llvm.ptr):
++  %cst = arith.constant 1.0 : f32
++  llvm.store %cst, %alloc : f32, !llvm.ptr
++  omp.yield (%alloc : !llvm.ptr)
++}
++combiner {
++^bb1(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %0 = llvm.load %arg0 : !llvm.ptr -> f32
++  %1 = llvm.load %arg1 : !llvm.ptr -> f32
++  %2 = arith.addf %0, %1 : f32
++  llvm.store %2, %arg0 : f32, !llvm.ptr
++  omp.yield (%arg0 : !llvm.ptr)
++}
++
+ // CHECK-LABEL: omp_targets_with_map_bounds
+ // CHECK-SAME: (%[[ARG0:.*]]: !llvm.ptr, %[[ARG1:.*]]: !llvm.ptr)
+ func.func @omp_targets_with_map_bounds(%arg0: !llvm.ptr, %arg1: !llvm.ptr) -> () {
+diff --git a/mlir/test/Target/LLVMIR/openmp-private.mlir b/mlir/test/Target/LLVMIR/openmp-private.mlir
+index e76f7e4d40f7a..21167668bbee1 100644
+--- a/mlir/test/Target/LLVMIR/openmp-private.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-private.mlir
+@@ -222,11 +222,13 @@ omp.private {type = private} @privatizer.part : !llvm.ptr alloc {
+   omp.yield(%1 : !llvm.ptr)
+ }
+ 
+-omp.declare_reduction @reducer.part : !llvm.ptr init {
+-^bb0(%arg0: !llvm.ptr):
++omp.declare_reduction @reducer.part : !llvm.ptr alloc {
+   %0 = llvm.mlir.constant(1 : i64) : i64
+   %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> : (i64) -> !llvm.ptr
+   omp.yield(%1 : !llvm.ptr)
++} init {
++^bb0(%mold: !llvm.ptr, %alloc: !llvm.ptr):
++  omp.yield(%alloc : !llvm.ptr)
+ } combiner {
+ ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
+   omp.yield(%arg0 : !llvm.ptr)
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
+index 5682e7e96ab18..da6f943004612 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-array-sections.mlir
+@@ -4,11 +4,15 @@
+ // for array reductions. The important thing here is that we are testing a byref
+ // reduction with a cleanup region, and the various regions contain multiple
+ // blocks
+-omp.declare_reduction @add_reduction_byref_box_Uxf32 : !llvm.ptr init {
+-^bb0(%arg0: !llvm.ptr):
++omp.declare_reduction @add_reduction_byref_box_Uxf32 : !llvm.ptr alloc {
+   %0 = llvm.mlir.constant(1 : i64) : i64
+   %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> : (i64) -> !llvm.ptr
+   omp.yield(%1 : !llvm.ptr)
++} init {
++^bb0(%arg0: !llvm.ptr, %alloc: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  llvm.store %0, %alloc : i64, !llvm.ptr
++  omp.yield(%alloc : !llvm.ptr)
+ } combiner {
+ ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
+   %0 = llvm.mlir.constant(0 : i64) : i64
+@@ -83,6 +87,9 @@ llvm.func @sectionsreduction_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attribute
+ // CHECK:         %[[VAL_11:.*]] = load i32, ptr %[[VAL_12:.*]], align 4
+ // CHECK:         store i32 %[[VAL_11]], ptr %[[VAL_10]], align 4
+ // CHECK:         %[[VAL_13:.*]] = load i32, ptr %[[VAL_10]], align 4
++// CHECK:         %[[VAL_20:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
++// CHECK:         %[[VAL_21:.*]] = alloca ptr, align 8
++// CHECK:         store ptr %[[VAL_20]], ptr %[[VAL_21]], align 8
+ // CHECK:         %[[VAL_14:.*]] = alloca [1 x ptr], align 8
+ // CHECK:         br label %[[VAL_15:.*]]
+ // CHECK:       omp.reduction.init:                               ; preds = %[[VAL_16:.*]]
+@@ -91,9 +98,6 @@ llvm.func @sectionsreduction_(%arg0: !llvm.ptr {fir.bindc_name = "x"}) attribute
+ // CHECK:         br label %[[VAL_18:.*]]
+ // CHECK:       omp.par.region1:                                  ; preds = %[[VAL_17]]
+ // CHECK:         %[[VAL_19:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
+-// CHECK:         %[[VAL_20:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i64 1, align 8
+-// CHECK:         %[[VAL_21:.*]] = alloca ptr, align 8
+-// CHECK:         store ptr %[[VAL_20]], ptr %[[VAL_21]], align 8
+ // CHECK:         br label %[[VAL_22:.*]]
+ // CHECK:       omp_section_loop.preheader:                       ; preds = %[[VAL_18]]
+ // CHECK:         store i32 0, ptr %[[VAL_7]], align 4
+diff --git a/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir b/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
+index ef1284547a88a..a0ca31b7d811e 100644
+--- a/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-reduction-byref.mlir
+@@ -1,12 +1,14 @@
+ // RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
+ 
+-  omp.declare_reduction @add_reduction_i_32 : !llvm.ptr init {
+-  ^bb0(%arg0: !llvm.ptr):
+-    %0 = llvm.mlir.constant(0 : i32) : i32
++  omp.declare_reduction @add_reduction_i_32 : !llvm.ptr alloc {
+     %1 = llvm.mlir.constant(1 : i64) : i64
+     %2 = llvm.alloca %1 x i32 : (i64) -> !llvm.ptr
+-    llvm.store %0, %2 : i32, !llvm.ptr
+     omp.yield(%2 : !llvm.ptr)
++  } init {
++  ^bb0(%arg0: !llvm.ptr, %alloc: !llvm.ptr):
++    %0 = llvm.mlir.constant(0 : i32) : i32
++    llvm.store %0, %alloc : i32, !llvm.ptr
++    omp.yield(%alloc : !llvm.ptr)
+   } combiner {
+   ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
+     %0 = llvm.load %arg0 : !llvm.ptr -> i32
+@@ -42,8 +44,8 @@
+ // Private reduction variable and its initialization.
+ // CHECK: %tid.addr.local = alloca i32
+ // CHECK: %[[PRIVATE:.+]] = alloca i32
+-// CHECK: store i32 0, ptr %[[PRIVATE]]
+ // CHECK: store ptr %[[PRIVATE]], ptr %[[PRIV_PTR:.+]],
++// CHECK: store i32 0, ptr %[[PRIVATE]]
+ 
+ // Call to the reduction function.
+ // CHECK: call i32 @__kmpc_reduce

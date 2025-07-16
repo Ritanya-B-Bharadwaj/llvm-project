@@ -1,0 +1,328 @@
+diff --git a/flang/include/flang/Semantics/tools.h b/flang/include/flang/Semantics/tools.h
+index 15c02ecc0058c..96d4dbb2acaa1 100644
+--- a/flang/include/flang/Semantics/tools.h
++++ b/flang/include/flang/Semantics/tools.h
+@@ -736,5 +736,34 @@ std::string GetCommonBlockObjectName(const Symbol &, bool underscoring);
+ // Check for ambiguous USE associations
+ bool HadUseError(SemanticsContext &, SourceName at, const Symbol *);
+ 
++/// Checks if the assignment statement has a single variable on the RHS.
++inline bool checkForSingleVariableOnRHS(
++    const Fortran::parser::AssignmentStmt &assignmentStmt) {
++  const Fortran::parser::Expr &expr{
++      std::get<Fortran::parser::Expr>(assignmentStmt.t)};
++  const Fortran::common::Indirection<Fortran::parser::Designator> *designator =
++      std::get_if<Fortran::common::Indirection<Fortran::parser::Designator>>(
++          &expr.u);
++  return designator != nullptr;
++}
++
++/// Checks if the symbol on the LHS of the assignment statement is present in
++/// the RHS expression.
++inline bool checkForSymbolMatch(
++    const Fortran::parser::AssignmentStmt &assignmentStmt) {
++  const auto &var{std::get<Fortran::parser::Variable>(assignmentStmt.t)};
++  const auto &expr{std::get<Fortran::parser::Expr>(assignmentStmt.t)};
++  const auto *e{Fortran::semantics::GetExpr(expr)};
++  const auto *v{Fortran::semantics::GetExpr(var)};
++  auto varSyms{Fortran::evaluate::GetSymbolVector(*v)};
++  const Fortran::semantics::Symbol &varSymbol{*varSyms.front()};
++  for (const Fortran::semantics::Symbol &symbol :
++      Fortran::evaluate::GetSymbolVector(*e)) {
++    if (varSymbol == symbol) {
++      return true;
++    }
++  }
++  return false;
++}
+ } // namespace Fortran::semantics
+ #endif // FORTRAN_SEMANTICS_TOOLS_H_
+diff --git a/flang/lib/Lower/DirectivesCommon.h b/flang/lib/Lower/DirectivesCommon.h
+index d2060e77ce530..a32f0b287e049 100644
+--- a/flang/lib/Lower/DirectivesCommon.h
++++ b/flang/lib/Lower/DirectivesCommon.h
+@@ -74,34 +74,6 @@ struct AddrAndBoundsInfo {
+   }
+ };
+ 
+-/// Checks if the assignment statement has a single variable on the RHS.
+-static inline bool checkForSingleVariableOnRHS(
+-    const Fortran::parser::AssignmentStmt &assignmentStmt) {
+-  const Fortran::parser::Expr &expr{
+-      std::get<Fortran::parser::Expr>(assignmentStmt.t)};
+-  const Fortran::common::Indirection<Fortran::parser::Designator> *designator =
+-      std::get_if<Fortran::common::Indirection<Fortran::parser::Designator>>(
+-          &expr.u);
+-  return designator != nullptr;
+-}
+-
+-/// Checks if the symbol on the LHS of the assignment statement is present in
+-/// the RHS expression.
+-static inline bool
+-checkForSymbolMatch(const Fortran::parser::AssignmentStmt &assignmentStmt) {
+-  const auto &var{std::get<Fortran::parser::Variable>(assignmentStmt.t)};
+-  const auto &expr{std::get<Fortran::parser::Expr>(assignmentStmt.t)};
+-  const auto *e{Fortran::semantics::GetExpr(expr)};
+-  const auto *v{Fortran::semantics::GetExpr(var)};
+-  auto varSyms{Fortran::evaluate::GetSymbolVector(*v)};
+-  const Fortran::semantics::Symbol &varSymbol{*varSyms.front()};
+-  for (const Fortran::semantics::Symbol &symbol :
+-       Fortran::evaluate::GetSymbolVector(*e))
+-    if (varSymbol == symbol)
+-      return true;
+-  return false;
+-}
+-
+ /// Populates \p hint and \p memoryOrder with appropriate clause information
+ /// if present on atomic construct.
+ static inline void genOmpAtomicHintAndMemoryOrderClauses(
+@@ -537,7 +509,7 @@ void genOmpAccAtomicCapture(Fortran::lower::AbstractConverter &converter,
+   stmt2LHSArg = fir::getBase(converter.genExprAddr(assign2.lhs, stmtCtx));
+ 
+   // Operation specific RHS evaluations
+-  if (checkForSingleVariableOnRHS(stmt1)) {
++  if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
+     // Atomic capture construct is of the form [capture-stmt, update-stmt] or
+     // of the form [capture-stmt, write-stmt]
+     stmt1RHSArg = fir::getBase(converter.genExprAddr(assign1.rhs, stmtCtx));
+@@ -573,8 +545,8 @@ void genOmpAccAtomicCapture(Fortran::lower::AbstractConverter &converter,
+   firOpBuilder.createBlock(&(atomicCaptureOp->getRegion(0)));
+   mlir::Block &block = atomicCaptureOp->getRegion(0).back();
+   firOpBuilder.setInsertionPointToStart(&block);
+-  if (checkForSingleVariableOnRHS(stmt1)) {
+-    if (checkForSymbolMatch(stmt2)) {
++  if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
++    if (Fortran::semantics::checkForSymbolMatch(stmt2)) {
+       // Atomic capture construct is of the form [capture-stmt, update-stmt]
+       const Fortran::semantics::SomeExpr &fromExpr =
+           *Fortran::semantics::GetExpr(stmt1Expr);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 643b713b32e29..dfc3f3290a81b 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1977,6 +1977,58 @@ void OmpStructureChecker::CheckAtomicUpdateStmt(
+   ErrIfAllocatableVariable(var);
+ }
+ 
++// TODO: Allow cond-update-stmt once compare clause is supported.
++void OmpStructureChecker::CheckAtomicCaptureConstruct(
++    const parser::OmpAtomicCapture &atomicCaptureConstruct) {
++  const Fortran::parser::AssignmentStmt &stmt1 =
++      std::get<Fortran::parser::OmpAtomicCapture::Stmt1>(
++          atomicCaptureConstruct.t)
++          .v.statement;
++  const auto &stmt1Var{std::get<Fortran::parser::Variable>(stmt1.t)};
++  const auto &stmt1Expr{std::get<Fortran::parser::Expr>(stmt1.t)};
++
++  const Fortran::parser::AssignmentStmt &stmt2 =
++      std::get<Fortran::parser::OmpAtomicCapture::Stmt2>(
++          atomicCaptureConstruct.t)
++          .v.statement;
++  const auto &stmt2Var{std::get<Fortran::parser::Variable>(stmt2.t)};
++  const auto &stmt2Expr{std::get<Fortran::parser::Expr>(stmt2.t)};
++
++  if (Fortran::semantics::checkForSingleVariableOnRHS(stmt1)) {
++    CheckAtomicCaptureStmt(stmt1);
++    if (Fortran::semantics::checkForSymbolMatch(stmt2)) {
++      // ATOMIC CAPTURE construct is of the form [capture-stmt, update-stmt]
++      CheckAtomicUpdateStmt(stmt2);
++    } else {
++      // ATOMIC CAPTURE construct is of the form [capture-stmt, write-stmt]
++      CheckAtomicWriteStmt(stmt2);
++    }
++    auto *v{stmt2Var.typedExpr.get()};
++    auto *e{stmt1Expr.typedExpr.get()};
++    if (v && e && !(v->v == e->v)) {
++      context_.Say(stmt1Expr.source,
++          "Captured variable/array element/derived-type component %s expected to be assigned in the second statement of ATOMIC CAPTURE construct"_err_en_US,
++          stmt1Expr.source);
++    }
++  } else if (Fortran::semantics::checkForSymbolMatch(stmt1) &&
++      Fortran::semantics::checkForSingleVariableOnRHS(stmt2)) {
++    // ATOMIC CAPTURE construct is of the form [update-stmt, capture-stmt]
++    CheckAtomicUpdateStmt(stmt1);
++    CheckAtomicCaptureStmt(stmt2);
++    // Variable updated in stmt1 should be captured in stmt2
++    auto *v{stmt1Var.typedExpr.get()};
++    auto *e{stmt2Expr.typedExpr.get()};
++    if (v && e && !(v->v == e->v)) {
++      context_.Say(stmt1Var.GetSource(),
++          "Updated variable/array element/derived-type component %s expected to be captured in the second statement of ATOMIC CAPTURE construct"_err_en_US,
++          stmt1Var.GetSource());
++    }
++  } else {
++    context_.Say(stmt1Expr.source,
++        "Invalid ATOMIC CAPTURE construct statements. Expected one of [update-stmt, capture-stmt], [capture-stmt, update-stmt], or [capture-stmt, write-stmt]"_err_en_US);
++  }
++}
++
+ void OmpStructureChecker::CheckAtomicMemoryOrderClause(
+     const parser::OmpAtomicClauseList *leftHandClauseList,
+     const parser::OmpAtomicClauseList *rightHandClauseList) {
+@@ -2060,15 +2112,15 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+                     atomicWrite.t)
+                     .statement);
+           },
+-          [&](const auto &atomicConstruct) {
+-            const auto &dir{std::get<parser::Verbatim>(atomicConstruct.t)};
++          [&](const parser::OmpAtomicCapture &atomicCapture) {
++            const auto &dir{std::get<parser::Verbatim>(atomicCapture.t)};
+             PushContextAndClauseSets(
+                 dir.source, llvm::omp::Directive::OMPD_atomic);
+-            CheckAtomicMemoryOrderClause(&std::get<0>(atomicConstruct.t),
+-                &std::get<2>(atomicConstruct.t));
++            CheckAtomicMemoryOrderClause(
++                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicConstruct.t),
+-                &std::get<2>(atomicConstruct.t));
++                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
++            CheckAtomicCaptureConstruct(atomicCapture);
+           },
+       },
+       x.u);
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 2cc1a78068f54..8bfd4d594b028 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -193,6 +193,7 @@ class OmpStructureChecker
+   void CheckAtomicUpdateStmt(const parser::AssignmentStmt &);
+   void CheckAtomicCaptureStmt(const parser::AssignmentStmt &);
+   void CheckAtomicWriteStmt(const parser::AssignmentStmt &);
++  void CheckAtomicCaptureConstruct(const parser::OmpAtomicCapture &);
+   void CheckAtomicConstructStructure(const parser::OpenMPAtomicConstruct &);
+   void CheckDistLinear(const parser::OpenMPLoopConstruct &x);
+   void CheckSIMDNest(const parser::OpenMPConstruct &x);
+diff --git a/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90 b/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
+index a346056dee383..0d4da5485af04 100644
+--- a/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
++++ b/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
+@@ -84,4 +84,68 @@ program sample
+     !$omp atomic write
+     !ERROR: Expected scalar variable on the LHS of atomic assignment statement
+         a = x
++
++    !$omp atomic capture
++        v = x
++        x = x + 1
++    !$omp end atomic
++
++    !$omp atomic release capture
++        v = x
++    !ERROR: Atomic update statement should be of form `x = x operator expr` OR `x = expr operator x`
++        x = b + (x*1)
++    !$omp end atomic
++
++    !$omp atomic capture hint(0)
++        v = x
++        x = 1
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Captured variable/array element/derived-type component x expected to be assigned in the second statement of ATOMIC CAPTURE construct
++        v = x
++        b = b + 1
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Captured variable/array element/derived-type component x expected to be assigned in the second statement of ATOMIC CAPTURE construct
++        v = x
++        b = 10
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Updated variable/array element/derived-type component x expected to be captured in the second statement of ATOMIC CAPTURE construct
++        x = x + 10
++        v = b
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Invalid ATOMIC CAPTURE construct statements. Expected one of [update-stmt, capture-stmt], [capture-stmt, update-stmt], or [capture-stmt, write-stmt]
++        v = 1
++        x = 4
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Captured variable/array element/derived-type component z%y expected to be assigned in the second statement of ATOMIC CAPTURE construct
++        x = z%y
++        z%m = z%m + 1.0
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Updated variable/array element/derived-type component z%m expected to be captured in the second statement of ATOMIC CAPTURE construct
++        z%m = z%m + 1.0
++        x = z%y
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Captured variable/array element/derived-type component y(2) expected to be assigned in the second statement of ATOMIC CAPTURE construct
++        x = y(2)
++        y(1) = y(1) + 1
++    !$omp end atomic
++
++    !$omp atomic capture
++    !ERROR: Updated variable/array element/derived-type component y(1) expected to be captured in the second statement of ATOMIC CAPTURE construct
++        y(1) = y(1) + 1
++        x = y(2)
++    !$omp end atomic
+ end program
+diff --git a/flang/test/Semantics/OpenMP/requires-atomic01.f90 b/flang/test/Semantics/OpenMP/requires-atomic01.f90
+index b39c9cdcc0bb3..cb7b1bc1ac52a 100644
+--- a/flang/test/Semantics/OpenMP/requires-atomic01.f90
++++ b/flang/test/Semantics/OpenMP/requires-atomic01.f90
+@@ -88,7 +88,7 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> SeqCst
+   !$omp atomic capture
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ 
+   ! CHECK-LABEL: OpenMPAtomicConstruct -> OmpAtomicCapture
+@@ -96,7 +96,7 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> Relaxed
+   !$omp atomic relaxed capture
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ 
+   ! CHECK-LABEL: OpenMPAtomicConstruct -> OmpAtomicCapture
+@@ -104,6 +104,6 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> Relaxed
+   !$omp atomic capture relaxed
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ end program requires
+diff --git a/flang/test/Semantics/OpenMP/requires-atomic02.f90 b/flang/test/Semantics/OpenMP/requires-atomic02.f90
+index 3af83970e7927..5a4249794f7b5 100644
+--- a/flang/test/Semantics/OpenMP/requires-atomic02.f90
++++ b/flang/test/Semantics/OpenMP/requires-atomic02.f90
+@@ -88,7 +88,7 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> AcqRel
+   !$omp atomic capture
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ 
+   ! CHECK-LABEL: OpenMPAtomicConstruct -> OmpAtomicCapture
+@@ -96,7 +96,7 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> Relaxed
+   !$omp atomic relaxed capture
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ 
+   ! CHECK-LABEL: OpenMPAtomicConstruct -> OmpAtomicCapture
+@@ -104,6 +104,6 @@ program requires
+   ! CHECK: OmpMemoryOrderClause -> OmpClause -> Relaxed
+   !$omp atomic capture relaxed
+   i = j
+-  i = j
++  j = j + 1
+   !$omp end atomic
+ end program requires

@@ -1,0 +1,268 @@
+diff --git a/clang/include/clang/Parse/Parser.h b/clang/include/clang/Parse/Parser.h
+index d2fec2b7a6462..8b47a70890a7d 100644
+--- a/clang/include/clang/Parse/Parser.h
++++ b/clang/include/clang/Parse/Parser.h
+@@ -3537,6 +3537,9 @@ class Parser : public CodeCompletionHandler {
+                                              DeclarationName &Name,
+                                              AccessSpecifier AS = AS_none);
+ 
++  /// Parses 'omp begin declare variant' directive.
++  bool ParseOpenMPDeclareBeginVariantDirective(SourceLocation Loc);
++
+   /// Tries to parse cast part of OpenMP array shaping operation:
+   /// '[' expression ']' { '[' expression ']' } ')'.
+   bool tryParseOpenMPArrayShapingCastPart();
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 2508bf5795900..91087a913d97e 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -668,6 +668,72 @@ TypeResult Parser::parseOpenMPDeclareMapperVarDecl(SourceRange &Range,
+                                                           DeclaratorInfo);
+ }
+ 
++/// Parses 'omp begin declare variant' directive.
++// The syntax is:
++// { #pragma omp begin declare variant clause }
++// <function-declaration-or-definition-sequence>
++// { #pragma omp end declare variant }
++//
++bool Parser::ParseOpenMPDeclareBeginVariantDirective(SourceLocation Loc) {
++  OMPTraitInfo *ParentTI =
++      Actions.OpenMP().getOMPTraitInfoForSurroundingScope();
++  ASTContext &ASTCtx = Actions.getASTContext();
++  OMPTraitInfo &TI = ASTCtx.getNewOMPTraitInfo();
++  if (parseOMPDeclareVariantMatchClause(Loc, TI, ParentTI)) {
++    while (!SkipUntil(tok::annot_pragma_openmp_end, Parser::StopBeforeMatch))
++      ;
++    // Skip the last annot_pragma_openmp_end.
++    (void)ConsumeAnnotationToken();
++    return true;
++  }
++
++  // Skip last tokens.
++  skipUntilPragmaOpenMPEnd(OMPD_begin_declare_variant);
++
++  ParsingOpenMPDirectiveRAII NormalScope(*this, /*Value=*/false);
++
++  VariantMatchInfo VMI;
++  TI.getAsVariantMatchInfo(ASTCtx, VMI);
++
++  std::function<void(StringRef)> DiagUnknownTrait = [this,
++                                                     Loc](StringRef ISATrait) {
++    // TODO Track the selector locations in a way that is accessible here
++    // to improve the diagnostic location.
++    Diag(Loc, diag::warn_unknown_declare_variant_isa_trait) << ISATrait;
++  };
++  TargetOMPContext OMPCtx(
++      ASTCtx, std::move(DiagUnknownTrait),
++      /* CurrentFunctionDecl */ nullptr,
++      /* ConstructTraits */ ArrayRef<llvm::omp::TraitProperty>(),
++      Actions.OpenMP().getOpenMPDeviceNum());
++
++  if (isVariantApplicableInContext(VMI, OMPCtx,
++                                   /*DeviceOrImplementationSetOnly=*/true)) {
++    Actions.OpenMP().ActOnOpenMPBeginDeclareVariant(Loc, TI);
++    return false;
++  }
++
++  // Elide all the code till the matching end declare variant was found.
++  unsigned Nesting = 1;
++  SourceLocation DKLoc;
++  OpenMPDirectiveKind DK = OMPD_unknown;
++  do {
++    DKLoc = Tok.getLocation();
++    DK = parseOpenMPDirectiveKind(*this);
++    if (DK == OMPD_end_declare_variant)
++      --Nesting;
++    else if (DK == OMPD_begin_declare_variant)
++      ++Nesting;
++    if (!Nesting || isEofOrEom())
++      break;
++    ConsumeAnyToken();
++  } while (true);
++
++  parseOMPEndDirective(OMPD_begin_declare_variant, OMPD_end_declare_variant, DK,
++                       Loc, DKLoc, /* SkipUntilOpenMPEnd */ true);
++  return false;
++}
++
+ namespace {
+ /// RAII that recreates function context for correct parsing of clauses of
+ /// 'declare simd' construct.
+@@ -2244,79 +2310,23 @@ Parser::DeclGroupPtrTy Parser::ParseOpenMPDeclarativeDirectiveWithExtDecl(
+     break;
+   }
+   case OMPD_begin_declare_variant: {
+-    // The syntax is:
+-    // { #pragma omp begin declare variant clause }
+-    // <function-declaration-or-definition-sequence>
+-    // { #pragma omp end declare variant }
+-    //
+     ConsumeToken();
+-    OMPTraitInfo *ParentTI =
+-        Actions.OpenMP().getOMPTraitInfoForSurroundingScope();
+-    ASTContext &ASTCtx = Actions.getASTContext();
+-    OMPTraitInfo &TI = ASTCtx.getNewOMPTraitInfo();
+-    if (parseOMPDeclareVariantMatchClause(Loc, TI, ParentTI)) {
+-      while (!SkipUntil(tok::annot_pragma_openmp_end, Parser::StopBeforeMatch))
+-        ;
++    if (!ParseOpenMPDeclareBeginVariantDirective(Loc)) {
+       // Skip the last annot_pragma_openmp_end.
+-      (void)ConsumeAnnotationToken();
+-      break;
++      if (!isEofOrEom())
++        ConsumeAnnotationToken();
+     }
+-
+-    // Skip last tokens.
+-    skipUntilPragmaOpenMPEnd(OMPD_begin_declare_variant);
+-
+-    ParsingOpenMPDirectiveRAII NormalScope(*this, /*Value=*/false);
+-
+-    VariantMatchInfo VMI;
+-    TI.getAsVariantMatchInfo(ASTCtx, VMI);
+-
+-    std::function<void(StringRef)> DiagUnknownTrait =
+-        [this, Loc](StringRef ISATrait) {
+-          // TODO Track the selector locations in a way that is accessible here
+-          // to improve the diagnostic location.
+-          Diag(Loc, diag::warn_unknown_declare_variant_isa_trait) << ISATrait;
+-        };
+-    TargetOMPContext OMPCtx(
+-        ASTCtx, std::move(DiagUnknownTrait),
+-        /* CurrentFunctionDecl */ nullptr,
+-        /* ConstructTraits */ ArrayRef<llvm::omp::TraitProperty>(),
+-        Actions.OpenMP().getOpenMPDeviceNum());
+-
+-    if (isVariantApplicableInContext(VMI, OMPCtx,
+-                                     /*DeviceOrImplementationSetOnly=*/true)) {
+-      Actions.OpenMP().ActOnOpenMPBeginDeclareVariant(Loc, TI);
+-      break;
+-    }
+-
+-    // Elide all the code till the matching end declare variant was found.
+-    unsigned Nesting = 1;
+-    SourceLocation DKLoc;
+-    OpenMPDirectiveKind DK = OMPD_unknown;
+-    do {
+-      DKLoc = Tok.getLocation();
+-      DK = parseOpenMPDirectiveKind(*this);
+-      if (DK == OMPD_end_declare_variant)
+-        --Nesting;
+-      else if (DK == OMPD_begin_declare_variant)
+-        ++Nesting;
+-      if (!Nesting || isEofOrEom())
+-        break;
+-      ConsumeAnyToken();
+-    } while (true);
+-
+-    parseOMPEndDirective(OMPD_begin_declare_variant, OMPD_end_declare_variant,
+-                         DK, Loc, DKLoc, /* SkipUntilOpenMPEnd */ true);
+-    if (isEofOrEom())
+-      return nullptr;
+-    break;
++    return nullptr;
+   }
+   case OMPD_end_declare_variant: {
++    ConsumeToken();
+     if (Actions.OpenMP().isInOpenMPDeclareVariantScope())
+       Actions.OpenMP().ActOnOpenMPEndDeclareVariant();
+     else
+       Diag(Loc, diag::err_expected_begin_declare_variant);
+-    ConsumeToken();
+-    break;
++    // Skip the last annot_pragma_openmp_end.
++    ConsumeAnnotationToken();
++    return nullptr;
+   }
+   case OMPD_declare_variant:
+   case OMPD_declare_simd: {
+@@ -3028,12 +3038,28 @@ StmtResult Parser::ParseOpenMPDeclarativeOrExecutableDirective(
+     Actions.OpenMP().ActOnFinishedOpenMPDeclareTargetContext(DTCI);
+     break;
+   }
++  case OMPD_begin_declare_variant: {
++    ConsumeToken();
++    if (!ParseOpenMPDeclareBeginVariantDirective(Loc)) {
++      // Skip the last annot_pragma_openmp_end.
++      if (!isEofOrEom())
++        ConsumeAnnotationToken();
++    }
++    return Directive;
++  }
++  case OMPD_end_declare_variant: {
++    ConsumeToken();
++    if (Actions.OpenMP().isInOpenMPDeclareVariantScope())
++      Actions.OpenMP().ActOnOpenMPEndDeclareVariant();
++    else
++      Diag(Loc, diag::err_expected_begin_declare_variant);
++    ConsumeAnnotationToken();
++    break;
++  }
+   case OMPD_declare_simd:
+   case OMPD_begin_declare_target:
+   case OMPD_end_declare_target:
+   case OMPD_requires:
+-  case OMPD_begin_declare_variant:
+-  case OMPD_end_declare_variant:
+   case OMPD_declare_variant:
+     Diag(Tok, diag::err_omp_unexpected_directive)
+         << 1 << getOpenMPDirectiveName(DKind, OMPVersion);
+diff --git a/clang/test/OpenMP/begin_declare_variant_executable_scope.c b/clang/test/OpenMP/begin_declare_variant_executable_scope.c
+new file mode 100644
+index 0000000000000..d3d74ebbfa3ac
+--- /dev/null
++++ b/clang/test/OpenMP/begin_declare_variant_executable_scope.c
+@@ -0,0 +1,23 @@
++// RUN: %clang_cc1 -triple=x86_64-pc-win32 -verify -fopenmp -x c -std=c99 -fms-extensions -Wno-pragma-pack %s
++// RUN: %clang_cc1 -triple=x86_64-pc-win32 -verify -fopenmp-simd -x c -std=c99 -fms-extensions -Wno-pragma-pack %s
++
++// expected-no-diagnostics
++
++#pragma omp begin declare variant match(implementation={vendor(ibm)})
++void f(int);
++#pragma omp end declare variant
++
++#pragma omp begin declare variant match(implementation={vendor(llvm)})
++void f(void);
++#pragma omp end declare variant
++
++int main() {
++#pragma omp begin declare variant match(implementation={vendor(ibm)})
++  int i = 0;
++  f(i);
++#pragma omp end declare variant
++
++#pragma omp begin declare variant match(implementation={vendor(llvm)})
++  f();
++#pragma omp end declare variant
++}
+diff --git a/clang/test/OpenMP/begin_declare_variant_messages.c b/clang/test/OpenMP/begin_declare_variant_messages.c
+index f87714a47dce0..d8d8f4211678f 100644
+--- a/clang/test/OpenMP/begin_declare_variant_messages.c
++++ b/clang/test/OpenMP/begin_declare_variant_messages.c
+@@ -16,8 +16,7 @@
+ #pragma omp variant begin // expected-error {{expected an OpenMP directive}}
+ #pragma omp declare variant end // expected-error {{function declaration is expected after 'declare variant' directive}}
+ #pragma omp begin declare variant // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+-#pragma omp end declare variant
+-// TODO: Issue an error message
++#pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+@@ -27,11 +26,11 @@ int foo(void);
+ const int var;
+ 
+ #pragma omp begin declare variant // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+-#pragma omp end declare variant
++#pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp begin declare variant xxx // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+-#pragma omp end declare variant
++#pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp begin declare variant match // expected-error {{expected '(' after 'match'}}
+-#pragma omp end declare variant
++#pragma omp end declare variant // expected-error {{'#pragma omp end declare variant' with no matching '#pragma omp begin declare variant'}}
+ #pragma omp begin declare variant match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+ #pragma omp end declare variant
+ #pragma omp begin declare variant match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}

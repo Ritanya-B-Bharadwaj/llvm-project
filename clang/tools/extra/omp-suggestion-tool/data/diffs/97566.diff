@@ -1,0 +1,650 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 17804ff58edc0..3dac44ac63691 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -992,6 +992,29 @@ static OpTy genOpWithBody(const OpWithBodyGenInfo &info,
+   return op;
+ }
+ 
++template <typename OpTy, typename ClauseOpsTy>
++static OpTy genWrapperOp(lower::AbstractConverter &converter,
++                         mlir::Location loc, const ClauseOpsTy &clauseOps,
++                         llvm::ArrayRef<mlir::Type> blockArgTypes) {
++  static_assert(
++      OpTy::template hasTrait<mlir::omp::LoopWrapperInterface::Trait>(),
++      "expected a loop wrapper");
++  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
++
++  // Create wrapper.
++  auto op = firOpBuilder.create<OpTy>(loc, clauseOps);
++
++  // Create entry block with arguments.
++  llvm::SmallVector<mlir::Location> locs(blockArgTypes.size(), loc);
++  firOpBuilder.createBlock(&op.getRegion(), /*insertPt=*/{}, blockArgTypes,
++                           locs);
++
++  firOpBuilder.setInsertionPoint(
++      lower::genOpenMPTerminator(firOpBuilder, op, loc));
++
++  return op;
++}
++
+ //===----------------------------------------------------------------------===//
+ // Code generation functions for clauses
+ //===----------------------------------------------------------------------===//
+@@ -1312,53 +1335,6 @@ genCriticalOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       queue, item, nameAttr);
+ }
+ 
+-static mlir::omp::DistributeOp
+-genDistributeOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+-                semantics::SemanticsContext &semaCtx,
+-                lower::pft::Evaluation &eval, mlir::Location loc,
+-                const ConstructQueue &queue, ConstructQueue::iterator item,
+-                DataSharingProcessor &dsp) {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-
+-  lower::StatementContext stmtCtx;
+-  mlir::omp::LoopNestClauseOps loopClauseOps;
+-  mlir::omp::DistributeClauseOps distributeClauseOps;
+-  llvm::SmallVector<const semantics::Symbol *> iv;
+-  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
+-                     loopClauseOps, iv);
+-  genDistributeClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
+-                       distributeClauseOps);
+-
+-  // Create omp.distribute wrapper.
+-  auto distributeOp =
+-      firOpBuilder.create<mlir::omp::DistributeOp>(loc, distributeClauseOps);
+-
+-  firOpBuilder.createBlock(&distributeOp.getRegion());
+-  firOpBuilder.setInsertionPoint(
+-      lower::genOpenMPTerminator(firOpBuilder, distributeOp, loc));
+-
+-  // Create nested omp.loop_nest and fill body with loop contents.
+-  auto loopOp = firOpBuilder.create<mlir::omp::LoopNestOp>(loc, loopClauseOps);
+-
+-  auto *nestedEval =
+-      getCollapsedLoopEval(eval, getCollapseValue(item->clauses));
+-
+-  auto ivCallback = [&](mlir::Operation *op) {
+-    genLoopVars(op, converter, loc, iv);
+-    return iv;
+-  };
+-
+-  createBodyOfOp(*loopOp,
+-                 OpWithBodyGenInfo(converter, symTable, semaCtx, loc,
+-                                   *nestedEval, llvm::omp::Directive::OMPD_simd)
+-                     .setClauses(&item->clauses)
+-                     .setDataSharingProcessor(&dsp)
+-                     .setGenRegionEntryCb(ivCallback),
+-                 queue, item);
+-
+-  return distributeOp;
+-}
+-
+ static mlir::omp::FlushOp
+ genFlushOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+            semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+@@ -1372,6 +1348,33 @@ genFlushOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       converter.getCurrentLocation(), operandRange);
+ }
+ 
++static mlir::omp::LoopNestOp
++genLoopNestOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
++              semantics::SemanticsContext &semaCtx,
++              lower::pft::Evaluation &eval, mlir::Location loc,
++              const ConstructQueue &queue, ConstructQueue::iterator item,
++              mlir::omp::LoopNestClauseOps &clauseOps,
++              llvm::ArrayRef<const semantics::Symbol *> iv,
++              llvm::ArrayRef<const semantics::Symbol *> wrapperSyms,
++              llvm::ArrayRef<mlir::BlockArgument> wrapperArgs,
++              llvm::omp::Directive directive, DataSharingProcessor &dsp) {
++  auto ivCallback = [&](mlir::Operation *op) {
++    genLoopVars(op, converter, loc, iv, wrapperSyms, wrapperArgs);
++    return llvm::SmallVector<const semantics::Symbol *>(iv);
++  };
++
++  auto *nestedEval =
++      getCollapsedLoopEval(eval, getCollapseValue(item->clauses));
++
++  return genOpWithBody<mlir::omp::LoopNestOp>(
++      OpWithBodyGenInfo(converter, symTable, semaCtx, loc, *nestedEval,
++                        directive)
++          .setClauses(&item->clauses)
++          .setDataSharingProcessor(&dsp)
++          .setGenRegionEntryCb(ivCallback),
++      queue, item, clauseOps);
++}
++
+ static mlir::omp::MasterOp
+ genMasterOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+             semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+@@ -1410,18 +1413,15 @@ static mlir::omp::ParallelOp
+ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+               semantics::SemanticsContext &semaCtx,
+               lower::pft::Evaluation &eval, mlir::Location loc,
+-              const ConstructQueue &queue, ConstructQueue::iterator item) {
++              const ConstructQueue &queue, ConstructQueue::iterator item,
++              mlir::omp::ParallelClauseOps &clauseOps,
++              llvm::ArrayRef<const semantics::Symbol *> reductionSyms,
++              llvm::ArrayRef<mlir::Type> reductionTypes) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-  lower::StatementContext stmtCtx;
+-  mlir::omp::ParallelClauseOps clauseOps;
+-  llvm::SmallVector<mlir::Type> reductionTypes;
+-  llvm::SmallVector<const semantics::Symbol *> reductionSyms;
+-  genParallelClauses(converter, semaCtx, stmtCtx, item->clauses, loc, clauseOps,
+-                     reductionTypes, reductionSyms);
+ 
+   auto reductionCallback = [&](mlir::Operation *op) {
+     genReductionVars(op, converter, loc, reductionSyms, reductionTypes);
+-    return reductionSyms;
++    return llvm::SmallVector<const semantics::Symbol *>(reductionSyms);
+   };
+ 
+   OpWithBodyGenInfo genInfo =
+@@ -1446,7 +1446,7 @@ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+         clauseOps.reductionVars.size(), loc);
+ 
+     llvm::SmallVector<mlir::Type> allRegionArgTypes;
+-    mergePrivateVarsInfo(parallelOp, llvm::ArrayRef(reductionTypes),
++    mergePrivateVarsInfo(parallelOp, reductionTypes,
+                          llvm::function_ref<mlir::Type(mlir::Value)>{
+                              [](mlir::Value v) { return v.getType(); }},
+                          allRegionArgTypes);
+@@ -1461,7 +1461,7 @@ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+     firOpBuilder.createBlock(&region, /*insertPt=*/{}, allRegionArgTypes,
+                              allRegionArgLocs);
+ 
+-    llvm::SmallVector<const semantics::Symbol *> allSymbols = reductionSyms;
++    llvm::SmallVector<const semantics::Symbol *> allSymbols(reductionSyms);
+     allSymbols.append(dsp.getAllSymbolsToPrivatize().begin(),
+                       dsp.getAllSymbolsToPrivatize().end());
+ 
+@@ -1572,51 +1572,6 @@ genSectionsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   return sectionsOp;
+ }
+ 
+-static mlir::omp::SimdOp
+-genSimdOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+-          semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+-          mlir::Location loc, const ConstructQueue &queue,
+-          ConstructQueue::iterator item, DataSharingProcessor &dsp) {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-
+-  lower::StatementContext stmtCtx;
+-  mlir::omp::LoopNestClauseOps loopClauseOps;
+-  mlir::omp::SimdClauseOps simdClauseOps;
+-  llvm::SmallVector<const semantics::Symbol *> iv;
+-  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
+-                     loopClauseOps, iv);
+-  genSimdClauses(converter, semaCtx, item->clauses, loc, simdClauseOps);
+-
+-  // Create omp.simd wrapper.
+-  auto simdOp = firOpBuilder.create<mlir::omp::SimdOp>(loc, simdClauseOps);
+-
+-  // TODO: Add reduction-related arguments to the wrapper's entry block.
+-  firOpBuilder.createBlock(&simdOp.getRegion());
+-  firOpBuilder.setInsertionPoint(
+-      lower::genOpenMPTerminator(firOpBuilder, simdOp, loc));
+-
+-  // Create nested omp.loop_nest and fill body with loop contents.
+-  auto loopOp = firOpBuilder.create<mlir::omp::LoopNestOp>(loc, loopClauseOps);
+-
+-  auto *nestedEval =
+-      getCollapsedLoopEval(eval, getCollapseValue(item->clauses));
+-
+-  auto ivCallback = [&](mlir::Operation *op) {
+-    genLoopVars(op, converter, loc, iv);
+-    return iv;
+-  };
+-
+-  createBodyOfOp(*loopOp,
+-                 OpWithBodyGenInfo(converter, symTable, semaCtx, loc,
+-                                   *nestedEval, llvm::omp::Directive::OMPD_simd)
+-                     .setClauses(&item->clauses)
+-                     .setDataSharingProcessor(&dsp)
+-                     .setGenRegionEntryCb(ivCallback),
+-                 queue, item);
+-
+-  return simdOp;
+-}
+-
+ static mlir::omp::SingleOp
+ genSingleOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+             semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+@@ -1848,15 +1803,6 @@ genTaskgroupOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       queue, item, clauseOps);
+ }
+ 
+-static mlir::omp::TaskloopOp
+-genTaskloopOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+-              semantics::SemanticsContext &semaCtx,
+-              lower::pft::Evaluation &eval, mlir::Location loc,
+-              const ConstructQueue &queue, ConstructQueue::iterator item,
+-              DataSharingProcessor &dsp) {
+-  TODO(loc, "Taskloop construct");
+-}
+-
+ static mlir::omp::TaskwaitOp
+ genTaskwaitOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+               semantics::SemanticsContext &semaCtx,
+@@ -1892,54 +1838,117 @@ genTeamsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       queue, item, clauseOps);
+ }
+ 
+-static mlir::omp::WsloopOp
+-genWsloopOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+-            semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+-            mlir::Location loc, const ConstructQueue &queue,
+-            ConstructQueue::iterator item, DataSharingProcessor &dsp) {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
++//===----------------------------------------------------------------------===//
++// Code generation functions for the standalone version of constructs that can
++// also be a leaf of a composite construct
++//===----------------------------------------------------------------------===//
+ 
++static void genStandaloneDistribute(
++    lower::AbstractConverter &converter, lower::SymMap &symTable,
++    semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
++    mlir::Location loc, const ConstructQueue &queue,
++    ConstructQueue::iterator item, DataSharingProcessor &dsp) {
+   lower::StatementContext stmtCtx;
+-  mlir::omp::LoopNestClauseOps loopClauseOps;
+-  mlir::omp::WsloopClauseOps wsClauseOps;
++
++  mlir::omp::DistributeClauseOps distributeClauseOps;
++  genDistributeClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
++                       distributeClauseOps);
++
++  mlir::omp::LoopNestClauseOps loopNestClauseOps;
+   llvm::SmallVector<const semantics::Symbol *> iv;
+-  llvm::SmallVector<mlir::Type> reductionTypes;
++  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
++                     loopNestClauseOps, iv);
++
++  // TODO: Populate entry block arguments with private variables.
++  auto distributeOp = genWrapperOp<mlir::omp::DistributeOp>(
++      converter, loc, distributeClauseOps, /*blockArgTypes=*/{});
++
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
++                loopNestClauseOps, iv,
++                /*wrapperSyms=*/{}, distributeOp.getRegion().getArguments(),
++                llvm::omp::Directive::OMPD_distribute, dsp);
++}
++
++static void genStandaloneDo(lower::AbstractConverter &converter,
++                            lower::SymMap &symTable,
++                            semantics::SemanticsContext &semaCtx,
++                            lower::pft::Evaluation &eval, mlir::Location loc,
++                            const ConstructQueue &queue,
++                            ConstructQueue::iterator item,
++                            DataSharingProcessor &dsp) {
++  lower::StatementContext stmtCtx;
++
++  mlir::omp::WsloopClauseOps wsloopClauseOps;
+   llvm::SmallVector<const semantics::Symbol *> reductionSyms;
++  llvm::SmallVector<mlir::Type> reductionTypes;
++  genWsloopClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
++                   wsloopClauseOps, reductionTypes, reductionSyms);
++
++  mlir::omp::LoopNestClauseOps loopNestClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> iv;
+   genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
+-                     loopClauseOps, iv);
+-  genWsloopClauses(converter, semaCtx, stmtCtx, item->clauses, loc, wsClauseOps,
+-                   reductionTypes, reductionSyms);
+-
+-  // Create omp.wsloop wrapper and populate entry block arguments with reduction
+-  // variables.
+-  auto wsloopOp = firOpBuilder.create<mlir::omp::WsloopOp>(loc, wsClauseOps);
+-  llvm::SmallVector<mlir::Location> reductionLocs(reductionSyms.size(), loc);
+-  mlir::Block *wsloopEntryBlock = firOpBuilder.createBlock(
+-      &wsloopOp.getRegion(), {}, reductionTypes, reductionLocs);
+-  firOpBuilder.setInsertionPoint(
+-      lower::genOpenMPTerminator(firOpBuilder, wsloopOp, loc));
++                     loopNestClauseOps, iv);
+ 
+-  // Create nested omp.loop_nest and fill body with loop contents.
+-  auto loopOp = firOpBuilder.create<mlir::omp::LoopNestOp>(loc, loopClauseOps);
++  // TODO: Add private variables to entry block arguments.
++  auto wsloopOp = genWrapperOp<mlir::omp::WsloopOp>(
++      converter, loc, wsloopClauseOps, reductionTypes);
+ 
+-  auto *nestedEval =
+-      getCollapsedLoopEval(eval, getCollapseValue(item->clauses));
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
++                loopNestClauseOps, iv, reductionSyms,
++                wsloopOp.getRegion().getArguments(),
++                llvm::omp::Directive::OMPD_do, dsp);
++}
+ 
+-  auto ivCallback = [&](mlir::Operation *op) {
+-    genLoopVars(op, converter, loc, iv, reductionSyms,
+-                wsloopEntryBlock->getArguments());
+-    return iv;
+-  };
++static void genStandaloneParallel(lower::AbstractConverter &converter,
++                                  lower::SymMap &symTable,
++                                  semantics::SemanticsContext &semaCtx,
++                                  lower::pft::Evaluation &eval,
++                                  mlir::Location loc,
++                                  const ConstructQueue &queue,
++                                  ConstructQueue::iterator item) {
++  lower::StatementContext stmtCtx;
++
++  mlir::omp::ParallelClauseOps clauseOps;
++  llvm::SmallVector<const semantics::Symbol *> reductionSyms;
++  llvm::SmallVector<mlir::Type> reductionTypes;
++  genParallelClauses(converter, semaCtx, stmtCtx, item->clauses, loc, clauseOps,
++                     reductionTypes, reductionSyms);
+ 
+-  createBodyOfOp(*loopOp,
+-                 OpWithBodyGenInfo(converter, symTable, semaCtx, loc,
+-                                   *nestedEval, llvm::omp::Directive::OMPD_do)
+-                     .setClauses(&item->clauses)
+-                     .setDataSharingProcessor(&dsp)
+-                     .setGenRegionEntryCb(ivCallback),
+-                 queue, item);
++  genParallelOp(converter, symTable, semaCtx, eval, loc, queue, item, clauseOps,
++                reductionSyms, reductionTypes);
++}
+ 
+-  return wsloopOp;
++static void genStandaloneSimd(lower::AbstractConverter &converter,
++                              lower::SymMap &symTable,
++                              semantics::SemanticsContext &semaCtx,
++                              lower::pft::Evaluation &eval, mlir::Location loc,
++                              const ConstructQueue &queue,
++                              ConstructQueue::iterator item,
++                              DataSharingProcessor &dsp) {
++  mlir::omp::SimdClauseOps simdClauseOps;
++  genSimdClauses(converter, semaCtx, item->clauses, loc, simdClauseOps);
++
++  mlir::omp::LoopNestClauseOps loopNestClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> iv;
++  genLoopNestClauses(converter, semaCtx, eval, item->clauses, loc,
++                     loopNestClauseOps, iv);
++
++  // TODO: Populate entry block arguments with reduction and private variables.
++  auto simdOp = genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps,
++                                                /*blockArgTypes=*/{});
++
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, item,
++                loopNestClauseOps, iv,
++                /*wrapperSyms=*/{}, simdOp.getRegion().getArguments(),
++                llvm::omp::Directive::OMPD_simd, dsp);
++}
++
++static void genStandaloneTaskloop(
++    lower::AbstractConverter &converter, lower::SymMap &symTable,
++    semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
++    mlir::Location loc, const ConstructQueue &queue,
++    ConstructQueue::iterator item, DataSharingProcessor &dsp) {
++  TODO(loc, "Taskloop construct");
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1989,7 +1998,7 @@ static void genCompositeDoSimd(lower::AbstractConverter &converter,
+   // When support for vectorization is enabled, then we need to add handling of
+   // if clause. Currently if clause can be skipped because we always assume
+   // SIMD length = 1.
+-  genWsloopOp(converter, symTable, semaCtx, eval, loc, queue, item, dsp);
++  genStandaloneDo(converter, symTable, semaCtx, eval, loc, queue, item, dsp);
+ }
+ 
+ static void genCompositeTaskloopSimd(
+@@ -2028,11 +2037,12 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+     genBarrierOp(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
+   case llvm::omp::Directive::OMPD_distribute:
+-    genDistributeOp(converter, symTable, semaCtx, eval, loc, queue, item,
+-                    *loopDsp);
++    genStandaloneDistribute(converter, symTable, semaCtx, eval, loc, queue,
++                            item, *loopDsp);
+     break;
+   case llvm::omp::Directive::OMPD_do:
+-    genWsloopOp(converter, symTable, semaCtx, eval, loc, queue, item, *loopDsp);
++    genStandaloneDo(converter, symTable, semaCtx, eval, loc, queue, item,
++                    *loopDsp);
+     break;
+   case llvm::omp::Directive::OMPD_loop:
+   case llvm::omp::Directive::OMPD_masked:
+@@ -2046,7 +2056,7 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+     genOrderedRegionOp(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
+   case llvm::omp::Directive::OMPD_parallel:
+-    genParallelOp(converter, symTable, semaCtx, eval, loc, queue, item);
++    genStandaloneParallel(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
+   case llvm::omp::Directive::OMPD_section:
+     genSectionOp(converter, symTable, semaCtx, eval, loc, queue, item);
+@@ -2055,7 +2065,8 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+     genSectionsOp(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
+   case llvm::omp::Directive::OMPD_simd:
+-    genSimdOp(converter, symTable, semaCtx, eval, loc, queue, item, *loopDsp);
++    genStandaloneSimd(converter, symTable, semaCtx, eval, loc, queue, item,
++                      *loopDsp);
+     break;
+   case llvm::omp::Directive::OMPD_single:
+     genSingleOp(converter, symTable, semaCtx, eval, loc, queue, item);
+@@ -2085,8 +2096,8 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+     genTaskgroupOp(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
+   case llvm::omp::Directive::OMPD_taskloop:
+-    genTaskloopOp(converter, symTable, semaCtx, eval, loc, queue, item,
+-                  *loopDsp);
++    genStandaloneTaskloop(converter, symTable, semaCtx, eval, loc, queue, item,
++                          *loopDsp);
+     break;
+   case llvm::omp::Directive::OMPD_taskwait:
+     genTaskwaitOp(converter, symTable, semaCtx, eval, loc, queue, item);
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 879f59dfad6b4..669d528a8ae14 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -69,13 +69,13 @@
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_14:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_14]] {uniq_name = "_QFsEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_17:.*]] = arith.constant 100 : i32
+-! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_19:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
+-! CHECK:             fir.store %[[VAL_12]]#0 to %[[VAL_19]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxi32 %[[VAL_19]] -> %[[VAL_20:.*]] : !fir.ref<!fir.box<!fir.array<?xi32>>>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_21:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
++! CHECK:             %[[VAL_16:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
++! CHECK:             fir.store %[[VAL_12]]#0 to %[[VAL_16]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:             %[[VAL_17:.*]] = arith.constant 1 : i32
++! CHECK:             %[[VAL_18:.*]] = arith.constant 100 : i32
++! CHECK:             %[[VAL_19:.*]] = arith.constant 1 : i32
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxi32 %[[VAL_16]] -> %[[VAL_20:.*]] : !fir.ref<!fir.box<!fir.array<?xi32>>>) {
++! CHECK-NEXT:          omp.loop_nest (%[[VAL_21:.*]]) : i32 = (%[[VAL_17]]) to (%[[VAL_18]]) inclusive step (%[[VAL_19]]) {
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFsEc"} : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> (!fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.array<?xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_21]] to %[[VAL_15]]#1 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_22]]#0 : !fir.ref<!fir.box<!fir.array<?xi32>>>
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index 66b7e463b2357..2127451878849 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -27,10 +27,10 @@ subroutine simd_with_if_clause(n, threshold)
+   ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} dummy_scope %{{[0-9]+}} {uniq_name = "_QFsimd_with_if_clauseEn"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
+   integer :: i, n, threshold
+   !$OMP SIMD IF( n .GE. threshold )
++  ! CHECK: %[[COND:.*]] = arith.cmpi sge
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: %[[COND:.*]] = arith.cmpi sge
+   ! CHECK: omp.simd if(%[[COND:.*]]) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+diff --git a/flang/test/Lower/OpenMP/wsloop-chunks.f90 b/flang/test/Lower/OpenMP/wsloop-chunks.f90
+index fa6ec219a490e..3d4e9bc505f28 100644
+--- a/flang/test/Lower/OpenMP/wsloop-chunks.f90
++++ b/flang/test/Lower/OpenMP/wsloop-chunks.f90
+@@ -16,12 +16,12 @@ program wsloop
+ do i=1, 9
+   print*, i
+ 
+-! CHECK:         %[[VAL_2:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_3:.*]] = arith.constant 9 : i32
+-! CHECK:         %[[VAL_4:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_5:.*]] = arith.constant 4 : i32
+-! CHECK:         omp.wsloop schedule(static = %[[VAL_5]] : i32) nowait {
+-! CHECK-NEXT:      omp.loop_nest (%[[ARG0:.*]]) : i32 = (%[[VAL_2]]) to (%[[VAL_3]]) inclusive step (%[[VAL_4]]) {
++! CHECK:         %[[VAL_2:.*]] = arith.constant 4 : i32
++! CHECK:         %[[VAL_3:.*]] = arith.constant 1 : i32
++! CHECK:         %[[VAL_4:.*]] = arith.constant 9 : i32
++! CHECK:         %[[VAL_5:.*]] = arith.constant 1 : i32
++! CHECK:         omp.wsloop schedule(static = %[[VAL_2]] : i32) nowait {
++! CHECK-NEXT:      omp.loop_nest (%[[ARG0:.*]]) : i32 = (%[[VAL_3]]) to (%[[VAL_4]]) inclusive step (%[[VAL_5]]) {
+ ! CHECK:             fir.store %[[ARG0]] to %[[STORE_IV:.*]]#1 : !fir.ref<i32>
+ ! CHECK:             %[[LOAD_IV:.*]] = fir.load %[[STORE_IV]]#0 : !fir.ref<i32>
+ ! CHECK:             {{.*}} = fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+@@ -37,12 +37,12 @@ program wsloop
+ do i=1, 9
+   print*, i*2
+ 
+-! CHECK:         %[[VAL_14:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_15:.*]] = arith.constant 9 : i32
+-! CHECK:         %[[VAL_16:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_17:.*]] = arith.constant 4 : i32
+-! CHECK:         omp.wsloop schedule(static = %[[VAL_17]] : i32) nowait {
+-! CHECK-NEXT:      omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[VAL_14]]) to (%[[VAL_15]]) inclusive step (%[[VAL_16]]) {
++! CHECK:         %[[VAL_14:.*]] = arith.constant 4 : i32
++! CHECK:         %[[VAL_15:.*]] = arith.constant 1 : i32
++! CHECK:         %[[VAL_16:.*]] = arith.constant 9 : i32
++! CHECK:         %[[VAL_17:.*]] = arith.constant 1 : i32
++! CHECK:         omp.wsloop schedule(static = %[[VAL_14]] : i32) nowait {
++! CHECK-NEXT:      omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[VAL_15]]) to (%[[VAL_16]]) inclusive step (%[[VAL_17]]) {
+ ! CHECK:             fir.store %[[ARG1]] to %[[STORE_IV1:.*]]#1 : !fir.ref<i32>
+ ! CHECK:             %[[VAL_24:.*]] = arith.constant 2 : i32
+ ! CHECK:             %[[LOAD_IV1:.*]] = fir.load %[[STORE_IV1]]#0 : !fir.ref<i32>
+@@ -64,12 +64,12 @@ program wsloop
+ !$OMP END DO NOWAIT
+ ! CHECK:         %[[VAL_28:.*]] = arith.constant 6 : i32
+ ! CHECK:         hlfir.assign %[[VAL_28]] to %[[VAL_0]]#0 : i32, !fir.ref<i32>
+-! CHECK:         %[[VAL_29:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_30:.*]] = arith.constant 9 : i32
+-! CHECK:         %[[VAL_31:.*]] = arith.constant 1 : i32
+-! CHECK:         %[[VAL_32:.*]] = fir.load %[[VAL_0]]#0 : !fir.ref<i32>
+-! CHECK:         omp.wsloop schedule(static = %[[VAL_32]] : i32) nowait {
+-! CHECK-NEXT:      omp.loop_nest (%[[ARG2:.*]]) : i32 = (%[[VAL_29]]) to (%[[VAL_30]]) inclusive step (%[[VAL_31]]) {
++! CHECK:         %[[VAL_29:.*]] = fir.load %[[VAL_0]]#0 : !fir.ref<i32>
++! CHECK:         %[[VAL_30:.*]] = arith.constant 1 : i32
++! CHECK:         %[[VAL_31:.*]] = arith.constant 9 : i32
++! CHECK:         %[[VAL_32:.*]] = arith.constant 1 : i32
++! CHECK:         omp.wsloop schedule(static = %[[VAL_29]] : i32) nowait {
++! CHECK-NEXT:      omp.loop_nest (%[[ARG2:.*]]) : i32 = (%[[VAL_30]]) to (%[[VAL_31]]) inclusive step (%[[VAL_32]]) {
+ ! CHECK:             fir.store %[[ARG2]] to %[[STORE_IV2:.*]]#1 : !fir.ref<i32>
+ ! CHECK:             %[[VAL_39:.*]] = arith.constant 3 : i32
+ ! CHECK:             %[[LOAD_IV2:.*]] = fir.load %[[STORE_IV2]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index 713cc2c0f02df..b79c3b4f749d2 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -79,13 +79,13 @@ subroutine reduce(r)
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_4:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_4]] {uniq_name = "_QFFreduceEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_6:.*]] = arith.constant 0 : i32
+-! CHECK:             %[[VAL_7:.*]] = arith.constant 10 : i32
+-! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_9:.*]] = fir.alloca !fir.box<!fir.array<?xf64>>
+-! CHECK:             fir.store %[[VAL_3]]#1 to %[[VAL_9]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+-! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxf64 %[[VAL_9]] -> %[[VAL_10:.*]] : !fir.ref<!fir.box<!fir.array<?xf64>>>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
++! CHECK:             %[[VAL_6:.*]] = fir.alloca !fir.box<!fir.array<?xf64>>
++! CHECK:             fir.store %[[VAL_3]]#1 to %[[VAL_6]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
++! CHECK:             %[[VAL_7:.*]] = arith.constant 0 : i32
++! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_Uxf64 %[[VAL_6]] -> %[[VAL_10:.*]] : !fir.ref<!fir.box<!fir.array<?xf64>>>) {
++! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {fortran_attrs = {{.*}}, uniq_name = "_QFFreduceEr"} : (!fir.ref<!fir.box<!fir.array<?xf64>>>) -> (!fir.ref<!fir.box<!fir.array<?xf64>>>, !fir.ref<!fir.box<!fir.array<?xf64>>>)
+ ! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_5]]#1 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index 18a76ed1d5a85..b92a096de4e1c 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -73,14 +73,14 @@ program reduce
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_6:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_8:.*]] = arith.constant 0 : i32
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 10 : i32
+-! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+-! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+-! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             %[[VAL_8:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
++! CHECK:             %[[VAL_9:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
++! CHECK:             fir.store %[[VAL_8]] to %[[VAL_9]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:             %[[VAL_10:.*]] = arith.constant 0 : i32
++! CHECK:             %[[VAL_11:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_9]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
++! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index 9c2cb862ba6c8..9105a76ec6e97 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -73,14 +73,14 @@ program reduce
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_6:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_8:.*]] = arith.constant 0 : i32
+-! CHECK:             %[[VAL_9:.*]] = arith.constant 10 : i32
+-! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+-! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+-! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
+-! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             %[[VAL_8:.*]] = fir.embox %[[VAL_5]]#0(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
++! CHECK:             %[[VAL_9:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
++! CHECK:             fir.store %[[VAL_8]] to %[[VAL_9]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
++! CHECK:             %[[VAL_10:.*]] = arith.constant 0 : i32
++! CHECK:             %[[VAL_11:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
++! CHECK:             omp.wsloop reduction(byref @add_reduction_byref_box_2xi32 %[[VAL_9]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>) {
++! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<!fir.box<!fir.array<2xi32>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+index 3551b90474aa6..eb7f7a59d5d52 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+@@ -109,14 +109,14 @@ program main
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_11:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_11]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_13:.*]] = fir.embox %[[VAL_4]]#0(%[[VAL_3]]) : (!fir.ref<!fir.array<3x3xf64>>, !fir.shape<2>) -> !fir.box<!fir.array<3x3xf64>>
++! CHECK:             %[[VAL_14:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
++! CHECK:             fir.store %[[VAL_13]] to %[[VAL_14]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             %[[VAL_16:.*]] = fir.embox %[[VAL_4]]#0(%[[VAL_3]]) : (!fir.ref<!fir.array<3x3xf64>>, !fir.shape<2>) -> !fir.box<!fir.array<3x3xf64>>
+-! CHECK:             %[[VAL_17:.*]] = fir.alloca !fir.box<!fir.array<3x3xf64>>
+-! CHECK:             fir.store %[[VAL_16]] to %[[VAL_17]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>
+-! CHECK:             omp.wsloop reduction(@add_reduction_f64 %[[VAL_8]]#0 -> %[[VAL_18:.*]] : !fir.ref<f64>, byref @add_reduction_byref_box_3x3xf64 %[[VAL_17]] -> %[[VAL_19:.*]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>) {
+-! CHECK:               omp.loop_nest (%[[VAL_20:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             %[[VAL_16:.*]] = arith.constant 10 : i32
++! CHECK:             %[[VAL_17:.*]] = arith.constant 1 : i32
++! CHECK:             omp.wsloop reduction(@add_reduction_f64 %[[VAL_8]]#0 -> %[[VAL_18:.*]] : !fir.ref<f64>, byref @add_reduction_byref_box_3x3xf64 %[[VAL_14]] -> %[[VAL_19:.*]] : !fir.ref<!fir.box<!fir.array<3x3xf64>>>) {
++! CHECK:               omp.loop_nest (%[[VAL_20:.*]]) : i32 = (%[[VAL_15]]) to (%[[VAL_16]]) inclusive step (%[[VAL_17]]) {
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFEscalar"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFEarray"} : (!fir.ref<!fir.box<!fir.array<3x3xf64>>>) -> (!fir.ref<!fir.box<!fir.array<3x3xf64>>>, !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
+ ! CHECK:                 fir.store %[[VAL_20]] to %[[VAL_12]]#1 : !fir.ref<i32>

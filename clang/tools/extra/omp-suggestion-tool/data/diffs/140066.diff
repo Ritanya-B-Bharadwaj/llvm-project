@@ -1,0 +1,1518 @@
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index cec212f0eae37..4f58bdecc37cc 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -30,6 +30,8 @@ class raw_ostream;
+ }
+ namespace Fortran::parser {
+ struct Expr;
++struct OpenMPDeclareReductionConstruct;
++struct OmpMetadirectiveDirective;
+ }
+ 
+ namespace Fortran::semantics {
+@@ -728,6 +730,40 @@ class GenericDetails {
+ };
+ llvm::raw_ostream &operator<<(llvm::raw_ostream &, const GenericDetails &);
+ 
++// Used for OpenMP DECLARE REDUCTION, it holds the information
++// needed to resolve which declaration (there could be multiple
++// with the same name) to use for a given type.
++class UserReductionDetails {
++public:
++  using TypeVector = std::vector<const DeclTypeSpec *>;
++  using DeclInfo = std::variant<const parser::OpenMPDeclareReductionConstruct *,
++      const parser::OmpMetadirectiveDirective *>;
++  using DeclVector = std::vector<DeclInfo>;
++
++  UserReductionDetails() = default;
++
++  void AddType(const DeclTypeSpec &type) { typeList_.push_back(&type); }
++  const TypeVector &GetTypeList() const { return typeList_; }
++
++  bool SupportsType(const DeclTypeSpec &type) const {
++    // We have to compare the actual type, not the pointer, as some
++    // types are not guaranteed to be the same object.
++    for (auto t : typeList_) {
++      if (*t == type) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  void AddDecl(const DeclInfo &decl) { declList_.emplace_back(decl); }
++  const DeclVector &GetDeclList() const { return declList_; }
++
++private:
++  TypeVector typeList_;
++  DeclVector declList_;
++};
++
+ class UnknownDetails {};
+ 
+ using Details = std::variant<UnknownDetails, MainProgramDetails, ModuleDetails,
+@@ -735,7 +771,7 @@ using Details = std::variant<UnknownDetails, MainProgramDetails, ModuleDetails,
+     ObjectEntityDetails, ProcEntityDetails, AssocEntityDetails,
+     DerivedTypeDetails, UseDetails, UseErrorDetails, HostAssocDetails,
+     GenericDetails, ProcBindingDetails, NamelistDetails, CommonBlockDetails,
+-    TypeParamDetails, MiscDetails>;
++    TypeParamDetails, MiscDetails, UserReductionDetails>;
+ llvm::raw_ostream &operator<<(llvm::raw_ostream &, const Details &);
+ std::string DetailsToString(const Details &);
+ 
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 0784a6703bbde..e0abe95d07c86 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -3368,4 +3368,12 @@ template void Unparse<Program>(llvm::raw_ostream &, const Program &,
+ template void Unparse<Expr>(llvm::raw_ostream &, const Expr &,
+     const common::LangOptions &, Encoding, bool, bool, preStatementType *,
+     AnalyzedObjectsAsFortran *);
++
++template void Unparse<parser::OpenMPDeclareReductionConstruct>(
++    llvm::raw_ostream &, const parser::OpenMPDeclareReductionConstruct &,
++    const common::LangOptions &, Encoding, bool, bool, preStatementType *,
++    AnalyzedObjectsAsFortran *);
++template void Unparse<parser::OmpMetadirectiveDirective>(llvm::raw_ostream &,
++    const parser::OmpMetadirectiveDirective &, const common::LangOptions &,
++    Encoding, bool, bool, preStatementType *, AnalyzedObjectsAsFortran *);
+ } // namespace Fortran::parser
+diff --git a/flang/lib/Semantics/assignment.cpp b/flang/lib/Semantics/assignment.cpp
+index 6e55d0210ee0e..43e23a9d8f60b 100644
+--- a/flang/lib/Semantics/assignment.cpp
++++ b/flang/lib/Semantics/assignment.cpp
+@@ -43,6 +43,7 @@ class AssignmentContext {
+   void Analyze(const parser::PointerAssignmentStmt &);
+   void Analyze(const parser::ConcurrentControl &);
+   int deviceConstructDepth_{0};
++  SemanticsContext &context() { return context_; }
+ 
+ private:
+   bool CheckForPureContext(const SomeExpr &rhs, parser::CharBlock rhsSource);
+@@ -218,8 +219,17 @@ void AssignmentContext::PopWhereContext() {
+ 
+ AssignmentChecker::~AssignmentChecker() {}
+ 
++SemanticsContext &AssignmentChecker::context() {
++  return context_.value().context();
++}
++
+ AssignmentChecker::AssignmentChecker(SemanticsContext &context)
+     : context_{new AssignmentContext{context}} {}
++
++void AssignmentChecker::Enter(
++    const parser::OpenMPDeclareReductionConstruct &x) {
++  context().set_location(x.source);
++}
+ void AssignmentChecker::Enter(const parser::AssignmentStmt &x) {
+   context_.value().Analyze(x);
+ }
+diff --git a/flang/lib/Semantics/assignment.h b/flang/lib/Semantics/assignment.h
+index a67bee4a03dfc..4a1bb92037119 100644
+--- a/flang/lib/Semantics/assignment.h
++++ b/flang/lib/Semantics/assignment.h
+@@ -37,6 +37,7 @@ class AssignmentChecker : public virtual BaseChecker {
+ public:
+   explicit AssignmentChecker(SemanticsContext &);
+   ~AssignmentChecker();
++  void Enter(const parser::OpenMPDeclareReductionConstruct &x);
+   void Enter(const parser::AssignmentStmt &);
+   void Enter(const parser::PointerAssignmentStmt &);
+   void Enter(const parser::WhereStmt &);
+@@ -54,6 +55,8 @@ class AssignmentChecker : public virtual BaseChecker {
+   void Enter(const parser::OpenACCLoopConstruct &);
+   void Leave(const parser::OpenACCLoopConstruct &);
+ 
++  SemanticsContext &context();
++
+ private:
+   common::Indirection<AssignmentContext> context_;
+ };
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index f9d645dc2e78a..bdd078c33da92 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "check-omp-structure.h"
+ #include "definable.h"
++#include "resolve-names-utils.h"
+ #include "flang/Evaluate/check-expression.h"
+ #include "flang/Evaluate/expression.h"
+ #include "flang/Evaluate/type.h"
+@@ -3520,6 +3521,17 @@ bool OmpStructureChecker::CheckReductionOperator(
+         break;
+       }
+     }
++    // User-defined operators are OK if there has been a declared reduction
++    // for that. We mangle those names to store the user details.
++    if (const auto *definedOp{std::get_if<parser::DefinedOpName>(&dOpr.u)}) {
++      std::string mangled{MangleDefinedOperator(definedOp->v.symbol->name())};
++      const Scope &scope{definedOp->v.symbol->owner()};
++      if (const Symbol *symbol{scope.FindSymbol(mangled)}) {
++        if (symbol->detailsIf<UserReductionDetails>()) {
++          return true;
++        }
++      }
++    }
+     context_.Say(source, "Invalid reduction operator in %s clause."_err_en_US,
+         parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
+     return false;
+@@ -3533,8 +3545,7 @@ bool OmpStructureChecker::CheckReductionOperator(
+       valid =
+           llvm::is_contained({"max", "min", "iand", "ior", "ieor"}, realName);
+       if (!valid) {
+-        auto *misc{name->symbol->detailsIf<MiscDetails>()};
+-        valid = misc && misc->kind() == MiscDetails::Kind::ConstructName;
++        valid = name->symbol->detailsIf<UserReductionDetails>();
+       }
+     }
+     if (!valid) {
+@@ -3614,8 +3625,20 @@ void OmpStructureChecker::CheckReductionObjects(
+   }
+ }
+ 
++static bool CheckSymbolSupportsType(const Scope &scope,
++    const parser::CharBlock &name, const DeclTypeSpec &type) {
++  if (const auto *symbol{scope.FindSymbol(name)}) {
++    if (const auto *reductionDetails{
++            symbol->detailsIf<UserReductionDetails>()}) {
++      return reductionDetails->SupportsType(type);
++    }
++  }
++  return false;
++}
++
+ static bool IsReductionAllowedForType(
+-    const parser::OmpReductionIdentifier &ident, const DeclTypeSpec &type) {
++    const parser::OmpReductionIdentifier &ident, const DeclTypeSpec &type,
++    const Scope &scope, SemanticsContext &context) {
+   auto isLogical{[](const DeclTypeSpec &type) -> bool {
+     return type.category() == DeclTypeSpec::Logical;
+   }};
+@@ -3635,27 +3658,40 @@ static bool IsReductionAllowedForType(
+       case parser::DefinedOperator::IntrinsicOperator::Multiply:
+       case parser::DefinedOperator::IntrinsicOperator::Add:
+       case parser::DefinedOperator::IntrinsicOperator::Subtract:
+-        return type.IsNumeric(TypeCategory::Integer) ||
++        if (type.IsNumeric(TypeCategory::Integer) ||
+             type.IsNumeric(TypeCategory::Real) ||
+-            type.IsNumeric(TypeCategory::Complex);
++            type.IsNumeric(TypeCategory::Complex))
++          return true;
++        break;
+ 
+       case parser::DefinedOperator::IntrinsicOperator::AND:
+       case parser::DefinedOperator::IntrinsicOperator::OR:
+       case parser::DefinedOperator::IntrinsicOperator::EQV:
+       case parser::DefinedOperator::IntrinsicOperator::NEQV:
+-        return isLogical(type);
++        if (isLogical(type)) {
++          return true;
++        }
++        break;
+ 
+       // Reduction identifier is not in OMP5.2 Table 5.2
+       default:
+         DIE("This should have been caught in CheckIntrinsicOperator");
+         return false;
+       }
+-    }
+-    return true;
++      parser::CharBlock name{MakeNameFromOperator(*intrinsicOp, context)};
++      return CheckSymbolSupportsType(scope, name, type);
++    } else if (const auto *definedOp{
++                   std::get_if<parser::DefinedOpName>(&dOpr.u)}) {
++      return CheckSymbolSupportsType(
++          scope, MangleDefinedOperator(definedOp->v.symbol->name()), type);
++    }
++    llvm_unreachable(
++        "A DefinedOperator is either a DefinedOpName or an IntrinsicOperator");
+   }};
+ 
+   auto checkDesignator{[&](const parser::ProcedureDesignator &procD) {
+     const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
++    CHECK(name && name->symbol);
+     if (name && name->symbol) {
+       const SourceName &realName{name->symbol->GetUltimate().name()};
+       // OMP5.2: The type [...] of a list item that appears in a
+@@ -3664,18 +3700,35 @@ static bool IsReductionAllowedForType(
+         // IAND: arguments must be integers: F2023 16.9.100
+         // IEOR: arguments must be integers: F2023 16.9.106
+         // IOR: arguments must be integers: F2023 16.9.111
+-        return type.IsNumeric(TypeCategory::Integer);
++        if (type.IsNumeric(TypeCategory::Integer)) {
++          return true;
++        }
+       } else if (realName == "max" || realName == "min") {
+         // MAX: arguments must be integer, real, or character:
+         // F2023 16.9.135
+         // MIN: arguments must be integer, real, or character:
+         // F2023 16.9.141
+-        return type.IsNumeric(TypeCategory::Integer) ||
+-            type.IsNumeric(TypeCategory::Real) || isCharacter(type);
++        if (type.IsNumeric(TypeCategory::Integer) ||
++            type.IsNumeric(TypeCategory::Real) || isCharacter(type)) {
++          return true;
++        }
+       }
++
++      // If we get here, it may be a user declared reduction, so check
++      // if the symbol has UserReductionDetails, and if so, the type is
++      // supported.
++      if (const auto *reductionDetails{
++              name->symbol->detailsIf<UserReductionDetails>()}) {
++        return reductionDetails->SupportsType(type);
++      }
++
++      // We also need to check for mangled names (max, min, iand, ieor and ior)
++      // and then check if the type is there.
++      parser::CharBlock mangledName{MangleSpecialFunctions(name->source)};
++      return CheckSymbolSupportsType(scope, mangledName, type);
+     }
+-    // TODO: user defined reduction operators. Just allow everything for now.
+-    return true;
++    // Everything else is "not matching type".
++    return false;
+   }};
+ 
+   return common::visit(
+@@ -3690,7 +3743,8 @@ void OmpStructureChecker::CheckReductionObjectTypes(
+ 
+   for (auto &[symbol, source] : symbols) {
+     if (auto *type{symbol->GetType()}) {
+-      if (!IsReductionAllowedForType(ident, *type)) {
++      const auto &scope{context_.FindScope(symbol->name())};
++      if (!IsReductionAllowedForType(ident, *type, scope, context_)) {
+         context_.Say(source,
+             "The type of '%s' is incompatible with the reduction operator."_err_en_US,
+             symbol->name());
+diff --git a/flang/lib/Semantics/mod-file.cpp b/flang/lib/Semantics/mod-file.cpp
+index a1ec956562204..a72641866aa15 100644
+--- a/flang/lib/Semantics/mod-file.cpp
++++ b/flang/lib/Semantics/mod-file.cpp
+@@ -894,6 +894,7 @@ void ModFileWriter::PutEntity(llvm::raw_ostream &os, const Symbol &symbol) {
+           [&](const ObjectEntityDetails &) { PutObjectEntity(os, symbol); },
+           [&](const ProcEntityDetails &) { PutProcEntity(os, symbol); },
+           [&](const TypeParamDetails &) { PutTypeParam(os, symbol); },
++          [&](const UserReductionDetails &) { PutUserReduction(os, symbol); },
+           [&](const auto &) {
+             common::die("PutEntity: unexpected details: %s",
+                 DetailsToString(symbol.details()).c_str());
+@@ -1043,6 +1044,28 @@ void ModFileWriter::PutTypeParam(llvm::raw_ostream &os, const Symbol &symbol) {
+   os << '\n';
+ }
+ 
++void ModFileWriter::PutUserReduction(
++    llvm::raw_ostream &os, const Symbol &symbol) {
++  const auto &details{symbol.get<UserReductionDetails>()};
++  // The module content for a OpenMP Declare Reduction is the OpenMP
++  // declaration. There may be multiple declarations.
++  // Decls are pointers, so do not use a reference.
++  for (const auto decl : details.GetDeclList()) {
++    common::visit( //
++        common::visitors{//
++            [&](const parser::OpenMPDeclareReductionConstruct *d) {
++              Unparse(os, *d, context_.langOptions());
++            },
++            [&](const parser::OmpMetadirectiveDirective *m) {
++              Unparse(os, *m, context_.langOptions());
++            },
++            [&](const auto &) {
++              DIE("Unknown OpenMP DECLARE REDUCTION content");
++            }},
++        decl);
++  }
++}
++
+ void PutInit(llvm::raw_ostream &os, const Symbol &symbol, const MaybeExpr &init,
+     const parser::Expr *unanalyzed, SemanticsContext &context) {
+   if (IsNamedConstant(symbol) || symbol.owner().IsDerivedType()) {
+diff --git a/flang/lib/Semantics/mod-file.h b/flang/lib/Semantics/mod-file.h
+index 82538fb510873..9e5724089b3c5 100644
+--- a/flang/lib/Semantics/mod-file.h
++++ b/flang/lib/Semantics/mod-file.h
+@@ -80,6 +80,7 @@ class ModFileWriter {
+   void PutDerivedType(const Symbol &, const Scope * = nullptr);
+   void PutDECStructure(const Symbol &, const Scope * = nullptr);
+   void PutTypeParam(llvm::raw_ostream &, const Symbol &);
++  void PutUserReduction(llvm::raw_ostream &, const Symbol &);
+   void PutSubprogram(const Symbol &);
+   void PutGeneric(const Symbol &);
+   void PutUse(const Symbol &);
+diff --git a/flang/lib/Semantics/resolve-names-utils.h b/flang/lib/Semantics/resolve-names-utils.h
+index 64784722ff4f8..ee8113a3fda5e 100644
+--- a/flang/lib/Semantics/resolve-names-utils.h
++++ b/flang/lib/Semantics/resolve-names-utils.h
+@@ -146,5 +146,11 @@ struct SymbolAndTypeMappings;
+ void MapSubprogramToNewSymbols(const Symbol &oldSymbol, Symbol &newSymbol,
+     Scope &newScope, SymbolAndTypeMappings * = nullptr);
+ 
++parser::CharBlock MakeNameFromOperator(
++    const parser::DefinedOperator::IntrinsicOperator &op,
++    SemanticsContext &context);
++parser::CharBlock MangleSpecialFunctions(const parser::CharBlock &name);
++std::string MangleDefinedOperator(const parser::CharBlock &name);
++
+ } // namespace Fortran::semantics
+ #endif // FORTRAN_SEMANTICS_RESOLVE_NAMES_H_
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 297007bcbde67..724879f2bbb07 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -38,6 +38,7 @@
+ #include "flang/Semantics/type.h"
+ #include "flang/Support/Fortran.h"
+ #include "flang/Support/default-kinds.h"
++#include "llvm/ADT/StringSwitch.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include <list>
+ #include <map>
+@@ -1467,11 +1468,15 @@ class OmpVisitor : public virtual DeclarationVisitor {
+   static bool NeedsScope(const parser::OpenMPBlockConstruct &);
+   static bool NeedsScope(const parser::OmpClause &);
+ 
+-  bool Pre(const parser::OmpMetadirectiveDirective &) {
++  bool Pre(const parser::OmpMetadirectiveDirective &x) { //
++    metaDirective_ = &x;
+     ++metaLevel_;
+     return true;
+   }
+-  void Post(const parser::OmpMetadirectiveDirective &) { --metaLevel_; }
++  void Post(const parser::OmpMetadirectiveDirective &) { //
++    metaDirective_ = nullptr;
++    --metaLevel_;
++  }
+ 
+   bool Pre(const parser::OpenMPRequiresConstruct &x) {
+     AddOmpSourceRange(x.source);
+@@ -1522,7 +1527,7 @@ class OmpVisitor : public virtual DeclarationVisitor {
+     auto *symbol{FindSymbol(NonDerivedTypeScope(), name)};
+     if (!symbol) {
+       context().Say(name.source,
+-          "Implicit subroutine declaration '%s' in !$OMP DECLARE REDUCTION"_err_en_US,
++          "Implicit subroutine declaration '%s' in DECLARE REDUCTION"_err_en_US,
+           name.source);
+     }
+     return true;
+@@ -1551,7 +1556,7 @@ class OmpVisitor : public virtual DeclarationVisitor {
+     AddOmpSourceRange(x.source);
+     ProcessReductionSpecifier(
+         std::get<Indirection<parser::OmpReductionSpecifier>>(x.t).value(),
+-        std::get<std::optional<parser::OmpClauseList>>(x.t));
++        std::get<std::optional<parser::OmpClauseList>>(x.t), x);
+     return false;
+   }
+   bool Pre(const parser::OmpMapClause &);
+@@ -1712,9 +1717,13 @@ class OmpVisitor : public virtual DeclarationVisitor {
+ private:
+   void ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
+       const parser::OmpClauseList &clauses);
++  template <typename T>
+   void ProcessReductionSpecifier(const parser::OmpReductionSpecifier &spec,
+-      const std::optional<parser::OmpClauseList> &clauses);
++      const std::optional<parser::OmpClauseList> &clauses,
++      const T &wholeConstruct);
++
+   int metaLevel_{0};
++  const parser::OmpMetadirectiveDirective *metaDirective_{nullptr};
+ };
+ 
+ bool OmpVisitor::NeedsScope(const parser::OpenMPBlockConstruct &x) {
+@@ -1801,14 +1810,92 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
+   PopScope();
+ }
+ 
++parser::CharBlock MakeNameFromOperator(
++    const parser::DefinedOperator::IntrinsicOperator &op,
++    SemanticsContext &context) {
++  switch (op) {
++  case parser::DefinedOperator::IntrinsicOperator::Multiply:
++    return parser::CharBlock{"op.*", 4};
++  case parser::DefinedOperator::IntrinsicOperator::Add:
++    return parser::CharBlock{"op.+", 4};
++  case parser::DefinedOperator::IntrinsicOperator::Subtract:
++    return parser::CharBlock{"op.-", 4};
++
++  case parser::DefinedOperator::IntrinsicOperator::AND:
++    return parser::CharBlock{"op.AND", 6};
++  case parser::DefinedOperator::IntrinsicOperator::OR:
++    return parser::CharBlock{"op.OR", 6};
++  case parser::DefinedOperator::IntrinsicOperator::EQV:
++    return parser::CharBlock{"op.EQV", 7};
++  case parser::DefinedOperator::IntrinsicOperator::NEQV:
++    return parser::CharBlock{"op.NEQV", 8};
++
++  default:
++    context.Say("Unsupported operator in DECLARE REDUCTION"_err_en_US);
++    return parser::CharBlock{"op.?", 4};
++  }
++}
++
++parser::CharBlock MangleSpecialFunctions(const parser::CharBlock &name) {
++  return llvm::StringSwitch<parser::CharBlock>(name.ToString())
++      .Case("max", {"op.max", 6})
++      .Case("min", {"op.min", 6})
++      .Case("iand", {"op.iand", 7})
++      .Case("ior", {"op.ior", 6})
++      .Case("ieor", {"op.ieor", 7})
++      .Default(name);
++}
++
++std::string MangleDefinedOperator(const parser::CharBlock &name) {
++  CHECK(name[0] == '.' && name[name.size() - 1] == '.');
++  return "op" + name.ToString();
++}
++
++template <typename T>
+ void OmpVisitor::ProcessReductionSpecifier(
+     const parser::OmpReductionSpecifier &spec,
+-    const std::optional<parser::OmpClauseList> &clauses) {
++    const std::optional<parser::OmpClauseList> &clauses,
++    const T &wholeOmpConstruct) {
++  const parser::Name *name{nullptr};
++  parser::CharBlock mangledName;
++  UserReductionDetails reductionDetailsTemp;
+   const auto &id{std::get<parser::OmpReductionIdentifier>(spec.t)};
+-  if (auto procDes{std::get_if<parser::ProcedureDesignator>(&id.u)}) {
+-    if (auto *name{std::get_if<parser::Name>(&procDes->u)}) {
+-      name->symbol =
+-          &MakeSymbol(*name, MiscDetails{MiscDetails::Kind::ConstructName});
++  if (auto *procDes{std::get_if<parser::ProcedureDesignator>(&id.u)}) {
++    name = std::get_if<parser::Name>(&procDes->u);
++    // This shouldn't be a procedure component: this is the name of the
++    // reduction being declared.
++    CHECK(name);
++    // Prevent the symbol from conflicting with the builtin function name
++    mangledName = MangleSpecialFunctions(name->source);
++    // Note: the Name inside the parse tree is not updated because it is const.
++    // All lookups must use MangleSpecialFunctions.
++  } else {
++    const auto &defOp{std::get<parser::DefinedOperator>(id.u)};
++    if (const auto *definedOp{std::get_if<parser::DefinedOpName>(&defOp.u)}) {
++      name = &definedOp->v;
++      mangledName = context().SaveTempName(MangleDefinedOperator(name->source));
++    } else {
++      mangledName = MakeNameFromOperator(
++          std::get<parser::DefinedOperator::IntrinsicOperator>(defOp.u),
++          context());
++    }
++  }
++
++  // Use reductionDetailsTemp if we can't find the symbol (this is
++  // the first, or only, instance with this name). The details then
++  // gets stored in the symbol when it's created.
++  UserReductionDetails *reductionDetails{&reductionDetailsTemp};
++  Symbol *symbol{currScope().FindSymbol(mangledName)};
++  if (symbol) {
++    // If we found a symbol, we append the type info to the
++    // existing reductionDetails.
++    reductionDetails = symbol->detailsIf<UserReductionDetails>();
++
++    if (!reductionDetails) {
++      context().Say(
++          "Duplicate definition of '%s' in DECLARE REDUCTION"_err_en_US,
++          mangledName);
++      return;
+     }
+   }
+ 
+@@ -1838,19 +1925,31 @@ void OmpVisitor::ProcessReductionSpecifier(
+     // We need to walk t.u because Walk(t) does it's own BeginDeclTypeSpec.
+     Walk(t.u);
+ 
+-    const DeclTypeSpec *typeSpec{GetDeclTypeSpec()};
+-    assert(typeSpec && "We should have a type here");
++    // Only process types we can find. There will be an error later on when
++    // a type isn't found.
++    if (const DeclTypeSpec *typeSpec{GetDeclTypeSpec()}) {
++      reductionDetails->AddType(*typeSpec);
+ 
+-    for (auto &nm : ompVarNames) {
+-      ObjectEntityDetails details{};
+-      details.set_type(*typeSpec);
+-      MakeSymbol(nm, Attrs{}, std::move(details));
++      for (auto &nm : ompVarNames) {
++        ObjectEntityDetails details{};
++        details.set_type(*typeSpec);
++        MakeSymbol(nm, Attrs{}, std::move(details));
++      }
+     }
+     EndDeclTypeSpec();
+     Walk(std::get<std::optional<parser::OmpReductionCombiner>>(spec.t));
+     Walk(clauses);
+     PopScope();
+   }
++
++  reductionDetails->AddDecl(&wholeOmpConstruct);
++
++  if (!symbol) {
++    symbol = &MakeSymbol(mangledName, Attrs{}, std::move(*reductionDetails));
++  }
++  if (name) {
++    name->symbol = symbol;
++  }
+ }
+ 
+ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+@@ -1880,7 +1979,8 @@ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+     if (maybeArgs && maybeClauses) {
+       const parser::OmpArgument &first{maybeArgs->v.front()};
+       if (auto *spec{std::get_if<parser::OmpReductionSpecifier>(&first.u)}) {
+-        ProcessReductionSpecifier(*spec, maybeClauses);
++        CHECK(metaDirective_);
++        ProcessReductionSpecifier(*spec, maybeClauses, *metaDirective_);
+       }
+     }
+     break;
+diff --git a/flang/lib/Semantics/symbol.cpp b/flang/lib/Semantics/symbol.cpp
+index 52f74035bd6a8..0380207927ad3 100644
+--- a/flang/lib/Semantics/symbol.cpp
++++ b/flang/lib/Semantics/symbol.cpp
+@@ -292,8 +292,7 @@ void GenericDetails::CopyFrom(const GenericDetails &from) {
+ // This is primarily for debugging.
+ std::string DetailsToString(const Details &details) {
+   return common::visit(
+-      common::visitors{
+-          [](const UnknownDetails &) { return "Unknown"; },
++      common::visitors{[](const UnknownDetails &) { return "Unknown"; },
+           [](const MainProgramDetails &) { return "MainProgram"; },
+           [](const ModuleDetails &) { return "Module"; },
+           [](const SubprogramDetails &) { return "Subprogram"; },
+@@ -312,7 +311,7 @@ std::string DetailsToString(const Details &details) {
+           [](const TypeParamDetails &) { return "TypeParam"; },
+           [](const MiscDetails &) { return "Misc"; },
+           [](const AssocEntityDetails &) { return "AssocEntity"; },
+-      },
++          [](const UserReductionDetails &) { return "UserReductionDetails"; }},
+       details);
+ }
+ 
+@@ -346,6 +345,9 @@ bool Symbol::CanReplaceDetails(const Details &details) const {
+             [&](const HostAssocDetails &) {
+               return this->has<HostAssocDetails>();
+             },
++            [&](const UserReductionDetails &) {
++              return this->has<UserReductionDetails>();
++            },
+             [](const auto &) { return false; },
+         },
+         details);
+@@ -644,6 +646,11 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Details &details) {
+           [&](const MiscDetails &x) {
+             os << ' ' << MiscDetails::EnumToString(x.kind());
+           },
++          [&](const UserReductionDetails &x) {
++            for (auto &type : x.GetTypeList()) {
++              DumpType(os, type);
++            }
++          },
+           [&](const auto &x) { os << x; },
+       },
+       details);
+diff --git a/flang/test/Parser/OpenMP/declare-reduction-multi.f90 b/flang/test/Parser/OpenMP/declare-reduction-multi.f90
+new file mode 100644
+index 0000000000000..0e1adcc9958d7
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/declare-reduction-multi.f90
+@@ -0,0 +1,134 @@
++! RUN: %flang_fc1 -fdebug-unparse -fopenmp %s | FileCheck --ignore-case %s
++! RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++!! Test multiple declarations for the same type, with different operations.
++module mymod
++  type :: tt
++     real r
++  end type tt
++contains
++  function mymax(a, b)
++    type(tt) :: a, b, mymax
++    if (a%r > b%r) then
++       mymax = a
++    else
++       mymax = b
++    end if
++  end function mymax
++end module mymod
++
++program omp_examples
++!CHECK-LABEL: PROGRAM omp_examples
++  use mymod
++  implicit none
++  integer, parameter :: n = 100
++  integer :: i
++  type(tt) :: values(n), sum, prod, big, small
++
++  !$omp declare reduction(+:tt:omp_out%r = omp_out%r + omp_in%r) initializer(omp_priv%r = 0)
++!CHECK: !$OMP DECLARE REDUCTION (+:tt: omp_out%r=omp_out%r+omp_in%r
++!CHECK-NEXT: ) INITIALIZER(omp_priv%r=0_4)
++!PARSE-TREE:  DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE:  Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE-NEXT: OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
++!PARSE-TREE-NEXT:  Name = 'tt'
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out%r=omp_out%r+omp_in%r'
++!PARSE-TREE: OmpClauseList -> OmpClause -> Initializer -> OmpInitializerClause -> AssignmentStmt = 'omp_priv%r=0._4
++  !$omp declare reduction(*:tt:omp_out%r = omp_out%r * omp_in%r) initializer(omp_priv%r = 1)
++!CHECK-NEXT: !$OMP DECLARE REDUCTION (*:tt: omp_out%r=omp_out%r*omp_in%r
++!CHECK-NEXT: ) INITIALIZER(omp_priv%r=1_4)
++!PARSE-TREE: DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE: OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Multiply
++!PARSE-TREE: OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
++!PARSE-TREE-NEXT:  Name = 'tt'
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out%r=omp_out%r*omp_in%r'
++!PARSE-TREE: OmpClauseList -> OmpClause -> Initializer -> OmpInitializerClause -> AssignmentStmt = 'omp_priv%r=1._4'
++  !$omp declare reduction(max:tt:omp_out = mymax(omp_out, omp_in)) initializer(omp_priv%r = 0)
++!CHECK-NEXT: !$OMP DECLARE REDUCTION (max:tt: omp_out=mymax(omp_out,omp_in)
++!CHECK-NEXT: ) INITIALIZER(omp_priv%r=0_4)
++!PARSE-TREE: DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE: OmpReductionIdentifier -> ProcedureDesignator -> Name = 'max'
++!PARSE-TREE: OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
++!PARSE-TREE: Name = 'tt'
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out=mymax(omp_out,omp_in)'
++!PARSE-TREE: OmpClauseList -> OmpClause -> Initializer -> OmpInitializerClause -> AssignmentStmt = 'omp_priv%r=0._4'
++  !$omp declare reduction(min:tt:omp_out%r = min(omp_out%r, omp_in%r)) initializer(omp_priv%r = 1)
++!CHECK-NEXT: !$OMP DECLARE REDUCTION (min:tt: omp_out%r=min(omp_out%r,omp_in%r)
++!CHECK-NEXT: ) INITIALIZER(omp_priv%r=1_4)
++!PARSE-TREE: DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE: OmpReductionIdentifier -> ProcedureDesignator -> Name = 'min'
++!PARSE-TREE: OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
++!PARSE-TREE: Name = 'tt'
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out%r=min(omp_out%r,omp_in%r)'
++!PARSE-TREE: OmpClauseList -> OmpClause -> Initializer -> OmpInitializerClause -> AssignmentStmt = 'omp_priv%r=1._4'
++  call random_number(values%r)
++
++  sum%r = 0
++  !$omp parallel do reduction(+:sum)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(+: sum) 
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: OmpLoopDirective -> llvm::omp::Directive = parallel do
++!PARSE-TREE: OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!PARSE-TREE: Modifier -> OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'sum
++!PARSE-TREE: DoConstruct
++  do i = 1, n
++     sum%r = sum%r + values(i)%r
++  end do
++
++  prod%r = 1
++  !$omp parallel do reduction(*:prod)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(*: prod)
++!PARSE-TREE:  ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: OmpLoopDirective -> llvm::omp::Directive = parallel do
++!PARSE-TREE: OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!PARSE-TREE: Modifier -> OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Multiply
++!PARSE-TREE: OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'prod'
++!PARSE-TREE: DoConstruct
++  do i = 1, n
++     prod%r = prod%r * (values(i)%r+0.6)
++  end do
++
++  big%r = 0
++  !$omp parallel do reduction(max:big)
++!CHECK:  $OMP PARALLEL DO  REDUCTION(max: big) 
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: OmpLoopDirective -> llvm::omp::Directive = parallel do
++!PARSE-TREE: OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!PARSE-TREE: Modifier -> OmpReductionIdentifier -> ProcedureDesignator -> Name = 'max'
++!PARSE-TREE: OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'big'
++!PARSE-TREE: DoConstruct
++  do i = 1, n
++     big = mymax(values(i), big)
++  end do
++
++  small%r = 1
++  !$omp parallel do reduction(min:small)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(min: small)
++!CHECK-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
++!CHECK-TREE: OmpBeginLoopDirective
++!CHECK-TREE: OmpLoopDirective -> llvm::omp::Directive = parallel do
++!CHECK-TREE: OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!CHECK-TREE: Modifier -> OmpReductionIdentifier -> ProcedureDesignator -> Name = 'min'
++!CHECK-TREE: OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'small'
++!CHECK-TREE: DoConstruct
++  do i = 1, n
++     small%r = min(values(i)%r, small%r)
++  end do
++  
++  print *, values%r
++  print *, "sum=", sum%r
++  print *, "prod=", prod%r
++  print *, "small=", small%r, " big=", big%r
++end program omp_examples
+diff --git a/flang/test/Parser/OpenMP/declare-reduction-operator.f90 b/flang/test/Parser/OpenMP/declare-reduction-operator.f90
+new file mode 100644
+index 0000000000000..7bfb78115b10d
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/declare-reduction-operator.f90
+@@ -0,0 +1,59 @@
++! RUN: %flang_fc1 -fdebug-unparse -fopenmp %s | FileCheck --ignore-case %s
++! RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++!CHECK-LABEL: SUBROUTINE reduce_1 (n, tts)
++subroutine reduce_1 ( n, tts )
++  type :: tt
++    integer :: x
++    integer :: y
++ end type tt
++  type :: tt2
++    real(8) :: x
++    real(8) :: y
++  end type
++ 
++  integer :: n
++  type(tt) :: tts(n)
++  type(tt2) :: tts2(n)
++
++!CHECK: !$OMP DECLARE REDUCTION (+:tt: omp_out=tt(x=omp_out%x-omp_in%x,y=omp_out%y-omp_in%y)
++!CHECK: ) INITIALIZER(omp_priv=tt(x=0_4,y=0_4))
++!PARSE-TREE:  DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE: OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out=tt(x=omp_out%x-omp_in%x,y=omp_out%y-omp_in%y)'
++!PARSE-TREE:    OmpInitializerClause -> AssignmentStmt = 'omp_priv=tt(x=0_4,y=0_4)'
++  
++  !$omp declare reduction(+ : tt :  omp_out = tt(omp_out%x - omp_in%x , omp_out%y - omp_in%y)) initializer(omp_priv = tt(0,0))
++
++  
++!CHECK: !$OMP DECLARE REDUCTION (+:tt2: omp_out=tt2(x=omp_out%x-omp_in%x,y=omp_out%y-omp_in%y)
++!CHECK: ) INITIALIZER(omp_priv=tt2(x=0._8,y=0._8)
++!PARSE-TREE:  DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: Verbatim
++!PARSE-TREE: OmpReductionSpecifier
++!PARSE-TREE: OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out=tt2(x=omp_out%x-omp_in%x,y=omp_out%y-omp_in%y)'
++!PARSE-TREE:    OmpInitializerClause -> AssignmentStmt = 'omp_priv=tt2(x=0._8,y=0._8)'
++  
++  !$omp declare reduction(+ :tt2 :  omp_out = tt2(omp_out%x - omp_in%x , omp_out%y - omp_in%y)) initializer(omp_priv = tt2(0,0))
++  
++  type(tt) :: diffp = tt( 0, 0 )
++  type(tt2) :: diffp2 = tt2( 0, 0 )
++  integer :: i
++
++  !$omp parallel do reduction(+ : diffp)
++  do i = 1, n
++     diffp%x = diffp%x + tts(i)%x
++     diffp%y = diffp%y + tts(i)%y
++  end do
++
++  !$omp parallel do reduction(+ : diffp2)
++  do i = 1, n
++     diffp2%x = diffp2%x + tts2(i)%x
++     diffp2%y = diffp2%y + tts2(i)%y
++  end do
++
++end subroutine reduce_1
++!CHECK: END SUBROUTINE reduce_1
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-bad-operator.f90 b/flang/test/Semantics/OpenMP/declare-reduction-bad-operator.f90
+new file mode 100644
+index 0000000000000..1d1d2903a2780
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-bad-operator.f90
+@@ -0,0 +1,6 @@
++! RUN: not %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++
++function func(n)
++    !$omp declare reduction(/:integer:omp_out=omp_out+omp_in)
++!CHECK: error: Unsupported operator in DECLARE REDUCTION
++end function func
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-bad-operator2.f90 b/flang/test/Semantics/OpenMP/declare-reduction-bad-operator2.f90
+new file mode 100644
+index 0000000000000..9ee223c1c71fe
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-bad-operator2.f90
+@@ -0,0 +1,28 @@
++! RUN: not %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++
++module m1
++  interface operator(.fluffy.)
++    procedure my_mul
++  end interface
++  type t1
++    integer :: val = 1
++  end type
++!$omp declare reduction(.fluffy.:t1:omp_out=omp_out.fluffy.omp_in)
++contains
++  function my_mul(x, y)
++    type (t1), intent (in) :: x, y
++    type (t1) :: my_mul
++    my_mul%val = x%val * y%val
++  end function my_mul
++
++  subroutine subr(a, r)
++    implicit none
++    integer, intent(in), dimension(10) :: a
++    integer, intent(out) :: r
++    integer :: i
++    !$omp do parallel reduction(.fluffy.:r)
++!CHECK: error: The type of 'r' is incompatible with the reduction operator.
++    do i=1,10
++    end do
++  end subroutine subr
++end module m1
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-dupsym.f90 b/flang/test/Semantics/OpenMP/declare-reduction-dupsym.f90
+new file mode 100644
+index 0000000000000..83f8f85299dca
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-dupsym.f90
+@@ -0,0 +1,15 @@
++! RUN: not %flang_fc1 -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++
++!! Check for duplicate symbol use.
++subroutine dup_symbol()
++  type :: loc
++     integer :: x
++     integer :: y
++  end type loc
++ 
++  integer :: my_red
++
++!CHECK: error: Duplicate definition of 'my_red' in DECLARE REDUCTION
++  !$omp declare reduction(my_red : loc :  omp_out%x = omp_out%x + omp_in%x) initializer(omp_priv%x = 0)
++  
++end subroutine dup_symbol
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-error.f90 b/flang/test/Semantics/OpenMP/declare-reduction-error.f90
+index c22cf106ea507..21f5cc186e037 100644
+--- a/flang/test/Semantics/OpenMP/declare-reduction-error.f90
++++ b/flang/test/Semantics/OpenMP/declare-reduction-error.f90
+@@ -7,5 +7,5 @@ end subroutine initme
+ 
+ subroutine subr
+   !$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
+-  !CHECK: error: Implicit subroutine declaration 'initme' in !$OMP DECLARE REDUCTION
++  !CHECK: error: Implicit subroutine declaration 'initme' in DECLARE REDUCTION
+ end subroutine subr
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-functions.f90 b/flang/test/Semantics/OpenMP/declare-reduction-functions.f90
+new file mode 100644
+index 0000000000000..000d323f522cf
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-functions.f90
+@@ -0,0 +1,203 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++module mm
++  implicit none
++  type two
++     integer(4) :: a, b
++  end type two
++
++  type three
++     integer(8) :: a, b, c
++  end type three
++
++  type twothree
++     type(two) t2
++     type(three) t3
++  end type twothree
++
++contains
++!CHECK-LABEL: Subprogram scope: inittwo
++  subroutine inittwo(x,n)
++    integer :: n
++    type(two) :: x
++    x%a=n
++    x%b=n
++  end subroutine inittwo
++  
++  subroutine initthree(x,n)
++    integer :: n
++    type(three) :: x
++    x%a=n
++    x%b=n
++  end subroutine initthree
++
++  function add_two(x, y)
++    type(two) add_two, x, y, res
++    res%a = x%a + y%a
++    res%b = x%b + y%b
++    add_two = res
++  end function add_two
++
++  function add_three(x, y)
++    type(three) add_three, x, y, res
++    res%a = x%a + y%a
++    res%b = x%b + y%b
++    res%c = x%c + y%c
++    add_three = res
++  end function add_three
++  
++!CHECK-LABEL: Subprogram scope: functwo
++  function functwo(x, n)
++    type(two) functwo
++    integer :: n
++    type(two) ::  x(n)
++    type(two) :: res
++    integer :: i
++    !$omp declare reduction(adder:two:omp_out=add_two(omp_out,omp_in)) initializer(inittwo(omp_priv,0))
++!CHECK: adder: UserReductionDetails TYPE(two)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=8 offset=0: ObjectEntity type: TYPE(two)
++!CHECK: omp_orig size=8 offset=8: ObjectEntity type: TYPE(two)
++!CHECK: omp_out size=8 offset=16: ObjectEntity type: TYPE(two)
++!CHECK: omp_priv size=8 offset=24: ObjectEntity type: TYPE(two)
++    
++  
++    !$omp simd reduction(adder:res)
++    do i=1,n
++       res=add_two(res,x(i))
++    enddo
++    functwo=res
++  end function functwo
++
++  function functhree(x, n)
++    implicit none
++    type(three) :: functhree
++    type(three) :: x(n)
++    type(three) :: res
++    integer :: i
++    integer :: n
++    !$omp declare reduction(adder:three:omp_out=add_three(omp_out,omp_in)) initializer(initthree(omp_priv,1))
++    
++    !$omp simd reduction(adder:res)
++    do i=1,n
++       res=add_three(res,x(i))
++    enddo
++    functhree=res
++  end function functhree
++  
++  function functwothree(x, n)
++    type(twothree) :: functwothree
++    type(twothree) :: x(n)
++    type(twothree) :: res
++    type(two) :: res2
++    type(three) :: res3
++    integer :: n
++    integer :: i
++
++    !$omp declare reduction(adder:two:omp_out=add_two(omp_out,omp_in)) initializer(inittwo(omp_priv,0))
++    
++    !$omp declare reduction(adder:three:omp_out=add_three(omp_out,omp_in)) initializer(initthree(omp_priv,1))
++    
++!CHECK: adder: UserReductionDetails TYPE(two) TYPE(three)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=8 offset=0: ObjectEntity type: TYPE(two)
++!CHECK: omp_orig size=8 offset=8: ObjectEntity type: TYPE(two)
++!CHECK: omp_out size=8 offset=16: ObjectEntity type: TYPE(two)
++!CHECK: omp_priv size=8 offset=24: ObjectEntity type: TYPE(two)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=24 offset=0: ObjectEntity type: TYPE(three)
++!CHECK: omp_orig size=24 offset=24: ObjectEntity type: TYPE(three)
++!CHECK: omp_out size=24 offset=48: ObjectEntity type: TYPE(three)
++!CHECK: omp_priv size=24 offset=72: ObjectEntity type: TYPE(three)
++
++    !$omp simd reduction(adder:res3)
++    do i=1,n
++       res3=add_three(res%t3,x(i)%t3)
++    enddo
++
++    !$omp simd reduction(adder:res2)
++    do i=1,n
++       res2=add_two(res2,x(i)%t2)
++    enddo
++    res%t2 = res2
++    res%t3 = res3
++    functwothree=res
++  end function functwothree
++
++!CHECK-LABEL: Subprogram scope: funcbtwo
++  function funcBtwo(x, n)
++    type(two) funcBtwo
++    integer :: n
++    type(two) ::  x(n)
++    type(two) :: res
++    integer :: i
++    !$omp declare reduction(+:two:omp_out=add_two(omp_out,omp_in)) initializer(inittwo(omp_priv,0))
++!CHECK: op.+: UserReductionDetails TYPE(two)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=8 offset=0: ObjectEntity type: TYPE(two)
++!CHECK: omp_orig size=8 offset=8: ObjectEntity type: TYPE(two)
++!CHECK: omp_out size=8 offset=16: ObjectEntity type: TYPE(two)
++!CHECK: omp_priv size=8 offset=24: ObjectEntity type: TYPE(two)
++    
++  
++    !$omp simd reduction(+:res)
++    do i=1,n
++       res=add_two(res,x(i))
++    enddo
++    funcBtwo=res
++  end function funcBtwo
++
++  function funcBtwothree(x, n)
++    type(twothree) :: funcBtwothree
++    type(twothree) :: x(n)
++    type(twothree) :: res
++    type(two) :: res2
++    type(three) :: res3
++    integer :: n
++    integer :: i
++
++    !$omp declare reduction(+:two:omp_out=add_two(omp_out,omp_in)) initializer(inittwo(omp_priv,0))
++    
++    !$omp declare reduction(+:three:omp_out=add_three(omp_out,omp_in)) initializer(initthree(omp_priv,1))
++    
++!CHECK: op.+: UserReductionDetails TYPE(two) TYPE(three)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=8 offset=0: ObjectEntity type: TYPE(two)
++!CHECK: omp_orig size=8 offset=8: ObjectEntity type: TYPE(two)
++!CHECK: omp_out size=8 offset=16: ObjectEntity type: TYPE(two)
++!CHECK: omp_priv size=8 offset=24: ObjectEntity type: TYPE(two)
++!CHECK: OtherConstruct scope
++!CHECK: omp_in size=24 offset=0: ObjectEntity type: TYPE(three)
++!CHECK: omp_orig size=24 offset=24: ObjectEntity type: TYPE(three)
++!CHECK: omp_out size=24 offset=48: ObjectEntity type: TYPE(three)
++!CHECK: omp_priv size=24 offset=72: ObjectEntity type: TYPE(three)
++
++    !$omp simd reduction(+:res3)
++    do i=1,n
++       res3=add_three(res%t3,x(i)%t3)
++    enddo
++
++    !$omp simd reduction(+:res2)
++    do i=1,n
++       res2=add_two(res2,x(i)%t2)
++    enddo
++    res%t2 = res2
++    res%t3 = res3
++  end function funcBtwothree
++
++  !! This is checking a special case, where a reduction is declared inside a
++  !! pure function
++
++  pure logical function reduction()
++!CHECK: reduction size=4 offset=0: ObjectEntity funcResult type: LOGICAL(4)
++!CHECK: rr: UserReductionDetails INTEGER(4)
++!CHECK: OtherConstruct scope: size=16 alignment=4 sourceRange=0 bytes
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: INTEGER(4)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: INTEGER(4)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: INTEGER(4)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: INTEGER(4)
++    !$omp declare reduction (rr : integer : omp_out = omp_out + omp_in) initializer (omp_priv = 0)
++    reduction = .false.
++  end function reduction
++  
++end module mm
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-logical.f90 b/flang/test/Semantics/OpenMP/declare-reduction-logical.f90
+new file mode 100644
+index 0000000000000..7ab7cad473ac8
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-logical.f90
+@@ -0,0 +1,32 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++module mm
++  implicit none
++  type logicalwrapper
++     logical b
++  end type logicalwrapper
++
++contains
++!CHECK-LABEL: Subprogram scope: func
++  function func(x, n)
++    logical func
++    integer :: n
++    type(logicalwrapper) ::  x(n)
++    type(logicalwrapper) :: res
++    integer :: i
++    !$omp declare reduction(.AND.:type(logicalwrapper):omp_out%b=omp_out%b .AND. omp_in%b) initializer(omp_priv%b=.true.)
++!CHECK: op.AND: UserReductionDetails TYPE(logicalwrapper)
++!CHECK OtherConstruct scope
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: TYPE(logicalwrapper)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: TYPE(logicalwrapper)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: TYPE(logicalwrapper)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: TYPE(logicalwrapper)
++  
++    !$omp simd reduction(.AND.:res)
++    do i=1,n
++       res%b=res%b .and. x(i)%b
++    enddo
++    
++    func=res%b
++  end function func
++end module mm
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-mangled.f90 b/flang/test/Semantics/OpenMP/declare-reduction-mangled.f90
+new file mode 100644
+index 0000000000000..9d0a097fb1991
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-mangled.f90
+@@ -0,0 +1,51 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++!! Test that the name mangling for min & max (also used for iand, ieor and ior).
++module mymod
++  type :: tt
++     real r
++  end type tt
++contains
++  function mymax(a, b)
++    type(tt) :: a, b, mymax
++    if (a%r > b%r) then
++       mymax = a
++    else
++       mymax = b
++    end if
++  end function mymax
++end module mymod
++
++program omp_examples
++!CHECK-LABEL: MainProgram scope: omp_examples
++  use mymod
++  implicit none
++  integer, parameter :: n = 100
++  integer :: i
++  type(tt) :: values(n), big, small
++
++  !$omp declare reduction(max:tt:omp_out = mymax(omp_out, omp_in)) initializer(omp_priv%r = 0)
++  !$omp declare reduction(min:tt:omp_out%r = min(omp_out%r, omp_in%r)) initializer(omp_priv%r = 1)
++
++!CHECK: min, ELEMENTAL, INTRINSIC, PURE (Function): ProcEntity
++!CHECK: mymax (Function): Use from mymax in mymod
++!CHECK: op.max: UserReductionDetails TYPE(tt)
++!CHECK: op.min: UserReductionDetails TYPE(tt)
++
++  big%r = 0
++  !$omp parallel do reduction(max:big)
++!CHECK: big (OmpReduction, OmpExplicit): HostAssoc
++!CHECK: max, INTRINSIC: ProcEntity  
++  do i = 1, n
++     big = mymax(values(i), big)
++  end do
++
++  small%r = 1
++  !$omp parallel do reduction(min:small)
++!CHECK: small (OmpReduction, OmpExplicit): HostAssoc
++  do i = 1, n
++     small%r = min(values(i)%r, small%r)
++  end do
++  
++  print *, "small=", small%r, " big=", big%r
++end program omp_examples
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-modfile.f90 b/flang/test/Semantics/OpenMP/declare-reduction-modfile.f90
+new file mode 100644
+index 0000000000000..f80eb1097e18a
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-modfile.f90
+@@ -0,0 +1,65 @@
++! RUN: %python %S/../test_modfile.py %s %flang_fc1 -fopenmp -fopenmp-version=52
++! Check correct modfile generation for OpenMP DECLARE REDUCTION construct.
++
++!Expect: drm.mod
++!module drm
++!type::t1
++!integer(4)::val
++!endtype
++!!$OMP DECLARE REDUCTION (*:t1:omp_out = omp_out*omp_in) INITIALIZER(omp_priv=t&
++!!$OMP&1(1))
++!!$OMP METADIRECTIVE OTHERWISE(DECLARE REDUCTION(+:INTEGER))
++!!$OMP DECLARE REDUCTION (.fluffy.:t1:omp_out = omp_out.fluffy.omp_in) INITIALI&
++!!$OMP&ZER(omp_priv=t1(0))
++!!$OMP DECLARE REDUCTION (.mul.:t1:omp_out = omp_out.mul.omp_in) INITIALIZER(om&
++!!$OMP&p_priv=t1(1))
++!interface operator(.mul.)
++!procedure::mul
++!end interface
++!interface operator(.fluffy.)
++!procedure::add
++!end interface
++!interface operator(*)
++!procedure::mul
++!end interface
++!contains
++!function mul(v1,v2)
++!type(t1),intent(in)::v1
++!type(t1),intent(in)::v2
++!type(t1)::mul
++!end
++!function add(v1,v2)
++!type(t1),intent(in)::v1
++!type(t1),intent(in)::v2
++!type(t1)::add
++!end
++!end
++
++module drm
++  type t1
++    integer :: val
++  end type t1
++  interface operator(.mul.)
++    procedure mul
++  end interface
++  interface operator(.fluffy.)
++    procedure add
++  end interface
++  interface operator(*)
++    module procedure mul
++  end interface
++!$omp declare reduction(*:t1:omp_out=omp_out*omp_in) initializer(omp_priv=t1(1))
++!$omp declare reduction(.mul.:t1:omp_out=omp_out.mul.omp_in) initializer(omp_priv=t1(1))
++!$omp declare reduction(.fluffy.:t1:omp_out=omp_out.fluffy.omp_in) initializer(omp_priv=t1(0))
++!$omp metadirective otherwise(declare reduction(+: integer))
++contains
++  type(t1) function mul(v1, v2)
++    type(t1), intent (in):: v1, v2
++    mul%val = v1%val * v2%val
++  end function
++  type(t1) function add(v1, v2)
++    type(t1), intent (in):: v1, v2
++    add%val = v1%val + v2%val
++  end function
++end module drm
++
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-operator.f90 b/flang/test/Semantics/OpenMP/declare-reduction-operator.f90
+new file mode 100644
+index 0000000000000..dc12332b80baf
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-operator.f90
+@@ -0,0 +1,36 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++module m1
++  interface operator(.fluffy.)
++!CHECK: .fluffy., PUBLIC (Function): Generic DefinedOp procs: my_mul
++    procedure my_mul
++  end interface
++  type t1
++    integer :: val = 1
++  end type
++!$omp declare reduction(.fluffy.:t1:omp_out=omp_out.fluffy.omp_in)
++!CHECK: op.fluffy., PUBLIC: UserReductionDetails TYPE(t1)
++!CHECK: t1, PUBLIC: DerivedType components: val
++!CHECK: OtherConstruct scope: size=16 alignment=4 sourceRange=0 bytes
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: TYPE(t1)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: TYPE(t1)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: TYPE(t1)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: TYPE(t1)
++contains
++  function my_mul(x, y)
++    type (t1), intent (in) :: x, y
++    type (t1) :: my_mul
++    my_mul%val = x%val * y%val
++  end function my_mul
++
++  subroutine subr(a, r)
++    implicit none
++    type(t1), intent(in), dimension(10) :: a
++    type(t1), intent(out) :: r
++    integer :: i
++    !$omp parallel do reduction(.fluffy.:r)
++    do i=1,10
++       r = r .fluffy. a(i)
++    end do
++  end subroutine subr
++end module m1
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-operators.f90 b/flang/test/Semantics/OpenMP/declare-reduction-operators.f90
+new file mode 100644
+index 0000000000000..d7a9f2fc0a36b
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-operators.f90
+@@ -0,0 +1,84 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++module vector_mod
++  implicit none
++  type :: Vector
++    real :: x, y, z
++  contains
++    procedure :: add_vectors
++    generic :: operator(+) => add_vectors
++  end type Vector
++contains
++  ! Function implementing vector addition
++  function add_vectors(a, b) result(res)
++    class(Vector), intent(in) :: a, b
++    type(Vector) :: res
++    res%x = a%x + b%x
++    res%y = a%y + b%y
++    res%z = a%z + b%z
++  end function add_vectors
++end module vector_mod
++
++!! Test user-defined operators. Two different varieties, using conventional and
++!! unconventional names.
++module m1
++  interface operator(.mul.)
++    procedure my_mul
++  end interface
++  interface operator(.fluffy.)
++    procedure my_add
++  end interface
++  type t1
++    integer :: val = 1
++  end type
++!$omp declare reduction(.mul.:t1:omp_out=omp_out.mul.omp_in)
++!$omp declare reduction(.fluffy.:t1:omp_out=omp_out.fluffy.omp_in)
++!CHECK: op.fluffy., PUBLIC: UserReductionDetails TYPE(t1)
++!CHECK: op.mul., PUBLIC: UserReductionDetails TYPE(t1)   
++contains
++  function my_mul(x, y)
++    type (t1), intent (in) :: x, y
++    type (t1) :: my_mul
++    my_mul%val = x%val * y%val
++  end function
++  function my_add(x, y)
++    type (t1), intent (in) :: x, y
++    type (t1) :: my_add
++    my_add%val = x%val + y%val
++  end function
++end module m1
++
++program test_vector
++!CHECK-LABEL: MainProgram scope: test_vector
++  use vector_mod
++!CHECK: add_vectors (Function): Use from add_vectors in vector_mod
++  implicit none
++  integer :: i
++  type(Vector) :: v1(100), v2(100)
++
++  !$OMP declare reduction(+:vector:omp_out=omp_out+omp_in) initializer(omp_priv=Vector(0,0,0))
++!CHECK: op.+: UserReductionDetails TYPE(vector)
++!CHECK: v1 size=1200 offset=4: ObjectEntity type: TYPE(vector) shape: 1_8:100_8
++!CHECK: v2 size=1200 offset=1204: ObjectEntity type: TYPE(vector) shape: 1_8:100_8
++!CHECK: vector: Use from vector in vector_mod
++
++!CHECK: OtherConstruct scope:
++!CHECK: omp_in size=12 offset=0: ObjectEntity type: TYPE(vector)
++!CHECK: omp_orig size=12 offset=12: ObjectEntity type: TYPE(vector)
++!CHECK: omp_out size=12 offset=24: ObjectEntity type: TYPE(vector)
++!CHECK: omp_priv size=12 offset=36: ObjectEntity type: TYPE(vector)
++
++  v2 = Vector(0.0, 0.0, 0.0)
++  v1 = Vector(1.0, 2.0, 3.0)
++  !$OMP parallel do reduction(+:v2)
++!CHECK: OtherConstruct scope
++!CHECK: i (OmpPrivate, OmpPreDetermined): HostAssoc
++!CHECK: v1 (OmpShared): HostAssoc
++!CHECK: v2 (OmpReduction, OmpExplicit): HostAssoc
++
++  do i = 1, 100
++     v2(i) = v2(i) + v1(i)  ! Invokes add_vectors
++  end do
++  
++  print *, 'v2 components:', v2%x, v2%y, v2%z
++end program test_vector
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-renamedop.f90 b/flang/test/Semantics/OpenMP/declare-reduction-renamedop.f90
+new file mode 100644
+index 0000000000000..12e80cbf7b327
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-renamedop.f90
+@@ -0,0 +1,47 @@
++! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
++
++!! Test that we can "rename" an operator when using a module's operator.
++module module1
++!CHECK:  Module scope: module1 size=0
++  implicit none
++  type :: t1
++     real :: value
++  end type t1
++  interface operator(.mul.)
++     module procedure my_mul
++  end interface operator(.mul.)
++!CHECK: .mul., PUBLIC (Function): Generic DefinedOp procs: my_mul
++!CHECK: my_mul, PUBLIC (Function): Subprogram result:TYPE(t1) r (TYPE(t1) x,TYPE(t1)
++!CHECK: t1, PUBLIC: DerivedType components: value
++contains
++    function my_mul(x, y) result(r)
++      type(t1), intent(in) :: x, y
++      type(t1) :: r
++      r%value = x%value * y%value
++    end function my_mul
++end module module1
++
++program test_omp_reduction
++!CHECK: MainProgram scope: test_omp_reduction
++  use module1, only: t1, operator(.modmul.) => operator(.mul.)
++
++!CHECK: .modmul. (Function): Use from .mul. in module1
++  implicit none
++
++  type(t1) :: result
++  integer :: i
++  !$omp declare reduction (.modmul. : t1 : omp_out = omp_out .modmul. omp_in) initializer(omp_priv = t1(1.0))
++!CHECK: op.modmul.: UserReductionDetails TYPE(t1)
++!CHECK: t1: Use from t1 in module1
++!CHECK: OtherConstruct scope: size=16 alignment=4 sourceRange=0 bytes
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: TYPE(t1)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: TYPE(t1)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: TYPE(t1)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: TYPE(t1)
++  result = t1(1.0)
++  !$omp parallel do reduction(.modmul.:result)
++  do i = 1, 10
++     result = result .modmul. t1(real(i))
++  end do
++  !$omp end parallel do
++end program test_omp_reduction
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-typeerror.f90 b/flang/test/Semantics/OpenMP/declare-reduction-typeerror.f90
+new file mode 100644
+index 0000000000000..b8ede55aa0ed7
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-typeerror.f90
+@@ -0,0 +1,34 @@
++! RUN: not %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++
++module mm
++  implicit none
++  type two
++     integer(4) :: a, b
++  end type two
++
++  type three
++     integer(8) :: a, b, c
++  end type three
++contains
++  function add_two(x, y)
++    type(two) add_two, x, y, res
++    add_two = res
++  end function add_two
++
++  function func(n)
++    type(three) :: func
++    type(three) :: res3
++    integer :: n
++    integer :: i
++
++    !$omp declare reduction(dummy:kerflunk:omp_out=omp_out+omp_in)
++!CHECK: error: Derived type 'kerflunk' not found
++    
++    !$omp declare reduction(adder:two:omp_out=add_two(omp_out,omp_in))
++    !$omp simd reduction(adder:res3)
++!CHECK: error: The type of 'res3' is incompatible with the reduction operator.
++    do i=1,n
++    enddo
++    func = res3
++  end function func
++end module mm
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction.f90 b/flang/test/Semantics/OpenMP/declare-reduction.f90
+index 11612f01f0f2d..ddca38fd57812 100644
+--- a/flang/test/Semantics/OpenMP/declare-reduction.f90
++++ b/flang/test/Semantics/OpenMP/declare-reduction.f90
+@@ -17,7 +17,7 @@ subroutine initme(x,n)
+      end subroutine initme
+   end interface
+   !$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
+-!CHECK: red_add: Misc ConstructName
++!CHECK: red_add: UserReductionDetails
+ !CHECK: Subprogram scope: initme
+ !CHECK: omp_in size=4 offset=0: ObjectEntity type: INTEGER(4)
+ !CHECK: omp_orig size=4 offset=4: ObjectEntity type: INTEGER(4)
+@@ -35,7 +35,7 @@ program main
+ 
+   !$omp declare reduction (my_add_red : integer : omp_out = omp_out + omp_in) initializer (omp_priv=0)
+ 
+-!CHECK: my_add_red: Misc ConstructName
++!CHECK: my_add_red: UserReductionDetails
+ !CHECK: omp_in size=4 offset=0: ObjectEntity type: INTEGER(4)
+ !CHECK: omp_orig size=4 offset=4: ObjectEntity type: INTEGER(4)
+ !CHECK: omp_out size=4 offset=8: ObjectEntity type: INTEGER(4)

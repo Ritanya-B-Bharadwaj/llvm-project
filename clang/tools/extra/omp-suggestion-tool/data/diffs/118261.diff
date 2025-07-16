@@ -1,0 +1,162 @@
+diff --git a/flang/lib/Optimizer/CodeGen/BoxedProcedure.cpp b/flang/lib/Optimizer/CodeGen/BoxedProcedure.cpp
+index c536fd19fcc69..1bb91d252529f 100644
+--- a/flang/lib/Optimizer/CodeGen/BoxedProcedure.cpp
++++ b/flang/lib/Optimizer/CodeGen/BoxedProcedure.cpp
+@@ -103,6 +103,8 @@ class BoxprocTypeRewriter : public mlir::TypeConverter {
+       return needsConversion(unwrapRefType(ty));
+     if (auto t = mlir::dyn_cast<SequenceType>(ty))
+       return needsConversion(unwrapSequenceType(ty));
++    if (auto t = mlir::dyn_cast<TypeDescType>(ty))
++      return needsConversion(t.getOfTy());
+     return false;
+   }
+ 
+@@ -167,6 +169,9 @@ class BoxprocTypeRewriter : public mlir::TypeConverter {
+       rec.finalize(ps, cs);
+       return rec;
+     });
++    addConversion([&](TypeDescType ty) {
++      return TypeDescType::get(convertType(ty.getOfTy()));
++    });
+     addArgumentMaterialization(materializeProcedure);
+     addSourceMaterialization(materializeProcedure);
+     addTargetMaterialization(materializeProcedure);
+@@ -220,7 +225,6 @@ class BoxedProcedurePass
+       auto *context = &getContext();
+       mlir::IRRewriter rewriter(context);
+       BoxprocTypeRewriter typeConverter(mlir::UnknownLoc::get(context));
+-      mlir::Dialect *firDialect = context->getLoadedDialect("fir");
+       getModule().walk([&](mlir::Operation *op) {
+         bool opIsValid = true;
+         typeConverter.setLocation(op->getLoc());
+@@ -366,13 +370,22 @@ class BoxedProcedurePass
+                 index, toTy, index.getFieldId(), toOnTy, index.getTypeparams());
+             opIsValid = false;
+           }
+-        } else if (op->getDialect() == firDialect) {
++        } else {
+           rewriter.startOpModification(op);
++          // Convert the operands if needed
+           for (auto i : llvm::enumerate(op->getResultTypes()))
+             if (typeConverter.needsConversion(i.value())) {
+               auto toTy = typeConverter.convertType(i.value());
+               op->getResult(i.index()).setType(toTy);
+             }
++
++          // Convert the type attributes if needed
++          for (const mlir::NamedAttribute &attr : op->getAttrDictionary())
++            if (auto tyAttr = llvm::dyn_cast<mlir::TypeAttr>(attr.getValue()))
++              if (typeConverter.needsConversion(tyAttr.getValue())) {
++                auto toTy = typeConverter.convertType(tyAttr.getValue());
++                op->setAttr(attr.getName(), mlir::TypeAttr::get(toTy));
++              }
+           rewriter.finalizeOpModification(op);
+         }
+         // Ensure block arguments are updated if needed.
+diff --git a/flang/test/Fir/boxproc-2.fir b/flang/test/Fir/boxproc-2.fir
+index 84132f89afebb..963dfa03663cb 100644
+--- a/flang/test/Fir/boxproc-2.fir
++++ b/flang/test/Fir/boxproc-2.fir
+@@ -13,6 +13,9 @@ func.func private @test3(!fir.boxproc<() -> (!fir.type<a{x:i32, y:f64}>)>) -> no
+ //CHECK-LABEL:  func.func private @test5(((i32) -> f32) -> ())
+ func.func private @test5(!fir.boxproc<(!fir.boxproc<(i32) -> (f32)>) -> ()>)
+ 
++//CHECK-LABEL:  func.func private @test6(!fir.tdesc<!fir.type<_QMcartesian_2d_objectsTcartesian_2d_objectUnboxProc{base_pde_object:!fir.type<_QMbase_pde_objectsTbase_pde_objectUnboxProc{process_p:(!fir.class<!fir.type<_QMbase_pde_objectsTbase_pde_objectUnboxProc>>) -> !fir.class<!fir.heap<!fir.type<_QMbase_pde_objectsTbase_pde_objectUnboxProc>>>,source_p:(!fir.class<!fir.type<_QMbase_pde_objectsTbase_pde_objectUnboxProc>>, !fir.ref<f32>) -> !fir.class<!fir.heap<!fir.type<_QMbase_pde_objectsTbase_pde_objectUnboxProc>>>}>,c:!fir.box<!fir.heap<!fir.array<?x?xf32>>>,dx:f32,dy:f32}>>) -> !fir.ref<none>
++func.func private @test6(!fir.tdesc<!fir.type<_QMcartesian_2d_objectsTcartesian_2d_object{base_pde_object:!fir.type<_QMbase_pde_objectsTbase_pde_object{process_p:!fir.boxproc<(!fir.class<!fir.type<_QMbase_pde_objectsTbase_pde_object>>) -> !fir.class<!fir.heap<!fir.type<_QMbase_pde_objectsTbase_pde_object>>>>,source_p:!fir.boxproc<(!fir.class<!fir.type<_QMbase_pde_objectsTbase_pde_object>>, !fir.ref<f32>) -> !fir.class<!fir.heap<!fir.type<_QMbase_pde_objectsTbase_pde_object>>>>}>,c:!fir.box<!fir.heap<!fir.array<?x?xf32>>>,dx:f32,dy:f32}>>) -> !fir.ref<none>
++
+ // CHECK-LABEL:   func.func @proc_pointer_component(
+ // CHECK-SAME:                                      %[[VAL_0:.*]]: (!fir.ref<i32>) -> f32,
+ // CHECK-SAME:                                      %[[VAL_1:.*]]: !fir.ref<i32>) {
+diff --git a/flang/test/Fir/boxproc-openmp.fir b/flang/test/Fir/boxproc-openmp.fir
+new file mode 100644
+index 0000000000000..8b714539b5e85
+--- /dev/null
++++ b/flang/test/Fir/boxproc-openmp.fir
+@@ -0,0 +1,87 @@
++// RUN: fir-opt --boxed-procedure %s | FileCheck %s
++// Test the boxed procedure pass with OpenMP declaration operations.
++// Check minimally, only arguments, yields and the private types.
++
++// Test a private declaration with one region (alloc)
++//CHECK: omp.private {type = private}  @_QFsub1Et1_private_ref_rec__QFsub1Tt : !fir.ref<!fir.type<_QFsub1TtUnboxProc{p1:() -> ()}>> alloc {
++omp.private {type = private} @_QFsub1Et1_private_ref_rec__QFsub1Tt : !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>> alloc {
++//CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.type<_QFsub1TtUnboxProc{p1:() -> ()}>>):
++^bb0(%arg0: !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>):
++  %c1_i32 = arith.constant 1 : i32
++  %0 = fir.alloca !fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}> {bindc_name = "t1", pinned, uniq_name = "_QFsub1Et1"}
++  %1 = fir.declare %0 {uniq_name = "_QFsub1Et1"} : (!fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>
++  %2 = fir.embox %1 : (!fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.box<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>
++  %3 = fir.address_of(@_QQclXea6256ba131ddd9c2210e68030a0edd3) : !fir.ref<!fir.char<1,49>>
++  %4 = fir.convert %2 : (!fir.box<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.box<none>
++  %5 = fir.convert %3 : (!fir.ref<!fir.char<1,49>>) -> !fir.ref<i8>
++  %6 = fir.call @_FortranAInitialize(%4, %5, %c1_i32) fastmath<contract> : (!fir.box<none>, !fir.ref<i8>, i32) -> none
++//CHECK: omp.yield(%{{.*}} : !fir.ref<!fir.type<_QFsub1TtUnboxProc{p1:() -> ()}>>)
++  omp.yield(%1 : !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>)
++}
++func.func @_QPsub1() {
++  %0 = fir.alloca !fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}> {bindc_name = "t1", uniq_name = "_QFsub1Et1"}
++  %1 = fir.declare %0 {uniq_name = "_QFsub1Et1"} : (!fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>
++//CHECK: omp.parallel private(@_QFsub1Et1_private_ref_rec__QFsub1Tt %{{.*}} -> %{{.*}} : !fir.ref<!fir.type<_QFsub1TtUnboxProc{p1:() -> ()}>>) {
++  omp.parallel private(@_QFsub1Et1_private_ref_rec__QFsub1Tt %1 -> %arg0 : !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) {
++    %2 = fir.declare %arg0 {uniq_name = "_QFsub1Et1"} : (!fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.ref<!fir.type<_QFsub1Tt{p1:!fir.boxproc<() -> ()>}>>
++    omp.terminator
++  }
++  return
++}
++
++
++// Test a private declaration with all regions (alloc, copy, dealloc)
++//CHECK: omp.private {type = firstprivate} @_QFsub2Et1_firstprivate_ref_box_heap_rec__QFsub2Tt : 
++//CHECK-SAME: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>> alloc {
++omp.private {type = firstprivate} @_QFsub2Et1_firstprivate_ref_box_heap_rec__QFsub2Tt : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>> alloc {
++//CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>):
++^bb0(%arg0: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>):
++  %0 = fir.alloca !fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>> {bindc_name = "t1", pinned, uniq_name = "_QFsub2Et1"}
++  %1 = fir.declare %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFsub2Et1"} : (!fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>
++//CHECK: omp.yield(%{{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>)
++  omp.yield(%1 : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>)
++} copy {
++//CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>,
++//CHECK-SAME: %{{.*}}: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>):
++^bb0(%arg0: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>, %arg1: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>):
++  %c5_i32 = arith.constant 5 : i32
++  %0 = fir.load %arg0 : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>
++  %1 = fir.box_addr %0 : (!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>) -> !fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>
++  %2 = fir.embox %1 : (!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.box<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>
++  %3 = fir.address_of(@_QQclXea) : !fir.ref<!fir.char<1,8>>
++  %4 = fir.convert %arg1 : (!fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) -> !fir.ref<!fir.box<none>>
++  %5 = fir.convert %2 : (!fir.box<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>) -> !fir.box<none>
++  %6 = fir.convert %3 : (!fir.ref<!fir.char<1,8>>) -> !fir.ref<i8>
++  %7 = fir.call @_FortranAAssign(%4, %5, %6, %c5_i32) : (!fir.ref<!fir.box<none>>, !fir.box<none>, !fir.ref<i8>, i32) -> none
++//CHECK: omp.yield(%{{.*}} : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>)
++  omp.yield(%arg1 : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>)
++} dealloc {
++//CHECK: ^bb0(%{{.*}}: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>):
++^bb0(%arg0: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>):
++  %c5_i32 = arith.constant 5 : i32
++  %false = arith.constant false
++  %0 = fir.absent !fir.box<none>
++  %1 = fir.address_of(@_QQclXea) : !fir.ref<!fir.char<1,8>>
++  %2 = fir.convert %arg0 : (!fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) -> !fir.ref<!fir.box<none>>
++  %3 = fir.convert %1 : (!fir.ref<!fir.char<1,8>>) -> !fir.ref<i8>
++  %4 = fir.call @_FortranAAllocatableDeallocate(%2, %false, %0, %3, %c5_i32) fastmath<contract> : (!fir.ref<!fir.box<none>>, i1, !fir.box<none>, !fir.ref<i8>, i32) -> i32
++  omp.yield
++}
++func.func @_QPsub2() {
++  %0 = fir.alloca !fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>> {bindc_name = "t1", uniq_name = "_QFsub2Et1"}
++  %1 = fir.declare %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFsub2Et1"} : (!fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>
++//CHECK: omp.parallel private(@_QFsub2Et1_firstprivate_ref_box_heap_rec__QFsub2Tt %{{.*}} -> %{{.*}} :
++//CHECK-SAME: !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2TtUnboxProc{p1:() -> ()}>>>>) {
++  omp.parallel private(@_QFsub2Et1_firstprivate_ref_box_heap_rec__QFsub2Tt %1 -> %arg0 : !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) {
++    %2 = fir.declare %arg0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFsub2Et1"} : (!fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.type<_QFsub2Tt{p1:!fir.boxproc<() -> ()>}>>>>
++    omp.terminator
++  }
++  return
++}
++func.func private @_FortranAInitialize(!fir.box<none>, !fir.ref<i8>, i32) -> none attributes {fir.runtime}
++fir.global linkonce @_QQclXea constant : !fir.char<1,8> {
++  %0 = fir.string_lit "pp.f90\00"(8) : !fir.char<1,8>
++  fir.has_value %0 : !fir.char<1,8>
++}
++func.func private @_FortranAAllocatableDeallocate(!fir.ref<!fir.box<none>>, i1, !fir.box<none>, !fir.ref<i8>, i32) -> i32 attributes {fir.runtime}
++func.func private @_FortranAAssign(!fir.ref<!fir.box<none>>, !fir.box<none>, !fir.ref<i8>, i32) -> none attributes {fir.runtime}

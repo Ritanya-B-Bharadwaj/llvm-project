@@ -1,0 +1,284 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 30904a68ca611..5400d6fac98a9 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -638,6 +638,8 @@ class ParseTreeDumper {
+   NODE(parser, OmpReductionCombiner)
+   NODE(parser, OmpTaskReductionClause)
+   NODE(OmpTaskReductionClause, Modifier)
++  NODE(parser, OmpReductionInitializerProc)
++  NODE(parser, OmpReductionInitializerExpr)
+   NODE(parser, OmpReductionInitializerClause)
+   NODE(parser, OmpReductionIdentifier)
+   NODE(parser, OmpAllocateClause)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index d3b3d69015bf3..efa878e7f0f06 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4629,7 +4629,16 @@ struct OpenMPDeclareMapperConstruct {
+ 
+ // 2.16 declare-reduction -> DECLARE REDUCTION (reduction-identifier : type-list
+ //                                              : combiner) [initializer-clause]
+-WRAPPER_CLASS(OmpReductionInitializerClause, Expr);
++struct OmpReductionInitializerProc {
++  TUPLE_CLASS_BOILERPLATE(OmpReductionInitializerProc);
++  std::tuple<ProcedureDesignator, std::list<ActualArgSpec>> t;
++};
++WRAPPER_CLASS(OmpReductionInitializerExpr, Expr);
++
++struct OmpReductionInitializerClause {
++  UNION_CLASS_BOILERPLATE(OmpReductionInitializerClause);
++  std::variant<OmpReductionInitializerProc, OmpReductionInitializerExpr> u;
++};
+ 
+ struct OpenMPDeclareReductionConstruct {
+   TUPLE_CLASS_BOILERPLATE(OpenMPDeclareReductionConstruct);
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 014b4f8c69574..43baabee02c4c 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -1158,8 +1158,16 @@ TYPE_PARSER(construct<OmpBlockDirective>(first(
+ TYPE_PARSER(sourced(construct<OmpBeginBlockDirective>(
+     sourced(Parser<OmpBlockDirective>{}), Parser<OmpClauseList>{})))
+ 
++TYPE_PARSER(construct<OmpReductionInitializerExpr>("OMP_PRIV =" >> expr))
++TYPE_PARSER(
++    construct<OmpReductionInitializerProc>(Parser<ProcedureDesignator>{},
++        parenthesized(many(maybe(","_tok) >> Parser<ActualArgSpec>{}))))
++
+ TYPE_PARSER(construct<OmpReductionInitializerClause>(
+-    "INITIALIZER" >> parenthesized("OMP_PRIV =" >> expr)))
++    "INITIALIZER" >> parenthesized(construct<OmpReductionInitializerClause>(
++                                       Parser<OmpReductionInitializerExpr>{}) ||
++                         construct<OmpReductionInitializerClause>(
++                             Parser<OmpReductionInitializerProc>{}))))
+ 
+ // 2.16 Declare Reduction Construct
+ TYPE_PARSER(sourced(construct<OpenMPDeclareReductionConstruct>(
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 960337b8a91b5..0d3f756b8b52c 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2699,9 +2699,19 @@ class UnparseVisitor {
+   void Unparse(const OmpDeclareTargetWithList &x) {
+     Put("("), Walk(x.v), Put(")");
+   }
+-  void Unparse(const OmpReductionInitializerClause &x) {
+-    Word(" INITIALIZER(OMP_PRIV = ");
++  void Unparse(const OmpReductionInitializerProc &x) {
++    Walk(std::get<ProcedureDesignator>(x.t));
++    Put("(");
++    Walk(std::get<std::list<ActualArgSpec>>(x.t));
++    Put(")");
++  }
++  void Unparse(const OmpReductionInitializerExpr &x) {
++    Word("OMP_PRIV = ");
+     Walk(x.v);
++  }
++  void Unparse(const OmpReductionInitializerClause &x) {
++    Word(" INITIALIZER(");
++    Walk(x.u);
+     Put(")");
+   }
+   void Unparse(const OpenMPDeclareReductionConstruct &x) {
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 1514c01a49528..c582b690a293d 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1482,13 +1482,27 @@ class OmpVisitor : public virtual DeclarationVisitor {
+     return false;
+   }
+ 
++  bool Pre(const parser::OmpReductionInitializerProc &x) {
++    auto &procDes = std::get<parser::ProcedureDesignator>(x.t);
++    auto &name = std::get<parser::Name>(procDes.u);
++    auto *symbol{FindSymbol(NonDerivedTypeScope(), name)};
++    if (!symbol) {
++      context().Say(name.source,
++          "Implicit subroutine declaration '%s' in !$OMP DECLARE REDUCTION"_err_en_US,
++          name.source);
++    }
++    return true;
++  }
++
+   bool Pre(const parser::OpenMPDeclareReductionConstruct &x) {
+     AddOmpSourceRange(x.source);
+     parser::OmpClauseList emptyList{std::list<parser::OmpClause>{}};
+     ProcessReductionSpecifier(
+         std::get<Indirection<parser::OmpReductionSpecifier>>(x.t).value(),
+         emptyList);
+-    Walk(std::get<std::optional<parser::OmpReductionInitializerClause>>(x.t));
++    auto &init =
++        std::get<std::optional<parser::OmpReductionInitializerClause>>(x.t);
++    Walk(init);
+     return false;
+   }
+   bool Pre(const parser::OmpMapClause &);
+@@ -1741,7 +1755,6 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
+ void OmpVisitor::ProcessReductionSpecifier(
+     const parser::OmpReductionSpecifier &spec,
+     const parser::OmpClauseList &clauses) {
+-  BeginDeclTypeSpec();
+   const auto &id{std::get<parser::OmpReductionIdentifier>(spec.t)};
+   if (auto procDes{std::get_if<parser::ProcedureDesignator>(&id.u)}) {
+     if (auto *name{std::get_if<parser::Name>(&procDes->u)}) {
+@@ -1749,7 +1762,6 @@ void OmpVisitor::ProcessReductionSpecifier(
+           &MakeSymbol(*name, MiscDetails{MiscDetails::Kind::ConstructName});
+     }
+   }
+-  EndDeclTypeSpec();
+   // Creating a new scope in case the combiner expression (or clauses) use
+   // reerved identifiers, like "omp_in". This is a temporary solution until
+   // we deal with these in a more thorough way.
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-declare-reduction-initsub.f90 b/flang/test/Lower/OpenMP/Todo/omp-declare-reduction-initsub.f90
+new file mode 100644
+index 0000000000000..30630465490b2
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/omp-declare-reduction-initsub.f90
+@@ -0,0 +1,28 @@
++! This test checks lowering of OpenMP declare reduction Directive, with initialization
++! via a subroutine. This functionality is currently not implemented.
++
++! RUN: not flang -fc1 -emit-fir -fopenmp %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: OpenMPDeclareReductionConstruct
++subroutine initme(x,n)
++  integer x,n
++  x=n
++end subroutine initme
++
++function func(x, n, init)
++  integer func
++  integer x(n)
++  integer res
++  interface
++     subroutine initme(x,n)
++       integer x,n
++     end subroutine initme
++  end interface
++!$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
++  res=init
++!$omp simd reduction(red_add:res)
++  do i=1,n
++     res=res+x(i)
++  enddo
++  func=res
++end function func
+diff --git a/flang/test/Parser/OpenMP/declare-reduction-unparse.f90 b/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
+index a2a3ef9f630ab..e7b15fb3e9d2c 100644
+--- a/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
++++ b/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
+@@ -1,11 +1,51 @@
+ ! RUN: %flang_fc1 -fdebug-unparse -fopenmp %s | FileCheck --ignore-case %s
+ ! RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++!CHECK-LABEL: SUBROUTINE initme (x, n)
++subroutine initme(x,n)
++  integer x,n
++  x=n
++end subroutine initme
++!CHECK: END SUBROUTINE initme
++
++!CHECK: FUNCTION func(x, n, init)
++function func(x, n, init)
++  integer func
++  integer x(n)
++  integer res
++  interface
++     subroutine initme(x,n)
++       integer x,n
++     end subroutine initme
++  end interface
++!CHECK: !$OMP DECLARE REDUCTION (red_add:INTEGER(KIND=4_4): omp_out=omp_out+omp_in
++!CHECK: ) INITIALIZER(initme(omp_priv, 0_4))  
++!$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
++!PARSE-TREE:  DeclarationConstruct -> SpecificationConstruct -> OpenMPDeclarativeConstruct -> OpenMPDeclareReductionConstruct
++!PARSE-TREE: OmpReductionCombiner -> AssignmentStmt = 'omp_out=omp_out+omp_in'
++!PARSE-TREE:    OmpReductionInitializerClause -> OmpReductionInitializerProc
++!PARSE-TREE-NEXT: ProcedureDesignator -> Name = 'initme'
++  res=init
++!$omp simd reduction(red_add:res)
++!CHECK: !$OMP SIMD REDUCTION(red_add: res)
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
++!PARSE-TREE:  OmpBeginLoopDirective
++!PARSE-TREE:  OmpLoopDirective -> llvm::omp::Directive = simd
++!PARSE-TREE:  OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!PARSE-TREE:  Modifier -> OmpReductionIdentifier -> ProcedureDesignator -> Name = 'red_add
++  do i=1,n
++     res=res+x(i)
++  enddo
++  func=res
++end function func
++!CHECK: END FUNCTION func
++
+ !CHECK-LABEL: program main
+ program main
+   integer :: my_var
+-  !CHECK: !$OMP DECLARE REDUCTION (my_add_red:INTEGER: omp_out=omp_out+omp_in
+-  !CHECK-NEXT: ) INITIALIZER(OMP_PRIV = 0_4)
+-  
++!CHECK: !$OMP DECLARE REDUCTION (my_add_red:INTEGER: omp_out=omp_out+omp_in
++!CHECK-NEXT: ) INITIALIZER(OMP_PRIV = 0_4)
++
+   !$omp declare reduction (my_add_red : integer : omp_out = omp_out + omp_in) initializer (omp_priv=0)
+   my_var = 0
+   !$omp parallel reduction (my_add_red : my_var) num_threads(4)
+@@ -18,4 +58,4 @@ end program main
+ !PARSE-TREE:        OmpReductionIdentifier -> ProcedureDesignator -> Name = 'my_add_red'
+ !PARSE-TREE:        DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec
+ !PARSE-TREE:        OmpReductionCombiner -> AssignmentStmt = 'omp_out=omp_out+omp_in'
+-!PARSE-TREE:        OmpReductionInitializerClause -> Expr = '0_4'
++!PARSE-TREE:        OmpReductionInitializerClause -> OmpReductionInitializerExpr -> Expr = '0_4'
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction-error.f90 b/flang/test/Semantics/OpenMP/declare-reduction-error.f90
+new file mode 100644
+index 0000000000000..c22cf106ea507
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declare-reduction-error.f90
+@@ -0,0 +1,11 @@
++! RUN: not %flang_fc1 -emit-obj -fopenmp -fopenmp-version=50 %s 2>&1 | FileCheck %s
++
++subroutine initme(x,n)
++  integer x,n
++  x=n
++end subroutine initme
++
++subroutine subr
++  !$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
++  !CHECK: error: Implicit subroutine declaration 'initme' in !$OMP DECLARE REDUCTION
++end subroutine subr
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction.f90 b/flang/test/Semantics/OpenMP/declare-reduction.f90
+index 8fee79dfc0b7b..e61af0430575f 100644
+--- a/flang/test/Semantics/OpenMP/declare-reduction.f90
++++ b/flang/test/Semantics/OpenMP/declare-reduction.f90
+@@ -1,5 +1,31 @@
+ ! RUN: %flang_fc1 -fdebug-dump-symbols -fopenmp -fopenmp-version=50 %s | FileCheck %s
+ 
++!CHECK-LABEL: Subprogram scope: initme
++subroutine initme(x,n)
++  integer x,n
++  x=n
++end subroutine initme
++
++!CHECK-LABEL: Subprogram scope: func
++function func(x, n, init)
++  integer func
++  integer x(n)
++  integer res
++  interface
++     subroutine initme(x,n)
++       integer x,n
++     end subroutine initme
++  end interface
++  !$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
++!CHECK: red_add: Misc ConstructName
++!CHECK: Subprogram scope: initme  
++!$omp simd reduction(red_add:res)
++  do i=1,n
++     res=res+x(i)
++  enddo
++  func=res
++end function func
++
+ program main
+ !CHECK-LABEL: MainProgram scope: main
+ 

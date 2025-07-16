@@ -1,0 +1,128 @@
+diff --git a/openmp/runtime/src/kmp.h b/openmp/runtime/src/kmp.h
+index 36656325be4bd..9b8c6102dbee2 100644
+--- a/openmp/runtime/src/kmp.h
++++ b/openmp/runtime/src/kmp.h
+@@ -2790,6 +2790,7 @@ struct kmp_taskdata { /* aligned during dynamic allocation       */
+ #if OMPX_TASKGRAPH
+   bool is_taskgraph = 0; // whether the task is within a TDG
+   kmp_tdg_info_t *tdg; // used to associate task with a TDG
++  kmp_int32 td_tdg_task_id; // local task id in its TDG
+ #endif
+   kmp_target_data_t td_target_data;
+ }; // struct kmp_taskdata
+diff --git a/openmp/runtime/src/kmp_taskdeps.cpp b/openmp/runtime/src/kmp_taskdeps.cpp
+index 41173e9e1de6e..e002877aaead2 100644
+--- a/openmp/runtime/src/kmp_taskdeps.cpp
++++ b/openmp/runtime/src/kmp_taskdeps.cpp
+@@ -233,10 +233,10 @@ static inline void __kmp_track_dependence(kmp_int32 gtid, kmp_depnode_t *source,
+   if (task_sink->is_taskgraph &&
+       __kmp_tdg_is_recording(task_sink->tdg->tdg_status)) {
+     kmp_node_info_t *source_info =
+-        &task_sink->tdg->record_map[task_source->td_task_id];
++        &task_sink->tdg->record_map[task_source->td_tdg_task_id];
+     bool exists = false;
+     for (int i = 0; i < source_info->nsuccessors; i++) {
+-      if (source_info->successors[i] == task_sink->td_task_id) {
++      if (source_info->successors[i] == task_sink->td_tdg_task_id) {
+         exists = true;
+         break;
+       }
+@@ -251,11 +251,12 @@ static inline void __kmp_track_dependence(kmp_int32 gtid, kmp_depnode_t *source,
+         __kmp_free(old_succ_ids);
+       }
+ 
+-      source_info->successors[source_info->nsuccessors] = task_sink->td_task_id;
++      source_info->successors[source_info->nsuccessors] =
++          task_sink->td_tdg_task_id;
+       source_info->nsuccessors++;
+ 
+       kmp_node_info_t *sink_info =
+-          &(task_sink->tdg->record_map[task_sink->td_task_id]);
++          &(task_sink->tdg->record_map[task_sink->td_tdg_task_id]);
+       sink_info->npredecessors++;
+     }
+   }
+@@ -727,8 +728,8 @@ kmp_int32 __kmpc_omp_task_with_deps(ident_t *loc_ref, kmp_int32 gtid,
+       }
+       __kmp_release_bootstrap_lock(&tdg->graph_lock);
+     }
+-    tdg->record_map[new_taskdata->td_task_id].task = new_task;
+-    tdg->record_map[new_taskdata->td_task_id].parent_task =
++    tdg->record_map[new_taskdata->td_tdg_task_id].task = new_task;
++    tdg->record_map[new_taskdata->td_tdg_task_id].parent_task =
+         new_taskdata->td_parent;
+     KMP_ATOMIC_INC(&tdg->num_tasks);
+   }
+diff --git a/openmp/runtime/src/kmp_taskdeps.h b/openmp/runtime/src/kmp_taskdeps.h
+index 893688bec9c80..f6bfb39218a21 100644
+--- a/openmp/runtime/src/kmp_taskdeps.h
++++ b/openmp/runtime/src/kmp_taskdeps.h
+@@ -98,7 +98,7 @@ static inline void __kmp_release_deps(kmp_int32 gtid, kmp_taskdata_t *task) {
+ 
+ #if OMPX_TASKGRAPH
+   if (task->is_taskgraph && !(__kmp_tdg_is_recording(task->tdg->tdg_status))) {
+-    kmp_node_info_t *TaskInfo = &(task->tdg->record_map[task->td_task_id]);
++    kmp_node_info_t *TaskInfo = &(task->tdg->record_map[task->td_tdg_task_id]);
+ 
+     for (int i = 0; i < TaskInfo->nsuccessors; i++) {
+       kmp_int32 successorNumber = TaskInfo->successors[i];
+diff --git a/openmp/runtime/src/kmp_tasking.cpp b/openmp/runtime/src/kmp_tasking.cpp
+index 3e229b517cfcd..563aa29f6265e 100644
+--- a/openmp/runtime/src/kmp_tasking.cpp
++++ b/openmp/runtime/src/kmp_tasking.cpp
+@@ -1656,7 +1656,8 @@ kmp_task_t *__kmp_task_alloc(ident_t *loc_ref, kmp_int32 gtid,
+       (task_entry != (kmp_routine_entry_t)__kmp_taskloop_task)) {
+     taskdata->is_taskgraph = 1;
+     taskdata->tdg = __kmp_global_tdgs[__kmp_curr_tdg_idx];
+-    taskdata->td_task_id = KMP_ATOMIC_INC(&__kmp_tdg_task_id);
++    taskdata->td_task_id = KMP_GEN_TASK_ID();
++    taskdata->td_tdg_task_id = KMP_ATOMIC_INC(&__kmp_tdg_task_id);
+   }
+ #endif
+   KA_TRACE(20, ("__kmp_task_alloc(exit): T#%d created task %p parent=%p\n",
+@@ -2019,11 +2020,11 @@ kmp_int32 __kmp_omp_task(kmp_int32 gtid, kmp_task_t *new_task,
+       __kmp_tdg_is_recording(new_taskdata->tdg->tdg_status)) {
+     kmp_tdg_info_t *tdg = new_taskdata->tdg;
+     // extend the record_map if needed
+-    if (new_taskdata->td_task_id >= new_taskdata->tdg->map_size) {
++    if (new_taskdata->td_tdg_task_id >= new_taskdata->tdg->map_size) {
+       __kmp_acquire_bootstrap_lock(&tdg->graph_lock);
+       // map_size could have been updated by another thread if recursive
+       // taskloop
+-      if (new_taskdata->td_task_id >= tdg->map_size) {
++      if (new_taskdata->td_tdg_task_id >= tdg->map_size) {
+         kmp_uint old_size = tdg->map_size;
+         kmp_uint new_size = old_size * 2;
+         kmp_node_info_t *old_record = tdg->record_map;
+@@ -2052,9 +2053,9 @@ kmp_int32 __kmp_omp_task(kmp_int32 gtid, kmp_task_t *new_task,
+       __kmp_release_bootstrap_lock(&tdg->graph_lock);
+     }
+     // record a task
+-    if (tdg->record_map[new_taskdata->td_task_id].task == nullptr) {
+-      tdg->record_map[new_taskdata->td_task_id].task = new_task;
+-      tdg->record_map[new_taskdata->td_task_id].parent_task =
++    if (tdg->record_map[new_taskdata->td_tdg_task_id].task == nullptr) {
++      tdg->record_map[new_taskdata->td_tdg_task_id].task = new_task;
++      tdg->record_map[new_taskdata->td_tdg_task_id].parent_task =
+           new_taskdata->td_parent;
+       KMP_ATOMIC_INC(&tdg->num_tasks);
+     }
+@@ -4681,14 +4682,11 @@ kmp_task_t *__kmp_task_dup_alloc(kmp_info_t *thread, kmp_task_t *task_src
+ 
+   // Initialize new task (only specific fields not affected by memcpy)
+ #if OMPX_TASKGRAPH
+-  if (!taskdata->is_taskgraph || taskloop_recur)
+-    taskdata->td_task_id = KMP_GEN_TASK_ID();
+-  else if (taskdata->is_taskgraph &&
+-           __kmp_tdg_is_recording(taskdata_src->tdg->tdg_status))
+-    taskdata->td_task_id = KMP_ATOMIC_INC(&__kmp_tdg_task_id);
+-#else
+-  taskdata->td_task_id = KMP_GEN_TASK_ID();
++  if (taskdata->is_taskgraph && !taskloop_recur &&
++      __kmp_tdg_is_recording(taskdata_src->tdg->tdg_status))
++    taskdata->td_tdg_task_id = KMP_ATOMIC_INC(&__kmp_tdg_task_id);
+ #endif
++  taskdata->td_task_id = KMP_GEN_TASK_ID();
+   if (task->shareds != NULL) { // need setup shareds pointer
+     shareds_offset = (char *)task_src->shareds - (char *)taskdata_src;
+     task->shareds = &((char *)taskdata)[shareds_offset];

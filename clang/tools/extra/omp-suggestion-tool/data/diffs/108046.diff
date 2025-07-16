@@ -1,0 +1,124 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index fa8a4309700f4..e9ef8579100e9 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1009,6 +1009,37 @@ bool ClauseProcessor::processMap(
+   return clauseFound;
+ }
+ 
++bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
++                                           mlir::omp::MapClauseOps &result) {
++  std::map<const semantics::Symbol *,
++           llvm::SmallVector<OmpMapMemberIndicesData>>
++      parentMemberIndices;
++  llvm::SmallVector<const semantics::Symbol *> mapSymbols;
++
++  auto callbackFn = [&](const auto &clause, const parser::CharBlock &source) {
++    mlir::Location clauseLocation = converter.genLocation(source);
++
++    // TODO Support motion modifiers: present, mapper, iterator.
++    constexpr llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
++        std::is_same_v<llvm::remove_cvref_t<decltype(clause)>, omp::clause::To>
++            ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
++            : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
++
++    processMapObjects(stmtCtx, clauseLocation, std::get<ObjectList>(clause.t),
++                      mapTypeBits, parentMemberIndices, result.mapVars,
++                      &mapSymbols);
++  };
++
++  bool clauseFound = findRepeatableClause<omp::clause::To>(callbackFn);
++  clauseFound =
++      findRepeatableClause<omp::clause::From>(callbackFn) || clauseFound;
++
++  insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
++                               mapSymbols,
++                               /*mapSymTypes=*/nullptr, /*mapSymLocs=*/nullptr);
++  return clauseFound;
++}
++
+ bool ClauseProcessor::processNontemporal(
+     mlir::omp::NontemporalClauseOps &result) const {
+   return findRepeatableClause<omp::clause::Nontemporal>(
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index be1d8a66ddfcc..0c8e7bd47ab5a 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -121,6 +121,8 @@ class ClauseProcessor {
+       llvm::SmallVectorImpl<const semantics::Symbol *> *mapSyms = nullptr,
+       llvm::SmallVectorImpl<mlir::Location> *mapSymLocs = nullptr,
+       llvm::SmallVectorImpl<mlir::Type> *mapSymTypes = nullptr) const;
++  bool processMotionClauses(lower::StatementContext &stmtCtx,
++                            mlir::omp::MapClauseOps &result);
+   bool processNontemporal(mlir::omp::NontemporalClauseOps &result) const;
+   bool processReduction(
+       mlir::Location currentLocation, mlir::omp::ReductionClauseOps &result,
+@@ -141,9 +143,6 @@ class ClauseProcessor {
+       llvm::SmallVectorImpl<mlir::Location> &useDeviceLocs,
+       llvm::SmallVectorImpl<const semantics::Symbol *> &useDeviceSyms) const;
+ 
+-  template <typename T>
+-  bool processMotionClauses(lower::StatementContext &stmtCtx,
+-                            mlir::omp::MapClauseOps &result);
+   // Call this method for these clauses that should be supported but are not
+   // implemented yet. It triggers a compilation error if any of the given
+   // clauses is found.
+@@ -191,38 +190,6 @@ class ClauseProcessor {
+   List<Clause> clauses;
+ };
+ 
+-template <typename T>
+-bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
+-                                           mlir::omp::MapClauseOps &result) {
+-  std::map<const semantics::Symbol *,
+-           llvm::SmallVector<OmpMapMemberIndicesData>>
+-      parentMemberIndices;
+-  llvm::SmallVector<const semantics::Symbol *> mapSymbols;
+-
+-  bool clauseFound = findRepeatableClause<T>(
+-      [&](const T &clause, const parser::CharBlock &source) {
+-        mlir::Location clauseLocation = converter.genLocation(source);
+-
+-        static_assert(std::is_same_v<T, omp::clause::To> ||
+-                      std::is_same_v<T, omp::clause::From>);
+-
+-        // TODO Support motion modifiers: present, mapper, iterator.
+-        constexpr llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+-            std::is_same_v<T, omp::clause::To>
+-                ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
+-                : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+-
+-        processMapObjects(stmtCtx, clauseLocation,
+-                          std::get<ObjectList>(clause.t), mapTypeBits,
+-                          parentMemberIndices, result.mapVars, &mapSymbols);
+-      });
+-
+-  insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
+-                               mapSymbols,
+-                               /*mapSymTypes=*/nullptr, /*mapSymLocs=*/nullptr);
+-  return clauseFound;
+-}
+-
+ template <typename... Ts>
+ void ClauseProcessor::processTODO(mlir::Location currentLocation,
+                                   llvm::omp::Directive directive) const {
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 99114dc38a249..960286732c90c 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1223,12 +1223,10 @@ static void genTargetEnterExitUpdateDataClauses(
+   cp.processDevice(stmtCtx, clauseOps);
+   cp.processIf(directive, clauseOps);
+ 
+-  if (directive == llvm::omp::Directive::OMPD_target_update) {
+-    cp.processMotionClauses<clause::To>(stmtCtx, clauseOps);
+-    cp.processMotionClauses<clause::From>(stmtCtx, clauseOps);
+-  } else {
++  if (directive == llvm::omp::Directive::OMPD_target_update)
++    cp.processMotionClauses(stmtCtx, clauseOps);
++  else
+     cp.processMap(loc, stmtCtx, clauseOps);
+-  }
+ 
+   cp.processNowait(clauseOps);
+ }

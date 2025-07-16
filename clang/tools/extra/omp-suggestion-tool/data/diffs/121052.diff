@@ -1,0 +1,234 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 158f76250572e..ae73e7b4dfb86 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -3341,6 +3341,7 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+         !std::holds_alternative<clause::UseDevicePtr>(clause.u) &&
+         !std::holds_alternative<clause::InReduction>(clause.u) &&
+         !std::holds_alternative<clause::Mergeable>(clause.u) &&
++        !std::holds_alternative<clause::Untied>(clause.u) &&
+         !std::holds_alternative<clause::TaskReduction>(clause.u) &&
+         !std::holds_alternative<clause::Detach>(clause.u)) {
+       std::string name =
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 6db43cf6f04bd..d3f2d3fd2f9dc 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -213,6 +213,30 @@ class AssociatedLoopChecker {
+   std::map<std::string, std::int64_t> constructNamesAndLevels_;
+ };
+ 
++// `OmpUnitedTaskDesignatorChecker` is used to check if the designator
++// can appear within the TASK construct
++class OmpUnitedTaskDesignatorChecker {
++public:
++  OmpUnitedTaskDesignatorChecker(SemanticsContext &context)
++      : context_{context} {}
++
++  template <typename T> bool Pre(const T &) { return true; }
++  template <typename T> void Post(const T &) {}
++
++  bool Pre(const parser::Name &name) {
++    if (name.symbol->test(Symbol::Flag::OmpThreadprivate)) {
++      // OpenMP 5.2: 5.2 threadprivate directive restriction
++      context_.Say(name.source,
++          "A THREADPRIVATE variable `%s` cannot appear in an UNTIED TASK region"_err_en_US,
++          name.source);
++    }
++    return true;
++  }
++
++private:
++  SemanticsContext &context_;
++};
++
+ bool OmpStructureChecker::CheckAllowedClause(llvmOmpClause clause) {
+   unsigned version{context_.langOptions().OpenMPVersion};
+   DirectiveContext &dirCtx = GetContext();
+@@ -1172,6 +1196,16 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
+     HasInvalidWorksharingNesting(
+         beginDir.source, llvm::omp::nestedWorkshareErrSet);
+     break;
++  case llvm::omp::Directive::OMPD_task: {
++    const auto &clauses{std::get<parser::OmpClauseList>(beginBlockDir.t)};
++    for (const auto &clause : clauses.v) {
++      if (std::get_if<parser::OmpClause::Untied>(&clause.u)) {
++        OmpUnitedTaskDesignatorChecker check{context_};
++        parser::Walk(block, check);
++      }
++    }
++    break;
++  }
+   default:
+     break;
+   }
+diff --git a/flang/test/Lower/OpenMP/Todo/task_untied.f90 b/flang/test/Lower/OpenMP/Todo/task_untied.f90
+deleted file mode 100644
+index 87d242ba3e9d2..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/task_untied.f90
++++ /dev/null
+@@ -1,13 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!===============================================================================
+-! `untied` clause
+-!===============================================================================
+-
+-! CHECK: not yet implemented: UNTIED clause is not implemented yet
+-subroutine omp_task_untied()
+-  !$omp task untied
+-  call foo()
+-  !$omp end task
+-end subroutine omp_task_untied
+diff --git a/flang/test/Lower/OpenMP/task.f90 b/flang/test/Lower/OpenMP/task.f90
+index f5591bd9d8609..13ebf2acd9101 100644
+--- a/flang/test/Lower/OpenMP/task.f90
++++ b/flang/test/Lower/OpenMP/task.f90
+@@ -247,6 +247,10 @@ subroutine task_multiple_clauses()
+   !$omp end task
+ end subroutine task_multiple_clauses
+ 
++!===============================================================================
++! `mergeable` clause
++!===============================================================================
++
+ subroutine task_mergeable()
+ !CHECK: omp.task mergeable {
+ !CHECK: omp.terminator
+@@ -254,3 +258,16 @@ subroutine task_mergeable()
+  !$omp task mergeable
+  !$omp end task
+ end subroutine
++
++!===============================================================================
++! `untied` clause
++!===============================================================================
++
++!CHECK-LABEL: func.func @_QPomp_task_untied() {
++subroutine omp_task_untied()
++  !CHECK: omp.task untied {
++  !$omp task untied
++    call foo()
++  !CHECK: omp.terminator
++  !$omp end task
++end subroutine omp_task_untied
+diff --git a/flang/test/Semantics/OpenMP/task-untied01.f90 b/flang/test/Semantics/OpenMP/task-untied01.f90
+new file mode 100644
+index 0000000000000..3eb14b8ca4be0
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/task-untied01.f90
+@@ -0,0 +1,28 @@
++! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++!
++! OpenMP 5.2: 5.2 threadprivate directive restriction
++
++subroutine task_untied01()
++    integer, save :: var_01, var_02(2)
++    real          :: var_03
++    common /c/ var_03
++
++    !$omp threadprivate(var_01, var_02)
++    !$omp threadprivate(/c/)
++
++    !$omp task untied
++        !ERROR: A THREADPRIVATE variable `var_01` cannot appear in an UNTIED TASK region
++        var_01    = 10
++        !ERROR: A THREADPRIVATE variable `var_02` cannot appear in an UNTIED TASK region
++        !ERROR: A THREADPRIVATE variable `var_01` cannot appear in an UNTIED TASK region
++        var_02(1) = sum([var_01, 20])
++    !$omp end task
++
++    !$omp task untied
++        !ERROR: A THREADPRIVATE variable `var_02` cannot appear in an UNTIED TASK region
++        !ERROR: A THREADPRIVATE variable `var_02` cannot appear in an UNTIED TASK region
++        var_02(2) = product(var_02)
++        !ERROR: A THREADPRIVATE variable `var_03` cannot appear in an UNTIED TASK region
++        var_03    = 3.14
++    !$omp end task
++end subroutine task_untied01
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index fdc9cee5b5dca..3c018dba8d95d 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -270,7 +270,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+       .Case([&](omp::TaskOp op) {
+         checkAllocate(op, result);
+         checkInReduction(op, result);
+-        checkUntied(op, result);
+       })
+       .Case([&](omp::TaskgroupOp op) {
+         checkAllocate(op, result);
+@@ -282,6 +281,7 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+       })
+       .Case([&](omp::TaskloopOp op) {
+         // TODO: Add other clauses check
++        checkUntied(op, result);
+         checkPriority(op, result);
+       })
+       .Case([&](omp::WsloopOp op) {
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index a5e64fc332754..7e0ec3b3c2116 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -3098,6 +3098,18 @@ module attributes {omp.is_target_device = true} {
+ 
+ // -----
+ 
++llvm.func @omp_task_untied() {
++  // The third argument is 0: which signifies the untied task
++  // CHECK: {{.*}} = call ptr @__kmpc_omp_task_alloc(ptr @1, i32 %{{.*}}, i32 0,
++  // CHECK-SAME:     i64 40, i64 0, ptr @{{.*}})
++  omp.task untied {
++        omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
+ // Third argument is 5: essentially (4 || 1)
+ // signifying this task is TIED and MERGEABLE
+ 
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index ea3d3b4bd9df8..bb2a74841e9af 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -400,17 +400,6 @@ llvm.func @task_in_reduction(%x : !llvm.ptr) {
+ 
+ // -----
+ 
+-llvm.func @task_untied() {
+-  // expected-error@below {{not yet implemented: Unhandled clause untied in omp.task operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
+-  omp.task untied {
+-    omp.terminator
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ llvm.func @taskgroup_allocate(%x : !llvm.ptr) {
+   // expected-error@below {{not yet implemented: Unhandled clause allocate in omp.taskgroup operation}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.taskgroup}}
+@@ -463,6 +452,19 @@ llvm.func @taskloop(%lb : i32, %ub : i32, %step : i32) {
+ 
+ // -----
+ 
++llvm.func @taskloop_untied(%lb : i32, %ub : i32, %step : i32) {
++  // expected-error@below {{not yet implemented: omp.taskloop}}
++  // expected-error@below {{LLVM Translation failed for operation: omp.taskloop}}
++  omp.taskloop untied {
++    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
+ llvm.func @taskwait_depend(%x: !llvm.ptr) {
+   // expected-error@below {{not yet implemented: Unhandled clause depend in omp.taskwait operation}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.taskwait}}

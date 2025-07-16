@@ -1,0 +1,232 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 940caaeea9c3b..485e021ac39e9 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -486,6 +486,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpAffinityClause)
+   NODE(OmpAffinityClause, Modifier)
+   NODE(parser, OmpAlignment)
++  NODE(parser, OmpAlignClause)
+   NODE(parser, OmpAlignedClause)
+   NODE(OmpAlignedClause, Modifier)
+   NODE(parser, OmpAtClause)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 1d97126d17dbc..3c494fa5290a9 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3752,6 +3752,11 @@ struct OmpAffinityClause {
+   std::tuple<MODIFIERS(), OmpObjectList> t;
+ };
+ 
++// Ref: 5.2: [174]
++struct OmpAlignClause {
++  WRAPPER_CLASS_BOILERPLATE(OmpAlignClause, ScalarIntExpr);
++};
++
+ // Ref: [4.5:72-81], [5.0:110-119], [5.1:134-143], [5.2:169-170]
+ //
+ // aligned-clause ->
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 67385c03f66c8..2c739378989dc 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -567,6 +567,8 @@ TYPE_PARSER(construct<OmpBindClause>(
+     "TEAMS" >> pure(OmpBindClause::Binding::Teams) ||
+     "THREAD" >> pure(OmpBindClause::Binding::Thread)))
+ 
++TYPE_PARSER(construct<OmpAlignClause>(scalarIntExpr))
++
+ TYPE_PARSER(construct<OmpAtClause>(
+     "EXECUTION" >> pure(OmpAtClause::ActionTime::Execution) ||
+     "COMPILATION" >> pure(OmpAtClause::ActionTime::Compilation)))
+@@ -582,6 +584,8 @@ TYPE_PARSER(
+     "ACQ_REL" >> construct<OmpClause>(construct<OmpClause::AcqRel>()) ||
+     "AFFINITY" >> construct<OmpClause>(construct<OmpClause::Affinity>(
+                       parenthesized(Parser<OmpAffinityClause>{}))) ||
++    "ALIGN" >> construct<OmpClause>(construct<OmpClause::Align>(
++                   parenthesized(Parser<OmpAlignClause>{}))) ||
+     "ALIGNED" >> construct<OmpClause>(construct<OmpClause::Aligned>(
+                      parenthesized(Parser<OmpAlignedClause>{}))) ||
+     "ALLOCATE" >> construct<OmpClause>(construct<OmpClause::Allocate>(
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 414753305a6e3..8fc4fe8103706 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1483,11 +1483,24 @@ void OmpStructureChecker::Leave(const parser::OpenMPRequiresConstruct &) {
+   dirContext_.pop_back();
+ }
+ 
++void OmpStructureChecker::CheckAlignValue(const parser::OmpClause &clause) {
++  if (auto *align{std::get_if<parser::OmpClause::Align>(&clause.u)}) {
++    if (const auto &v{GetIntValue(align->v)}; !v || *v <= 0) {
++      context_.Say(clause.source,
++          "The alignment value should be a constant positive integer"_err_en_US);
++    }
++  }
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPDeclarativeAllocate &x) {
+   isPredefinedAllocator = true;
+   const auto &dir{std::get<parser::Verbatim>(x.t)};
+   const auto &objectList{std::get<parser::OmpObjectList>(x.t)};
+   PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_allocate);
++  const auto &clauseList{std::get<parser::OmpClauseList>(x.t)};
++  for (const auto &clause : clauseList.v) {
++    CheckAlignValue(clause);
++  }
+   CheckIsVarPartOfAnotherVar(dir.source, objectList);
+ }
+ 
+@@ -1704,6 +1717,10 @@ void OmpStructureChecker::Enter(const parser::OpenMPExecutableAllocate &x) {
+   const auto &dir{std::get<parser::Verbatim>(x.t)};
+   const auto &objectList{std::get<std::optional<parser::OmpObjectList>>(x.t)};
+   PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_allocate);
++  const auto &clauseList{std::get<parser::OmpClauseList>(x.t)};
++  for (const auto &clause : clauseList.v) {
++    CheckAlignValue(clause);
++  }
+   if (objectList) {
+     CheckIsVarPartOfAnotherVar(dir.source, *objectList);
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 346a7bed9138f..adbd9ab73c205 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -261,6 +261,8 @@ class OmpStructureChecker
+   void CheckAllowedRequiresClause(llvmOmpClause clause);
+   bool deviceConstructFound_{false};
+ 
++  void CheckAlignValue(const parser::OmpClause &);
++
+   void EnterDirectiveNest(const int index) { directiveNest_[index]++; }
+   void ExitDirectiveNest(const int index) { directiveNest_[index]--; }
+   int GetDirectiveNest(const int index) { return directiveNest_[index]; }
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-declarative-allocate-align.f90 b/flang/test/Lower/OpenMP/Todo/omp-declarative-allocate-align.f90
+new file mode 100644
+index 0000000000000..d0ed0cbb4c831
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/omp-declarative-allocate-align.f90
+@@ -0,0 +1,10 @@
++! This test checks lowering of OpenMP allocate Directive with align clause.
++
++// RUN: not flang -fc1 -emit-fir -fopenmp %s 2>&1 | FileCheck %s
++
++program main
++  integer :: x
++
++  // CHECK: not yet implemented: OpenMPDeclarativeAllocate
++  !$omp allocate(x) align(32)
++end
+diff --git a/flang/test/Parser/OpenMP/allocate-align-tree.f90 b/flang/test/Parser/OpenMP/allocate-align-tree.f90
+new file mode 100644
+index 0000000000000..8cb009dfe46c8
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/allocate-align-tree.f90
+@@ -0,0 +1,42 @@
++! REQUIRES: openmp_runtime
++
++! RUN: %flang_fc1 %openmp_flags -fopenmp-version=51 -fdebug-dump-parse-tree %s | FileCheck %s
++! RUN: %flang_fc1 %openmp_flags -fdebug-unparse -fopenmp-version=51 %s | FileCheck %s --check-prefix="UNPARSE"
++! Ensures associated declarative OMP allocations are nested in their
++! corresponding executable allocate directive
++
++program allocate_align_tree
++    use omp_lib
++    integer, allocatable :: j(:), xarray(:)
++    integer :: z, t
++    t = 2
++    z = 3
++!$omp allocate(j) align(16)
++!$omp allocate(xarray) align(32) allocator(omp_large_cap_mem_alloc)
++    allocate(j(z), xarray(t))
++end program allocate_align_tree
++
++!CHECK: | | DeclarationConstruct -> SpecificationConstruct -> TypeDeclarationStmt
++!CHECK-NEXT: | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!CHECK-NEXT: | | | AttrSpec -> Allocatable
++!CHECK-NEXT: | | | EntityDecl
++!CHECK-NEXT: | | | | Name = 'j'
++
++
++!CHECK: | | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPExecutableAllocate
++!CHECK-NEXT: | | | Verbatim
++!CHECK-NEXT: | | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'xarray'
++!CHECK-NEXT: | | | OmpClauseList -> OmpClause -> Align -> OmpAlignClause -> Scalar -> Integer -> Expr = '32_4'
++!CHECK-NEXT: | | | | LiteralConstant -> IntLiteralConstant = '32'
++!CHECK-NEXT: | | | OmpClause -> Allocator -> Scalar -> Integer -> Expr = '2_8'
++!CHECK-NEXT: | | | | Designator -> DataRef -> Name = 'omp_large_cap_mem_alloc'
++!CHECK-NEXT: | | | OpenMPDeclarativeAllocate
++!CHECK-NEXT: | | | | Verbatim
++!CHECK-NEXT: | | | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'j'
++!CHECK-NEXT: | | | | OmpClauseList -> OmpClause -> Align -> OmpAlignClause -> Scalar -> Integer -> Expr = '16_4'
++!CHECK-NEXT: | | | | | LiteralConstant -> IntLiteralConstant = '16'
++!CHECK-NEXT: | | | AllocateStmt
++
++!UNPARSE: !$OMP ALLOCATE (j) ALIGN(16_4)
++!UNPARSE: !$OMP ALLOCATE (xarray) ALIGN(32_4) ALLOCATOR(2_8)
++!UNPARSE-NEXT: ALLOCATE(j(z), xarray(t))
+diff --git a/flang/test/Parser/OpenMP/allocate-unparse.f90 b/flang/test/Parser/OpenMP/allocate-unparse.f90
+index 81b3677ad954b..94bc2adf35ea9 100644
+--- a/flang/test/Parser/OpenMP/allocate-unparse.f90
++++ b/flang/test/Parser/OpenMP/allocate-unparse.f90
+@@ -5,7 +5,7 @@ program allocate_unparse
+ use omp_lib
+ 
+ real, dimension (:,:), allocatable :: darray
+-integer :: a, b, m, n, t, x, y, z
++integer :: a, b, j, m, n, t, x, y, z
+ 
+ ! 2.11.3 declarative allocate
+ 
+@@ -25,6 +25,7 @@ program allocate_unparse
+ !$omp allocate(z) allocator(omp_default_mem_alloc)
+ !$omp allocate(m) allocator(omp_default_mem_alloc)
+ !$omp allocate(n)
++!$omp allocate(j) align(16)
+     allocate ( darray(z, t) )
+ 
+ end program allocate_unparse
+@@ -41,4 +42,5 @@ end program allocate_unparse
+ !CHECK:!$OMP ALLOCATE (z) ALLOCATOR(omp_default_mem_alloc)
+ !CHECK:!$OMP ALLOCATE (m) ALLOCATOR(omp_default_mem_alloc)
+ !CHECK:!$OMP ALLOCATE (n)
++!CHECK:!$OMP ALLOCATE (j) ALIGN(16)
+ !CHECK:ALLOCATE(darray(z,t))
+diff --git a/flang/test/Semantics/OpenMP/allocate-align01.f90 b/flang/test/Semantics/OpenMP/allocate-align01.f90
+new file mode 100644
+index 0000000000000..ba0776cf46a6d
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/allocate-align01.f90
+@@ -0,0 +1,20 @@
++! REQUIRES: openmp_runtime
++
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=51
++! OpenMP Version 5.2
++! The allocate clause's allocator modifier must be of type allocator_handle
++! and the align modifier must be constant, positive integer expression
++
++program allocate_align_tree
++    use omp_lib
++    integer, allocatable :: j(:), xarray(:)
++    integer :: z, t, xx
++    t = 2
++    z = 3
++    !ERROR: The alignment value should be a constant positive integer
++!$omp allocate(j) align(xx)
++    !ERROR: The alignment value should be a constant positive integer
++!$omp allocate(xarray) align(-32) allocator(omp_large_cap_mem_alloc)
++    allocate(j(z), xarray(t))
++end program allocate_align_tree
++
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index e36eb77cefe7e..a4c1964c3e88f 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -49,6 +49,7 @@ def OMPC_Affinity : Clause<"affinity"> {
+ }
+ def OMPC_Align : Clause<"align"> {
+   let clangClass = "OMPAlignClause";
++  let flangClass = "OmpAlignClause";
+ }
+ def OMPC_Aligned : Clause<"aligned"> {
+   let clangClass = "OMPAlignedClause";

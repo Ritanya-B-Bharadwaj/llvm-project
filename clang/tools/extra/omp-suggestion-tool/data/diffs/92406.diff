@@ -1,0 +1,196 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 2493eb3ed3676..a98c2618e3ff4 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2309,6 +2309,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+   if (CheckReductionOperators(x)) {
+     CheckReductionTypeList(x);
+   }
++  CheckReductionModifier(x);
+ }
+ 
+ bool OmpStructureChecker::CheckReductionOperators(
+@@ -2393,6 +2394,64 @@ void OmpStructureChecker::CheckReductionTypeList(
+   }
+ }
+ 
++void OmpStructureChecker::CheckReductionModifier(
++    const parser::OmpClause::Reduction &x) {
++  using ReductionModifier = parser::OmpReductionClause::ReductionModifier;
++  const auto &maybeModifier{std::get<std::optional<ReductionModifier>>(x.v.t)};
++  if (!maybeModifier || *maybeModifier == ReductionModifier::Default) {
++    // No modifier, or the default one is always ok.
++    return;
++  }
++  ReductionModifier modifier{*maybeModifier};
++  const DirectiveContext &dirCtx{GetContext()};
++  if (dirCtx.directive == llvm::omp::Directive::OMPD_loop) {
++    // [5.2:257:33-34]
++    // If a reduction-modifier is specified in a reduction clause that
++    // appears on the directive, then the reduction modifier must be
++    // default.
++    context_.Say(GetContext().clauseSource,
++        "REDUCTION modifier on LOOP directive must be DEFAULT"_err_en_US);
++  }
++  if (modifier == ReductionModifier::Task) {
++    // "Task" is only allowed on worksharing or "parallel" directive.
++    static llvm::omp::Directive worksharing[]{
++        llvm::omp::Directive::OMPD_do, llvm::omp::Directive::OMPD_scope,
++        llvm::omp::Directive::OMPD_sections,
++        // There are more worksharing directives, but they do not apply:
++        // "for" is C++ only,
++        // "single" and "workshare" don't allow reduction clause,
++        // "loop" has different restrictions (checked above).
++    };
++    if (dirCtx.directive != llvm::omp::Directive::OMPD_parallel &&
++        !llvm::is_contained(worksharing, dirCtx.directive)) {
++      context_.Say(GetContext().clauseSource,
++          "Modifier 'TASK' on REDUCTION clause is only allowed with "
++          "PARALLEL or worksharing directive"_err_en_US);
++    }
++  } else if (modifier == ReductionModifier::Inscan) {
++    // "Inscan" is only allowed on worksharing-loop, worksharing-loop simd,
++    // or "simd" directive.
++    // The worksharing-loop directives are OMPD_do and OMPD_for. Only the
++    // former is allowed in Fortran.
++    switch (dirCtx.directive) {
++    case llvm::omp::Directive::OMPD_do: // worksharing-loop
++    case llvm::omp::Directive::OMPD_do_simd: // worksharing-loop simd
++    case llvm::omp::Directive::OMPD_simd: // "simd"
++      break;
++    default:
++      context_.Say(GetContext().clauseSource,
++          "Modifier 'INSCAN' on REDUCTION clause is only allowed with "
++          "worksharing-loop, worksharing-loop simd, "
++          "or SIMD directive"_err_en_US);
++    }
++  } else {
++    // Catch-all for potential future modifiers to make sure that this
++    // function is up-to-date.
++    context_.Say(GetContext().clauseSource,
++        "Unexpected modifier on REDUCTION clause"_err_en_US);
++  }
++}
++
+ void OmpStructureChecker::CheckIntentInPointerAndDefinable(
+     const parser::OmpObjectList &objectList, const llvm::omp::Clause clause) {
+   for (const auto &ompObject : objectList.v) {
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 1f7284307703b..47705771e8e28 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -205,6 +205,7 @@ class OmpStructureChecker
+   bool CheckIntrinsicOperator(
+       const parser::DefinedOperator::IntrinsicOperator &);
+   void CheckReductionTypeList(const parser::OmpClause::Reduction &);
++  void CheckReductionModifier(const parser::OmpClause::Reduction &);
+   void CheckMasterNesting(const parser::OpenMPBlockConstruct &x);
+   void ChecksOnOrderedAsBlock();
+   void CheckBarrierNesting(const parser::OpenMPSimpleStandaloneConstruct &x);
+diff --git a/flang/test/Lower/OpenMP/invalid-reduction-modifier.f90 b/flang/test/Lower/OpenMP/invalid-reduction-modifier.f90
+index 53871276761fa..b3e87df7086eb 100644
+--- a/flang/test/Lower/OpenMP/invalid-reduction-modifier.f90
++++ b/flang/test/Lower/OpenMP/invalid-reduction-modifier.f90
+@@ -1,6 +1,4 @@
+-!Remove the --crash below once we can diagnose the issue more gracefully.
+-!REQUIRES: asserts
+-!RUN: not --crash %flang_fc1 -fopenmp -emit-hlfir -o - %s
++!RUN: not %flang_fc1 -fopenmp -emit-hlfir -o - %s
+ 
+ ! Check that we reject the "task" reduction modifier on the "simd" directive.
+ 
+diff --git a/flang/test/Semantics/OpenMP/reduction-modifiers.f90 b/flang/test/Semantics/OpenMP/reduction-modifiers.f90
+new file mode 100644
+index 0000000000000..cf38200ba0a83
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/reduction-modifiers.f90
+@@ -0,0 +1,89 @@
++! RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=52
++
++subroutine mod_task1(x)
++  integer, intent(inout) :: x
++
++  !Correct: "parallel" directive.
++  !$omp parallel reduction(task, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end parallel
++end
++
++subroutine mod_task2(x)
++  integer, intent(inout) :: x
++
++  !Correct: worksharing directive.
++  !$omp sections reduction(task, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end sections
++end
++
++subroutine mod_task3(x)
++  integer, intent(inout) :: x
++
++  !ERROR: Modifier 'TASK' on REDUCTION clause is only allowed with PARALLEL or worksharing directive
++  !$omp simd reduction(task, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end simd
++end
++
++subroutine mod_inscan1(x)
++  integer, intent(inout) :: x
++
++  !Correct: worksharing-loop directive
++  !$omp do reduction(inscan, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end do
++end
++
++subroutine mod_inscan2(x)
++  integer, intent(inout) :: x
++
++  !Correct: worksharing-loop simd directive
++  !$omp do simd reduction(inscan, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end do simd
++end
++
++subroutine mod_inscan3(x)
++  integer, intent(inout) :: x
++
++  !Correct: "simd" directive
++  !$omp simd reduction(inscan, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end simd
++end
++
++subroutine mod_inscan4(x)
++  integer, intent(inout) :: x
++
++  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with worksharing-loop, worksharing-loop simd, or SIMD directive
++  !$omp parallel reduction(inscan, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end parallel
++end
++
++subroutine mod_inscan5(x)
++  integer, intent(inout) :: x
++
++  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with worksharing-loop, worksharing-loop simd, or SIMD directive
++  !$omp sections reduction(inscan, +:x)
++  do i = 1, 100
++    x = foo(i)
++  enddo
++  !$omp end sections
++end

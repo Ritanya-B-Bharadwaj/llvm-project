@@ -1,0 +1,86 @@
+diff --git a/openmp/libomptarget/DeviceRTL/CMakeLists.txt b/openmp/libomptarget/DeviceRTL/CMakeLists.txt
+index 2509f1276ccee..2e7f28df24d64 100644
+--- a/openmp/libomptarget/DeviceRTL/CMakeLists.txt
++++ b/openmp/libomptarget/DeviceRTL/CMakeLists.txt
+@@ -122,6 +122,11 @@ set(clang_opt_flags -O3 -mllvm -openmp-opt-disable -DSHARED_SCRATCHPAD_SIZE=512
+ set(link_opt_flags  -O3        -openmp-opt-disable -attributor-enable=module -vectorize-slp=false )
+ set(link_export_flag -passes=internalize -internalize-public-api-file=${source_directory}/exports)
+ 
++# If the user built with the GPU C library enabled we will use that instead.
++if(${LIBOMPTARGET_GPU_LIBC_SUPPORT})
++  list(APPEND clang_opt_flags -DOMPTARGET_HAS_LIBC)
++endif()
++
+ # Prepend -I to each list element
+ set (LIBOMPTARGET_LLVM_INCLUDE_DIRS_DEVICERTL "${LIBOMPTARGET_LLVM_INCLUDE_DIRS}")
+ list(TRANSFORM LIBOMPTARGET_LLVM_INCLUDE_DIRS_DEVICERTL PREPEND "-I")
+diff --git a/openmp/libomptarget/DeviceRTL/src/LibC.cpp b/openmp/libomptarget/DeviceRTL/src/LibC.cpp
+index af675b97256f6..33fec8135ef03 100644
+--- a/openmp/libomptarget/DeviceRTL/src/LibC.cpp
++++ b/openmp/libomptarget/DeviceRTL/src/LibC.cpp
+@@ -53,10 +53,23 @@ void memset(void *dst, int C, size_t count) {
+     dstc[I] = C;
+ }
+ 
++// If the user built with the GPU C library enabled we will assume that we can
++// call it.
++#ifdef OMPTARGET_HAS_LIBC
++
++// TODO: Remove this handling once we have varargs support.
++extern struct FILE *stdout;
++int32_t rpc_fprintf(FILE *, const char *, void *, uint64_t);
++
++int32_t __llvm_omp_vprintf(const char *Format, void *Arguments, uint32_t Size) {
++  return rpc_fprintf(stdout, Format, Arguments, Size);
++}
++#else
+ /// printf() calls are rewritten by CGGPUBuiltin to __llvm_omp_vprintf
+ int32_t __llvm_omp_vprintf(const char *Format, void *Arguments, uint32_t Size) {
+   return impl::omp_vprintf(Format, Arguments, Size);
+ }
++#endif
+ }
+ 
+ #pragma omp end declare target
+diff --git a/openmp/libomptarget/test/libc/printf.c b/openmp/libomptarget/test/libc/printf.c
+new file mode 100644
+index 0000000000000..64cdd805d3550
+--- /dev/null
++++ b/openmp/libomptarget/test/libc/printf.c
+@@ -0,0 +1,36 @@
++// RUN: %libomptarget-compile-run-and-check-generic
++
++// REQUIRES: libc
++
++#include <stdio.h>
++
++int main() {
++  // CHECK: PASS
++#pragma omp target
++  { printf("PASS\n"); }
++
++  // CHECK: PASS
++#pragma omp target
++  { printf("%s\n", "PASS"); }
++
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++  // CHECK: PASS
++#pragma omp target teams num_teams(4)
++#pragma omp parallel num_threads(2)
++  { printf("PASS\n"); }
++
++  // CHECK: PASS
++  char str[] = {'P', 'A', 'S', 'S', '\0'};
++#pragma omp target map(to : str)
++  { printf("%s\n", str); }
++
++  // CHECK: 11111111111
++#pragma omp target
++  { printf("%s%-.0f%4b%c%ld\n", "1111", 1.0, 0xf, '1', 1lu); }
++}
