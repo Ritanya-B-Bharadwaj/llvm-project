@@ -108,6 +108,12 @@ void foo1(void) {
 						    : parallel) otherwise(parallel for)
   for (int i=0; i<10; i++)
     ;
+
+#pragma omp metadirective when(user = {condition(1)}              \
+                               : parallel for) when(implementation = {extension(match_none)} \
+                                                    : parallel)
+  for (int i=0; i<10; i++)
+    ;
 }
 
 // OMP52: void bar(void);
