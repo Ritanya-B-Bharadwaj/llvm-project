@@ -192,6 +192,7 @@ public:
   HeaderUnitKind getHeaderUnitKind() const {
     return static_cast<HeaderUnitKind>(HeaderUnit);
   }
+  
   bool isPreprocessed() const { return Preprocessed; }
   bool isHeader() const { return IsHeader; }
   bool isHeaderUnit() const { return HeaderUnit != HeaderUnit_None; }
@@ -278,6 +279,12 @@ public:
   /// Disable memory freeing on exit.
   LLVM_PREFERRED_TYPE(bool)
   unsigned DisableFree : 1;
+
+  /// Function Extents Dumping
+  bool DumpFunctionExtents = false;
+
+  /// Class Extents Dumping
+  bool DumpClassExtents = false;
 
   /// When generating PCH files, instruct the AST writer to create relocatable
   /// PCH files.
