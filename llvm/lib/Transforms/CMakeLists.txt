@@ -1,4 +1,5 @@
 add_subdirectory(Utils)
+add_subdirectory(PointerTracker)
 add_subdirectory(Instrumentation)
 add_subdirectory(AggressiveInstCombine)
 add_subdirectory(InstCombine)
@@ -9,3 +10,4 @@ add_subdirectory(ObjCARC)
 add_subdirectory(Coroutines)
 add_subdirectory(CFGuard)
 add_subdirectory(HipStdPar)
+
