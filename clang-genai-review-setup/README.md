@@ -20,7 +20,7 @@ It fetches a GitHub PR patch, analyzes the code locally, and generates a unified
 ```bash
 # Clone the repository (forked llvm-project)
 git clone https://github.com/ritanya-b-bharadwaj/llvm-project.git
-cd llvm-project/clang_genai_review
+cd llvm-project/clang-genai-review-setup
 
 # Set up virtual environment
 python -m venv venv
@@ -35,34 +35,29 @@ Python 3.8+
 clang-format and clang-tidy installed and available in PATH
 
 🔧 Installing Clang Tools (Ubuntu/Debian)
-bash
-Copy
-Edit
+```bash
 sudo apt update
 sudo apt install clang-format clang-tidy
 🔧 On Windows (via LLVM pre-built binaries)
 Download from: https://github.com/llvm/llvm-project/releases
 
 Add clang-format.exe and clang-tidy.exe to your system PATH
-
+```
 🚀 Usage
 ▶️ Run via CLI
-bash
-Copy
-Edit
+```bash
 clang-genai-review --pr <PR_NUMBER> --repo llvm/llvm-project --sha <COMMIT_SHA>
+```
 Example:
-bash
-Copy
-Edit
+```bash
 clang-genai-review --pr 144629 --repo llvm/llvm-project --sha abcdef1234567890
+```
 ✅ Output will be saved to clang_genai_review/reviews/pr_<PR_NUMBER>.md
 
 💻 Run via Web UI (Streamlit)
-bash
-Copy
-Edit
+```bash
 streamlit run clang_genai_review/app.py
+```
 Then open the link shown in terminal (usually http://localhost:8501).
 
 Fill in:
@@ -76,9 +71,7 @@ Commit SHA
 Then click "Analyze PR" to generate and view the review interactively.
 
 📁 Folder Structure
-bash
-Copy
-Edit
+```bash
 clang_genai_review/
 │
 ├── cli.py                    # CLI entry point
@@ -89,6 +82,7 @@ clang_genai_review/
 ├── groq_review.py           # GenAI interface
 │
 └── reviews/                 # Auto-generated markdown reviews
+```
 📄 Sample Output
 You can explore example reviews in the reviews/ folder — these are real outputs from past PRs like #143422 and #144629.
 
@@ -110,23 +104,9 @@ This is a prototype for automating and accelerating LLVM code review with AI. Co
 This project is built as part of LLVM tooling research and follows the LLVM Project license structure.
 
 📣 Maintained by
-ritanya-b-bharadwaj
-
-markdown
-Copy
-Edit
+priyanshrd
 
 ---
-
-### ✅ What You Should Do Now:
-- Add this as `README.md` in `clang_genai_review/`
-- Make sure `__init__.py` exists (even if empty)
-- Test `pip install -e .` and CLI call from any directory
-- Push to your fork and create a PR in `llvm-project`
-- Reference the corresponding issue (if there’s one open)
-
-Let me know if you want me to help generate that sample PR, or if you need a smaller test commit idea!
-
 
 
 
