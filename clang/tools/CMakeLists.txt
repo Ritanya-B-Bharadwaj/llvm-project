@@ -53,4 +53,4 @@ add_clang_subdirectory(libclang)
 
 add_clang_subdirectory(offload-arch)
 
-add_clang_subdirectory(downcasting)
+add_clang_subdirectory(fp16-downcast-check)
