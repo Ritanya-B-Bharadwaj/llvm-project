@@ -1,44 +1,64 @@
-# The LLVM Compiler Infrastructure
+# Automatic Down casting of Constants to __fp16 / __bf16 in Clang Frontend
+This Clang plugin performs automatic downcasting of floating-point literals to low-precision formats like __fp16 or __bf16 when safe. 
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)
-[![libc++](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml/badge.svg?branch=main&event=schedule)](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml?query=event%3Aschedule)
+It also generates a JSON report for visualization of the downcasting decisions and their effects, optionally integrates with a web-based heatmap UI for analysis.
 
-Welcome to the LLVM project!
+## Features
+AST-level analysis of floating-point constants.
 
-This repository contains the source code for LLVM, a toolkit for the
-construction of highly optimized compilers, optimizers, and run-time
-environments.
+Automatic downcasting to __fp16 or __bf16 when safe based on error thresholds.
 
-The LLVM project has multiple components. The core of the project is
-itself called "LLVM". This contains all of the tools, libraries, and header
-files needed to process intermediate representations and convert them into
-object files. Tools include an assembler, disassembler, bitcode analyzer, and
-bitcode optimizer.
+Modifies source code (modified.cpp) with downcasted values.
 
-C-like languages use the [Clang](https://clang.llvm.org/) frontend. This
-component compiles C, C++, Objective-C, and Objective-C++ code into LLVM bitcode
--- and from there into object files, using LLVM.
+Generates JSON output (float_map.json) for further visualization.
 
-Other components include:
-the [libc++ C++ standard library](https://libcxx.llvm.org),
-the [LLD linker](https://lld.llvm.org), and more.
+Web UI heatmap viewer for visualizing performance and errors.
 
-## Getting the Source Code and Building LLVM
+## Use Cases
+Performance and memory optimization in embedded systems (e.g., ML on edge devices).
 
-Consult the
-[Getting Started with LLVM](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)
-page for information on building and running LLVM.
+Teaching and debugging floating-point precision trade-offs.
 
-For information on how to contribute to the LLVM project, please take a look at
-the [Contributing to LLVM](https://llvm.org/docs/Contributing.html) guide.
+Visualization of downcast safety in large codebases.
 
-## Getting in touch
+## Requirements
+LLVM/Clang (tested with LLVM 18)
 
-Join the [LLVM Discourse forums](https://discourse.llvm.org/), [Discord
-chat](https://discord.gg/xS7Z362),
-[LLVM Office Hours](https://llvm.org/docs/GettingInvolved.html#office-hours) or
-[Regular sync-ups](https://llvm.org/docs/GettingInvolved.html#online-sync-ups).
+Python 3.x for runner and script tools
 
-The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
-participants to all modes of communication within the project.
+C++17 compatible compiler
+
+Web browser for viewing index.html
+
+## Building the Plugin
+<pre>clang++ -shared -fPIC -o FloatDowncastChecker.so \
+  -std=c++17 \
+  -I$(llvm-config --includedir) \
+  -fno-rtti \
+  FloatDowncastChecker.cpp \
+  $(llvm-config --cxxflags --ldflags --libs --system-libs)</pre>
+If using LLVM 18, make sure llvm-config is in your PATH.
+
+## Running the Tool
+  For __fp16:
+
+    clang++ -fsyntax-only \
+    -Xclang -load -Xclang ./FloatDowncastChecker.so \
+    -Xclang -plugin -Xclang float-downcast \
+    -Xclang -plugin-arg-float-downcast -Xclang -threshold=0.001 \
+    -Xclang -plugin-arg-float-downcast -Xclang -mode=fp16 \
+    test.cpp
+    
+  For __bf16:
+    
+    clang++ -fsyntax-only \
+    -Xclang -load -Xclang ./FloatDowncastChecker.so \
+    -Xclang -plugin -Xclang float-downcast \
+    -Xclang -plugin-arg-float-downcast -Xclang -threshold=0.001 \
+    -Xclang -plugin-arg-float-downcast -Xclang -mode=bf16 \
+    test.cpp
+  
+## Run the Analysis and Downcast Script
+
+    python3 benchmark.py
+  This script will analyze downcasting accuracy, time execution of original and modified binaries.
