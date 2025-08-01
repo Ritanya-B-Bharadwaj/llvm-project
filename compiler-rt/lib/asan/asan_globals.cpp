@@ -29,6 +29,15 @@
 #include "sanitizer_common/sanitizer_symbolizer.h"
 #include "sanitizer_common/sanitizer_thread_safety.h"
 
+#include "sanitizer_common/sanitizer_special_case_list.h"
+#include "asan_options.h"
+
+namespace __asan {
+::__sanitizer::SpecialCaseList *Whitelist = nullptr;
+}
+
+
+
 namespace __asan {
 
 typedef __asan_global Global;
@@ -458,6 +467,8 @@ void __asan_register_globals(__asan_global *globals, uptr n) {
             globals[i].odr_indicator == 0);
       continue;
     }
+    if (__asan::Whitelist && __asan::Whitelist->inGlobal(g.name))
+      continue;
     RegisterGlobal(&globals[i]);
   }
 
