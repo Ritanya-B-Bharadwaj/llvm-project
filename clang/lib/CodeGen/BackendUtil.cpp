@@ -87,6 +87,7 @@
 #include "llvm/Transforms/Scalar/JumpThreading.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/Analysis/InstructionFrequencyAnalysis.h"
 #include <limits>
 #include <memory>
 #include <optional>
@@ -125,10 +126,17 @@ namespace clang {
 extern llvm::cl::opt<bool> ClSanitizeGuardChecks;
 }
 
+// Default filename used for profile generation.
+static std::string getDefaultProfileGenName() {
+  return DebugInfoCorrelate || ProfileCorrelate != InstrProfCorrelator::NONE
+             ? "default_%m.proflite"
+             : "default_%m.profraw";
+}
+
 // Path and name of file used for profile generation
 static std::string getProfileGenName(const CodeGenOptions &CodeGenOpts) {
   std::string FileName = CodeGenOpts.InstrProfileOutput.empty()
-                             ? llvm::driver::getDefaultProfileGenName()
+                             ? getDefaultProfileGenName()
                              : CodeGenOpts.InstrProfileOutput;
   if (CodeGenOpts.ContinuousProfileSync)
     FileName = "%c" + FileName;
@@ -1011,6 +1019,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   // Add a verifier pass, before any other passes, to catch CodeGen issues.
   if (CodeGenOpts.VerifyModule)
     MPM.addPass(VerifierPass());
+
+  if (CodeGenOpts.EmitInstrFreq) {
+  MPM.addPass(RequireAnalysisPass<InstructionFrequencyAnalysis,llvm:: Module>());
+  MPM.addPass(InstructionFrequencyPrinterPass());
+}
 
   if (!CodeGenOpts.DisableLLVMPasses) {
     // Map our optimization levels into one of the distinct levels used to

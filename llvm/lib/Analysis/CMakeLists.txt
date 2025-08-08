@@ -91,6 +91,7 @@ add_llvm_component_library(LLVMAnalysis
   InlineOrder.cpp
   InlineSizeEstimatorAnalysis.cpp
   InstCount.cpp
+  InstructionFrequencyAnalysis.cpp
   InstructionPrecedenceTracking.cpp
   InstructionSimplify.cpp
   InteractiveModelRunner.cpp
