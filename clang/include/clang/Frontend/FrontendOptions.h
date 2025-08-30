@@ -275,6 +275,10 @@ public:
 /// FrontendOptions - Options for controlling the behavior of the frontend.
 class FrontendOptions {
 public:
+
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned DumpFunctionExtents : 1;
+
   /// Disable memory freeing on exit.
   LLVM_PREFERRED_TYPE(bool)
   unsigned DisableFree : 1;
@@ -542,6 +546,7 @@ public:
         FixToTemporaries(false), SkipFunctionBodies(false),
         UseGlobalModuleIndex(true), GenerateGlobalModuleIndex(true),
         ASTDumpDecls(false), ASTDumpLookups(false),
+        DumpFunctionExtents(false),
         BuildingImplicitModule(false), BuildingImplicitModuleUsesLock(true),
         ModulesEmbedAllFiles(false), IncludeTimestamps(true),
         UseTemporary(true), AllowPCMWithCompilerErrors(false),
