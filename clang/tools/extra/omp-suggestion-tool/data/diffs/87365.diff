@@ -1,0 +1,2423 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 9b99752236662..c31d63625dbb1 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -502,8 +502,10 @@ struct OpWithBodyGenInfo {
+ 
+   OpWithBodyGenInfo(Fortran::lower::AbstractConverter &converter,
+                     Fortran::semantics::SemanticsContext &semaCtx,
+-                    mlir::Location loc, Fortran::lower::pft::Evaluation &eval)
+-      : converter(converter), semaCtx(semaCtx), loc(loc), eval(eval) {}
++                    mlir::Location loc, Fortran::lower::pft::Evaluation &eval,
++                    llvm::omp::Directive dir)
++      : converter(converter), semaCtx(semaCtx), loc(loc), eval(eval), dir(dir) {
++  }
+ 
+   OpWithBodyGenInfo &setGenNested(bool value) {
+     genNested = value;
+@@ -546,6 +548,8 @@ struct OpWithBodyGenInfo {
+   mlir::Location loc;
+   /// [in] current PFT node/evaluation.
+   Fortran::lower::pft::Evaluation &eval;
++  /// [in] leaf directive for which to generate the op body.
++  llvm::omp::Directive dir;
+   /// [in] whether to generate FIR for nested evaluations
+   bool genNested = true;
+   /// [in] is this an outer operation - prevents privatization.
+@@ -568,8 +572,7 @@ struct OpWithBodyGenInfo {
+ ///
+ /// \param [in]   op - the operation the body belongs to.
+ /// \param [in] info - options controlling code-gen for the construction.
+-template <typename Op>
+-static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
++static void createBodyOfOp(mlir::Operation &op, OpWithBodyGenInfo &info) {
+   fir::FirOpBuilder &firOpBuilder = info.converter.getFirOpBuilder();
+ 
+   auto insertMarker = [](fir::FirOpBuilder &builder) {
+@@ -585,10 +588,10 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
+   auto regionArgs =
+       [&]() -> llvm::SmallVector<const Fortran::semantics::Symbol *> {
+     if (info.genRegionEntryCB != nullptr) {
+-      return info.genRegionEntryCB(op);
++      return info.genRegionEntryCB(&op);
+     }
+ 
+-    firOpBuilder.createBlock(&op.getRegion());
++    firOpBuilder.createBlock(&op.getRegion(0));
+     return {};
+   }();
+   // Mark the earliest insertion point.
+@@ -603,8 +606,8 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
+ 
+   // Start with privatization, so that the lowering of the nested
+   // code will use the right symbols.
+-  constexpr bool isLoop = std::is_same_v<Op, mlir::omp::WsloopOp> ||
+-                          std::is_same_v<Op, mlir::omp::SimdLoopOp>;
++  bool isLoop = llvm::omp::getDirectiveAssociation(info.dir) ==
++                llvm::omp::Association::Loop;
+   bool privatize = info.clauses && !info.outerCombined;
+ 
+   firOpBuilder.setInsertionPoint(marker);
+@@ -616,7 +619,7 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
+     }
+   }
+ 
+-  if constexpr (std::is_same_v<Op, mlir::omp::ParallelOp>) {
++  if (info.dir == llvm::omp::Directive::OMPD_parallel) {
+     threadPrivatizeVars(info.converter, info.eval);
+     if (info.clauses) {
+       firOpBuilder.setInsertionPoint(marker);
+@@ -630,9 +633,9 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
+     // a lot of complications for our approach if the terminator generation
+     // is delayed past this point. Insert a temporary terminator here, then
+     // delete it.
+-    firOpBuilder.setInsertionPointToEnd(&op.getRegion().back());
+-    auto *temp = Fortran::lower::genOpenMPTerminator(
+-        firOpBuilder, op.getOperation(), info.loc);
++    firOpBuilder.setInsertionPointToEnd(&op.getRegion(0).back());
++    auto *temp =
++        Fortran::lower::genOpenMPTerminator(firOpBuilder, &op, info.loc);
+     firOpBuilder.setInsertionPointAfter(marker);
+     genNestedEvaluations(info.converter, info.eval);
+     temp->erase();
+@@ -674,23 +677,36 @@ static void createBodyOfOp(Op &op, OpWithBodyGenInfo &info) {
+     return exit;
+   };
+ 
+-  if (auto *exitBlock = getUniqueExit(op.getRegion())) {
++  if (auto *exitBlock = getUniqueExit(op.getRegion(0))) {
+     firOpBuilder.setInsertionPointToEnd(exitBlock);
+-    auto *term = Fortran::lower::genOpenMPTerminator(
+-        firOpBuilder, op.getOperation(), info.loc);
++    auto *term =
++        Fortran::lower::genOpenMPTerminator(firOpBuilder, &op, info.loc);
+     // Only insert lastprivate code when there actually is an exit block.
+     // Such a block may not exist if the nested code produced an infinite
+     // loop (this may not make sense in production code, but a user could
+     // write that and we should handle it).
+     firOpBuilder.setInsertionPoint(term);
+     if (privatize) {
++      // DataSharingProcessor::processStep2() may create operations before/after
++      // the one passed as argument. We need to treat loop wrappers and their
++      // nested loop as a unit, so we need to pass the top level wrapper (if
++      // present). Otherwise, these operations will be inserted within a
++      // wrapper region.
++      mlir::Operation *privatizationTopLevelOp = &op;
++      if (auto loopNest = llvm::dyn_cast<mlir::omp::LoopNestOp>(op)) {
++        llvm::SmallVector<mlir::omp::LoopWrapperInterface> wrappers;
++        loopNest.gatherWrappers(wrappers);
++        if (!wrappers.empty())
++          privatizationTopLevelOp = &*wrappers.back();
++      }
++
+       if (!info.dsp) {
+         assert(tempDsp.has_value());
+-        tempDsp->processStep2(op, isLoop);
++        tempDsp->processStep2(privatizationTopLevelOp, isLoop);
+       } else {
+         if (isLoop && regionArgs.size() > 0)
+           info.dsp->setLoopIV(info.converter.getSymbolAddress(*regionArgs[0]));
+-        info.dsp->processStep2(op, isLoop);
++        info.dsp->processStep2(privatizationTopLevelOp, isLoop);
+       }
+     }
+   }
+@@ -921,7 +937,7 @@ template <typename OpTy, typename... Args>
+ static OpTy genOpWithBody(OpWithBodyGenInfo &info, Args &&...args) {
+   auto op = info.converter.getFirOpBuilder().create<OpTy>(
+       info.loc, std::forward<Args>(args)...);
+-  createBodyOfOp<OpTy>(op, info);
++  createBodyOfOp(*op, info);
+   return op;
+ }
+ 
+@@ -954,6 +970,18 @@ static void genFlushClauses(
+     TODO(converter.getCurrentLocation(), "Handle OmpMemoryOrderClause");
+ }
+ 
++static void genLoopNestClauses(
++    Fortran::lower::AbstractConverter &converter,
++    Fortran::semantics::SemanticsContext &semaCtx,
++    Fortran::lower::pft::Evaluation &eval,
++    const Fortran::parser::OmpClauseList &clauses, mlir::Location loc,
++    mlir::omp::LoopNestClauseOps &clauseOps,
++    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> &iv) {
++  ClauseProcessor cp(converter, semaCtx, clauses);
++  cp.processCollapse(loc, eval, clauseOps, iv);
++  clauseOps.loopInclusiveAttr = converter.getFirOpBuilder().getUnitAttr();
++}
++
+ static void
+ genOrderedRegionClauses(Fortran::lower::AbstractConverter &converter,
+                         Fortran::semantics::SemanticsContext &semaCtx,
+@@ -1002,21 +1030,16 @@ static void genSectionsClauses(Fortran::lower::AbstractConverter &converter,
+   }
+ }
+ 
+-static void genSimdLoopClauses(
+-    Fortran::lower::AbstractConverter &converter,
+-    Fortran::semantics::SemanticsContext &semaCtx,
+-    Fortran::lower::StatementContext &stmtCtx,
+-    Fortran::lower::pft::Evaluation &eval,
+-    const Fortran::parser::OmpClauseList &clauses, mlir::Location loc,
+-    mlir::omp::SimdLoopClauseOps &clauseOps,
+-    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> &iv) {
++static void genSimdClauses(Fortran::lower::AbstractConverter &converter,
++                           Fortran::semantics::SemanticsContext &semaCtx,
++                           const Fortran::parser::OmpClauseList &clauses,
++                           mlir::Location loc,
++                           mlir::omp::SimdClauseOps &clauseOps) {
+   ClauseProcessor cp(converter, semaCtx, clauses);
+-  cp.processCollapse(loc, eval, clauseOps, iv);
+   cp.processIf(llvm::omp::Directive::OMPD_simd, clauseOps);
+   cp.processReduction(loc, clauseOps);
+   cp.processSafelen(clauseOps);
+   cp.processSimdlen(clauseOps);
+-  clauseOps.loopInclusiveAttr = converter.getFirOpBuilder().getUnitAttr();
+   // TODO Support delayed privatization.
+ 
+   cp.processTODO<clause::Aligned, clause::Allocate, clause::Linear,
+@@ -1260,7 +1283,9 @@ genCriticalOp(Fortran::lower::AbstractConverter &converter,
+   }
+ 
+   return genOpWithBody<mlir::omp::CriticalOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval).setGenNested(genNested),
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_critical)
++          .setGenNested(genNested),
+       nameAttr);
+ }
+ 
+@@ -1295,7 +1320,9 @@ genMasterOp(Fortran::lower::AbstractConverter &converter,
+             Fortran::lower::pft::Evaluation &eval, bool genNested,
+             mlir::Location loc) {
+   return genOpWithBody<mlir::omp::MasterOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval).setGenNested(genNested));
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_master)
++          .setGenNested(genNested));
+ }
+ 
+ static mlir::omp::OrderedOp
+@@ -1317,7 +1344,9 @@ genOrderedRegionOp(Fortran::lower::AbstractConverter &converter,
+   genOrderedRegionClauses(converter, semaCtx, clauseList, loc, clauseOps);
+ 
+   return genOpWithBody<mlir::omp::OrderedRegionOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval).setGenNested(genNested),
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_ordered)
++          .setGenNested(genNested),
+       clauseOps);
+ }
+ 
+@@ -1345,7 +1374,8 @@ genParallelOp(Fortran::lower::AbstractConverter &converter,
+   };
+ 
+   OpWithBodyGenInfo genInfo =
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_parallel)
+           .setGenNested(genNested)
+           .setOuterCombined(outerCombined)
+           .setClauses(&clauseList)
+@@ -1408,7 +1438,8 @@ genSectionOp(Fortran::lower::AbstractConverter &converter,
+   // Currently only private/firstprivate clause is handled, and
+   // all privatization is done within `omp.section` operations.
+   return genOpWithBody<mlir::omp::SectionOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_section)
+           .setGenNested(genNested)
+           .setClauses(&clauseList));
+ }
+@@ -1419,23 +1450,39 @@ genSectionsOp(Fortran::lower::AbstractConverter &converter,
+               Fortran::lower::pft::Evaluation &eval, mlir::Location loc,
+               const mlir::omp::SectionsClauseOps &clauseOps) {
+   return genOpWithBody<mlir::omp::SectionsOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval).setGenNested(false),
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_sections)
++          .setGenNested(false),
+       clauseOps);
+ }
+ 
+-static mlir::omp::SimdLoopOp
+-genSimdLoopOp(Fortran::lower::AbstractConverter &converter,
+-              Fortran::semantics::SemanticsContext &semaCtx,
+-              Fortran::lower::pft::Evaluation &eval, mlir::Location loc,
+-              const Fortran::parser::OmpClauseList &clauseList) {
++static mlir::omp::SimdOp
++genSimdOp(Fortran::lower::AbstractConverter &converter,
++          Fortran::semantics::SemanticsContext &semaCtx,
++          Fortran::lower::pft::Evaluation &eval, mlir::Location loc,
++          const Fortran::parser::OmpClauseList &clauseList) {
++  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   DataSharingProcessor dsp(converter, semaCtx, clauseList, eval);
+   dsp.processStep1();
+ 
+   Fortran::lower::StatementContext stmtCtx;
+-  mlir::omp::SimdLoopClauseOps clauseOps;
++  mlir::omp::LoopNestClauseOps loopClauseOps;
++  mlir::omp::SimdClauseOps simdClauseOps;
+   llvm::SmallVector<const Fortran::semantics::Symbol *> iv;
+-  genSimdLoopClauses(converter, semaCtx, stmtCtx, eval, clauseList, loc,
+-                     clauseOps, iv);
++  genLoopNestClauses(converter, semaCtx, eval, clauseList, loc, loopClauseOps,
++                     iv);
++  genSimdClauses(converter, semaCtx, clauseList, loc, simdClauseOps);
++
++  // Create omp.simd wrapper.
++  auto simdOp = firOpBuilder.create<mlir::omp::SimdOp>(loc, simdClauseOps);
++
++  // TODO: Add reduction-related arguments to the wrapper's entry block.
++  firOpBuilder.createBlock(&simdOp.getRegion());
++  firOpBuilder.setInsertionPoint(
++      Fortran::lower::genOpenMPTerminator(firOpBuilder, simdOp, loc));
++
++  // Create nested omp.loop_nest and fill body with loop contents.
++  auto loopOp = firOpBuilder.create<mlir::omp::LoopNestOp>(loc, loopClauseOps);
+ 
+   auto *nestedEval =
+       getCollapsedLoopEval(eval, Fortran::lower::getCollapseValue(clauseList));
+@@ -1444,12 +1491,14 @@ genSimdLoopOp(Fortran::lower::AbstractConverter &converter,
+     return genLoopVars(op, converter, loc, iv);
+   };
+ 
+-  return genOpWithBody<mlir::omp::SimdLoopOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, *nestedEval)
+-          .setClauses(&clauseList)
+-          .setDataSharingProcessor(&dsp)
+-          .setGenRegionEntryCb(ivCallback),
+-      clauseOps);
++  createBodyOfOp(*loopOp,
++                 OpWithBodyGenInfo(converter, semaCtx, loc, *nestedEval,
++                                   llvm::omp::Directive::OMPD_simd)
++                     .setClauses(&clauseList)
++                     .setDataSharingProcessor(&dsp)
++                     .setGenRegionEntryCb(ivCallback));
++
++  return simdOp;
+ }
+ 
+ static mlir::omp::SingleOp
+@@ -1464,7 +1513,8 @@ genSingleOp(Fortran::lower::AbstractConverter &converter,
+                    clauseOps);
+ 
+   return genOpWithBody<mlir::omp::SingleOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_single)
+           .setGenNested(genNested)
+           .setClauses(&beginClauseList),
+       clauseOps);
+@@ -1645,7 +1695,8 @@ genTaskOp(Fortran::lower::AbstractConverter &converter,
+   genTaskClauses(converter, semaCtx, stmtCtx, clauseList, loc, clauseOps);
+ 
+   return genOpWithBody<mlir::omp::TaskOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_task)
+           .setGenNested(genNested)
+           .setClauses(&clauseList),
+       clauseOps);
+@@ -1661,7 +1712,8 @@ genTaskgroupOp(Fortran::lower::AbstractConverter &converter,
+   genTaskgroupClauses(converter, semaCtx, clauseList, loc, clauseOps);
+ 
+   return genOpWithBody<mlir::omp::TaskgroupOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_taskgroup)
+           .setGenNested(genNested)
+           .setClauses(&clauseList),
+       clauseOps);
+@@ -1704,7 +1756,8 @@ genTeamsOp(Fortran::lower::AbstractConverter &converter,
+   genTeamsClauses(converter, semaCtx, stmtCtx, clauseList, loc, clauseOps);
+ 
+   return genOpWithBody<mlir::omp::TeamsOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, eval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, eval,
++                        llvm::omp::Directive::OMPD_teams)
+           .setGenNested(genNested)
+           .setOuterCombined(outerCombined)
+           .setClauses(&clauseList),
+@@ -1738,7 +1791,8 @@ genWsloopOp(Fortran::lower::AbstractConverter &converter,
+   };
+ 
+   return genOpWithBody<mlir::omp::WsloopOp>(
+-      OpWithBodyGenInfo(converter, semaCtx, loc, *nestedEval)
++      OpWithBodyGenInfo(converter, semaCtx, loc, *nestedEval,
++                        llvm::omp::Directive::OMPD_do)
+           .setClauses(&beginClauseList)
+           .setDataSharingProcessor(&dsp)
+           .setReductions(&reductionSyms, &reductionTypes)
+@@ -2253,7 +2307,7 @@ static void genOMP(Fortran::lower::AbstractConverter &converter,
+                        endClauseList, currentLocation);
+   } else if (llvm::omp::allSimdSet.test(ompDirective)) {
+     // 2.9.3.1 SIMD construct
+-    genSimdLoopOp(converter, semaCtx, eval, currentLocation, beginClauseList);
++    genSimdOp(converter, semaCtx, eval, currentLocation, beginClauseList);
+   } else {
+     genWsloopOp(converter, semaCtx, eval, currentLocation, beginClauseList,
+                 endClauseList);
+@@ -2341,10 +2395,9 @@ mlir::Operation *Fortran::lower::genOpenMPTerminator(fir::FirOpBuilder &builder,
+                                                      mlir::Operation *op,
+                                                      mlir::Location loc) {
+   if (mlir::isa<mlir::omp::WsloopOp, mlir::omp::DeclareReductionOp,
+-                mlir::omp::AtomicUpdateOp, mlir::omp::SimdLoopOp>(op))
++                mlir::omp::AtomicUpdateOp, mlir::omp::LoopNestOp>(op))
+     return builder.create<mlir::omp::YieldOp>(loc);
+-  else
+-    return builder.create<mlir::omp::TerminatorOp>(loc);
++  return builder.create<mlir::omp::TerminatorOp>(loc);
+ }
+ 
+ void Fortran::lower::genOpenMPConstruct(
+diff --git a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+index 92628af37085a..fa7979e8875af 100644
+--- a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
++++ b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+@@ -180,14 +180,16 @@ func.func @_QPsimd1(%arg0: !fir.ref<i32> {fir.bindc_name = "n"}, %arg1: !fir.ref
+   omp.parallel  {
+     %1 = fir.alloca i32 {adapt.valuebyref, pinned}
+     %2 = fir.load %arg0 : !fir.ref<i32>
+-    omp.simdloop for (%arg2) : i32 = (%c1_i32) to (%2) step (%c1_i32)  {
+-      fir.store %arg2 to %1 : !fir.ref<i32>
+-      %3 = fir.load %1 : !fir.ref<i32>
+-      %4 = fir.convert %3 : (i32) -> i64
+-      %5 = arith.subi %4, %c1_i64 : i64
+-      %6 = fir.coordinate_of %arg1, %5 : (!fir.ref<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+-      fir.store %3 to %6 : !fir.ref<i32>
+-      omp.yield
++    omp.simd {
++      omp.loop_nest (%arg2) : i32 = (%c1_i32) to (%2) step (%c1_i32) {
++        fir.store %arg2 to %1 : !fir.ref<i32>
++        %3 = fir.load %1 : !fir.ref<i32>
++        %4 = fir.convert %3 : (i32) -> i64
++        %5 = arith.subi %4, %c1_i64 : i64
++        %6 = fir.coordinate_of %arg1, %5 : (!fir.ref<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
++        fir.store %3 to %6 : !fir.ref<i32>
++        omp.yield
++      }
+     }
+     omp.terminator
+   }
+@@ -202,8 +204,8 @@ func.func @_QPsimd1(%arg0: !fir.ref<i32> {fir.bindc_name = "n"}, %arg1: !fir.ref
+ // CHECK:      %[[ONE_3:.*]] = llvm.mlir.constant(1 : i64) : i64
+ // CHECK:      %[[I_VAR:.*]] = llvm.alloca %[[ONE_3]] x i32 {pinned} : (i64) -> !llvm.ptr
+ // CHECK:      %[[N:.*]] = llvm.load %[[N_REF]] : !llvm.ptr -> i32
+-// CHECK: omp.simdloop
+-// CHECK-SAME: (%[[I:.*]]) : i32 = (%[[ONE_2]]) to (%[[N]]) step (%[[ONE_2]]) {
++// CHECK: omp.simd {
++// CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[ONE_2]]) to (%[[N]]) step (%[[ONE_2]]) {
+ // CHECK:   llvm.store %[[I]], %[[I_VAR]] : i32, !llvm.ptr
+ // CHECK:   %[[I1:.*]] = llvm.load %[[I_VAR]] : !llvm.ptr -> i32
+ // CHECK:   %[[I1_EXT:.*]] = llvm.sext %[[I1]] : i32 to i64
+@@ -212,6 +214,7 @@ func.func @_QPsimd1(%arg0: !fir.ref<i32> {fir.bindc_name = "n"}, %arg1: !fir.ref
+ // CHECK:   llvm.store %[[I1]], %[[ARR_I_REF]] : i32, !llvm.ptr
+ // CHECK: omp.yield
+ // CHECK: }
++// CHECK: }
+ // CHECK: omp.terminator
+ // CHECK: }
+ // CHECK: llvm.return
+@@ -471,55 +474,59 @@ func.func @_QPomp_target() {
+ 
+ // -----
+ 
+-func.func @_QPsimdloop_with_nested_loop() {
++func.func @_QPsimd_with_nested_loop() {
+   %0 = fir.alloca i32 {adapt.valuebyref}
+-  %1 = fir.alloca !fir.array<10xi32> {bindc_name = "a", uniq_name = "_QFsimdloop_with_nested_loopEa"}
+-  %2 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimdloop_with_nested_loopEi"}
+-  %3 = fir.alloca i32 {bindc_name = "j", uniq_name = "_QFsimdloop_with_nested_loopEj"}
++  %1 = fir.alloca !fir.array<10xi32> {bindc_name = "a", uniq_name = "_QFsimd_with_nested_loopEa"}
++  %2 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimd_with_nested_loopEi"}
++  %3 = fir.alloca i32 {bindc_name = "j", uniq_name = "_QFsimd_with_nested_loopEj"}
+   %c1_i32 = arith.constant 1 : i32
+   %c10_i32 = arith.constant 10 : i32
+   %c1_i32_0 = arith.constant 1 : i32
+-  omp.simdloop   for  (%arg0) : i32 = (%c1_i32) to (%c10_i32) inclusive step (%c1_i32_0) {
+-    fir.store %arg0 to %0 : !fir.ref<i32>
+-    %c1_i32_1 = arith.constant 1 : i32
+-    %4 = fir.convert %c1_i32_1 : (i32) -> index
+-    %c10_i32_2 = arith.constant 10 : i32
+-    %5 = fir.convert %c10_i32_2 : (i32) -> index
+-    %c1 = arith.constant 1 : index
+-    %6 = fir.do_loop %arg1 = %4 to %5 step %c1 -> index {
+-      %8 = fir.convert %arg1 : (index) -> i32
+-      fir.store %8 to %3 : !fir.ref<i32>
+-      %9 = fir.load %0 : !fir.ref<i32>
+-      %10 = fir.load %0 : !fir.ref<i32>
+-      %11 = fir.convert %10 : (i32) -> i64
+-      %c1_i64 = arith.constant 1 : i64
+-      %12 = arith.subi %11, %c1_i64 : i64
+-      %13 = fir.coordinate_of %1, %12 : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
+-      fir.store %9 to %13 : !fir.ref<i32>
+-      %14 = arith.addi %arg1, %c1 : index
+-      fir.result %14 : index
++  omp.simd {
++    omp.loop_nest (%arg0) : i32 = (%c1_i32) to (%c10_i32) inclusive step (%c1_i32_0) {
++      fir.store %arg0 to %0 : !fir.ref<i32>
++      %c1_i32_1 = arith.constant 1 : i32
++      %4 = fir.convert %c1_i32_1 : (i32) -> index
++      %c10_i32_2 = arith.constant 10 : i32
++      %5 = fir.convert %c10_i32_2 : (i32) -> index
++      %c1 = arith.constant 1 : index
++      %6 = fir.do_loop %arg1 = %4 to %5 step %c1 -> index {
++        %8 = fir.convert %arg1 : (index) -> i32
++        fir.store %8 to %3 : !fir.ref<i32>
++        %9 = fir.load %0 : !fir.ref<i32>
++        %10 = fir.load %0 : !fir.ref<i32>
++        %11 = fir.convert %10 : (i32) -> i64
++        %c1_i64 = arith.constant 1 : i64
++        %12 = arith.subi %11, %c1_i64 : i64
++        %13 = fir.coordinate_of %1, %12 : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++        fir.store %9 to %13 : !fir.ref<i32>
++        %14 = arith.addi %arg1, %c1 : index
++        fir.result %14 : index
++      }
++      %7 = fir.convert %6 : (index) -> i32
++      fir.store %7 to %3 : !fir.ref<i32>
++      omp.yield
+     }
+-    %7 = fir.convert %6 : (index) -> i32
+-    fir.store %7 to %3 : !fir.ref<i32>
+-    omp.yield
+   }
+   return
+ }
+ 
+-// CHECK-LABEL:   llvm.func @_QPsimdloop_with_nested_loop() {
++// CHECK-LABEL:   llvm.func @_QPsimd_with_nested_loop() {
+ // CHECK:           %[[LOWER:.*]] = llvm.mlir.constant(1 : i32) : i32
+ // CHECK:           %[[UPPER:.*]] = llvm.mlir.constant(10 : i32) : i32
+ // CHECK:           %[[STEP:.*]] = llvm.mlir.constant(1 : i32) : i32
+-// CHECK:           omp.simdloop   for  (%[[CNT:.*]]) : i32 = (%[[LOWER]]) to (%[[UPPER]]) inclusive step (%[[STEP]]) {
+-// CHECK:             llvm.br ^bb1(%[[VAL_1:.*]], %[[VAL_2:.*]] : i64, i64)
+-// CHECK:           ^bb1(%[[VAL_3:.*]]: i64, %[[VAL_4:.*]]: i64):
+-// CHECK:             %[[VAL_5:.*]] = llvm.mlir.constant(0 : index) : i64
+-// CHECK:             %[[VAL_6:.*]] = llvm.icmp "sgt" %[[VAL_4]], %[[VAL_5]] : i64
+-// CHECK:             llvm.cond_br %[[VAL_6]], ^bb2, ^bb3
+-// CHECK:           ^bb2:
+-// CHECK:             llvm.br ^bb1(%[[VAL_7:.*]], %[[VAL_8:.*]] : i64, i64)
+-// CHECK:           ^bb3:
+-// CHECK:             omp.yield
++// CHECK:           omp.simd {
++// CHECK-NEXT:        omp.loop_nest (%[[CNT:.*]]) : i32 = (%[[LOWER]]) to (%[[UPPER]]) inclusive step (%[[STEP]]) {
++// CHECK:               llvm.br ^bb1(%[[VAL_1:.*]], %[[VAL_2:.*]] : i64, i64)
++// CHECK:             ^bb1(%[[VAL_3:.*]]: i64, %[[VAL_4:.*]]: i64):
++// CHECK:               %[[VAL_5:.*]] = llvm.mlir.constant(0 : index) : i64
++// CHECK:               %[[VAL_6:.*]] = llvm.icmp "sgt" %[[VAL_4]], %[[VAL_5]] : i64
++// CHECK:               llvm.cond_br %[[VAL_6]], ^bb2, ^bb3
++// CHECK:             ^bb2:
++// CHECK:               llvm.br ^bb1(%[[VAL_7:.*]], %[[VAL_8:.*]] : i64, i64)
++// CHECK:             ^bb3:
++// CHECK:               omp.yield
++// CHECK:             }
+ // CHECK:           }
+ // CHECK:           llvm.return
+ // CHECK:         }
+diff --git a/flang/test/Lower/OpenMP/FIR/if-clause.f90 b/flang/test/Lower/OpenMP/FIR/if-clause.f90
+index a1235be8e61ea..f686b9708fc54 100644
+--- a/flang/test/Lower/OpenMP/FIR/if-clause.f90
++++ b/flang/test/Lower/OpenMP/FIR/if-clause.f90
+@@ -116,7 +116,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-SAME: if({{.*}})
+   ! CHECK:      omp.wsloop
+@@ -124,7 +124,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-SAME: if({{.*}})
+   ! CHECK:      omp.wsloop
+@@ -134,7 +134,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+@@ -147,7 +147,7 @@ program main
+   ! ----------------------------------------------------------------------------
+   ! SIMD
+   ! ----------------------------------------------------------------------------
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp simd
+@@ -155,14 +155,14 @@ program main
+   end do
+   !$omp end simd
+ 
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp simd if(.true.)
+   do i = 1, 10
+   end do
+   !$omp end simd
+ 
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp simd if(simd: .true.)
+   do i = 1, 10
+@@ -281,7 +281,6 @@ program main
+   end do
+   !$omp end target parallel do
+ 
+-  
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+@@ -360,7 +359,7 @@ program main
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp target simd
+@@ -370,7 +369,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(.true.)
+   do i = 1, 10
+@@ -379,7 +378,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(target: .true.) if(simd: .false.)
+   do i = 1, 10
+@@ -388,7 +387,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp target simd if(target: .true.)
+@@ -399,7 +398,7 @@ program main
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(simd: .true.)
+   do i = 1, 10
+diff --git a/flang/test/Lower/OpenMP/FIR/loop-combined.f90 b/flang/test/Lower/OpenMP/FIR/loop-combined.f90
+index a6cec1beb49c8..6c6618dc9fb57 100644
+--- a/flang/test/Lower/OpenMP/FIR/loop-combined.f90
++++ b/flang/test/Lower/OpenMP/FIR/loop-combined.f90
+@@ -75,7 +75,7 @@ program main
+   ! TARGET SIMD
+   ! ----------------------------------------------------------------------------
+   ! CHECK: omp.target
+-  ! CHECK: omp.simdloop
++  ! CHECK: omp.simd
+   !$omp target simd
+   do i = 1, 10
+   end do
+diff --git a/flang/test/Lower/OpenMP/FIR/parallel-private-clause.f90 b/flang/test/Lower/OpenMP/FIR/parallel-private-clause.f90
+index 8f5d280943cc2..8b75ecbaae8c7 100644
+--- a/flang/test/Lower/OpenMP/FIR/parallel-private-clause.f90
++++ b/flang/test/Lower/OpenMP/FIR/parallel-private-clause.f90
+@@ -361,7 +361,8 @@ subroutine simd_loop_1
+   ! FIRDialect:     %[[UB:.*]] = arith.constant 9 : i32
+   ! FIRDialect:     %[[STEP:.*]] = arith.constant 1 : i32
+ 
+-  ! FIRDialect: omp.simdloop for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! FIRDialect: omp.simd {
++  ! FIRDialect-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   !$OMP SIMD PRIVATE(r)
+   do i=1, 9
+   ! FIRDialect:     fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/simd.f90 b/flang/test/Lower/OpenMP/FIR/simd.f90
+index c8c2022d693d4..db7d30295c45d 100644
+--- a/flang/test/Lower/OpenMP/FIR/simd.f90
++++ b/flang/test/Lower/OpenMP/FIR/simd.f90
+@@ -2,32 +2,34 @@
+ 
+ ! RUN: bbc -fopenmp -emit-fir -hlfir=false %s -o - | FileCheck %s
+ 
+-!CHECK-LABEL: func @_QPsimdloop()
+-subroutine simdloop
+-integer :: i
++!CHECK-LABEL: func @_QPsimd()
++subroutine simd
++  integer :: i
+   !$OMP SIMD
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK-NEXT: %[[UB:.*]] = arith.constant 9 : i32
+   ! CHECK-NEXT: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK-NEXT: omp.simdloop for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i=1, 9
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+   end do
+-  !$OMP END SIMD 
++  !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_if_clause
+-subroutine simdloop_with_if_clause(n, threshold)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_if_clause
++subroutine simd_with_if_clause(n, threshold)
++  integer :: i, n, threshold
+   !$OMP SIMD IF( n .GE. threshold )
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[COND:.*]] = arith.cmpi sge
+-  ! CHECK: omp.simdloop if(%[[COND:.*]]) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd if(%[[COND:.*]]) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -37,14 +39,15 @@ subroutine simdloop_with_if_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause
+-subroutine simdloop_with_simdlen_clause(n, threshold)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause
++subroutine simd_with_simdlen_clause(n, threshold)
++  integer :: i, n, threshold
+   !$OMP SIMD SIMDLEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -54,15 +57,16 @@ subroutine simdloop_with_simdlen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause_from_param
+-subroutine simdloop_with_simdlen_clause_from_param(n, threshold)
+-integer :: i, n, threshold
+-integer, parameter :: simdlen = 2;
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause_from_param
++subroutine simd_with_simdlen_clause_from_param(n, threshold)
++  integer :: i, n, threshold
++  integer, parameter :: simdlen = 2;
+   !$OMP SIMD SIMDLEN(simdlen)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -72,15 +76,16 @@ subroutine simdloop_with_simdlen_clause_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause_from_expr_from_param
+-subroutine simdloop_with_simdlen_clause_from_expr_from_param(n, threshold)
+-integer :: i, n, threshold
+-integer, parameter :: simdlen = 2;
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause_from_expr_from_param
++subroutine simd_with_simdlen_clause_from_expr_from_param(n, threshold)
++  integer :: i, n, threshold
++  integer, parameter :: simdlen = 2;
+   !$OMP SIMD SIMDLEN(simdlen*2 + 2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(6) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(6) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -90,14 +95,15 @@ subroutine simdloop_with_simdlen_clause_from_expr_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_safelen_clause
+-subroutine simdloop_with_safelen_clause(n, threshold)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_safelen_clause
++subroutine simd_with_safelen_clause(n, threshold)
++  integer :: i, n, threshold
+   !$OMP SIMD SAFELEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop safelen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd safelen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -107,15 +113,16 @@ subroutine simdloop_with_safelen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_safelen_clause_from_expr_from_param
+-subroutine simdloop_with_safelen_clause_from_expr_from_param(n, threshold)
+-integer :: i, n, threshold
+-integer, parameter :: safelen = 2;
++!CHECK-LABEL: func @_QPsimd_with_safelen_clause_from_expr_from_param
++subroutine simd_with_safelen_clause_from_expr_from_param(n, threshold)
++  integer :: i, n, threshold
++  integer, parameter :: safelen = 2;
+   !$OMP SIMD SAFELEN(safelen*2 + 2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop safelen(6) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd safelen(6) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -125,14 +132,15 @@ subroutine simdloop_with_safelen_clause_from_expr_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_safelen_clause
+-subroutine simdloop_with_simdlen_safelen_clause(n, threshold)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_simdlen_safelen_clause
++subroutine simd_with_simdlen_safelen_clause(n, threshold)
++  integer :: i, n, threshold
+   !$OMP SIMD SIMDLEN(1) SAFELEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %arg0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(1) safelen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(1) safelen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]] : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]] : !fir.ref<i32>
+@@ -142,20 +150,21 @@ subroutine simdloop_with_simdlen_safelen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_collapse_clause
+-subroutine simdloop_with_collapse_clause(n)
+-integer :: i, j, n
+-integer :: A(n,n)
+-! CHECK: %[[LOWER_I:.*]] = arith.constant 1 : i32
+-! CHECK: %[[UPPER_I:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
+-! CHECK: %[[STEP_I:.*]] = arith.constant 1 : i32
+-! CHECK: %[[LOWER_J:.*]] = arith.constant 1 : i32
+-! CHECK: %[[UPPER_J:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
+-! CHECK: %[[STEP_J:.*]] = arith.constant 1 : i32
+-! CHECK: omp.simdloop  for (%[[ARG_0:.*]], %[[ARG_1:.*]]) : i32 = (
+-! CHECK-SAME:               %[[LOWER_I]], %[[LOWER_J]]) to (
+-! CHECK-SAME:               %[[UPPER_I]], %[[UPPER_J]]) inclusive step (
+-! CHECK-SAME:               %[[STEP_I]], %[[STEP_J]]) {
++!CHECK-LABEL: func @_QPsimd_with_collapse_clause
++subroutine simd_with_collapse_clause(n)
++  integer :: i, j, n
++  integer :: A(n,n)
++  ! CHECK: %[[LOWER_I:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[UPPER_I:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
++  ! CHECK: %[[STEP_I:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[LOWER_J:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[UPPER_J:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
++  ! CHECK: %[[STEP_J:.*]] = arith.constant 1 : i32
++  ! CHECK: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG_0:.*]], %[[ARG_1:.*]]) : i32 = (
++  ! CHECK-SAME:               %[[LOWER_I]], %[[LOWER_J]]) to (
++  ! CHECK-SAME:               %[[UPPER_I]], %[[UPPER_J]]) inclusive step (
++  ! CHECK-SAME:               %[[STEP_I]], %[[STEP_J]]) {
+   !$OMP SIMD COLLAPSE(2)
+   do i = 1, n
+     do j = 1, n
+diff --git a/flang/test/Lower/OpenMP/if-clause.f90 b/flang/test/Lower/OpenMP/if-clause.f90
+index f982bf67b0722..ce4427a0c2cab 100644
+--- a/flang/test/Lower/OpenMP/if-clause.f90
++++ b/flang/test/Lower/OpenMP/if-clause.f90
+@@ -116,7 +116,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-SAME: if({{.*}})
+   ! CHECK:      omp.wsloop
+@@ -124,7 +124,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-SAME: if({{.*}})
+   ! CHECK:      omp.wsloop
+@@ -134,7 +134,7 @@ program main
+   do i = 1, 10
+   end do
+   !$omp end parallel do simd
+-  
++
+   ! CHECK:      omp.parallel
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+@@ -147,7 +147,7 @@ program main
+   ! ----------------------------------------------------------------------------
+   ! SIMD
+   ! ----------------------------------------------------------------------------
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp simd
+@@ -155,14 +155,14 @@ program main
+   end do
+   !$omp end simd
+ 
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp simd if(.true.)
+   do i = 1, 10
+   end do
+   !$omp end simd
+ 
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp simd if(simd: .true.)
+   do i = 1, 10
+@@ -281,7 +281,6 @@ program main
+   end do
+   !$omp end target parallel do
+ 
+-  
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+@@ -360,7 +359,7 @@ program main
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp target simd
+@@ -370,7 +369,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(.true.)
+   do i = 1, 10
+@@ -379,7 +378,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(target: .true.) if(simd: .false.)
+   do i = 1, 10
+@@ -388,7 +387,7 @@ program main
+ 
+   ! CHECK:      omp.target
+   ! CHECK-SAME: if({{.*}})
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+   !$omp target simd if(target: .true.)
+@@ -399,7 +398,7 @@ program main
+   ! CHECK:      omp.target
+   ! CHECK-NOT:  if({{.*}})
+   ! CHECK-SAME: {
+-  ! CHECK:      omp.simdloop
++  ! CHECK:      omp.simd
+   ! CHECK-SAME: if({{.*}})
+   !$omp target simd if(simd: .true.)
+   do i = 1, 10
+diff --git a/flang/test/Lower/OpenMP/loop-combined.f90 b/flang/test/Lower/OpenMP/loop-combined.f90
+index 70488b6a769ce..298634b3f6f82 100644
+--- a/flang/test/Lower/OpenMP/loop-combined.f90
++++ b/flang/test/Lower/OpenMP/loop-combined.f90
+@@ -75,7 +75,7 @@ program main
+   ! TARGET SIMD
+   ! ----------------------------------------------------------------------------
+   ! CHECK: omp.target
+-  ! CHECK: omp.simdloop
++  ! CHECK: omp.simd
+   !$omp target simd
+   do i = 1, 10
+   end do
+diff --git a/flang/test/Lower/OpenMP/parallel-private-clause.f90 b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+index 5578b6710da7c..775f7b4f2cb10 100644
+--- a/flang/test/Lower/OpenMP/parallel-private-clause.f90
++++ b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+@@ -411,7 +411,8 @@ subroutine simd_loop_1
+   ! FIRDialect:     %[[UB:.*]] = arith.constant 9 : i32
+   ! FIRDialect:     %[[STEP:.*]] = arith.constant 1 : i32
+ 
+-  ! FIRDialect: omp.simdloop for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! FIRDialect: omp.simd {
++  ! FIRDialect-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   !$OMP SIMD PRIVATE(r)
+   do i=1, 9
+   ! FIRDialect:     fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index 135b38c792623..190aa61521217 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -3,33 +3,35 @@
+ !RUN: %flang_fc1 -flang-experimental-hlfir -emit-hlfir -fopenmp %s -o - | FileCheck %s
+ !RUN: bbc -hlfir -emit-hlfir -fopenmp %s -o - | FileCheck %s
+ 
+-!CHECK-LABEL: func @_QPsimdloop()
+-subroutine simdloop
+-integer :: i
++!CHECK-LABEL: func @_QPsimd()
++subroutine simd
++  integer :: i
+   !$OMP SIMD
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK-NEXT: %[[UB:.*]] = arith.constant 9 : i32
+   ! CHECK-NEXT: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK-NEXT: omp.simdloop for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i=1, 9
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+   end do
+-  !$OMP END SIMD 
++  !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_if_clause
+-subroutine simdloop_with_if_clause(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_if_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_if_clause
++subroutine simd_with_if_clause(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_if_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
+   !$OMP SIMD IF( n .GE. threshold )
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[COND:.*]] = arith.cmpi sge
+-  ! CHECK: omp.simdloop if(%[[COND:.*]]) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd if(%[[COND:.*]]) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -39,15 +41,16 @@ subroutine simdloop_with_if_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause
+-subroutine simdloop_with_simdlen_clause(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_simdlen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause
++subroutine simd_with_simdlen_clause(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_simdlen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
+   !$OMP SIMD SIMDLEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -57,16 +60,17 @@ subroutine simdloop_with_simdlen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause_from_param
+-subroutine simdloop_with_simdlen_clause_from_param(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_simdlen_clause_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
+-integer, parameter :: simdlen = 2;
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause_from_param
++subroutine simd_with_simdlen_clause_from_param(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_simdlen_clause_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
++  integer, parameter :: simdlen = 2;
+   !$OMP SIMD SIMDLEN(simdlen)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -76,16 +80,17 @@ subroutine simdloop_with_simdlen_clause_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_clause_from_expr_from_param
+-subroutine simdloop_with_simdlen_clause_from_expr_from_param(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_simdlen_clause_from_expr_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
+-integer, parameter :: simdlen = 2;
++!CHECK-LABEL: func @_QPsimd_with_simdlen_clause_from_expr_from_param
++subroutine simd_with_simdlen_clause_from_expr_from_param(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_simdlen_clause_from_expr_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
++  integer, parameter :: simdlen = 2;
+   !$OMP SIMD SIMDLEN(simdlen*2 + 2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(6) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(6) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -95,15 +100,16 @@ subroutine simdloop_with_simdlen_clause_from_expr_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_safelen_clause
+-subroutine simdloop_with_safelen_clause(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_safelen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_safelen_clause
++subroutine simd_with_safelen_clause(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_safelen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
+   !$OMP SIMD SAFELEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop safelen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd safelen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -113,16 +119,17 @@ subroutine simdloop_with_safelen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_safelen_clause_from_expr_from_param
+-subroutine simdloop_with_safelen_clause_from_expr_from_param(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_safelen_clause_from_expr_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
+-integer, parameter :: safelen = 2;
++!CHECK-LABEL: func @_QPsimd_with_safelen_clause_from_expr_from_param
++subroutine simd_with_safelen_clause_from_expr_from_param(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_safelen_clause_from_expr_from_paramEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
++  integer, parameter :: safelen = 2;
+   !$OMP SIMD SAFELEN(safelen*2 + 2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop safelen(6) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd safelen(6) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -132,15 +139,16 @@ subroutine simdloop_with_safelen_clause_from_expr_from_param(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_simdlen_safelen_clause
+-subroutine simdloop_with_simdlen_safelen_clause(n, threshold)
+-  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimdloop_with_simdlen_safelen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-integer :: i, n, threshold
++!CHECK-LABEL: func @_QPsimd_with_simdlen_safelen_clause
++subroutine simd_with_simdlen_safelen_clause(n, threshold)
++  ! CHECK: %[[ARG_N:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_simdlen_safelen_clauseEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n, threshold
+   !$OMP SIMD SIMDLEN(1) SAFELEN(2)
+   ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
+   ! CHECK: %[[UB:.*]] = fir.load %[[ARG_N]]#0
+   ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
+-  ! CHECK: omp.simdloop simdlen(1) safelen(2) for (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive  step (%[[STEP]]) {
++  ! CHECK: omp.simd simdlen(1) safelen(2) {
++  ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+     ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+@@ -150,20 +158,21 @@ subroutine simdloop_with_simdlen_safelen_clause(n, threshold)
+   !$OMP END SIMD
+ end subroutine
+ 
+-!CHECK-LABEL: func @_QPsimdloop_with_collapse_clause
+-subroutine simdloop_with_collapse_clause(n)
+-integer :: i, j, n
+-integer :: A(n,n)
+-! CHECK: %[[LOWER_I:.*]] = arith.constant 1 : i32
+-! CHECK: %[[UPPER_I:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
+-! CHECK: %[[STEP_I:.*]] = arith.constant 1 : i32
+-! CHECK: %[[LOWER_J:.*]] = arith.constant 1 : i32
+-! CHECK: %[[UPPER_J:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
+-! CHECK: %[[STEP_J:.*]] = arith.constant 1 : i32
+-! CHECK: omp.simdloop  for (%[[ARG_0:.*]], %[[ARG_1:.*]]) : i32 = (
+-! CHECK-SAME:               %[[LOWER_I]], %[[LOWER_J]]) to (
+-! CHECK-SAME:               %[[UPPER_I]], %[[UPPER_J]]) inclusive step (
+-! CHECK-SAME:               %[[STEP_I]], %[[STEP_J]]) {
++!CHECK-LABEL: func @_QPsimd_with_collapse_clause
++subroutine simd_with_collapse_clause(n)
++  integer :: i, j, n
++  integer :: A(n,n)
++  ! CHECK: %[[LOWER_I:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[UPPER_I:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
++  ! CHECK: %[[STEP_I:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[LOWER_J:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[UPPER_J:.*]] = fir.load %[[PARAM_ARG:.*]] : !fir.ref<i32>
++  ! CHECK: %[[STEP_J:.*]] = arith.constant 1 : i32
++  ! CHECK: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG_0:.*]], %[[ARG_1:.*]]) : i32 = (
++  ! CHECK-SAME:                %[[LOWER_I]], %[[LOWER_J]]) to (
++  ! CHECK-SAME:                %[[UPPER_I]], %[[UPPER_J]]) inclusive step (
++  ! CHECK-SAME:                %[[STEP_I]], %[[STEP_J]]) {
+   !$OMP SIMD COLLAPSE(2)
+   do i = 1, n
+     do j = 1, n
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index db1c4a8951ad2..8344bca08404e 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -2097,7 +2097,7 @@ TEST_F(OpenMPIRBuilderTest, ApplySimdlenSafelen) {
+   }));
+ }
+ 
+-TEST_F(OpenMPIRBuilderTest, ApplySimdLoopIf) {
++TEST_F(OpenMPIRBuilderTest, ApplySimdIf) {
+   OpenMPIRBuilder OMPBuilder(*M);
+   IRBuilder<> Builder(BB);
+   MapVector<Value *, Value *> AlignedVars;
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+index 27a766aceb316..3c5fa23bd4a7f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+@@ -251,11 +251,10 @@ using SectionsClauseOps = detail::Clauses<AllocateClauseOps, NowaitClauseOps,
+                                           PrivateClauseOps, ReductionClauseOps>;
+ 
+ // TODO `linear` clause.
+-using SimdLoopClauseOps =
+-    detail::Clauses<AlignedClauseOps, CollapseClauseOps, IfClauseOps,
+-                    LoopRelatedOps, NontemporalClauseOps, OrderClauseOps,
+-                    PrivateClauseOps, ReductionClauseOps, SafelenClauseOps,
+-                    SimdlenClauseOps>;
++using SimdClauseOps =
++    detail::Clauses<AlignedClauseOps, IfClauseOps, NontemporalClauseOps,
++                    OrderClauseOps, PrivateClauseOps, ReductionClauseOps,
++                    SafelenClauseOps, SimdlenClauseOps>;
+ 
+ using SingleClauseOps = detail::Clauses<AllocateClauseOps, CopyprivateClauseOps,
+                                         NowaitClauseOps, PrivateClauseOps>;
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 82be7ad31a158..10771f6e854dd 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -562,7 +562,7 @@ def LoopNestOp : OpenMP_Op<"loop_nest", [SameVariadicOperandSize,
+     loop operations intended to serve as a stopgap solution until the long-term
+     representation of canonical loops is defined. Specifically, this operation
+     is intended to serve as a unique source for loop information during the
+-    transition to making `omp.distribute`, `omp.simdloop`, `omp.taskloop` and
++    transition to making `omp.distribute`, `omp.simd`, `omp.taskloop` and
+     `omp.wsloop` wrapper operations. It is not intended to help with the
+     addition of support for loop transformations, non-rectangular loops and
+     non-perfectly nested loops.
+@@ -722,24 +722,19 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+ // Simd construct [2.9.3.1]
+ //===----------------------------------------------------------------------===//
+ 
+-def SimdLoopOp : OpenMP_Op<"simdloop", [AttrSizedOperandSegments,
+-                         AllTypesMatch<["lowerBound", "upperBound", "step"]>,
+-                         DeclareOpInterfaceMethods<LoopWrapperInterface>,
+-                         RecursiveMemoryEffects]> {
+- let summary = "simd loop construct";
++def SimdOp : OpenMP_Op<"simd", [AttrSizedOperandSegments,
++                       DeclareOpInterfaceMethods<LoopWrapperInterface>,
++                       RecursiveMemoryEffects,
++                       SingleBlockImplicitTerminator<"TerminatorOp">]> {
++ let summary = "simd construct";
+   let description = [{
+     The simd construct can be applied to a loop to indicate that the loop can be
+     transformed into a SIMD loop (that is, multiple iterations of the loop can
+-    be executed concurrently using SIMD instructions).. The lower and upper
+-    bounds specify a half-open range: the range includes the lower bound but
+-    does not include the upper bound. If the `inclusive` attribute is specified
+-    then the upper bound is also included.
++    be executed concurrently using SIMD instructions).
+ 
+-    The body region can contain any number of blocks. The region is terminated
+-    by "omp.yield" instruction without operands.
+-
+-    Collapsed loops are represented by the simd-loop having a list of indices,
+-    bounds and steps where the size of the list is equal to the collapse value.
++    The body region can contain a single block which must contain a single
++    operation and a terminator. The operation must be another compatible loop
++    wrapper or an `omp.loop_nest`.
+ 
+     The `alignment_values` attribute additionally specifies alignment of each
+     corresponding aligned operand. Note that `$aligned_vars` and
+@@ -763,32 +758,32 @@ def SimdLoopOp : OpenMP_Op<"simdloop", [AttrSizedOperandSegments,
+     SIMD chunk can have a distance in the logical iteration space that is
+     greater than or equal to the value given in the clause.
+     ```
+-    omp.simdloop <clauses>
+-    for (%i1, %i2) : index = (%c0, %c0) to (%c10, %c10) step (%c1, %c1) {
+-      // block operations
+-      omp.yield
++    omp.simd <clauses> {
++      omp.loop_nest (%i1, %i2) : index = (%c0, %c0) to (%c10, %c10) step (%c1, %c1) {
++        %a = load %arrA[%i1, %i2] : memref<?x?xf32>
++        %b = load %arrB[%i1, %i2] : memref<?x?xf32>
++        %sum = arith.addf %a, %b : f32
++        store %sum, %arrC[%i1, %i2] : memref<?x?xf32>
++        omp.yield
++      }
+     }
+     ```
+   }];
+ 
+   // TODO: Add other clauses
+-  let arguments = (ins Variadic<IntLikeType>:$lowerBound,
+-             Variadic<IntLikeType>:$upperBound,
+-             Variadic<IntLikeType>:$step,
+-             Variadic<OpenMP_PointerLikeType>:$aligned_vars,
++  let arguments = (ins Variadic<OpenMP_PointerLikeType>:$aligned_vars,
+              OptionalAttr<I64ArrayAttr>:$alignment_values,
+              Optional<I1>:$if_expr,
+              Variadic<OpenMP_PointerLikeType>:$nontemporal_vars,
+              OptionalAttr<OrderKindAttr>:$order_val,
+              ConfinedAttr<OptionalAttr<I64Attr>, [IntPositive]>:$simdlen,
+-             ConfinedAttr<OptionalAttr<I64Attr>, [IntPositive]>:$safelen,
+-             UnitAttr:$inclusive
++             ConfinedAttr<OptionalAttr<I64Attr>, [IntPositive]>:$safelen
+      );
+ 
+   let regions = (region AnyRegion:$region);
+ 
+   let builders = [
+-    OpBuilder<(ins CArg<"const SimdLoopClauseOps &">:$clauses)>
++    OpBuilder<(ins CArg<"const SimdClauseOps &">:$clauses)>
+   ];
+ 
+   let assemblyFormat = [{
+@@ -800,14 +795,7 @@ def SimdLoopOp : OpenMP_Op<"simdloop", [AttrSizedOperandSegments,
+           |`order` `(` custom<ClauseAttr>($order_val) `)`
+           |`simdlen` `(` $simdlen  `)`
+           |`safelen` `(` $safelen  `)`
+-    ) `for` custom<LoopControl>($region, $lowerBound, $upperBound, $step,
+-                                  type($step), $inclusive) attr-dict
+-  }];
+-
+-  let extraClassDeclaration = [{
+-    /// Returns the number of loops in the simd loop nest.
+-    unsigned getNumLoops() { return getLowerBound().size(); }
+-
++    ) $region attr-dict
+   }];
+ 
+   let hasCustomAssemblyFormat = 1;
+@@ -818,7 +806,7 @@ def SimdLoopOp : OpenMP_Op<"simdloop", [AttrSizedOperandSegments,
+ def YieldOp : OpenMP_Op<"yield",
+     [Pure, ReturnLike, Terminator,
+      ParentOneOf<["LoopNestOp", "WsloopOp", "DeclareReductionOp",
+-     "AtomicUpdateOp", "SimdLoopOp", "PrivateClauseOp"]>]> {
++     "AtomicUpdateOp", "PrivateClauseOp"]>]> {
+   let summary = "loop yield and termination operation";
+   let description = [{
+     "omp.yield" yields SSA values from the OpenMP dialect op region and
+diff --git a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+index b9ada0fa0f979..a206c7b228d21 100644
+--- a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
++++ b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+@@ -251,11 +251,11 @@ void mlir::configureOpenMPToLLVMConversionLegality(
+   });
+   target.addDynamicallyLegalOp<
+       mlir::omp::AtomicUpdateOp, mlir::omp::CriticalOp, mlir::omp::TargetOp,
+-      mlir::omp::TargetDataOp, mlir::omp::OrderedRegionOp,
+-      mlir::omp::ParallelOp, mlir::omp::WsloopOp, mlir::omp::SimdLoopOp,
+-      mlir::omp::MasterOp, mlir::omp::SectionOp, mlir::omp::SectionsOp,
+-      mlir::omp::SingleOp, mlir::omp::TaskgroupOp, mlir::omp::TaskOp,
+-      mlir::omp::DeclareReductionOp,
++      mlir::omp::TargetDataOp, mlir::omp::LoopNestOp,
++      mlir::omp::OrderedRegionOp, mlir::omp::ParallelOp, mlir::omp::WsloopOp,
++      mlir::omp::SimdOp, mlir::omp::MasterOp, mlir::omp::SectionOp,
++      mlir::omp::SectionsOp, mlir::omp::SingleOp, mlir::omp::TaskgroupOp,
++      mlir::omp::TaskOp, mlir::omp::DeclareReductionOp,
+       mlir::omp::PrivateClauseOp>([&](Operation *op) {
+     return std::all_of(op->getRegions().begin(), op->getRegions().end(),
+                        [&](Region &region) {
+@@ -278,11 +278,12 @@ void mlir::populateOpenMPToLLVMConversionPatterns(LLVMTypeConverter &converter,
+       AtomicReadOpConversion, MapInfoOpConversion, ReductionOpConversion,
+       MultiRegionOpConversion<omp::DeclareReductionOp>,
+       MultiRegionOpConversion<omp::PrivateClauseOp>,
+-      RegionOpConversion<omp::CriticalOp>, RegionOpConversion<omp::MasterOp>,
+-      ReductionOpConversion, RegionOpConversion<omp::OrderedRegionOp>,
++      RegionOpConversion<omp::CriticalOp>, RegionOpConversion<omp::LoopNestOp>,
++      RegionOpConversion<omp::MasterOp>, ReductionOpConversion,
++      RegionOpConversion<omp::OrderedRegionOp>,
+       RegionOpConversion<omp::ParallelOp>, RegionOpConversion<omp::WsloopOp>,
+       RegionOpConversion<omp::SectionsOp>, RegionOpConversion<omp::SectionOp>,
+-      RegionOpConversion<omp::SimdLoopOp>, RegionOpConversion<omp::SingleOp>,
++      RegionOpConversion<omp::SimdOp>, RegionOpConversion<omp::SingleOp>,
+       RegionOpConversion<omp::TaskgroupOp>, RegionOpConversion<omp::TaskOp>,
+       RegionOpConversion<omp::TargetDataOp>, RegionOpConversion<omp::TargetOp>,
+       RegionLessOpWithVarOperandsConversion<omp::AtomicWriteOp>,
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index e500d0fca741f..caf0ac3f86017 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1604,34 +1604,37 @@ void printLoopControl(OpAsmPrinter &p, Operation *op, Region &region,
+ // Simd construct [2.9.3.1]
+ //===----------------------------------------------------------------------===//
+ 
+-void SimdLoopOp::build(OpBuilder &builder, OperationState &state,
+-                       const SimdLoopClauseOps &clauses) {
++void SimdOp::build(OpBuilder &builder, OperationState &state,
++                   const SimdClauseOps &clauses) {
+   MLIRContext *ctx = builder.getContext();
+   // TODO Store clauses in op: privateVars, reductionByRefAttr, reductionVars,
+   // privatizers, reductionDeclSymbols.
+-  SimdLoopOp::build(
+-      builder, state, clauses.loopLBVar, clauses.loopUBVar, clauses.loopStepVar,
+-      clauses.alignedVars, makeArrayAttr(ctx, clauses.alignmentAttrs),
+-      clauses.ifVar, clauses.nontemporalVars, clauses.orderAttr,
+-      clauses.simdlenAttr, clauses.safelenAttr, clauses.loopInclusiveAttr);
++  SimdOp::build(builder, state, clauses.alignedVars,
++                makeArrayAttr(ctx, clauses.alignmentAttrs), clauses.ifVar,
++                clauses.nontemporalVars, clauses.orderAttr, clauses.simdlenAttr,
++                clauses.safelenAttr);
+ }
+ 
+-LogicalResult SimdLoopOp::verify() {
+-  if (this->getLowerBound().empty()) {
+-    return emitOpError() << "empty lowerbound for simd loop operation";
+-  }
+-  if (this->getSimdlen().has_value() && this->getSafelen().has_value() &&
+-      this->getSimdlen().value() > this->getSafelen().value()) {
++LogicalResult SimdOp::verify() {
++  if (getSimdlen().has_value() && getSafelen().has_value() &&
++      getSimdlen().value() > getSafelen().value())
+     return emitOpError()
+            << "simdlen clause and safelen clause are both present, but the "
+               "simdlen value is not less than or equal to safelen value";
+-  }
+-  if (verifyAlignedClause(*this, this->getAlignmentValues(),
+-                          this->getAlignedVars())
++
++  if (verifyAlignedClause(*this, getAlignmentValues(), getAlignedVars())
+           .failed())
+     return failure();
+-  if (verifyNontemporalClause(*this, this->getNontemporalVars()).failed())
++
++  if (verifyNontemporalClause(*this, getNontemporalVars()).failed())
+     return failure();
++
++  if (!isWrapper())
++    return emitOpError() << "must be a loop wrapper";
++
++  if (getNestedWrapper())
++    return emitOpError() << "must wrap an 'omp.loop_nest' directly";
++
+   return success();
+ }
+ 
+@@ -1662,9 +1665,9 @@ LogicalResult DistributeOp::verify() {
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after DISTRIBUTE.
+-    if (!isa<ParallelOp, SimdLoopOp>(nested))
++    if (!isa<ParallelOp, SimdOp>(nested))
+       return emitError() << "only supported nested wrappers are 'omp.parallel' "
+-                            "and 'omp.simdloop'";
++                            "and 'omp.simd'";
+   }
+ 
+   return success();
+@@ -1876,8 +1879,8 @@ LogicalResult TaskloopOp::verify() {
+   if (LoopWrapperInterface nested = getNestedWrapper()) {
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after TASKLOOP.
+-    if (!isa<SimdLoopOp>(nested))
+-      return emitError() << "only supported nested wrapper is 'omp.simdloop'";
++    if (!isa<SimdOp>(nested))
++      return emitError() << "only supported nested wrapper is 'omp.simd'";
+   }
+   return success();
+ }
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 300fc8ba56fc5..e89ff9209b034 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -1406,9 +1406,10 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+ 
+ /// Converts an OpenMP simd loop into LLVM IR using OpenMPIRBuilder.
+ static LogicalResult
+-convertOmpSimdLoop(Operation &opInst, llvm::IRBuilderBase &builder,
+-                   LLVM::ModuleTranslation &moduleTranslation) {
+-  auto loop = cast<omp::SimdLoopOp>(opInst);
++convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
++               LLVM::ModuleTranslation &moduleTranslation) {
++  auto simdOp = cast<omp::SimdOp>(opInst);
++  auto loopOp = cast<omp::LoopNestOp>(simdOp.getWrappedLoop());
+ 
+   llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+ 
+@@ -1421,33 +1422,34 @@ convertOmpSimdLoop(Operation &opInst, llvm::IRBuilderBase &builder,
+   auto bodyGen = [&](llvm::OpenMPIRBuilder::InsertPointTy ip, llvm::Value *iv) {
+     // Make sure further conversions know about the induction variable.
+     moduleTranslation.mapValue(
+-        loop.getRegion().front().getArgument(loopInfos.size()), iv);
++        loopOp.getRegion().front().getArgument(loopInfos.size()), iv);
+ 
+     // Capture the body insertion point for use in nested loops. BodyIP of the
+     // CanonicalLoopInfo always points to the beginning of the entry block of
+     // the body.
+     bodyInsertPoints.push_back(ip);
+ 
+-    if (loopInfos.size() != loop.getNumLoops() - 1)
++    if (loopInfos.size() != loopOp.getNumLoops() - 1)
+       return;
+ 
+     // Convert the body of the loop.
+     builder.restoreIP(ip);
+-    convertOmpOpRegions(loop.getRegion(), "omp.simdloop.region", builder,
++    convertOmpOpRegions(loopOp.getRegion(), "omp.simd.region", builder,
+                         moduleTranslation, bodyGenStatus);
+   };
+ 
+   // Delegate actual loop construction to the OpenMP IRBuilder.
+-  // TODO: this currently assumes SimdLoop is semantically similar to SCF loop,
+-  // i.e. it has a positive step, uses signed integer semantics. Reconsider
+-  // this code when SimdLoop clearly supports more cases.
++  // TODO: this currently assumes omp.loop_nest is semantically similar to SCF
++  // loop, i.e. it has a positive step, uses signed integer semantics.
++  // Reconsider this code when the nested loop operation clearly supports more
++  // cases.
+   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
+-  for (unsigned i = 0, e = loop.getNumLoops(); i < e; ++i) {
++  for (unsigned i = 0, e = loopOp.getNumLoops(); i < e; ++i) {
+     llvm::Value *lowerBound =
+-        moduleTranslation.lookupValue(loop.getLowerBound()[i]);
++        moduleTranslation.lookupValue(loopOp.getLowerBound()[i]);
+     llvm::Value *upperBound =
+-        moduleTranslation.lookupValue(loop.getUpperBound()[i]);
+-    llvm::Value *step = moduleTranslation.lookupValue(loop.getStep()[i]);
++        moduleTranslation.lookupValue(loopOp.getUpperBound()[i]);
++    llvm::Value *step = moduleTranslation.lookupValue(loopOp.getStep()[i]);
+ 
+     // Make sure loop trip count are emitted in the preheader of the outermost
+     // loop at the latest so that they are all available for the new collapsed
+@@ -1473,18 +1475,18 @@ convertOmpSimdLoop(Operation &opInst, llvm::IRBuilderBase &builder,
+       ompBuilder->collapseLoops(ompLoc.DL, loopInfos, {});
+ 
+   llvm::ConstantInt *simdlen = nullptr;
+-  if (std::optional<uint64_t> simdlenVar = loop.getSimdlen())
++  if (std::optional<uint64_t> simdlenVar = simdOp.getSimdlen())
+     simdlen = builder.getInt64(simdlenVar.value());
+ 
+   llvm::ConstantInt *safelen = nullptr;
+-  if (std::optional<uint64_t> safelenVar = loop.getSafelen())
++  if (std::optional<uint64_t> safelenVar = simdOp.getSafelen())
+     safelen = builder.getInt64(safelenVar.value());
+ 
+   llvm::MapVector<llvm::Value *, llvm::Value *> alignedVars;
+   ompBuilder->applySimd(
+       loopInfo, alignedVars,
+-      loop.getIfExpr() ? moduleTranslation.lookupValue(loop.getIfExpr())
+-                       : nullptr,
++      simdOp.getIfExpr() ? moduleTranslation.lookupValue(simdOp.getIfExpr())
++                         : nullptr,
+       llvm::omp::OrderKind::OMP_ORDER_unknown, simdlen, safelen);
+ 
+   builder.restoreIP(afterIP);
+@@ -3198,8 +3200,8 @@ convertHostOrTargetOperation(Operation *op, llvm::IRBuilderBase &builder,
+       .Case([&](omp::WsloopOp) {
+         return convertOmpWsloop(*op, builder, moduleTranslation);
+       })
+-      .Case([&](omp::SimdLoopOp) {
+-        return convertOmpSimdLoop(*op, builder, moduleTranslation);
++      .Case([&](omp::SimdOp) {
++        return convertOmpSimd(*op, builder, moduleTranslation);
+       })
+       .Case([&](omp::AtomicReadOp) {
+         return convertOmpAtomicRead(*op, builder, moduleTranslation);
+@@ -3421,7 +3423,6 @@ LogicalResult OpenMPDialectLLVMIRTranslationInterface::convertOperation(
+       return convertTargetOpsInNest(op, builder, moduleTranslation);
+     }
+   }
+-
+   return convertHostOrTargetOperation(op, builder, moduleTranslation);
+ }
+ 
+diff --git a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+index dc5d6969ca789..9f45d139b81f2 100644
+--- a/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
++++ b/mlir/test/Conversion/OpenMPToLLVM/convert-to-llvmir.mlir
+@@ -145,9 +145,10 @@ func.func @threadprivate(%a: !llvm.ptr) -> () {
+ 
+ // -----
+ 
+-// CHECK:      llvm.func @simdloop_block_arg(%[[LOWER:.*]]: i32, %[[UPPER:.*]]: i32, %[[ITER:.*]]: i64) {
+-// CHECK:      omp.simdloop   for  (%[[ARG_0:.*]]) : i32 =
+-// CHECK-SAME:     (%[[LOWER]]) to (%[[UPPER]]) inclusive step (%[[LOWER]]) {
++// CHECK:      llvm.func @loop_nest_block_arg(%[[LOWER:.*]]: i32, %[[UPPER:.*]]: i32, %[[ITER:.*]]: i64) {
++// CHECK:      omp.simd {
++// CHECK-NEXT: omp.loop_nest (%[[ARG_0:.*]]) : i32 = (%[[LOWER]])
++// CHECK-SAME: to (%[[UPPER]]) inclusive step (%[[LOWER]]) {
+ // CHECK:      llvm.br ^[[BB1:.*]](%[[ITER]] : i64)
+ // CHECK:        ^[[BB1]](%[[VAL_0:.*]]: i64):
+ // CHECK:          %[[VAL_1:.*]] = llvm.icmp "slt" %[[VAL_0]], %[[ITER]] : i64
+@@ -157,17 +158,19 @@ func.func @threadprivate(%a: !llvm.ptr) -> () {
+ // CHECK:          llvm.br ^[[BB1]](%[[VAL_2]] : i64)
+ // CHECK:        ^[[BB3]]:
+ // CHECK:          omp.yield
+-func.func @simdloop_block_arg(%val : i32, %ub : i32, %i : index) {
+-  omp.simdloop   for  (%arg0) : i32 = (%val) to (%ub) inclusive step (%val) {
+-    cf.br ^bb1(%i : index)
+-  ^bb1(%0: index):
+-    %1 = arith.cmpi slt, %0, %i : index
+-    cf.cond_br %1, ^bb2, ^bb3
+-  ^bb2:
+-    %2 = arith.addi %0, %i : index
+-    cf.br ^bb1(%2 : index)
+-  ^bb3:
+-    omp.yield
++func.func @loop_nest_block_arg(%val : i32, %ub : i32, %i : index) {
++  omp.simd {
++    omp.loop_nest (%arg0) : i32 = (%val) to (%ub) inclusive step (%val) {
++      cf.br ^bb1(%i : index)
++    ^bb1(%0: index):
++      %1 = arith.cmpi slt, %0, %i : index
++      cf.cond_br %1, ^bb2, ^bb3
++    ^bb2:
++      %2 = arith.addi %0, %i : index
++      cf.br ^bb1(%2 : index)
++    ^bb3:
++      omp.yield
++    }
+   }
+   return
+ }
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index 7f86a7f5b3182..9323beadf4549 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -243,145 +243,168 @@ llvm.func @test_omp_wsloop_dynamic_wrong_modifier3(%lb : i64, %ub : i64, %step :
+ 
+ // -----
+ 
+-func.func @omp_simdloop(%lb : index, %ub : index, %step : i32) -> () {
+-  // expected-error @below {{op failed to verify that all of {lowerBound, upperBound, step} have same type}}
+-  "omp.simdloop" (%lb, %ub, %step) ({
+-    ^bb0(%iv: index):
+-      omp.yield
+-  }) {operandSegmentSizes = array<i32: 1,1,1,0,0,0>} :
+-    (index, index, i32) -> ()
++func.func @omp_simd() -> () {
++  // expected-error @below {{op must be a loop wrapper}}
++  omp.simd {
++    omp.terminator
++  }
++  return
++}
+ 
++// -----
++
++func.func @omp_simd_nested_wrapper() -> () {
++  // expected-error @below {{op must wrap an 'omp.loop_nest' directly}}
++  omp.simd {
++    omp.distribute {
++      omp.terminator
++    }
++  }
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_pretty_aligned(%lb : index, %ub : index, %step : index,
+-                                       %data_var : memref<i32>) -> () {
++func.func @omp_simd_pretty_aligned(%lb : index, %ub : index, %step : index,
++                                   %data_var : memref<i32>) -> () {
+   //  expected-error @below {{expected '->'}}
+-  omp.simdloop aligned(%data_var : memref<i32>)
+-  for (%iv) : index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++  omp.simd aligned(%data_var : memref<i32>) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_aligned_mismatch(%arg0 : index, %arg1 : index,
+-                                         %arg2 : index, %arg3 : memref<i32>,
+-                                         %arg4 : memref<i32>) -> () {
++func.func @omp_simd_aligned_mismatch(%arg0 : index, %arg1 : index,
++                                     %arg2 : index, %arg3 : memref<i32>,
++                                     %arg4 : memref<i32>) -> () {
+   //  expected-error @below {{op expected as many alignment values as aligned variables}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg4) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
++  "omp.simd"(%arg3, %arg4) ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
+   }) {alignment_values = [128],
+-      operandSegmentSizes = array<i32: 1, 1, 1, 2, 0, 0>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++      operandSegmentSizes = array<i32: 2, 0, 0>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_aligned_negative(%arg0 : index, %arg1 : index,
+-                                         %arg2 : index, %arg3 : memref<i32>,
+-                                         %arg4 : memref<i32>) -> () {
++func.func @omp_simd_aligned_negative(%arg0 : index, %arg1 : index,
++                                     %arg2 : index, %arg3 : memref<i32>,
++                                     %arg4 : memref<i32>) -> () {
+   //  expected-error @below {{op alignment should be greater than 0}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg4) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
+-  }) {alignment_values = [-1, 128], operandSegmentSizes = array<i32: 1, 1, 1,2, 0, 0>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++  "omp.simd"(%arg3, %arg4) ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }) {alignment_values = [-1, 128], operandSegmentSizes = array<i32: 2, 0, 0>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_unexpected_alignment(%arg0 : index, %arg1 : index,
+-                                             %arg2 : index, %arg3 : memref<i32>,
+-                                             %arg4 : memref<i32>) -> () {
++func.func @omp_simd_unexpected_alignment(%arg0 : index, %arg1 : index,
++                                         %arg2 : index, %arg3 : memref<i32>,
++                                         %arg4 : memref<i32>) -> () {
+   //  expected-error @below {{unexpected alignment values attribute}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
+-  }) {alignment_values = [1, 128], operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0>} : (index, index, index) -> ()
++  "omp.simd"() ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }) {alignment_values = [1, 128]} : () -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_aligned_float(%arg0 : index, %arg1 : index,
+-                                      %arg2 : index, %arg3 : memref<i32>,
+-                                      %arg4 : memref<i32>) -> () {
++func.func @omp_simd_aligned_float(%arg0 : index, %arg1 : index,
++                                  %arg2 : index, %arg3 : memref<i32>,
++                                  %arg4 : memref<i32>) -> () {
+   //  expected-error @below {{failed to satisfy constraint: 64-bit integer array attribute}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg4) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
+-  }) {alignment_values = [1.5, 128], operandSegmentSizes = array<i32: 1, 1, 1,2, 0, 0>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++  "omp.simd"(%arg3, %arg4) ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }) {alignment_values = [1.5, 128], operandSegmentSizes = array<i32: 2, 0, 0>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_aligned_the_same_var(%arg0 : index, %arg1 : index,
+-                                             %arg2 : index, %arg3 : memref<i32>,
+-                                             %arg4 : memref<i32>) -> () {
++func.func @omp_simd_aligned_the_same_var(%arg0 : index, %arg1 : index,
++                                         %arg2 : index, %arg3 : memref<i32>,
++                                         %arg4 : memref<i32>) -> () {
+   //  expected-error @below {{aligned variable used more than once}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg3) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
+-  }) {alignment_values = [1, 128], operandSegmentSizes = array<i32: 1, 1, 1,2, 0, 0>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++  "omp.simd"(%arg3, %arg3) ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }) {alignment_values = [1, 128], operandSegmentSizes = array<i32: 2, 0, 0>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_nontemporal_the_same_var(%arg0 : index,
+-                                                 %arg1 : index,
+-                                                 %arg2 : index,
+-                                                 %arg3 : memref<i32>) -> () {
++func.func @omp_simd_nontemporal_the_same_var(%arg0 : index,  %arg1 : index,
++                                             %arg2 : index,
++                                             %arg3 : memref<i32>) -> () {
+   //  expected-error @below {{nontemporal variable used more than once}}
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg3) ({
+-    ^bb0(%arg5: index):
+-      "omp.yield"() : () -> ()
+-  }) {operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 2>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++  "omp.simd"(%arg3, %arg3) ({
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }) {operandSegmentSizes = array<i32: 0, 0, 2>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_order_value(%lb : index, %ub : index, %step : index) {
++func.func @omp_simd_order_value(%lb : index, %ub : index, %step : index) {
+   // expected-error @below {{invalid clause value: 'default'}}
+-  omp.simdloop order(default) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++  omp.simd order(default) {
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_pretty_simdlen(%lb : index, %ub : index, %step : index) -> () {
++func.func @omp_simd_pretty_simdlen(%lb : index, %ub : index, %step : index) -> () {
+   // expected-error @below {{op attribute 'simdlen' failed to satisfy constraint: 64-bit signless integer attribute whose value is positive}}
+-  omp.simdloop simdlen(0) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++  omp.simd simdlen(0) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_pretty_safelen(%lb : index, %ub : index, %step : index) -> () {
++func.func @omp_simd_pretty_safelen(%lb : index, %ub : index, %step : index) -> () {
+   // expected-error @below {{op attribute 'safelen' failed to satisfy constraint: 64-bit signless integer attribute whose value is positive}}
+-  omp.simdloop safelen(0) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++  omp.simd safelen(0) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+ // -----
+ 
+-func.func @omp_simdloop_pretty_simdlen_safelen(%lb : index, %ub : index, %step : index) -> () {
+-  // expected-error @below {{'omp.simdloop' op simdlen clause and safelen clause are both present, but the simdlen value is not less than or equal to safelen value}}
+-  omp.simdloop simdlen(2) safelen(1) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++func.func @omp_simd_pretty_simdlen_safelen(%lb : index, %ub : index, %step : index) -> () {
++  // expected-error @below {{op simdlen clause and safelen clause are both present, but the simdlen value is not less than or equal to safelen value}}
++  omp.simd simdlen(2) safelen(1) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+@@ -1720,7 +1743,7 @@ func.func @taskloop(%lb: i32, %ub: i32, %step: i32) {
+ // -----
+ 
+ func.func @taskloop(%lb: i32, %ub: i32, %step: i32) {
+-  // expected-error @below {{only supported nested wrapper is 'omp.simdloop'}}
++  // expected-error @below {{only supported nested wrapper is 'omp.simd'}}
+   omp.taskloop {
+     omp.distribute {
+       omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+@@ -1927,7 +1950,7 @@ func.func @omp_distribute_wrapper() -> () {
+ // -----
+ 
+ func.func @omp_distribute_nested_wrapper(%data_var : memref<i32>) -> () {
+-  // expected-error @below {{only supported nested wrappers are 'omp.parallel' and 'omp.simdloop'}}
++  // expected-error @below {{only supported nested wrappers are 'omp.parallel' and 'omp.simd'}}
+   "omp.distribute"() ({
+       "omp.wsloop"() ({
+         %0 = arith.constant 0 : i32
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 802e1795b3fff..e2ca12afc14bd 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -439,154 +439,161 @@ func.func @omp_wsloop_pretty_multiple(%lb1 : i32, %ub1 : i32, %step1 : i32, %lb2
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop
+-func.func @omp_simdloop(%lb : index, %ub : index, %step : index) -> () {
+-  // CHECK: omp.simdloop for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  "omp.simdloop" (%lb, %ub, %step) ({
+-    ^bb0(%iv: index):
+-      omp.yield
+-  }) {operandSegmentSizes = array<i32: 1,1,1,0,0,0>} :
+-    (index, index, index) -> ()
++// CHECK-LABEL: omp_simd
++func.func @omp_simd(%lb : index, %ub : index, %step : index) -> () {
++  // CHECK: omp.simd
++  "omp.simd" () ({
++    "omp.loop_nest" (%lb, %ub, %step) ({
++    ^bb1(%iv2: index):
++      "omp.yield"() : () -> ()
++    }) : (index, index, index) -> ()
++    "omp.terminator"() : () -> ()
++  }) : () -> ()
+ 
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_aligned_list
+-func.func @omp_simdloop_aligned_list(%arg0 : index, %arg1 : index, %arg2 : index,
+-                                     %arg3 : memref<i32>, %arg4 : memref<i32>) -> () {
+-  // CHECK:      omp.simdloop   aligned(%{{.*}} : memref<i32> -> 32 : i64,
++// CHECK-LABEL: omp_simd_aligned_list
++func.func @omp_simd_aligned_list(%arg0 : index, %arg1 : index, %arg2 : index,
++                                 %arg3 : memref<i32>, %arg4 : memref<i32>) -> () {
++  // CHECK:      omp.simd aligned(
++  // CHECK-SAME: %{{.*}} : memref<i32> -> 32 : i64,
+   // CHECK-SAME: %{{.*}} : memref<i32> -> 128 : i64)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg4) ({
+-    ^bb0(%arg5: index):
++  "omp.simd"(%arg3, %arg4) ({
++    "omp.loop_nest" (%arg0, %arg1, %arg2) ({
++    ^bb1(%iv2: index):
+       "omp.yield"() : () -> ()
++    }) : (index, index, index) -> ()
++    "omp.terminator"() : () -> ()
+   }) {alignment_values = [32, 128],
+-      operandSegmentSizes = array<i32: 1, 1, 1, 2, 0, 0>} : (index, index, index, memref<i32>, memref<i32>) -> ()
++      operandSegmentSizes = array<i32: 2, 0, 0>} : (memref<i32>, memref<i32>) -> ()
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_aligned_single
+-func.func @omp_simdloop_aligned_single(%arg0 : index, %arg1 : index, %arg2 : index,
+-                                       %arg3 : memref<i32>, %arg4 : memref<i32>) -> () {
+-  // CHECK:      omp.simdloop   aligned(%{{.*}} : memref<i32> -> 32 : i64)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3) ({
+-    ^bb0(%arg5: index):
++// CHECK-LABEL: omp_simd_aligned_single
++func.func @omp_simd_aligned_single(%arg0 : index, %arg1 : index, %arg2 : index,
++                                   %arg3 : memref<i32>, %arg4 : memref<i32>) -> () {
++  // CHECK: omp.simd aligned(%{{.*}} : memref<i32> -> 32 : i64)
++  "omp.simd"(%arg3) ({
++    "omp.loop_nest" (%arg0, %arg1, %arg2) ({
++    ^bb1(%iv2: index):
+       "omp.yield"() : () -> ()
++    }) : (index, index, index) -> ()
++    "omp.terminator"() : () -> ()
+   }) {alignment_values = [32],
+-      operandSegmentSizes = array<i32: 1, 1, 1, 1, 0, 0>} : (index, index, index, memref<i32>) -> ()
++      operandSegmentSizes = array<i32: 1, 0, 0>} : (memref<i32>) -> ()
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_nontemporal_list
+-func.func @omp_simdloop_nontemporal_list(%arg0 : index,
+-                                         %arg1 : index,
+-                                         %arg2 : index,
+-                                         %arg3 : memref<i32>,
+-                                         %arg4 : memref<i64>) -> () {
+-  // CHECK:      omp.simdloop   nontemporal(%{{.*}}, %{{.*}} : memref<i32>, memref<i64>)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3, %arg4) ({
+-    ^bb0(%arg5: index):
++// CHECK-LABEL: omp_simd_nontemporal_list
++func.func @omp_simd_nontemporal_list(%arg0 : index, %arg1 : index,
++                                     %arg2 : index, %arg3 : memref<i32>,
++                                     %arg4 : memref<i64>) -> () {
++  // CHECK: omp.simd nontemporal(%{{.*}}, %{{.*}} : memref<i32>, memref<i64>)
++  "omp.simd"(%arg3, %arg4) ({
++    "omp.loop_nest" (%arg0, %arg1, %arg2) ({
++    ^bb1(%iv2: index):
+       "omp.yield"() : () -> ()
+-  }) {operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 2>} : (index, index, index, memref<i32>, memref<i64>) -> ()
++    }) : (index, index, index) -> ()
++    "omp.terminator"() : () -> ()
++  }) {operandSegmentSizes = array<i32: 0, 0, 2>} : (memref<i32>, memref<i64>) -> ()
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_nontemporal_single
+-func.func @omp_simdloop_nontemporal_single(%arg0 : index,
+-                                           %arg1 : index,
+-                                           %arg2 : index,
+-                                           %arg3 : memref<i32>,
+-                                           %arg4 : memref<i64>) -> () {
+-  // CHECK:      omp.simdloop   nontemporal(%{{.*}} : memref<i32>)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  "omp.simdloop"(%arg0, %arg1, %arg2, %arg3) ({
+-    ^bb0(%arg5: index):
++// CHECK-LABEL: omp_simd_nontemporal_single
++func.func @omp_simd_nontemporal_single(%arg0 : index, %arg1 : index,
++                                       %arg2 : index, %arg3 : memref<i32>,
++                                       %arg4 : memref<i64>) -> () {
++  // CHECK: omp.simd nontemporal(%{{.*}} : memref<i32>)
++  "omp.simd"(%arg3) ({
++    "omp.loop_nest" (%arg0, %arg1, %arg2) ({
++    ^bb1(%iv2: index):
+       "omp.yield"() : () -> ()
+-  }) {operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 1>} : (index, index, index, memref<i32>) -> ()
++    }) : (index, index, index) -> ()
++    "omp.terminator"() : () -> ()
++  }) {operandSegmentSizes = array<i32: 0, 0, 1>} : (memref<i32>) -> ()
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_pretty
+-func.func @omp_simdloop_pretty(%lb : index, %ub : index, %step : index) -> () {
+-  // CHECK: omp.simdloop for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  omp.simdloop for (%iv) : index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++// CHECK-LABEL: omp_simd_pretty
++func.func @omp_simd_pretty(%lb : index, %ub : index, %step : index) -> () {
++  // CHECK: omp.simd {
++  omp.simd {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL:   func.func @omp_simdloop_pretty_aligned(
+-func.func @omp_simdloop_pretty_aligned(%lb : index, %ub : index, %step : index,
+-                                       %data_var : memref<i32>,
+-                                       %data_var1 : memref<i32>) -> () {
+-  // CHECK:      omp.simdloop   aligned(%{{.*}} : memref<i32> -> 32 : i64,
++// CHECK-LABEL:   func.func @omp_simd_pretty_aligned(
++func.func @omp_simd_pretty_aligned(%lb : index, %ub : index, %step : index,
++                                   %data_var : memref<i32>,
++                                   %data_var1 : memref<i32>) -> () {
++  // CHECK:      omp.simd aligned(
++  // CHECK-SAME: %{{.*}} : memref<i32> -> 32 : i64,
+   // CHECK-SAME: %{{.*}} : memref<i32> -> 128 : i64)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  omp.simdloop aligned(%data_var :  memref<i32> -> 32, %data_var1 : memref<i32> -> 128)
+-    for (%iv) : index = (%lb) to (%ub) step (%step) {
++  omp.simd aligned(%data_var :  memref<i32> -> 32, %data_var1 : memref<i32> -> 128) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+       omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_pretty_if
+-func.func @omp_simdloop_pretty_if(%lb : index, %ub : index, %step : index, %if_cond : i1) -> () {
+-  // CHECK: omp.simdloop if(%{{.*}}) for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  omp.simdloop if(%if_cond) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++// CHECK-LABEL: omp_simd_pretty_if
++func.func @omp_simd_pretty_if(%lb : index, %ub : index, %step : index, %if_cond : i1) -> () {
++  // CHECK: omp.simd if(%{{.*}})
++  omp.simd if(%if_cond) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL:   func.func @omp_simdloop_pretty_nontemporal
+-func.func @omp_simdloop_pretty_nontemporal(%lb : index,
+-                                           %ub : index,
+-                                           %step : index,
+-                                           %data_var : memref<i32>,
+-                                           %data_var1 : memref<i32>) -> () {
+-  // CHECK:      omp.simdloop   nontemporal(%{{.*}}, %{{.*}} : memref<i32>, memref<i32>)
+-  // CHECK-SAME: for  (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}}) {
+-  omp.simdloop nontemporal(%data_var, %data_var1 : memref<i32>, memref<i32>)
+-    for (%iv) : index = (%lb) to (%ub) step (%step) {
++// CHECK-LABEL: func.func @omp_simd_pretty_nontemporal
++func.func @omp_simd_pretty_nontemporal(%lb : index, %ub : index, %step : index,
++                                       %data_var : memref<i32>,
++                                       %data_var1 : memref<i32>) -> () {
++  // CHECK: omp.simd nontemporal(%{{.*}}, %{{.*}} : memref<i32>, memref<i32>)
++  omp.simd nontemporal(%data_var, %data_var1 : memref<i32>, memref<i32>) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+       omp.yield
+-  }
+-  return
+-}
+-// CHECK-LABEL: omp_simdloop_pretty_order
+-func.func @omp_simdloop_pretty_order(%lb : index, %ub : index, %step : index) -> () {
+-  // CHECK: omp.simdloop order(concurrent)
+-  // CHECK-SAME: for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  omp.simdloop order(concurrent) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_pretty_simdlen
+-func.func @omp_simdloop_pretty_simdlen(%lb : index, %ub : index, %step : index) -> () {
+-  // CHECK: omp.simdloop simdlen(2) for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  omp.simdloop simdlen(2) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++// CHECK-LABEL: omp_simd_pretty_order
++func.func @omp_simd_pretty_order(%lb : index, %ub : index, %step : index) -> () {
++  // CHECK: omp.simd order(concurrent)
++  omp.simd order(concurrent) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_pretty_safelen
+-func.func @omp_simdloop_pretty_safelen(%lb : index, %ub : index, %step : index) -> () {
+-  // CHECK: omp.simdloop safelen(2) for (%{{.*}}) : index = (%{{.*}}) to (%{{.*}}) step (%{{.*}})
+-  omp.simdloop safelen(2) for (%iv): index = (%lb) to (%ub) step (%step) {
+-    omp.yield
++// CHECK-LABEL: omp_simd_pretty_simdlen
++func.func @omp_simd_pretty_simdlen(%lb : index, %ub : index, %step : index) -> () {
++  // CHECK: omp.simd simdlen(2)
++  omp.simd simdlen(2) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+ 
+-// CHECK-LABEL: omp_simdloop_pretty_multiple
+-func.func @omp_simdloop_pretty_multiple(%lb1 : index, %ub1 : index, %step1 : index, %lb2 : index, %ub2 : index, %step2 : index) -> () {
+-  // CHECK: omp.simdloop for (%{{.*}}, %{{.*}}) : index = (%{{.*}}, %{{.*}}) to (%{{.*}}, %{{.*}}) step (%{{.*}}, %{{.*}})
+-  omp.simdloop for (%iv1, %iv2) : index = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
+-    omp.yield
++// CHECK-LABEL: omp_simd_pretty_safelen
++func.func @omp_simd_pretty_safelen(%lb : index, %ub : index, %step : index) -> () {
++  // CHECK: omp.simd safelen(2)
++  omp.simd safelen(2) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
+   }
+   return
+ }
+@@ -633,15 +640,13 @@ func.func @omp_distribute(%chunk_size : i32, %data_var : memref<i32>, %arg0 : i3
+   }
+   // CHECK: omp.distribute
+   omp.distribute {
+-    // TODO Remove induction variables from omp.simdloop.
+-    omp.simdloop for (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++    omp.simd {
+       omp.loop_nest (%iv2) : i32 = (%arg0) to (%arg0) step (%arg0) {
+         omp.yield
+       }
+-      omp.yield
+     }
+   }
+-return
++  return
+ }
+ 
+ 
+@@ -2170,14 +2175,11 @@ func.func @omp_taskloop(%lb: i32, %ub: i32, %step: i32) -> () {
+ 
+   // CHECK: omp.taskloop {
+   omp.taskloop {
+-    // TODO Remove induction variables from omp.simdloop.
+-    omp.simdloop for (%iv) : i32 = (%lb) to (%ub) step (%step) {
++    omp.simd {
+       omp.loop_nest (%i, %j) : i32 = (%lb, %ub) to (%ub, %lb) step (%step, %step) {
+         // CHECK: omp.yield
+         omp.yield
+       }
+-      // CHECK: omp.yield
+-      omp.yield
+     }
+   }
+ 
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index 4cb99c1f1a285..d1390022c1dc4 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -638,10 +638,10 @@ llvm.func @test_omp_wsloop_guided_simd(%lb : i64, %ub : i64, %step : i64) -> ()
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_simple
+-llvm.func @simdloop_simple(%lb : i64, %ub : i64, %step : i64, %arg0: !llvm.ptr) {
+-  "omp.simdloop" (%lb, %ub, %step) ({
+-    ^bb0(%iv: i64):
++// CHECK-LABEL: @simd_simple
++llvm.func @simd_simple(%lb : i64, %ub : i64, %step : i64, %arg0: !llvm.ptr) {
++  "omp.simd" () ({
++    omp.loop_nest (%iv) : i64 = (%lb) to (%ub) step (%step) {
+       %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
+       // The form of the emitted IR is controlled by OpenMPIRBuilder and
+       // tested there. Just check that the right metadata is added.
+@@ -649,8 +649,9 @@ llvm.func @simdloop_simple(%lb : i64, %ub : i64, %step : i64, %arg0: !llvm.ptr)
+       %4 = llvm.getelementptr %arg0[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+       llvm.store %3, %4 : f32, !llvm.ptr
+       omp.yield
+-  }) {operandSegmentSizes = array<i32: 1,1,1,0,0,0>} :
+-    (i64, i64, i64) -> ()
++    }
++    "omp.terminator"() : () -> ()
++  }) : () -> ()
+ 
+   llvm.return
+ }
+@@ -659,34 +660,36 @@ llvm.func @simdloop_simple(%lb : i64, %ub : i64, %step : i64, %arg0: !llvm.ptr)
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_simple_multiple
+-llvm.func @simdloop_simple_multiple(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+-  omp.simdloop for (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
+-    %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
+-    // The form of the emitted IR is controlled by OpenMPIRBuilder and
+-    // tested there. Just check that the right metadata is added and collapsed
+-    // loop bound is generated (Collapse clause is represented as a loop with
+-    // list of indices, bounds and steps where the size of the list is equal
+-    // to the collapse value.)
+-    // CHECK: icmp slt i64
+-    // CHECK-COUNT-3: select
+-    // CHECK: %[[TRIPCOUNT0:.*]] = select
+-    // CHECK: br label %[[PREHEADER:.*]]
+-    // CHECK: [[PREHEADER]]:
+-    // CHECK: icmp slt i64
+-    // CHECK-COUNT-3: select
+-    // CHECK: %[[TRIPCOUNT1:.*]] = select
+-    // CHECK: mul nuw i64 %[[TRIPCOUNT0]], %[[TRIPCOUNT1]]
+-    // CHECK: br label %[[COLLAPSED_PREHEADER:.*]]
+-    // CHECK: [[COLLAPSED_PREHEADER]]:
+-    // CHECK: br label %[[COLLAPSED_HEADER:.*]]
+-    // CHECK: llvm.access.group
+-    // CHECK-NEXT: llvm.access.group
+-    %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    llvm.store %3, %4 : f32, !llvm.ptr
+-    llvm.store %3, %5 : f32, !llvm.ptr
+-    omp.yield
++// CHECK-LABEL: @simd_simple_multiple
++llvm.func @simd_simple_multiple(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
++  omp.simd {
++    omp.loop_nest (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
++      %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
++      // The form of the emitted IR is controlled by OpenMPIRBuilder and
++      // tested there. Just check that the right metadata is added and collapsed
++      // loop bound is generated (Collapse clause is represented as a loop with
++      // list of indices, bounds and steps where the size of the list is equal
++      // to the collapse value.)
++      // CHECK: icmp slt i64
++      // CHECK-COUNT-3: select
++      // CHECK: %[[TRIPCOUNT0:.*]] = select
++      // CHECK: br label %[[PREHEADER:.*]]
++      // CHECK: [[PREHEADER]]:
++      // CHECK: icmp slt i64
++      // CHECK-COUNT-3: select
++      // CHECK: %[[TRIPCOUNT1:.*]] = select
++      // CHECK: mul nuw i64 %[[TRIPCOUNT0]], %[[TRIPCOUNT1]]
++      // CHECK: br label %[[COLLAPSED_PREHEADER:.*]]
++      // CHECK: [[COLLAPSED_PREHEADER]]:
++      // CHECK: br label %[[COLLAPSED_HEADER:.*]]
++      // CHECK: llvm.access.group
++      // CHECK-NEXT: llvm.access.group
++      %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      llvm.store %3, %4 : f32, !llvm.ptr
++      llvm.store %3, %5 : f32, !llvm.ptr
++      omp.yield
++    }
+   }
+   llvm.return
+ }
+@@ -695,19 +698,21 @@ llvm.func @simdloop_simple_multiple(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 :
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_simple_multiple_simdlen
+-llvm.func @simdloop_simple_multiple_simdlen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+-  omp.simdloop simdlen(2) for (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
+-    %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
+-    // The form of the emitted IR is controlled by OpenMPIRBuilder and
+-    // tested there. Just check that the right metadata is added.
+-    // CHECK: llvm.access.group
+-    // CHECK-NEXT: llvm.access.group
+-    %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    llvm.store %3, %4 : f32, !llvm.ptr
+-    llvm.store %3, %5 : f32, !llvm.ptr
+-    omp.yield
++// CHECK-LABEL: @simd_simple_multiple_simdlen
++llvm.func @simd_simple_multiple_simdlen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
++  omp.simd simdlen(2) {
++    omp.loop_nest (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
++      %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
++      // The form of the emitted IR is controlled by OpenMPIRBuilder and
++      // tested there. Just check that the right metadata is added.
++      // CHECK: llvm.access.group
++      // CHECK-NEXT: llvm.access.group
++      %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      llvm.store %3, %4 : f32, !llvm.ptr
++      llvm.store %3, %5 : f32, !llvm.ptr
++      omp.yield
++    }
+   }
+   llvm.return
+ }
+@@ -717,15 +722,17 @@ llvm.func @simdloop_simple_multiple_simdlen(%lb1 : i64, %ub1 : i64, %step1 : i64
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_simple_multiple_safelen
+-llvm.func @simdloop_simple_multiple_safelen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+-  omp.simdloop safelen(2) for (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
+-    %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
+-    %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    llvm.store %3, %4 : f32, !llvm.ptr
+-    llvm.store %3, %5 : f32, !llvm.ptr
+-    omp.yield
++// CHECK-LABEL: @simd_simple_multiple_safelen
++llvm.func @simd_simple_multiple_safelen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
++  omp.simd safelen(2) {
++    omp.loop_nest (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
++      %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
++      %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      llvm.store %3, %4 : f32, !llvm.ptr
++      llvm.store %3, %5 : f32, !llvm.ptr
++      omp.yield
++    }
+   }
+   llvm.return
+ }
+@@ -734,15 +741,17 @@ llvm.func @simdloop_simple_multiple_safelen(%lb1 : i64, %ub1 : i64, %step1 : i64
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_simple_multiple_simdlen_safelen
+-llvm.func @simdloop_simple_multiple_simdlen_safelen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+-  omp.simdloop simdlen(1) safelen(2) for (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
+-    %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
+-    %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+-    llvm.store %3, %4 : f32, !llvm.ptr
+-    llvm.store %3, %5 : f32, !llvm.ptr
+-    omp.yield
++// CHECK-LABEL: @simd_simple_multiple_simdlen_safelen
++llvm.func @simd_simple_multiple_simdlen_safelen(%lb1 : i64, %ub1 : i64, %step1 : i64, %lb2 : i64, %ub2 : i64, %step2 : i64, %arg0: !llvm.ptr, %arg1: !llvm.ptr) {
++  omp.simd simdlen(1) safelen(2) {
++    omp.loop_nest (%iv1, %iv2) : i64 = (%lb1, %lb2) to (%ub1, %ub2) step (%step1, %step2) {
++      %3 = llvm.mlir.constant(2.000000e+00 : f32) : f32
++      %4 = llvm.getelementptr %arg0[%iv1] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      %5 = llvm.getelementptr %arg1[%iv2] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++      llvm.store %3, %4 : f32, !llvm.ptr
++      llvm.store %3, %5 : f32, !llvm.ptr
++      omp.yield
++    }
+   }
+   llvm.return
+ }
+@@ -751,8 +760,8 @@ llvm.func @simdloop_simple_multiple_simdlen_safelen(%lb1 : i64, %ub1 : i64, %ste
+ 
+ // -----
+ 
+-// CHECK-LABEL: @simdloop_if
+-llvm.func @simdloop_if(%arg0: !llvm.ptr {fir.bindc_name = "n"}, %arg1: !llvm.ptr {fir.bindc_name = "threshold"}) {
++// CHECK-LABEL: @simd_if
++llvm.func @simd_if(%arg0: !llvm.ptr {fir.bindc_name = "n"}, %arg1: !llvm.ptr {fir.bindc_name = "threshold"}) {
+   %0 = llvm.mlir.constant(1 : i64) : i64
+   %1 = llvm.alloca %0 x i32 {adapt.valuebyref, in_type = i32, operandSegmentSizes = array<i32: 0, 0>} : (i64) -> !llvm.ptr
+   %2 = llvm.mlir.constant(1 : i64) : i64
+@@ -763,12 +772,14 @@ llvm.func @simdloop_if(%arg0: !llvm.ptr {fir.bindc_name = "n"}, %arg1: !llvm.ptr
+   %7 = llvm.load %arg0 : !llvm.ptr -> i32
+   %8 = llvm.load %arg1 : !llvm.ptr -> i32
+   %9 = llvm.icmp "sge" %7, %8 : i32
+-  omp.simdloop   if(%9) for  (%arg2) : i32 = (%4) to (%5) inclusive step (%6) {
+-    // The form of the emitted IR is controlled by OpenMPIRBuilder and
+-    // tested there. Just check that the right metadata is added.
+-    // CHECK: llvm.access.group
+-    llvm.store %arg2, %1 : i32, !llvm.ptr
+-    omp.yield
++  omp.simd if(%9) {
++    omp.loop_nest (%arg2) : i32 = (%4) to (%5) inclusive step (%6) {
++      // The form of the emitted IR is controlled by OpenMPIRBuilder and
++      // tested there. Just check that the right metadata is added.
++      // CHECK: llvm.access.group
++      llvm.store %arg2, %1 : i32, !llvm.ptr
++      omp.yield
++    }
+   }
+   llvm.return
+ }

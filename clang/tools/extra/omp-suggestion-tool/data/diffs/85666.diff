@@ -1,0 +1,1545 @@
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index d01c585e0ddb9..2477f635792a2 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -81,8 +81,10 @@ bool ReductionProcessor::supportedIntrinsicProcReduction(
+   return redType;
+ }
+ 
+-std::string ReductionProcessor::getReductionName(llvm::StringRef name,
+-                                                 mlir::Type ty, bool isByRef) {
++std::string
++ReductionProcessor::getReductionName(llvm::StringRef name,
++                                     const fir::KindMapping &kindMap,
++                                     mlir::Type ty, bool isByRef) {
+   ty = fir::unwrapRefType(ty);
+ 
+   // extra string to distinguish reduction functions for variables passed by
+@@ -91,47 +93,12 @@ std::string ReductionProcessor::getReductionName(llvm::StringRef name,
+   if (isByRef)
+     byrefAddition = "_byref";
+ 
+-  if (fir::isa_trivial(ty))
+-    return (llvm::Twine(name) +
+-            (ty.isIntOrIndex() ? llvm::Twine("_i_") : llvm::Twine("_f_")) +
+-            llvm::Twine(ty.getIntOrFloatBitWidth()) + byrefAddition)
+-        .str();
+-
+-  // creates a name like reduction_i_64_box_ux4x3
+-  if (auto boxTy = mlir::dyn_cast_or_null<fir::BaseBoxType>(ty)) {
+-    // TODO: support for allocatable boxes:
+-    // !fir.box<!fir.heap<!fir.array<...>>>
+-    fir::SequenceType seqTy = fir::unwrapRefType(boxTy.getEleTy())
+-                                  .dyn_cast_or_null<fir::SequenceType>();
+-    if (!seqTy)
+-      return {};
+-
+-    std::string prefix = getReductionName(
+-        name, fir::unwrapSeqOrBoxedSeqType(ty), /*isByRef=*/false);
+-    if (prefix.empty())
+-      return {};
+-    std::stringstream tyStr;
+-    tyStr << prefix << "_box_";
+-    bool first = true;
+-    for (std::int64_t extent : seqTy.getShape()) {
+-      if (first)
+-        first = false;
+-      else
+-        tyStr << "x";
+-      if (extent == seqTy.getUnknownExtent())
+-        tyStr << 'u'; // I'm not sure that '?' is safe in symbol names
+-      else
+-        tyStr << extent;
+-    }
+-    return (tyStr.str() + byrefAddition).str();
+-  }
+-
+-  return {};
++  return fir::getTypeAsString(ty, kindMap, (name + byrefAddition).str());
+ }
+ 
+ std::string ReductionProcessor::getReductionName(
+-    omp::clause::DefinedOperator::IntrinsicOperator intrinsicOp, mlir::Type ty,
+-    bool isByRef) {
++    omp::clause::DefinedOperator::IntrinsicOperator intrinsicOp,
++    const fir::KindMapping &kindMap, mlir::Type ty, bool isByRef) {
+   std::string reductionName;
+ 
+   switch (intrinsicOp) {
+@@ -154,7 +121,7 @@ std::string ReductionProcessor::getReductionName(
+     break;
+   }
+ 
+-  return getReductionName(reductionName, ty, isByRef);
++  return getReductionName(reductionName, kindMap, ty, isByRef);
+ }
+ 
+ mlir::Value
+@@ -162,9 +129,9 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
+                                           ReductionIdentifier redId,
+                                           fir::FirOpBuilder &builder) {
+   type = fir::unwrapRefType(type);
+-  assert((fir::isa_integer(type) || fir::isa_real(type) ||
+-          type.isa<fir::LogicalType>()) &&
+-         "only integer, logical and real types are currently supported");
++  if (!fir::isa_integer(type) && !fir::isa_real(type) &&
++      !mlir::isa<fir::LogicalType>(type))
++    TODO(loc, "Reduction of some types is not supported");
+   switch (redId) {
+   case ReductionIdentifier::MAX: {
+     if (auto ty = type.dyn_cast<mlir::FloatType>()) {
+@@ -463,8 +430,7 @@ mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
+   mlir::OpBuilder::InsertionGuard guard(builder);
+   mlir::ModuleOp module = builder.getModule();
+ 
+-  if (reductionOpName.empty())
+-    TODO(loc, "Reduction of some types is not supported");
++  assert(!reductionOpName.empty());
+ 
+   auto decl =
+       module.lookupSymbol<mlir::omp::DeclareReductionOp>(reductionOpName);
+@@ -601,15 +567,18 @@ void ReductionProcessor::addDeclareReduction(
+ 
+     for (mlir::Value symVal : reductionVars) {
+       auto redType = mlir::cast<fir::ReferenceType>(symVal.getType());
++      const auto &kindMap = firOpBuilder.getKindMap();
+       if (redType.getEleTy().isa<fir::LogicalType>())
+-        decl = createDeclareReduction(
+-            firOpBuilder,
+-            getReductionName(intrinsicOp, firOpBuilder.getI1Type(), isByRef),
+-            redId, redType, currentLocation, isByRef);
++        decl = createDeclareReduction(firOpBuilder,
++                                      getReductionName(intrinsicOp, kindMap,
++                                                       firOpBuilder.getI1Type(),
++                                                       isByRef),
++                                      redId, redType, currentLocation, isByRef);
+       else
+         decl = createDeclareReduction(
+-            firOpBuilder, getReductionName(intrinsicOp, redType, isByRef),
+-            redId, redType, currentLocation, isByRef);
++            firOpBuilder,
++            getReductionName(intrinsicOp, kindMap, redType, isByRef), redId,
++            redType, currentLocation, isByRef);
+       reductionDeclSymbols.push_back(mlir::SymbolRefAttr::get(
+           firOpBuilder.getContext(), decl.getSymName()));
+     }
+@@ -631,7 +600,7 @@ void ReductionProcessor::addDeclareReduction(
+         decl = createDeclareReduction(
+             firOpBuilder,
+             getReductionName(getRealName(*reductionIntrinsic).ToString(),
+-                             redType, isByRef),
++                             firOpBuilder.getKindMap(), redType, isByRef),
+             redId, redType, currentLocation, isByRef);
+         reductionDeclSymbols.push_back(mlir::SymbolRefAttr::get(
+             firOpBuilder.getContext(), decl.getSymName()));
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.h b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+index 52b44e555bdb3..ee2732547fc28 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.h
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+@@ -76,12 +76,14 @@ class ReductionProcessor {
+   static bool
+   doReductionByRef(const llvm::SmallVectorImpl<mlir::Value> &reductionVars);
+ 
+-  static std::string getReductionName(llvm::StringRef name, mlir::Type ty,
+-                                      bool isByRef);
++  static std::string getReductionName(llvm::StringRef name,
++                                      const fir::KindMapping &kindMap,
++                                      mlir::Type ty, bool isByRef);
+ 
+   static std::string
+   getReductionName(omp::clause::DefinedOperator::IntrinsicOperator intrinsicOp,
+-                   mlir::Type ty, bool isByRef);
++                   const fir::KindMapping &kindMap, mlir::Type ty,
++                   bool isByRef);
+ 
+   /// This function returns the identity value of the operator \p
+   /// reductionOpName. For example:
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add-byref.f90
+index e9eadb4bc31ae..08f5a0fcdbae6 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add-byref.f90
+@@ -2,7 +2,7 @@
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_64_byref : !fir.ref<f64>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f64 : !fir.ref<f64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f64
+@@ -19,7 +19,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_64_byref : !fir.ref<i64>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i64 : !fir.ref<i64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i64
+@@ -36,7 +36,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<i64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_32_byref : !fir.ref<f32>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f32 : !fir.ref<f32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
+@@ -53,7 +53,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -80,7 +80,7 @@
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+@@ -116,7 +116,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_7]] : !fir.ref<f32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+@@ -152,7 +152,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -187,7 +187,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.convert %[[VAL_9]] : (i32) -> f32
+@@ -229,7 +229,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<i32>, @add_reduction_i_32_byref %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<i32>, @add_reduction_i_32_byref %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<i32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<i32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_11]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -282,7 +282,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<f32>, @add_reduction_f_32_byref %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<f32>, @add_reduction_f_32_byref %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<f32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<f32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_11]] : !fir.ref<f32>
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -341,7 +341,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_2]] -> %[[VAL_13:.*]] : !fir.ref<i32>, @add_reduction_i_64_byref %[[VAL_3]] -> %[[VAL_14:.*]] : !fir.ref<i64>, @add_reduction_f_32_byref %[[VAL_4]] -> %[[VAL_15:.*]] : !fir.ref<f32>, @add_reduction_f_64_byref %[[VAL_1]] -> %[[VAL_16:.*]] : !fir.ref<f64>)  for  (%[[VAL_17:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_2]] -> %[[VAL_13:.*]] : !fir.ref<i32>, @add_reduction_byref_i64 %[[VAL_3]] -> %[[VAL_14:.*]] : !fir.ref<i64>, @add_reduction_byref_f32 %[[VAL_4]] -> %[[VAL_15:.*]] : !fir.ref<f32>, @add_reduction_byref_f64 %[[VAL_1]] -> %[[VAL_16:.*]] : !fir.ref<f64>)  for  (%[[VAL_17:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:               fir.store %[[VAL_17]] to %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_18:.*]] = fir.load %[[VAL_13]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_19:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add.f90
+index b53dc715e65b5..dc96b875f745f 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-add.f90
+@@ -1,13 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -fopenmp %s -o - | FileCheck %s
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! The script is designed to make adding checks to
+-! a test case fast, it is *not* designed to be authoritative
+-! about what constitutes a good test! The CHECK should be
+-! minimized and named to reflect the test intent.
+-
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_64 : f64 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_f64 : f64 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f64):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
+ ! CHECK:           omp.yield(%[[VAL_1]] : f64)
+@@ -18,7 +12,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_64 : i64 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_i64 : i64 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i64):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i64
+ ! CHECK:           omp.yield(%[[VAL_1]] : i64)
+@@ -29,7 +23,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : i64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_32 : f32 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_f32 : f32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f32
+ ! CHECK:           omp.yield(%[[VAL_1]] : f32)
+@@ -40,7 +34,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f32)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -61,7 +55,7 @@
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+@@ -97,7 +91,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_7]] : !fir.ref<f32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+@@ -133,7 +127,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<i32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -168,7 +162,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_4:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_5:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_1]] -> %[[VAL_7:.*]] : !fir.ref<f32>)  for  (%[[VAL_8:.*]]) : i32 = (%[[VAL_4]]) to (%[[VAL_5]]) inclusive step (%[[VAL_6]]) {
+ ! CHECK:               fir.store %[[VAL_8]] to %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[VAL_3]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_10:.*]] = fir.convert %[[VAL_9]] : (i32) -> f32
+@@ -210,7 +204,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<i32>, @add_reduction_i_32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<i32>, @add_reduction_i_32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<i32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<i32>, @add_reduction_i32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<i32>, @add_reduction_i32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<i32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_11]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -263,7 +257,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<f32>, @add_reduction_f_32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<f32>, @add_reduction_f_32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<f32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_1]] -> %[[VAL_11:.*]] : !fir.ref<f32>, @add_reduction_f32 %[[VAL_2]] -> %[[VAL_12:.*]] : !fir.ref<f32>, @add_reduction_f32 %[[VAL_3]] -> %[[VAL_13:.*]] : !fir.ref<f32>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_11]] : !fir.ref<f32>
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_7]] : !fir.ref<i32>
+@@ -322,7 +316,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_12:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_2]] -> %[[VAL_13:.*]] : !fir.ref<i32>, @add_reduction_i_64 %[[VAL_3]] -> %[[VAL_14:.*]] : !fir.ref<i64>, @add_reduction_f_32 %[[VAL_4]] -> %[[VAL_15:.*]] : !fir.ref<f32>, @add_reduction_f_64 %[[VAL_1]] -> %[[VAL_16:.*]] : !fir.ref<f64>)  for  (%[[VAL_17:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_2]] -> %[[VAL_13:.*]] : !fir.ref<i32>, @add_reduction_i64 %[[VAL_3]] -> %[[VAL_14:.*]] : !fir.ref<i64>, @add_reduction_f32 %[[VAL_4]] -> %[[VAL_15:.*]] : !fir.ref<f32>, @add_reduction_f64 %[[VAL_1]] -> %[[VAL_16:.*]] : !fir.ref<f64>)  for  (%[[VAL_17:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:               fir.store %[[VAL_17]] to %[[VAL_9]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_18:.*]] = fir.load %[[VAL_13]] : !fir.ref<i32>
+ ! CHECK:               %[[VAL_19:.*]] = fir.load %[[VAL_9]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-iand-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-iand-byref.f90
+index 92e5e8a0abb57..6717597ff3b04 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-iand-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-iand-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-!CHECK-LABEL:   omp.declare_reduction @iand_i_32_byref : !fir.ref<i32>
++!CHECK-LABEL:   omp.declare_reduction @iand_byref_i32 : !fir.ref<i32>
+ !CHECK-SAME:    init {
+ !CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ !CHECK:            %[[C0_1:.*]] = arith.constant -1 : i32
+@@ -23,7 +23,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xi32>>
+ !CHECK: %[[X_REF:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_iandEx"}
+ !CHECK: omp.parallel
+-!CHECK: omp.wsloop byref reduction(@iand_i_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
++!CHECK: omp.wsloop byref reduction(@iand_byref_i32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
+ !CHECK: %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<i32>
+ !CHECK: %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK: %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ieor-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ieor-byref.f90
+index c557789039241..1baa59a510fa1 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ieor-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ieor-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -mmlir --force-byref-reduction -fopenmp %s -o - | FileCheck %s
+ 
+-! CHECK-LABEL:   omp.declare_reduction @ieor_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @ieor_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -22,7 +22,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xi32>>
+ !CHECK: %[[X_REF:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_ieorEx"}
+ !CHECK: omp.parallel
+-!CHECK: omp.wsloop byref reduction(@ieor_i_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
++!CHECK: omp.wsloop byref reduction(@ieor_byref_i32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
+ !CHECK: %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<i32>
+ !CHECK: %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK: %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ior-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ior-byref.f90
+index 57f393b9688e7..5482ef33fc8aa 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ior-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-ior-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-! CHECK-LABEL:   omp.declare_reduction @ior_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @ior_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -22,7 +22,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xi32>> 
+ !CHECK: %[[X_REF:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_iorEx"}
+ !CHECK: omp.parallel
+-!CHECK: omp.wsloop byref reduction(@ior_i_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for 
++!CHECK: omp.wsloop byref reduction(@ior_byref_i32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for 
+ !CHECK: %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<i32>
+ !CHECK: %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK: %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-max-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-max-byref.f90
+index bc655b5e4295b..f0979ab95f568 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-max-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-max-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -fopenmp -mmlir --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ 
+-!CHECK: omp.declare_reduction @max_f_32_byref : !fir.ref<f32>
++!CHECK: omp.declare_reduction @max_byref_f32 : !fir.ref<f32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -3.40282347E+38 : f32
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+@@ -15,7 +15,7 @@
+ !CHECK:   fir.store %[[RES]] to %[[ARG0]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+-!CHECK-LABEL: omp.declare_reduction @max_i_32_byref : !fir.ref<i32>
++!CHECK-LABEL: omp.declare_reduction @max_byref_i32 : !fir.ref<i32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
+ !CHECK:   fir.store %[[MINIMUM_VAL]] to %[[REF]] : !fir.ref<i32>
+@@ -32,7 +32,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xi32>>
+ !CHECK:   %[[X_REF:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_max_intEx"}
+ !CHECK:   omp.parallel
+-!CHECK:     omp.wsloop byref reduction(@max_i_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
++!CHECK:     omp.wsloop byref reduction(@max_byref_i32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
+ !CHECK:       %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<i32>
+ !CHECK:       %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK:       %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<i32>
+@@ -45,7 +45,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xf32>>
+ !CHECK:   %[[X_REF:.*]] = fir.alloca f32 {bindc_name = "x", uniq_name = "_QFreduction_max_realEx"}
+ !CHECK:   omp.parallel
+-!CHECK:     omp.wsloop byref reduction(@max_f_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<f32>) for
++!CHECK:     omp.wsloop byref reduction(@max_byref_f32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<f32>) for
+ !CHECK:       %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<f32>
+ !CHECK:       %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK:       %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-min-byref.f90 b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-min-byref.f90
+index ce928aa131b72..24aa8e46e5bbb 100644
+--- a/flang/test/Lower/OpenMP/FIR/wsloop-reduction-min-byref.f90
++++ b/flang/test/Lower/OpenMP/FIR/wsloop-reduction-min-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-fir -hlfir=false -fopenmp --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-fir -flang-deprecated-no-hlfir -mmlir --force-byref-reduction -fopenmp -o - %s 2>&1 | FileCheck %s
+ 
+-!CHECK: omp.declare_reduction @min_f_32_byref : !fir.ref<f32>
++!CHECK: omp.declare_reduction @min_byref_f32 : !fir.ref<f32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 3.40282347E+38 : f32
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+@@ -15,7 +15,7 @@
+ !CHECK:   fir.store %[[RES]] to %[[ARG0]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+-!CHECK-LABEL: omp.declare_reduction @min_i_32_byref : !fir.ref<i32>
++!CHECK-LABEL: omp.declare_reduction @min_byref_i32 : !fir.ref<i32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 2147483647 : i32
+ !CHECK:   fir.store %[[MAXIMUM_VAL]] to %[[REF]] : !fir.ref<i32>
+@@ -32,7 +32,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xi32>>
+ !CHECK:   %[[X_REF:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFreduction_min_intEx"}
+ !CHECK:   omp.parallel
+-!CHECK:     omp.wsloop byref reduction(@min_i_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
++!CHECK:     omp.wsloop byref reduction(@min_byref_i32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<i32>) for
+ !CHECK:       %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<i32>
+ !CHECK:       %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK:       %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<i32>
+@@ -46,7 +46,7 @@
+ !CHECK-SAME: %[[Y_BOX:.*]]: !fir.box<!fir.array<?xf32>>
+ !CHECK:   %[[X_REF:.*]] = fir.alloca f32 {bindc_name = "x", uniq_name = "_QFreduction_min_realEx"}
+ !CHECK:   omp.parallel
+-!CHECK:     omp.wsloop byref reduction(@min_f_32_byref %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<f32>) for
++!CHECK:     omp.wsloop byref reduction(@min_byref_f32 %[[X_REF]] -> %[[PRV:.+]] : !fir.ref<f32>) for
+ !CHECK:       %[[LPRV:.+]] = fir.load %[[PRV]] : !fir.ref<f32>
+ !CHECK:       %[[Y_I_REF:.*]] = fir.coordinate_of %[[Y_BOX]]
+ !CHECK:       %[[Y_I:.*]] = fir.load %[[Y_I_REF]] : !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/default-clause-byref.f90 b/flang/test/Lower/OpenMP/default-clause-byref.f90
+index 5d9538e53069d..1167ba7e6ae0d 100644
+--- a/flang/test/Lower/OpenMP/default-clause-byref.f90
++++ b/flang/test/Lower/OpenMP/default-clause-byref.f90
+@@ -352,7 +352,7 @@ subroutine skipped_default_clause_checks()
+        type(it)::iii
+ 
+ !CHECK: omp.parallel {
+-!CHECK: omp.wsloop byref reduction(@min_i_32_byref %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for (%[[ARG:.*]]) {{.*}} {
++!CHECK: omp.wsloop byref reduction(@min_byref_i32 %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for (%[[ARG:.*]]) {{.*}} {
+ !CHECK: omp.yield
+ !CHECK: }
+ !CHECK: omp.terminator
+diff --git a/flang/test/Lower/OpenMP/default-clause.f90 b/flang/test/Lower/OpenMP/default-clause.f90
+index 0e118742689d6..f86b51aef4e02 100644
+--- a/flang/test/Lower/OpenMP/default-clause.f90
++++ b/flang/test/Lower/OpenMP/default-clause.f90
+@@ -352,7 +352,7 @@ subroutine skipped_default_clause_checks()
+        type(it)::iii
+ 
+ !CHECK: omp.parallel {
+-!CHECK: omp.wsloop reduction(@min_i_32 %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for (%[[ARG:.*]]) {{.*}} {
++!CHECK: omp.wsloop reduction(@min_i32 %[[VAL_Z_DECLARE]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for (%[[ARG:.*]]) {{.*}} {
+ !CHECK: omp.yield
+ !CHECK: }
+ !CHECK: omp.terminator
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+index 359dab35e8a6e..735a99854308c 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+@@ -13,7 +13,7 @@ program reduce
+ print *,i
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32_box_3_byref : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = fir.alloca !fir.array<3xi32> {bindc_name = ".tmp"}
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+@@ -53,7 +53,7 @@ program reduce
+ ! CHECK:           %[[VAL_4:.*]] = fir.embox %[[VAL_3]]#1(%[[VAL_2]]) : (!fir.ref<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_4]] to %[[VAL_5]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.parallel byref reduction(@add_reduction_i_32_box_3_byref %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
++! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3xi32>>>, !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_9:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<!fir.box<!fir.array<3xi32>>>
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+index 5a31be8d206b2..4834047a98a4a 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+@@ -13,7 +13,7 @@ program reduce
+ print *,i
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32_box_3_byref : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3xi32 : !fir.ref<!fir.box<!fir.array<3xi32>>> init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = fir.alloca !fir.array<3xi32> {bindc_name = ".tmp"}
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+@@ -53,7 +53,7 @@ program reduce
+ ! CHECK:           %[[VAL_4:.*]] = fir.embox %[[VAL_3]]#1(%[[VAL_2]]) : (!fir.ref<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           %[[VAL_5:.*]] = fir.alloca !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_4]] to %[[VAL_5]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+-! CHECK:           omp.parallel byref reduction(@add_reduction_i_32_box_3_byref %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
++! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3xi32 %[[VAL_5]] -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<3xi32>>>) {
+ ! CHECK:             %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3xi32>>>, !fir.ref<!fir.box<!fir.array<3xi32>>>)
+ ! CHECK:             %[[VAL_8:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : index
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-rename.f90 b/flang/test/Lower/OpenMP/parallel-reduction-rename.f90
+index 7845f808e6c51..c06343e997bfd 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-rename.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-rename.f90
+@@ -14,7 +14,7 @@ end program main
+ 
+ ! test that we understood that this should be a max reduction
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @max_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -30,7 +30,7 @@ end program main
+ ! CHECK:           %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFEn"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_1]]#0 : i32, !fir.ref<i32>
+-! CHECK:           omp.parallel reduction(@max_i_32 %[[VAL_1]]#0 -> %[[VAL_3:.*]] : !fir.ref<i32>) {
++! CHECK:           omp.parallel reduction(@max_i32 %[[VAL_1]]#0 -> %[[VAL_3:.*]] : !fir.ref<i32>) {
+ ! ...
+ ! CHECK:             omp.terminator
+ 
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
+index 8492a69fed582..66c80c31917ba 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-reduction-byref.f90
+@@ -4,7 +4,7 @@
+ ! RUN: flang-new -fc1 -fopenmp -mmlir --force-byref-reduction -emit-hlfir %s -o - | FileCheck %s
+ 
+ ! CHECK: omp.parallel {
+-! CHECK: omp.wsloop byref reduction(@add_reduction_i_32
++! CHECK: omp.wsloop byref reduction(@add_reduction_byref_i32
+ subroutine sb
+   integer :: x
+   x = 0
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-reduction.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-reduction.f90
+index c13ec2bc4aec8..fdedbb0616076 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-reduction.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-reduction.f90
+@@ -4,7 +4,7 @@
+ ! RUN: flang-new -fc1 -fopenmp -emit-hlfir %s -o - | FileCheck %s
+ 
+ ! CHECK: omp.parallel {
+-! CHECK: omp.wsloop reduction(@add_reduction_i_32
++! CHECK: omp.wsloop reduction(@add_reduction_i32
+ subroutine sb
+   integer :: x
+   x = 0
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+index caec65b6051c6..e63db33bbe250 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_64_byref : !fir.ref<f64>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f64 : !fir.ref<f64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f64
+@@ -18,7 +18,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_64_byref : !fir.ref<i64>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i64 : !fir.ref<i64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i64
+@@ -35,7 +35,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<i64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_32_byref : !fir.ref<f32>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_f32 : !fir.ref<f32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0.000000e+00 : f32
+@@ -52,7 +52,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -82,7 +82,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+@@ -122,7 +122,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -163,7 +163,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -202,7 +202,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -250,7 +250,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @add_reduction_i_32_byref %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @add_reduction_i_32_byref %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @add_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -311,7 +311,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @add_reduction_f_32_byref %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @add_reduction_f_32_byref %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @add_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -379,7 +379,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @add_reduction_i_64_byref %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @add_reduction_f_32_byref %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @add_reduction_f_64_byref %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @add_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @add_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @add_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:               fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
+index 5e5df8c1365a3..3b4d9666c6937 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir-byref.f90
+@@ -1,9 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -33,7 +31,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]])
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]])
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90
+index d6006f21b3bdf..7c9070592e468 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-hlfir.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -27,7 +27,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]])
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]])
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
+index d6222a248b7ff..11e1ffb79f8e4 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
+@@ -1,17 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
+ 
+-
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! The script is designed to make adding checks to
+-! a test case fast, it is *not* designed to be authoritative
+-! about what constitutes a good test! The CHECK should be
+-! minimized and named to reflect the test intent.
+-
+-
+-
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_64 : f64 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_f64 : f64 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f64):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f64
+ ! CHECK:           omp.yield(%[[VAL_1]] : f64)
+@@ -22,7 +12,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_64 : i64 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_i64 : i64 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i64):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i64
+ ! CHECK:           omp.yield(%[[VAL_1]] : i64)
+@@ -33,7 +23,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : i64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_f_32 : f32 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_f32 : f32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0.000000e+00 : f32
+ ! CHECK:           omp.yield(%[[VAL_1]] : f32)
+@@ -44,7 +34,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f32)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @add_reduction_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -68,7 +58,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+@@ -108,7 +98,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -149,7 +139,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -188,7 +178,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -236,7 +226,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @add_reduction_i_32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @add_reduction_i_32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @add_reduction_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @add_reduction_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -297,7 +287,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @add_reduction_f_32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @add_reduction_f_32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @add_reduction_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @add_reduction_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -365,7 +355,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@add_reduction_i_32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @add_reduction_i_64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @add_reduction_f_32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @add_reduction_f_64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
++! CHECK:             omp.wsloop reduction(@add_reduction_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @add_reduction_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @add_reduction_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @add_reduction_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:               fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index be4d27f6ac471..a20ed1ca83ce2 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -14,7 +14,7 @@ program reduce
+ print *,r
+ end program
+ 
+-! CHECK-LABEL   omp.declare_reduction @add_reduction_i_32_box_2_byref : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
++! CHECK-LABEL   omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = fir.alloca !fir.array<2xi32> {bindc_name = ".tmp"}
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+@@ -63,7 +63,7 @@ program reduce
+ ! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#1(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_box_2_byref %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index c77bd72f916dd..61599876da8ea 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -14,7 +14,7 @@ program reduce
+ print *,r
+ end program
+ 
+-! CHECK-LABEL   omp.declare_reduction @add_reduction_i_32_box_2_byref : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
++! CHECK-LABEL   omp.declare_reduction @add_reduction_byref_box_2xi32 : !fir.ref<!fir.box<!fir.array<2xi32>>> init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<2xi32>>>):
+ ! CHECK:           %[[VAL_1:.*]] = fir.alloca !fir.array<2xi32> {bindc_name = ".tmp"}
+ ! CHECK:           %[[VAL_2:.*]] = arith.constant 0 : i32
+@@ -63,7 +63,7 @@ program reduce
+ ! CHECK:             %[[VAL_11:.*]] = fir.embox %[[VAL_5]]#1(%[[VAL_4]]) : (!fir.ref<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:             %[[VAL_12:.*]] = fir.alloca !fir.box<!fir.array<2xi32>>
+ ! CHECK:             fir.store %[[VAL_11]] to %[[VAL_12]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+-! CHECK:             omp.wsloop byref reduction(@add_reduction_i_32_box_2_byref %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
++! CHECK:             omp.wsloop byref reduction(@add_reduction_byref_box_2xi32 %[[VAL_12]] -> %[[VAL_13:.*]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)  for  (%[[VAL_14:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:               fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+ ! CHECK:               %[[VAL_16:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<!fir.box<!fir.array<2xi32>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+index 2df3ad393ba50..e3f06a446ed4c 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @iand_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @iand_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant -1 : i32
+@@ -35,7 +35,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@iand_i_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@iand_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iandEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
+index 707be66def8d8..746617e210624 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @iand_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @iand_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -1 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -29,7 +29,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@iand_i_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@iand_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iandEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+index 72a6901878ad3..7e3a283bf783c 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-! CHECK-LABEL:   omp.declare_reduction @ieor_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @ieor_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -28,7 +28,7 @@
+ !CHECK: omp.parallel
+ !CHECK: %[[I_REF:.*]] = fir.alloca i32 {adapt.valuebyref, pinned}
+ !CHECK: %[[I_DECL:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFreduction_ieorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: omp.wsloop byref reduction(@ieor_i_32_byref %[[X_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for
++!CHECK: omp.wsloop byref reduction(@ieor_byref_i32 %[[X_DECL]]#0 -> %[[PRV:.+]] : !fir.ref<i32>) for
+ !CHECK: fir.store %{{.*}} to %[[I_DECL]]#1 : !fir.ref<i32>
+ !CHECK: %[[PRV_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[I_32:.*]] = fir.load %[[I_DECL]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+index 662e64b8fae65..c7f8e8bdede54 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+@@ -1,9 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction %s -o - | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction %s -o - | FileCheck %s
+ 
+-! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+-
+-! CHECK-LABEL:   omp.declare_reduction @ior_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @ior_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:            %[[C0_1:.*]] = arith.constant 0 : i32
+@@ -35,7 +33,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@ior_i_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]])
++! CHECK:             omp.wsloop byref reduction(@ior_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]])
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iorEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
+index 8f6ca7c41c42d..dd0bbeb1a0761 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @ior_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @ior_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -29,7 +29,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@ior_i_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]])
++! CHECK:             omp.wsloop reduction(@ior_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]])
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iorEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
+index 360cd34df2d11..5358806cdcdec 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-2-byref.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --force-byref-reduction -o - %s 2>&1 | FileCheck %s
+ 
+-! CHECK: omp.wsloop byref reduction(@max_i_32
++! CHECK: omp.wsloop byref reduction(@max_byref_i32
+ ! CHECK: arith.cmpi sgt
+ ! CHECK: arith.select
+ 
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-2.f90
+index 1f4d61985689f..abd7ca1ae555d 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-2.f90
+@@ -1,7 +1,7 @@
+ ! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+ 
+-! CHECK: omp.wsloop reduction(@max_i_32
++! CHECK: omp.wsloop reduction(@max_i32
+ ! CHECK: arith.cmpi sgt
+ ! CHECK: arith.select
+ 
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+index 058eeea5fb929..ee562bbe15863 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-!CHECK: omp.declare_reduction @max_f_32_byref : !fir.ref<f32>
++!CHECK: omp.declare_reduction @max_byref_f32 : !fir.ref<f32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -3.40282347E+38 : f32
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+@@ -17,7 +17,7 @@
+ !CHECK:   fir.store %[[RES]] to %[[ARG0]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+-!CHECK-LABEL: omp.declare_reduction @max_i_32_byref : !fir.ref<i32>
++!CHECK-LABEL: omp.declare_reduction @max_byref_i32 : !fir.ref<i32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
+ !CHECK:   %[[REF:.*]] = fir.alloca i32
+@@ -46,7 +46,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_i_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -75,7 +75,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_f_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -94,7 +94,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_f_32_byref %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
++! CHECK:             omp.wsloop byref reduction(@max_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:               fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
+index 3a07450765cf9..10bba6ac4b51b 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir-byref.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:  omp.declare_reduction @max_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:  omp.declare_reduction @max_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:   init {
+ ! CHECK:        ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:          %[[MINIMUM_VAL:.*]] = arith.constant -2147483648 : i32
+@@ -33,7 +33,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@max_i_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@max_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90
+index 3dfed100a02e3..5ea5d6626f186 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-hlfir.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @max_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -29,7 +29,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@max_i_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@max_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
+index 895eca85fd1ec..6f11f0ec96a7d 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_f_32 : f32 init {
++! CHECK-LABEL:   omp.declare_reduction @max_f32 : f32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -3.40282347E+38 : f32
+ ! CHECK:           omp.yield(%[[VAL_1]] : f32)
+@@ -14,7 +14,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f32)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @max_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @max_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant -2147483648 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -40,7 +40,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@max_i_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@max_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -69,7 +69,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@max_f_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@max_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -88,7 +88,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@max_f_32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
++! CHECK:             omp.wsloop reduction(@max_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:               fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+index c44301f68b838..c0372117a03b9 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-!CHECK: omp.declare_reduction @min_f_32_byref : !fir.ref<f32>
++!CHECK: omp.declare_reduction @min_byref_f32 : !fir.ref<f32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 3.40282347E+38 : f32
+ !CHECK:   %[[REF:.*]] = fir.alloca f32
+@@ -17,7 +17,7 @@
+ !CHECK:   fir.store %[[RES]] to %[[ARG0]] : !fir.ref<f32>
+ !CHECK:   omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ 
+-!CHECK-LABEL: omp.declare_reduction @min_i_32_byref : !fir.ref<i32>
++!CHECK-LABEL: omp.declare_reduction @min_byref_i32 : !fir.ref<i32>
+ !CHECK-SAME: init {
+ !CHECK:   %[[MAXIMUM_VAL:.*]] = arith.constant 2147483647 : i32
+ !CHECK:   %[[REF:.*]] = fir.alloca i32
+@@ -46,7 +46,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_i_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@min_byref_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -75,7 +75,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_f_32_byref %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop byref reduction(@min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -96,7 +96,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@min_f_32_byref %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
++! CHECK:             omp.wsloop byref reduction(@min_byref_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:               fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
+index 700ff78339c18..2c694f82e279a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
+@@ -3,7 +3,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @min_f_32 : f32 init {
++! CHECK-LABEL:   omp.declare_reduction @min_f32 : f32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 3.40282347E+38 : f32
+ ! CHECK:           omp.yield(%[[VAL_1]] : f32)
+@@ -14,7 +14,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f32)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @min_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @min_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 2147483647 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -40,7 +40,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@min_i_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@min_i32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<i32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -69,7 +69,7 @@
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_10:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_11:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@min_f_32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
++! CHECK:             omp.wsloop reduction(@min_f32 %[[VAL_4]]#0 -> %[[VAL_12:.*]] : !fir.ref<f32>)  for  (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:               fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+@@ -90,7 +90,7 @@
+ ! CHECK:             %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_33:.*]] = arith.constant 100 : i32
+ ! CHECK:             %[[VAL_34:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@min_f_32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
++! CHECK:             omp.wsloop reduction(@min_f32 %[[VAL_4]]#0 -> %[[VAL_35:.*]] : !fir.ref<f32>)  for  (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:               fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+index cef1102a2fcce..0138a95782061 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+@@ -17,7 +17,7 @@ program reduce
+ 
+ end program
+ 
+-! CHECK-LABEL:   omp.declare_reduction @min_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @min_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 2147483647 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -39,7 +39,7 @@ program reduce
+ ! CHECK:             %[[VAL_6:.*]] = arith.constant 0 : i32
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@min_i_32 %[[VAL_3]]#0 -> %[[VAL_9:.*]] : !fir.ref<i32>)  for  (%[[VAL_10:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
++! CHECK:             omp.wsloop reduction(@min_i32 %[[VAL_3]]#0 -> %[[VAL_9:.*]] : !fir.ref<i32>)  for  (%[[VAL_10:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
+ ! CHECK:               fir.store %[[VAL_10]] to %[[VAL_5]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_9]] {uniq_name = "_QFEr"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_12:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+index c6aa21c4231cd..a2829948d472a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+@@ -4,7 +4,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f_64_byref : !fir.ref<f64>
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_f64 : !fir.ref<f64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f64>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f64
+@@ -21,7 +21,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i_64_byref : !fir.ref<i64>
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_i64 : !fir.ref<i64>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i64>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i64
+@@ -38,7 +38,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<i64>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f_32_byref : !fir.ref<f32>
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_f32 : !fir.ref<f32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<f32>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
+@@ -55,7 +55,7 @@
+ ! CHECK:           omp.yield(%[[ARG0]] : !fir.ref<f32>)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i_32_byref : !fir.ref<i32>
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_byref_i32 : !fir.ref<i32>
+ ! CHECK-SAME:    init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<i32>):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i32
+@@ -85,7 +85,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+@@ -121,7 +121,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -158,7 +158,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -194,7 +194,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -239,7 +239,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_i_32_byref %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @multiply_reduction_i_32_byref %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @multiply_reduction_i_32_byref %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -297,7 +297,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_f_32_byref %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @multiply_reduction_f_32_byref %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @multiply_reduction_f_32_byref %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -362,7 +362,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop byref reduction(@multiply_reduction_i_32_byref %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @multiply_reduction_i_64_byref %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @multiply_reduction_f_32_byref %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @multiply_reduction_f_64_byref %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
++! CHECK:             omp.wsloop byref reduction(@multiply_reduction_byref_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @multiply_reduction_byref_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @multiply_reduction_byref_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @multiply_reduction_byref_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:               fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
+index ce34aafe7dc5e..90d9aa5e839bd 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
+@@ -4,8 +4,7 @@
+ 
+ ! NOTE: Assertions have been autogenerated by utils/generate-test-checks.py
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f_64 : f64 init {
+-! CHECK:         ^bb0(%[[VAL_0:.*]]: f64):
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f64 : f64 init {
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f64
+ ! CHECK:           omp.yield(%[[VAL_1]] : f64)
+ 
+@@ -15,7 +14,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i_64 : i64 init {
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i64 : i64 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i64):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i64
+ ! CHECK:           omp.yield(%[[VAL_1]] : i64)
+@@ -26,7 +25,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : i64)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f_32 : f32 init {
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_f32 : f32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: f32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1.000000e+00 : f32
+ ! CHECK:           omp.yield(%[[VAL_1]] : f32)
+@@ -37,7 +36,7 @@
+ ! CHECK:           omp.yield(%[[VAL_2]] : f32)
+ ! CHECK:         }
+ 
+-! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i_32 : i32 init {
++! CHECK-LABEL:   omp.declare_reduction @multiply_reduction_i32 : i32 init {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: i32):
+ ! CHECK:           %[[VAL_1:.*]] = arith.constant 1 : i32
+ ! CHECK:           omp.yield(%[[VAL_1]] : i32)
+@@ -61,7 +60,7 @@
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+@@ -97,7 +96,7 @@ subroutine simple_int_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -134,7 +133,7 @@ subroutine simple_real_reduction
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<i32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -170,7 +169,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_8:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_9:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_10:.*]] : !fir.ref<f32>)  for  (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:               fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+@@ -215,7 +214,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_i_32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @multiply_reduction_i_32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @multiply_reduction_i_32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_i32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<i32>, @multiply_reduction_i32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<i32>, @multiply_reduction_i32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<i32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -273,7 +272,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_14:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_15:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_f_32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @multiply_reduction_f_32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @multiply_reduction_f_32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_f32 %[[VAL_3]]#0 -> %[[VAL_16:.*]] : !fir.ref<f32>, @multiply_reduction_f32 %[[VAL_5]]#0 -> %[[VAL_17:.*]] : !fir.ref<f32>, @multiply_reduction_f32 %[[VAL_7]]#0 -> %[[VAL_18:.*]] : !fir.ref<f32>)  for  (%[[VAL_19:.*]]) : i32 = (%[[VAL_13]]) to (%[[VAL_14]]) inclusive step (%[[VAL_15]]) {
+ ! CHECK:               fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:               %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+@@ -338,7 +337,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:             %[[VAL_16:.*]] = arith.constant 1 : i32
+ ! CHECK:             %[[VAL_17:.*]] = arith.constant 10 : i32
+ ! CHECK:             %[[VAL_18:.*]] = arith.constant 1 : i32
+-! CHECK:             omp.wsloop reduction(@multiply_reduction_i_32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @multiply_reduction_i_64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @multiply_reduction_f_32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @multiply_reduction_f_64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
++! CHECK:             omp.wsloop reduction(@multiply_reduction_i32 %[[VAL_5]]#0 -> %[[VAL_19:.*]] : !fir.ref<i32>, @multiply_reduction_i64 %[[VAL_7]]#0 -> %[[VAL_20:.*]] : !fir.ref<i64>, @multiply_reduction_f32 %[[VAL_9]]#0 -> %[[VAL_21:.*]] : !fir.ref<f32>, @multiply_reduction_f64 %[[VAL_3]]#0 -> %[[VAL_22:.*]] : !fir.ref<f64>)  for  (%[[VAL_23:.*]]) : i32 = (%[[VAL_16]]) to (%[[VAL_17]]) inclusive step (%[[VAL_18]]) {
+ ! CHECK:               fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
+ ! CHECK:               %[[VAL_24:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFmultiple_reductions_different_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:               %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)

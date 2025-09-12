@@ -1,0 +1,238 @@
+diff --git a/clang/include/clang/Basic/OpenMPKinds.h b/clang/include/clang/Basic/OpenMPKinds.h
+index 6ca9f9c550285..9afcce21a499d 100644
+--- a/clang/include/clang/Basic/OpenMPKinds.h
++++ b/clang/include/clang/Basic/OpenMPKinds.h
+@@ -411,9 +411,11 @@ bool isOpenMPCapturingDirective(OpenMPDirectiveKind DKind);
+ /// directive that can be nested within region corresponding to construct
+ /// on which order clause was specified with concurrent as ordering argument.
+ /// \param DKind Specified directive.
++/// \param LangOpts Used for getting the OpenMP version.
+ /// \return true - if the above condition is met for this directive
+ /// otherwise - false.
+-bool isOpenMPOrderConcurrentNestableDirective(OpenMPDirectiveKind DKind);
++bool isOpenMPOrderConcurrentNestableDirective(OpenMPDirectiveKind DKind,
++                                              const LangOptions &LangOpts);
+ }
+ 
+ template <>
+diff --git a/clang/lib/Basic/OpenMPKinds.cpp b/clang/lib/Basic/OpenMPKinds.cpp
+index 09921e3b1edfc..7b90861c78de0 100644
+--- a/clang/lib/Basic/OpenMPKinds.cpp
++++ b/clang/lib/Basic/OpenMPKinds.cpp
+@@ -768,9 +768,20 @@ bool clang::isOpenMPCapturingDirective(OpenMPDirectiveKind DKind) {
+ }
+ 
+ bool clang::isOpenMPOrderConcurrentNestableDirective(
+-    OpenMPDirectiveKind DKind) {
+-  return DKind == OMPD_atomic || DKind == OMPD_loop || DKind == OMPD_simd ||
+-         DKind == OMPD_parallel || isOpenMPLoopTransformationDirective(DKind);
++    OpenMPDirectiveKind DKind, const LangOptions &LangOpts) {
++  // Directives strictly nestable in a construct with order(concurrent) are:
++  // OpenMP 5.x: loop, parallel, simd, combined directive starting with parallel
++  // OpenMP 6.0: above plus atomic and all loop-transformation directives
++
++  if (DKind == OMPD_loop || DKind == OMPD_parallel || DKind == OMPD_simd ||
++      isOpenMPCombinedParallelADirective(DKind))
++    return true;
++
++  if (LangOpts.OpenMP >= 60)
++    return DKind == OMPD_atomic ||
++           isOpenMPLoopTransformationDirective(DKind);
++
++  return false;
+ }
+ 
+ void clang::getOpenMPCaptureRegions(
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 0e44cfab6f216..274d3b90ff30f 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -4789,26 +4789,12 @@ static bool checkNestingOfRegions(Sema &SemaRef, const DSAStackTy *Stack,
+       getLeafOrCompositeConstructs(ParentRegion, LeafOrComposite);
+   OpenMPDirectiveKind EnclosingConstruct = ParentLOC.back();
+ 
+-  if (Stack->isParentOrderConcurrent()) {
+-    bool InvalidOrderNesting = false;
+-    if ((SemaRef.LangOpts.OpenMP == 51 || SemaRef.LangOpts.OpenMP == 52) &&
+-        CurrentRegion != OMPD_simd && CurrentRegion != OMPD_loop &&
+-        CurrentRegion != OMPD_parallel &&
+-        !isOpenMPCombinedParallelADirective(CurrentRegion)) {
+-      InvalidOrderNesting = true;
+-    } else if (SemaRef.LangOpts.OpenMP >= 60 &&
+-               !isOpenMPOrderConcurrentNestableDirective(CurrentRegion)) {
+-      // OpenMP 6.0 [12.3 order Clause, Restrictions]
+-      // Only regions that correspond to order-concurrent-nestable constructs
+-      // or order-concurrent-nestable routines may be strictly nested regions
+-      // of regions that correspond to constructs on which the order clause is
+-      // specified with concurrent as the ordering argument.
+-      InvalidOrderNesting = true;
+-    }
+-    if (InvalidOrderNesting) {
+-      SemaRef.Diag(StartLoc, diag::err_omp_prohibited_region_order)
+-          << getOpenMPDirectiveName(CurrentRegion);
+-    }
++  if (SemaRef.LangOpts.OpenMP >= 50 && Stack->isParentOrderConcurrent() &&
++      !isOpenMPOrderConcurrentNestableDirective(CurrentRegion,
++                                                SemaRef.LangOpts)) {
++    SemaRef.Diag(StartLoc, diag::err_omp_prohibited_region_order)
++        << getOpenMPDirectiveName(CurrentRegion);
++    return true;
+   }
+   if (isOpenMPSimdDirective(ParentRegion) &&
+       ((SemaRef.LangOpts.OpenMP <= 45 && CurrentRegion != OMPD_ordered) ||
+@@ -7132,7 +7118,7 @@ ExprResult SemaOpenMP::ActOnOpenMPCall(ExprResult Call, Scope *Scope,
+   if (!CalleeFnDecl)
+     return Call;
+ 
+-  if (getLangOpts().OpenMP >= 51 && getLangOpts().OpenMP < 60 &&
++  if (getLangOpts().OpenMP >= 50 && getLangOpts().OpenMP <= 60 &&
+       CalleeFnDecl->getIdentifier() &&
+       CalleeFnDecl->getName().starts_with_insensitive("omp_")) {
+     // checking for any calls inside an Order region
+@@ -16373,21 +16359,20 @@ OMPClause *SemaOpenMP::ActOnOpenMPOrderClause(
+         << getOpenMPClauseName(OMPC_order);
+     return nullptr;
+   }
+-  if (getLangOpts().OpenMP >= 51) {
+-    if (Modifier == OMPC_ORDER_MODIFIER_unknown && MLoc.isValid()) {
+-      Diag(MLoc, diag::err_omp_unexpected_clause_value)
+-          << getListOfPossibleValues(OMPC_order,
+-                                     /*First=*/OMPC_ORDER_MODIFIER_unknown + 1,
+-                                     /*Last=*/OMPC_ORDER_MODIFIER_last)
+-          << getOpenMPClauseName(OMPC_order);
+-    } else {
+-      DSAStack->setRegionHasOrderConcurrent(/*HasOrderConcurrent=*/true);
+-      if (DSAStack->getCurScope()) {
+-        // mark the current scope with 'order' flag
+-        unsigned existingFlags = DSAStack->getCurScope()->getFlags();
+-        DSAStack->getCurScope()->setFlags(existingFlags |
+-                                          Scope::OpenMPOrderClauseScope);
+-      }
++  if (getLangOpts().OpenMP >= 51 && Modifier == OMPC_ORDER_MODIFIER_unknown &&
++      MLoc.isValid()) {
++    Diag(MLoc, diag::err_omp_unexpected_clause_value)
++        << getListOfPossibleValues(OMPC_order,
++                                   /*First=*/OMPC_ORDER_MODIFIER_unknown + 1,
++                                   /*Last=*/OMPC_ORDER_MODIFIER_last)
++        << getOpenMPClauseName(OMPC_order);
++  } else if (getLangOpts().OpenMP >= 50) {
++    DSAStack->setRegionHasOrderConcurrent(/*HasOrderConcurrent=*/true);
++    if (DSAStack->getCurScope()) {
++      // mark the current scope with 'order' flag
++      unsigned existingFlags = DSAStack->getCurScope()->getFlags();
++      DSAStack->getCurScope()->setFlags(existingFlags |
++                                        Scope::OpenMPOrderClauseScope);
+     }
+   }
+   return new (getASTContext()) OMPOrderClause(
+diff --git a/clang/test/OpenMP/for_order_messages.cpp b/clang/test/OpenMP/for_order_messages.cpp
+index 530c051849201..f41d3f7f635ce 100644
+--- a/clang/test/OpenMP/for_order_messages.cpp
++++ b/clang/test/OpenMP/for_order_messages.cpp
+@@ -8,35 +8,47 @@
+ // RUN: %clang_cc1 -fsyntax-only -fopenmp-simd -fopenmp-version=52 -triple x86_64-unknown-unknown -verify=expected,omp51 %s -Wuninitialized
+ // RUN: %clang_cc1 -fsyntax-only -fopenmp-simd -fopenmp-version=60 -triple x86_64-unknown-unknown -verify=expected,omp60 %s -Wuninitialized
+ 
++// Constructs strictly nestable in a construct with order(concurrent) specified vary by OpenMP version:
++// OMP5.0,5.1,5.2: loop, parallel, simd, and combined constructs with parallel as the first component.
++// OMP6.0: in addition to the ones allowed in OMP5.x, also atomic and all loop-transformation constructs.
++
+ extern int omp_get_num_threads  (void);
+ 
+ int main(int argc, char **argv) {
+   int A = 0;
+ #pragma omp parallel for order(concurrent)
+   for (int i = 0; i < 10; ++i)
+-    omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
++    omp_get_num_threads(); // omp50-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp60-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
+ 
+ #pragma omp parallel for order(reproducible:concurrent) // omp50-error {{expected 'concurrent' in OpenMP clause 'order'}}
+   for (int i = 0; i < 10; ++i)
+-    omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
++    omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp60-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
+ 
+ #pragma omp parallel for order(unconstrained:concurrent) // omp50-error {{expected 'concurrent' in OpenMP clause 'order'}}
+   for (int i = 0; i < 10; ++i)
+-    omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
++    omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp60-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
+ 
+ #pragma omp parallel for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+     for (int j = 0; j < 10; ++j) {
+-      omp_get_num_threads(); // omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
++      omp_get_num_threads(); // omp50-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp51-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}} omp60-error {{calls to OpenMP runtime API are not allowed within a region that corresponds to a construct with an order clause that specifies concurrent}}
+     }
+   }
+ 
++// nested atomic: OK in OMP6.0 but not in OMP5.x
+ #pragma omp parallel for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp atomic //omp51-error {{construct 'atomic' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp atomic //omp50-error {{construct 'atomic' not allowed in a region associated with a directive with 'order' clause}} omp51-error {{construct 'atomic' not allowed in a region associated with a directive with 'order' clause}}
+       A++;
+   }
+ 
++// nested loop-transformation construct: OK in OMP6.0 but not in OMP5.x
++#pragma omp parallel for order(concurrent)
++  for (int i = 0; i < 10; ++i) {
++#pragma omp unroll //omp50-error {{construct 'unroll' not allowed in a region associated with a directive with 'order' clause}} omp51-error {{construct 'unroll' not allowed in a region associated with a directive with 'order' clause}}
++    for (int j = 0; j < 10; ++j);
++  }
++
+ #pragma omp parallel for order(reproducible: concurrent) // omp50-error {{expected 'concurrent' in OpenMP clause 'order'}}
+   for (int i = 0; i < 10; ++i) {
+ #pragma omp target //omp51-error {{construct 'target' not allowed in a region associated with a directive with 'order' clause}} omp60-error {{construct 'target' not allowed in a region associated with a directive with 'order' clause}}
+@@ -51,7 +63,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp loop bind(parallel) order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp parallel for //omp60-error {{construct 'parallel for' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp parallel for
+     for (int j = 0; j < 10; ++j) {
+       A += j;
+     }
+@@ -59,7 +71,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp distribute order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp parallel for simd //omp60-error {{construct 'parallel for simd' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp parallel for simd
+     for (int j = 0; j < 10; ++j) {
+       A += j;
+     }
+@@ -67,7 +79,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp parallel master //omp60-error {{construct 'parallel master' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp parallel master
+     for (int j = 0; j < 10; ++j) {
+       A += j;
+     }
+@@ -75,7 +87,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp parallel master taskloop //omp60-error {{construct 'parallel master taskloop' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp parallel master taskloop
+     for (int j = 0; j < 10; ++j) {
+       A += j;
+     }
+@@ -83,7 +95,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-#pragma omp parallel master taskloop simd //omp60-error {{construct 'parallel master taskloop simd' not allowed in a region associated with a directive with 'order' clause}}
++#pragma omp parallel master taskloop simd
+     for (int j = 0; j < 10; ++j) {
+       A += j;
+     }
+@@ -91,7 +103,7 @@ int main(int argc, char **argv) {
+ 
+ #pragma omp for order(concurrent)
+   for (int i = 0; i < 10; ++i) {
+-    #pragma omp parallel sections //omp60-error {{construct 'parallel sections' not allowed in a region associated with a directive with 'order' clause}}
++    #pragma omp parallel sections
+     {
+       A++;
+     }

@@ -1,0 +1,371 @@
+diff --git a/flang/docs/OpenMPSupport.md b/flang/docs/OpenMPSupport.md
+index 2d4b9dd737777..587723890d226 100644
+--- a/flang/docs/OpenMPSupport.md
++++ b/flang/docs/OpenMPSupport.md
+@@ -64,4 +64,4 @@ Note : No distinction is made between the support in Parser/Semantics, MLIR, Low
+ | target teams distribute parallel loop simd construct       | P      | device, reduction, dist_schedule and linear clauses are not supported |
+ 
+ ## OpenMP 3.1, OpenMP 2.5, OpenMP 1.1
+-All features except a few corner cases in atomic (complex type, different but compatible types in lhs and rhs), threadprivate (character type) constructs/clauses are supported.
++All features except a few corner cases in atomic (complex type, different but compatible types in lhs and rhs) are supported.
+diff --git a/flang/include/flang/Lower/ConvertVariable.h b/flang/include/flang/Lower/ConvertVariable.h
+index 8288b814134c8..e05625a229ac7 100644
+--- a/flang/include/flang/Lower/ConvertVariable.h
++++ b/flang/include/flang/Lower/ConvertVariable.h
+@@ -134,10 +134,11 @@ mlir::Value genInitialDataTarget(Fortran::lower::AbstractConverter &,
+                                  const SomeExpr &initialTarget,
+                                  bool couldBeInEquivalence = false);
+ 
+-/// Call \p genInit to generate code inside \p global initializer region.
+-void createGlobalInitialization(
+-    fir::FirOpBuilder &builder, fir::GlobalOp global,
+-    std::function<void(fir::FirOpBuilder &)> genInit);
++/// Create the global op and its init if it has one
++fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
++                           const Fortran::lower::pft::Variable &var,
++                           llvm::StringRef globalName, mlir::StringAttr linkage,
++                           cuf::DataAttributeAttr dataAttr = {});
+ 
+ /// Generate address \p addr inside an initializer.
+ fir::ExtendedValue
+diff --git a/flang/lib/Lower/ConvertVariable.cpp b/flang/lib/Lower/ConvertVariable.cpp
+index b277c0d7040a7..372c71b6d4821 100644
+--- a/flang/lib/Lower/ConvertVariable.cpp
++++ b/flang/lib/Lower/ConvertVariable.cpp
+@@ -145,11 +145,10 @@ static bool isConstant(const Fortran::semantics::Symbol &sym) {
+          sym.test(Fortran::semantics::Symbol::Flag::ReadOnly);
+ }
+ 
+-static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+-                                  const Fortran::lower::pft::Variable &var,
+-                                  llvm::StringRef globalName,
+-                                  mlir::StringAttr linkage,
+-                                  cuf::DataAttributeAttr dataAttr = {});
++/// Call \p genInit to generate code inside \p global initializer region.
++static void
++createGlobalInitialization(fir::FirOpBuilder &builder, fir::GlobalOp global,
++                           std::function<void(fir::FirOpBuilder &)> genInit);
+ 
+ static mlir::Location genLocation(Fortran::lower::AbstractConverter &converter,
+                                   const Fortran::semantics::Symbol &sym) {
+@@ -467,9 +466,9 @@ static bool globalIsInitialized(fir::GlobalOp global) {
+ }
+ 
+ /// Call \p genInit to generate code inside \p global initializer region.
+-void Fortran::lower::createGlobalInitialization(
+-    fir::FirOpBuilder &builder, fir::GlobalOp global,
+-    std::function<void(fir::FirOpBuilder &)> genInit) {
++static void
++createGlobalInitialization(fir::FirOpBuilder &builder, fir::GlobalOp global,
++                           std::function<void(fir::FirOpBuilder &)> genInit) {
+   mlir::Region &region = global.getRegion();
+   region.push_back(new mlir::Block);
+   mlir::Block &block = region.back();
+@@ -479,7 +478,7 @@ void Fortran::lower::createGlobalInitialization(
+   builder.restoreInsertionPoint(insertPt);
+ }
+ 
+-static unsigned getAllocatorIdx(cuf::DataAttributeAttr dataAttr) {
++static unsigned getAllocatorIdxFromDataAttr(cuf::DataAttributeAttr dataAttr) {
+   if (dataAttr) {
+     if (dataAttr.getValue() == cuf::DataAttribute::Pinned)
+       return kPinnedAllocatorPos;
+@@ -494,11 +493,10 @@ static unsigned getAllocatorIdx(cuf::DataAttributeAttr dataAttr) {
+ }
+ 
+ /// Create the global op and its init if it has one
+-static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+-                                  const Fortran::lower::pft::Variable &var,
+-                                  llvm::StringRef globalName,
+-                                  mlir::StringAttr linkage,
+-                                  cuf::DataAttributeAttr dataAttr) {
++fir::GlobalOp Fortran::lower::defineGlobal(
++    Fortran::lower::AbstractConverter &converter,
++    const Fortran::lower::pft::Variable &var, llvm::StringRef globalName,
++    mlir::StringAttr linkage, cuf::DataAttributeAttr dataAttr) {
+   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+   const Fortran::semantics::Symbol &sym = var.getSymbol();
+   mlir::Location loc = genLocation(converter, sym);
+@@ -545,27 +543,25 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+         sym.detailsIf<Fortran::semantics::ObjectEntityDetails>();
+     if (details && details->init()) {
+       auto expr = *details->init();
+-      Fortran::lower::createGlobalInitialization(
+-          builder, global, [&](fir::FirOpBuilder &b) {
+-            mlir::Value box = Fortran::lower::genInitialDataTarget(
+-                converter, loc, symTy, expr);
+-            b.create<fir::HasValueOp>(loc, box);
+-          });
++      createGlobalInitialization(builder, global, [&](fir::FirOpBuilder &b) {
++        mlir::Value box =
++            Fortran::lower::genInitialDataTarget(converter, loc, symTy, expr);
++        b.create<fir::HasValueOp>(loc, box);
++      });
+     } else {
+       // Create unallocated/disassociated descriptor if no explicit init
+-      Fortran::lower::createGlobalInitialization(
+-          builder, global, [&](fir::FirOpBuilder &b) {
+-            mlir::Value box = fir::factory::createUnallocatedBox(
+-                b, loc, symTy,
+-                /*nonDeferredParams=*/std::nullopt,
+-                /*typeSourceBox=*/{}, getAllocatorIdx(dataAttr));
+-            b.create<fir::HasValueOp>(loc, box);
+-          });
++      createGlobalInitialization(builder, global, [&](fir::FirOpBuilder &b) {
++        mlir::Value box = fir::factory::createUnallocatedBox(
++            b, loc, symTy,
++            /*nonDeferredParams=*/std::nullopt,
++            /*typeSourceBox=*/{}, getAllocatorIdxFromDataAttr(dataAttr));
++        b.create<fir::HasValueOp>(loc, box);
++      });
+     }
+   } else if (const auto *details =
+                  sym.detailsIf<Fortran::semantics::ObjectEntityDetails>()) {
+     if (details->init()) {
+-      Fortran::lower::createGlobalInitialization(
++      createGlobalInitialization(
+           builder, global, [&](fir::FirOpBuilder &builder) {
+             Fortran::lower::StatementContext stmtCtx(
+                 /*cleanupProhibited=*/true);
+@@ -576,7 +572,7 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+             builder.create<fir::HasValueOp>(loc, castTo);
+           });
+     } else if (Fortran::lower::hasDefaultInitialization(sym)) {
+-      Fortran::lower::createGlobalInitialization(
++      createGlobalInitialization(
+           builder, global, [&](fir::FirOpBuilder &builder) {
+             Fortran::lower::StatementContext stmtCtx(
+                 /*cleanupProhibited=*/true);
+@@ -591,7 +587,7 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+     if (details && details->init()) {
+       auto sym{*details->init()};
+       if (sym) // Has a procedure target.
+-        Fortran::lower::createGlobalInitialization(
++        createGlobalInitialization(
+             builder, global, [&](fir::FirOpBuilder &b) {
+               Fortran::lower::StatementContext stmtCtx(
+                   /*cleanupProhibited=*/true);
+@@ -601,19 +597,17 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+               b.create<fir::HasValueOp>(loc, castTo);
+             });
+       else { // Has NULL() target.
+-        Fortran::lower::createGlobalInitialization(
+-            builder, global, [&](fir::FirOpBuilder &b) {
+-              auto box{fir::factory::createNullBoxProc(b, loc, symTy)};
+-              b.create<fir::HasValueOp>(loc, box);
+-            });
++        createGlobalInitialization(builder, global, [&](fir::FirOpBuilder &b) {
++          auto box{fir::factory::createNullBoxProc(b, loc, symTy)};
++          b.create<fir::HasValueOp>(loc, box);
++        });
+       }
+     } else {
+       // No initialization.
+-      Fortran::lower::createGlobalInitialization(
+-          builder, global, [&](fir::FirOpBuilder &b) {
+-            auto box{fir::factory::createNullBoxProc(b, loc, symTy)};
+-            b.create<fir::HasValueOp>(loc, box);
+-          });
++      createGlobalInitialization(builder, global, [&](fir::FirOpBuilder &b) {
++        auto box{fir::factory::createNullBoxProc(b, loc, symTy)};
++        b.create<fir::HasValueOp>(loc, box);
++      });
+     }
+   } else if (sym.has<Fortran::semantics::CommonBlockDetails>()) {
+     mlir::emitError(loc, "COMMON symbol processed elsewhere");
+@@ -634,7 +628,7 @@ static fir::GlobalOp defineGlobal(Fortran::lower::AbstractConverter &converter,
+     // file.
+     if (sym.attrs().test(Fortran::semantics::Attr::BIND_C))
+       global.setLinkName(builder.createCommonLinkage());
+-    Fortran::lower::createGlobalInitialization(
++    createGlobalInitialization(
+         builder, global, [&](fir::FirOpBuilder &builder) {
+           mlir::Value initValue;
+           if (converter.getLoweringOptions().getInitGlobalZero())
+@@ -826,7 +820,7 @@ void Fortran::lower::defaultInitializeAtRuntime(
+                                       /*isConst=*/true,
+                                       /*isTarget=*/false,
+                                       /*dataAttr=*/{});
+-        Fortran::lower::createGlobalInitialization(
++        createGlobalInitialization(
+             builder, global, [&](fir::FirOpBuilder &builder) {
+               Fortran::lower::StatementContext stmtCtx(
+                   /*cleanupProhibited=*/true);
+@@ -842,7 +836,7 @@ void Fortran::lower::defaultInitializeAtRuntime(
+                                       /*isConst=*/true,
+                                       /*isTarget=*/false,
+                                       /*dataAttr=*/{});
+-        Fortran::lower::createGlobalInitialization(
++        createGlobalInitialization(
+             builder, global, [&](fir::FirOpBuilder &builder) {
+               Fortran::lower::StatementContext stmtCtx(
+                   /*cleanupProhibited=*/true);
+@@ -1207,7 +1201,7 @@ static fir::GlobalOp defineGlobalAggregateStore(
+     if (const auto *objectDetails =
+             initSym->detailsIf<Fortran::semantics::ObjectEntityDetails>())
+       if (objectDetails->init()) {
+-        Fortran::lower::createGlobalInitialization(
++        createGlobalInitialization(
+             builder, global, [&](fir::FirOpBuilder &builder) {
+               Fortran::lower::StatementContext stmtCtx;
+               mlir::Value initVal = fir::getBase(genInitializerExprValue(
+@@ -1219,12 +1213,11 @@ static fir::GlobalOp defineGlobalAggregateStore(
+   // Equivalence has no Fortran initial value. Create an undefined FIR initial
+   // value to ensure this is consider an object definition in the IR regardless
+   // of the linkage.
+-  Fortran::lower::createGlobalInitialization(
+-      builder, global, [&](fir::FirOpBuilder &builder) {
+-        Fortran::lower::StatementContext stmtCtx;
+-        mlir::Value initVal = builder.create<fir::ZeroOp>(loc, aggTy);
+-        builder.create<fir::HasValueOp>(loc, initVal);
+-      });
++  createGlobalInitialization(builder, global, [&](fir::FirOpBuilder &builder) {
++    Fortran::lower::StatementContext stmtCtx;
++    mlir::Value initVal = builder.create<fir::ZeroOp>(loc, aggTy);
++    builder.create<fir::HasValueOp>(loc, initVal);
++  });
+   return global;
+ }
+ 
+@@ -1543,7 +1536,7 @@ static void finalizeCommonBlockDefinition(
+     LLVM_DEBUG(llvm::dbgs() << "}\n");
+     builder.create<fir::HasValueOp>(loc, cb);
+   };
+-  Fortran::lower::createGlobalInitialization(builder, global, initFunc);
++  createGlobalInitialization(builder, global, initFunc);
+ }
+ 
+ void Fortran::lower::defineCommonBlocks(
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 47e7c266ff7d3..b60d2d5f275ab 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -662,32 +662,9 @@ static fir::GlobalOp globalInitialization(lower::AbstractConverter &converter,
+                                           const semantics::Symbol &sym,
+                                           const lower::pft::Variable &var,
+                                           mlir::Location currentLocation) {
+-  mlir::Type ty = converter.genType(sym);
+   std::string globalName = converter.mangleName(sym);
+   mlir::StringAttr linkage = firOpBuilder.createInternalLinkage();
+-  fir::GlobalOp global =
+-      firOpBuilder.createGlobal(currentLocation, ty, globalName, linkage);
+-
+-  // Create default initialization for non-character scalar.
+-  if (semantics::IsAllocatableOrObjectPointer(&sym)) {
+-    mlir::Type baseAddrType = mlir::dyn_cast<fir::BoxType>(ty).getEleTy();
+-    lower::createGlobalInitialization(
+-        firOpBuilder, global, [&](fir::FirOpBuilder &b) {
+-          mlir::Value nullAddr =
+-              b.createNullConstant(currentLocation, baseAddrType);
+-          mlir::Value box =
+-              b.create<fir::EmboxOp>(currentLocation, ty, nullAddr);
+-          b.create<fir::HasValueOp>(currentLocation, box);
+-        });
+-  } else {
+-    lower::createGlobalInitialization(
+-        firOpBuilder, global, [&](fir::FirOpBuilder &b) {
+-          mlir::Value undef = b.create<fir::UndefOp>(currentLocation, ty);
+-          b.create<fir::HasValueOp>(currentLocation, undef);
+-        });
+-  }
+-
+-  return global;
++  return Fortran::lower::defineGlobal(converter, var, globalName, linkage);
+ }
+ 
+ // Get the extended value for \p val by extracting additional variable
+diff --git a/flang/test/Lower/OpenMP/omp-declare-target-program-var.f90 b/flang/test/Lower/OpenMP/omp-declare-target-program-var.f90
+index 20538ff34871f..d18f42ae3ceb0 100644
+--- a/flang/test/Lower/OpenMP/omp-declare-target-program-var.f90
++++ b/flang/test/Lower/OpenMP/omp-declare-target-program-var.f90
+@@ -6,7 +6,7 @@ PROGRAM main
+     ! HOST-DAG: %[[I_DECL:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFEi"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+     REAL :: I
+     ! ALL-DAG: fir.global internal @_QFEi {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>} : f32 {
+-    ! ALL-DAG: %[[UNDEF:.*]] = fir.undefined f32
++    ! ALL-DAG: %[[UNDEF:.*]] = fir.zero_bits f32
+     ! ALL-DAG: fir.has_value %[[UNDEF]] : f32
+     ! ALL-DAG: }
+     !$omp declare target(I)
+diff --git a/flang/test/Lower/OpenMP/threadprivate-host-association-2.f90 b/flang/test/Lower/OpenMP/threadprivate-host-association-2.f90
+index 546d4920042d7..5e54cef8c29db 100644
+--- a/flang/test/Lower/OpenMP/threadprivate-host-association-2.f90
++++ b/flang/test/Lower/OpenMP/threadprivate-host-association-2.f90
+@@ -27,7 +27,7 @@
+ !CHECK:   return
+ !CHECK: }
+ !CHECK: fir.global internal @_QFEa : i32 {
+-!CHECK:   %[[A:.*]] = fir.undefined i32
++!CHECK:   %[[A:.*]] = fir.zero_bits i32
+ !CHECK:   fir.has_value %[[A]] : i32
+ !CHECK: }
+ 
+diff --git a/flang/test/Lower/OpenMP/threadprivate-host-association-3.f90 b/flang/test/Lower/OpenMP/threadprivate-host-association-3.f90
+index 22ee51f82bc0f..21547b47cf381 100644
+--- a/flang/test/Lower/OpenMP/threadprivate-host-association-3.f90
++++ b/flang/test/Lower/OpenMP/threadprivate-host-association-3.f90
+@@ -27,7 +27,7 @@
+ !CHECK:   return
+ !CHECK: }
+ !CHECK: fir.global internal @_QFEa : i32 {
+-!CHECK:   %[[A:.*]] = fir.undefined i32
++!CHECK:   %[[A:.*]] = fir.zero_bits i32
+ !CHECK:   fir.has_value %[[A]] : i32
+ !CHECK: }
+ 
+diff --git a/flang/test/Lower/OpenMP/threadprivate-lenparams.f90 b/flang/test/Lower/OpenMP/threadprivate-lenparams.f90
+new file mode 100644
+index 0000000000000..a220db2a11b2e
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/threadprivate-lenparams.f90
+@@ -0,0 +1,22 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++! Regression test for https://github.com/llvm/llvm-project/issues/108136
++
++character(:), pointer :: c
++character(2), pointer :: c2
++!$omp threadprivate(c, c2)
++end
++
++! CHECK-LABEL:   fir.global internal @_QFEc : !fir.box<!fir.ptr<!fir.char<1,?>>> {
++! CHECK:           %[[VAL_0:.*]] = fir.zero_bits !fir.ptr<!fir.char<1,?>>
++! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_2:.*]] = fir.embox %[[VAL_0]] typeparams %[[VAL_1]] : (!fir.ptr<!fir.char<1,?>>, index) -> !fir.box<!fir.ptr<!fir.char<1,?>>>
++! CHECK:           fir.has_value %[[VAL_2]] : !fir.box<!fir.ptr<!fir.char<1,?>>>
++! CHECK:         }
++
++! CHECK-LABEL:   fir.global internal @_QFEc2 : !fir.box<!fir.ptr<!fir.char<1,2>>> {
++! CHECK:           %[[VAL_0:.*]] = fir.zero_bits !fir.ptr<!fir.char<1,2>>
++! CHECK:           %[[VAL_1:.*]] = fir.embox %[[VAL_0]] : (!fir.ptr<!fir.char<1,2>>) -> !fir.box<!fir.ptr<!fir.char<1,2>>>
++! CHECK:           fir.has_value %[[VAL_1]] : !fir.box<!fir.ptr<!fir.char<1,2>>>
++! CHECK:         }
++
+diff --git a/flang/test/Lower/OpenMP/threadprivate-non-global.f90 b/flang/test/Lower/OpenMP/threadprivate-non-global.f90
+index 0b9abd1d0bcf4..508a67deb698b 100644
+--- a/flang/test/Lower/OpenMP/threadprivate-non-global.f90
++++ b/flang/test/Lower/OpenMP/threadprivate-non-global.f90
+@@ -85,19 +85,19 @@ program test
+ !CHECK-DAG:   fir.has_value [[E1]] : !fir.box<!fir.heap<f32>>
+ !CHECK-DAG: }
+ !CHECK-DAG: fir.global internal @_QFEw : complex<f32> {
+-!CHECK-DAG:   [[Z2:%.*]] = fir.undefined complex<f32>
++!CHECK-DAG:   [[Z2:%.*]] = fir.zero_bits complex<f32>
+ !CHECK-DAG:   fir.has_value [[Z2]] : complex<f32>
+ !CHECK-DAG: }
+ !CHECK-DAG: fir.global internal @_QFEx : i32 {
+-!CHECK-DAG:   [[Z3:%.*]] = fir.undefined i32
++!CHECK-DAG:   [[Z3:%.*]] = fir.zero_bits i32
+ !CHECK-DAG:   fir.has_value [[Z3]] : i32
+ !CHECK-DAG: }
+ !CHECK-DAG: fir.global internal @_QFEy : f32 {
+-!CHECK-DAG:   [[Z4:%.*]] = fir.undefined f32
++!CHECK-DAG:   [[Z4:%.*]] = fir.zero_bits f32
+ !CHECK-DAG:   fir.has_value [[Z4]] : f32
+ !CHECK-DAG: }
+ !CHECK-DAG: fir.global internal @_QFEz : !fir.logical<4> {
+-!CHECK-DAG:   [[Z5:%.*]] = fir.undefined !fir.logical<4>
++!CHECK-DAG:   [[Z5:%.*]] = fir.zero_bits !fir.logical<4>
+ !CHECK-DAG:   fir.has_value [[Z5]] : !fir.logical<4>
+ !CHECK-DAG: }
+ end

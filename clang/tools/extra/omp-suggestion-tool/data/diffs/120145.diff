@@ -1,0 +1,292 @@
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index d922709db1778..523761f5e0d80 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -1493,6 +1493,8 @@ def libomptarget_amdgcn_bc_path_EQ : Joined<["--"], "libomptarget-amdgcn-bc-path
+   HelpText<"Path to libomptarget-amdgcn bitcode library">, Alias<libomptarget_amdgpu_bc_path_EQ>;
+ def libomptarget_nvptx_bc_path_EQ : Joined<["--"], "libomptarget-nvptx-bc-path=">, Group<i_Group>,
+   HelpText<"Path to libomptarget-nvptx bitcode library">;
++def libomptarget_spirv_bc_path_EQ : Joined<["--"], "libomptarget-spirv-bc-path=">, Group<i_Group>,
++  HelpText<"Path to libomptarget-spirv bitcode library">;
+ def dD : Flag<["-"], "dD">, Group<d_Group>, Visibility<[ClangOption, CC1Option]>,
+   HelpText<"Print macro definitions in -E mode in addition to normal output">;
+ def dI : Flag<["-"], "dI">, Group<d_Group>, Visibility<[ClangOption, CC1Option]>,
+diff --git a/clang/lib/Driver/CMakeLists.txt b/clang/lib/Driver/CMakeLists.txt
+index 4fd10bf671512..57d04c3fefa84 100644
+--- a/clang/lib/Driver/CMakeLists.txt
++++ b/clang/lib/Driver/CMakeLists.txt
+@@ -77,6 +77,7 @@ add_clang_library(clangDriver
+   ToolChains/RISCVToolchain.cpp
+   ToolChains/Solaris.cpp
+   ToolChains/SPIRV.cpp
++  ToolChains/SPIRVOpenMP.cpp
+   ToolChains/TCE.cpp
+   ToolChains/UEFI.cpp
+   ToolChains/VEToolchain.cpp
+diff --git a/clang/lib/Driver/Driver.cpp b/clang/lib/Driver/Driver.cpp
+index dc84c1b9d1cc4..bc5ce9f14ab69 100644
+--- a/clang/lib/Driver/Driver.cpp
++++ b/clang/lib/Driver/Driver.cpp
+@@ -43,6 +43,7 @@
+ #include "ToolChains/PS4CPU.h"
+ #include "ToolChains/RISCVToolchain.h"
+ #include "ToolChains/SPIRV.h"
++#include "ToolChains/SPIRVOpenMP.h"
+ #include "ToolChains/Solaris.h"
+ #include "ToolChains/TCE.h"
+ #include "ToolChains/UEFI.h"
+@@ -890,9 +891,9 @@ void Driver::CreateOffloadingDeviceToolChains(Compilation &C,
+                                                       HostTC->getTriple());
+ 
+       // Attempt to deduce the offloading triple from the set of architectures.
+-      // We can only correctly deduce NVPTX / AMDGPU triples currently. We need
+-      // to temporarily create these toolchains so that we can access tools for
+-      // inferring architectures.
++      // We can only correctly deduce NVPTX / AMDGPU triples currently.
++      // We need to temporarily create these toolchains so that we can access
++      // tools for inferring architectures.
+       llvm::DenseSet<StringRef> Archs;
+       if (NVPTXTriple) {
+         auto TempTC = std::make_unique<toolchains::CudaToolChain>(
+@@ -962,7 +963,7 @@ void Driver::CreateOffloadingDeviceToolChains(Compilation &C,
+         const ToolChain *TC;
+         // Device toolchains have to be selected differently. They pair host
+         // and device in their implementation.
+-        if (TT.isNVPTX() || TT.isAMDGCN()) {
++        if (TT.isNVPTX() || TT.isAMDGCN() || TT.isSPIRV()) {
+           const ToolChain *HostTC =
+               C.getSingleOffloadToolChain<Action::OFK_Host>();
+           assert(HostTC && "Host toolchain should be always defined.");
+@@ -975,6 +976,9 @@ void Driver::CreateOffloadingDeviceToolChains(Compilation &C,
+             else if (TT.isAMDGCN())
+               DeviceTC = std::make_unique<toolchains::AMDGPUOpenMPToolChain>(
+                   *this, TT, *HostTC, C.getInputArgs());
++            else if (TT.isSPIRV())
++              DeviceTC = std::make_unique<toolchains::SPIRVOpenMPToolChain>(
++                  *this, TT, *HostTC, C.getInputArgs());
+             else
+               assert(DeviceTC && "Device toolchain not defined.");
+           }
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index 8b9639061d543..60214c4d59cee 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -2839,10 +2839,13 @@ void tools::addOpenMPDeviceRTL(const Driver &D,
+     LibraryPaths.emplace_back(LibPath);
+ 
+   OptSpecifier LibomptargetBCPathOpt =
+-      Triple.isAMDGCN() ? options::OPT_libomptarget_amdgpu_bc_path_EQ
+-                        : options::OPT_libomptarget_nvptx_bc_path_EQ;
++      Triple.isAMDGCN()  ? options::OPT_libomptarget_amdgpu_bc_path_EQ
++      : Triple.isNVPTX() ? options::OPT_libomptarget_nvptx_bc_path_EQ
++                         : options::OPT_libomptarget_spirv_bc_path_EQ;
+ 
+-  StringRef ArchPrefix = Triple.isAMDGCN() ? "amdgpu" : "nvptx";
++  StringRef ArchPrefix = Triple.isAMDGCN()  ? "amdgpu"
++                         : Triple.isNVPTX() ? "nvptx"
++                                            : "spirv64";
+   std::string LibOmpTargetName = ("libomptarget-" + ArchPrefix + ".bc").str();
+ 
+   // First check whether user specifies bc library
+diff --git a/clang/lib/Driver/ToolChains/SPIRV.h b/clang/lib/Driver/ToolChains/SPIRV.h
+index d59a8c76ed473..415f639bba3ec 100644
+--- a/clang/lib/Driver/ToolChains/SPIRV.h
++++ b/clang/lib/Driver/ToolChains/SPIRV.h
+@@ -52,7 +52,7 @@ class LLVM_LIBRARY_VISIBILITY Linker final : public Tool {
+ 
+ namespace toolchains {
+ 
+-class LLVM_LIBRARY_VISIBILITY SPIRVToolChain final : public ToolChain {
++class LLVM_LIBRARY_VISIBILITY SPIRVToolChain : public ToolChain {
+   mutable std::unique_ptr<Tool> Translator;
+ 
+ public:
+diff --git a/clang/lib/Driver/ToolChains/SPIRVOpenMP.cpp b/clang/lib/Driver/ToolChains/SPIRVOpenMP.cpp
+new file mode 100644
+index 0000000000000..1f27245e2839c
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/SPIRVOpenMP.cpp
+@@ -0,0 +1,34 @@
++//==- SPIRVOpenMP.cpp - SPIR-V OpenMP Tool Implementations --------*- C++ -*==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//==------------------------------------------------------------------------==//
++#include "SPIRVOpenMP.h"
++#include "CommonArgs.h"
++
++using namespace clang::driver;
++using namespace clang::driver::toolchains;
++using namespace clang::driver::tools;
++using namespace llvm::opt;
++
++namespace clang::driver::toolchains {
++SPIRVOpenMPToolChain::SPIRVOpenMPToolChain(const Driver &D,
++                                           const llvm::Triple &Triple,
++                                           const ToolChain &HostToolchain,
++                                           const ArgList &Args)
++    : SPIRVToolChain(D, Triple, Args), HostTC(HostToolchain) {}
++
++void SPIRVOpenMPToolChain::addClangTargetOptions(
++    const llvm::opt::ArgList &DriverArgs, llvm::opt::ArgStringList &CC1Args,
++    Action::OffloadKind DeviceOffloadingKind) const {
++
++  if (DeviceOffloadingKind != Action::OFK_OpenMP)
++    return;
++
++  if (DriverArgs.hasArg(options::OPT_nogpulib))
++    return;
++  addOpenMPDeviceRTL(getDriver(), DriverArgs, CC1Args, "", getTriple(), HostTC);
++}
++} // namespace clang::driver::toolchains
+diff --git a/clang/lib/Driver/ToolChains/SPIRVOpenMP.h b/clang/lib/Driver/ToolChains/SPIRVOpenMP.h
+new file mode 100644
+index 0000000000000..64404e2a28210
+--- /dev/null
++++ b/clang/lib/Driver/ToolChains/SPIRVOpenMP.h
+@@ -0,0 +1,29 @@
++//===--- SPIRVOpenMP.h - SPIR-V OpenMP Tool Implementations ------*- C++-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_SPIRV_OPENMP_H
++#define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_SPIRV_OPENMP_H
++
++#include "SPIRV.h"
++#include "clang/Driver/Tool.h"
++#include "clang/Driver/ToolChain.h"
++
++namespace clang::driver::toolchains {
++class LLVM_LIBRARY_VISIBILITY SPIRVOpenMPToolChain : public SPIRVToolChain {
++public:
++  SPIRVOpenMPToolChain(const Driver &D, const llvm::Triple &Triple,
++                       const ToolChain &HostTC, const llvm::opt::ArgList &Args);
++
++  void addClangTargetOptions(
++      const llvm::opt::ArgList &DriverArgs, llvm::opt::ArgStringList &CC1Args,
++      Action::OffloadKind DeviceOffloadingKind) const override;
++
++  const ToolChain &HostTC;
++};
++} // namespace clang::driver::toolchains
++#endif
+diff --git a/clang/lib/Frontend/CompilerInvocation.cpp b/clang/lib/Frontend/CompilerInvocation.cpp
+index 348c56cc37da3..0ae6dce5dd40a 100644
+--- a/clang/lib/Frontend/CompilerInvocation.cpp
++++ b/clang/lib/Frontend/CompilerInvocation.cpp
+@@ -4263,6 +4263,7 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
+ 
+       if (TT.getArch() == llvm::Triple::UnknownArch ||
+           !(TT.getArch() == llvm::Triple::aarch64 || TT.isPPC() ||
++            TT.getArch() == llvm::Triple::spirv64 ||
+             TT.getArch() == llvm::Triple::systemz ||
+             TT.getArch() == llvm::Triple::loongarch64 ||
+             TT.getArch() == llvm::Triple::nvptx ||
+diff --git a/clang/test/Driver/Inputs/spirv-openmp/lib/libomptarget-spirv64.bc b/clang/test/Driver/Inputs/spirv-openmp/lib/libomptarget-spirv64.bc
+new file mode 100644
+index 0000000000000..e69de29bb2d1d
+diff --git a/clang/test/Driver/spirv-openmp-toolchain.c b/clang/test/Driver/spirv-openmp-toolchain.c
+new file mode 100644
+index 0000000000000..3eb1f22a03ed0
+--- /dev/null
++++ b/clang/test/Driver/spirv-openmp-toolchain.c
+@@ -0,0 +1,64 @@
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -fopenmp -fopenmp-targets=spirv64-intel \
++// RUN:        --libomptarget-spirv-bc-path=%t/ -nogpulib %s 2>&1 \
++// RUN: | FileCheck %s
++
++// verify the tools invocations
++// CHECK: "-cc1" "-triple" "x86_64-unknown-linux-gnu"{{.*}}"-emit-llvm-bc"{{.*}}"-x" "c"
++// CHECK: "-cc1" "-triple" "spirv64-intel" "-aux-triple" "x86_64-unknown-linux-gnu"
++// CHECK: llvm-spirv{{.*}}
++// CHECK: "-cc1" "-triple" "x86_64-unknown-linux-gnu"{{.*}}"-emit-obj"
++// CHECK: clang-linker-wrapper{{.*}} "-o" "a.out"
++
++// RUN: %clang -ccc-print-phases --target=x86_64-unknown-linux-gnu -fopenmp -fopenmp-targets=spirv64-intel %s 2>&1 \
++// RUN: | FileCheck --check-prefix=CHECK-PHASES %s
++
++// CHECK-PHASES: 0: input, "[[INPUT:.+]]", c, (host-openmp)
++// CHECK-PHASES: 1: preprocessor, {0}, cpp-output, (host-openmp)
++// CHECK-PHASES: 2: compiler, {1}, ir, (host-openmp)
++// CHECK-PHASES: 3: input, "[[INPUT]]", c, (device-openmp)
++// CHECK-PHASES: 4: preprocessor, {3}, cpp-output, (device-openmp)
++// CHECK-PHASES: 5: compiler, {4}, ir, (device-openmp)
++// CHECK-PHASES: 6: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (spirv64-intel)" {5}, ir
++// CHECK-PHASES: 7: backend, {6}, assembler, (device-openmp)
++// CHECK-PHASES: 8: assembler, {7}, object, (device-openmp)
++// CHECK-PHASES: 9: offload, "device-openmp (spirv64-intel)" {8}, object
++// CHECK-PHASES: 10: clang-offload-packager, {9}, image, (device-openmp)
++// CHECK-PHASES: 11: offload, "host-openmp (x86_64-unknown-linux-gnu)" {2}, "device-openmp (x86_64-unknown-linux-gnu)" {10}, ir
++// CHECK-PHASES: 12: backend, {11}, assembler, (host-openmp)
++// CHECK-PHASES: 13: assembler, {12}, object, (host-openmp)
++// CHECK-PHASES: 14: clang-linker-wrapper, {13}, image, (host-openmp)
++
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-bindings -fopenmp -fopenmp-targets=spirv64-intel -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-BINDINGS
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-bindings -fopenmp -fopenmp-targets=spirv64-intel -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-BINDINGS
++
++// CHECK-BINDINGS: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[INPUT:.+]]"], output: "[[HOST_BC:.+]]"
++// CHECK-BINDINGS: "spirv64-intel" - "clang", inputs: ["[[INPUT]]", "[[HOST_BC]]"], output: "[[DEVICE_TEMP_BC:.+]]"
++// CHECK-BINDINGS: "spirv64-intel" - "SPIR-V::Translator", inputs: ["[[DEVICE_TEMP_BC]]"], output: "[[DEVICE_SPV:.+]]"
++// CHECK-BINDINGS: "x86_64-unknown-linux-gnu" - "Offload::Packager", inputs: ["[[DEVICE_SPV]]"], output: "[[DEVICE_IMAGE:.+]]"
++// CHECK-BINDINGS: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[HOST_BC]]", "[[DEVICE_IMAGE]]"], output: "[[HOST_OBJ:.+]]"
++// CHECK-BINDINGS: "x86_64-unknown-linux-gnu" - "Offload::Linker", inputs: ["[[HOST_OBJ]]"], output: "a.out"
++
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-bindings -save-temps -fopenmp -fopenmp-targets=spirv64-intel -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-BINDINGS-TEMPS
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -ccc-print-bindings -save-temps -fopenmp -fopenmp-targets=spirv64-intel %s 2>&1 | FileCheck %s --check-prefix=CHECK-BINDINGS-TEMPS
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[INPUT:.+]]"], output: "[[HOST_PP:.+]]"
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[HOST_PP]]"], output: "[[HOST_BC:.+]]"
++// CHECK-BINDINGS-TEMPS: "spirv64-intel" - "clang", inputs: ["[[INPUT]]"], output: "[[DEVICE_PP:.+]]"
++// CHECK-BINDINGS-TEMPS: "spirv64-intel" - "clang", inputs: ["[[DEVICE_PP]]", "[[HOST_BC]]"], output: "[[DEVICE_TEMP_BC:.+]]"
++// CHECK-BINDINGS-TEMPS: "spirv64-intel" - "SPIR-V::Translator", inputs: ["[[DEVICE_TEMP_BC]]"], output: "[[DEVICE_ASM:.+]]"
++// CHECK-BINDINGS-TEMPS: "spirv64-intel" - "SPIR-V::Translator", inputs: ["[[DEVICE_ASM]]"], output: "[[DEVICE_SPV:.+]]"
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "Offload::Packager", inputs: ["[[DEVICE_SPV]]"], output: "[[DEVICE_IMAGE:.+]]"
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "clang", inputs: ["[[HOST_BC]]", "[[DEVICE_IMAGE]]"], output: "[[HOST_ASM:.+]]"
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "clang::as", inputs: ["[[HOST_ASM]]"], output: "[[HOST_OBJ:.+]]"
++// CHECK-BINDINGS-TEMPS: "x86_64-unknown-linux-gnu" - "Offload::Linker", inputs: ["[[HOST_OBJ]]"], output: "a.out"
++
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -emit-llvm -S -fopenmp -fopenmp-targets=spirv64-intel -nogpulib %s 2>&1 | FileCheck %s --check-prefix=CHECK-EMIT-LLVM-IR
++// CHECK-EMIT-LLVM-IR: "-cc1" "-triple" "spirv64-intel"{{.*}}"-emit-llvm-bc"
++
++// RUN: %clang -### --target=x86_64-unknown-linux-gnu -fopenmp -fopenmp-targets=spirv64-intel \
++// RUN: --sysroot=%S/Inputs/spirv-openmp/ %s 2>&1 | FileCheck --check-prefix=CHECK-GPULIB %s
++// CHECK-GPULIB: "-cc1" "-triple" "spirv64-intel"{{.*}}"-mlink-builtin-bitcode" "{{.*}}libomptarget-spirv64.bc"
++
++// RUN: not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=spirv64-intel \
++// RUN:        --libomptarget-spirv-bc-path=%t/ -nogpulib %s 2>&1 \
++// RUN: | FileCheck %s --check-prefix=CHECK-OFFLOAD-ARCH-ERROR
++// CHECK-OFFLOAD-ARCH-ERROR: error: failed to deduce triple for target architecture 'spirv64-intel'; specify the triple using '-fopenmp-targets' and '-Xopenmp-target' instead
+diff --git a/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp b/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
+index 4201f043944ed..9fba63b195bc1 100644
+--- a/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
++++ b/clang/tools/clang-linker-wrapper/ClangLinkerWrapper.cpp
+@@ -504,14 +504,14 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
+         {"-Xlinker",
+          Args.MakeArgString("--plugin-opt=" + StringRef(Arg->getValue()))});
+ 
+-  if (!Triple.isNVPTX())
++  if (!Triple.isNVPTX() && !Triple.isSPIRV())
+     CmdArgs.push_back("-Wl,--no-undefined");
+ 
+   for (StringRef InputFile : InputFiles)
+     CmdArgs.push_back(InputFile);
+ 
+   // If this is CPU offloading we copy the input libraries.
+-  if (!Triple.isAMDGPU() && !Triple.isNVPTX()) {
++  if (!Triple.isAMDGPU() && !Triple.isNVPTX() && !Triple.isSPIRV()) {
+     CmdArgs.push_back("-Wl,-Bsymbolic");
+     CmdArgs.push_back("-shared");
+     ArgStringList LinkerArgs;
+@@ -595,6 +595,7 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
+   case Triple::aarch64_be:
+   case Triple::ppc64:
+   case Triple::ppc64le:
++  case Triple::spirv64:
+   case Triple::systemz:
+   case Triple::loongarch64:
+     return generic::clang(InputFiles, Args);

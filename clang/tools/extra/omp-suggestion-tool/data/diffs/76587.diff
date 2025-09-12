@@ -1,0 +1,688 @@
+diff --git a/clang/lib/CodeGen/CodeGenPGO.cpp b/clang/lib/CodeGen/CodeGenPGO.cpp
+index db8e6f55302ad..3edfbdd679c61 100644
+--- a/clang/lib/CodeGen/CodeGenPGO.cpp
++++ b/clang/lib/CodeGen/CodeGenPGO.cpp
+@@ -1197,10 +1197,15 @@ void CodeGenPGO::emitCounterSetOrIncrement(CGBuilderTy &Builder, const Stmt *S,
+ 
+   unsigned Counter = (*RegionCounterMap)[S];
+ 
+-  llvm::Value *Args[] = {FuncNameVar,
+-                         Builder.getInt64(FunctionHash),
+-                         Builder.getInt32(NumRegionCounters),
+-                         Builder.getInt32(Counter), StepV};
++  // Make sure that pointer to global is passed in with zero addrspace
++  // This is relevant during GPU profiling
++  auto *NormalizedFuncNameVarPtr =
++      llvm::ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++          FuncNameVar, llvm::PointerType::get(CGM.getLLVMContext(), 0));
++
++  llvm::Value *Args[] = {
++      NormalizedFuncNameVarPtr, Builder.getInt64(FunctionHash),
++      Builder.getInt32(NumRegionCounters), Builder.getInt32(Counter), StepV};
+ 
+   if (llvm::EnableSingleByteCoverage)
+     Builder.CreateCall(CGM.getIntrinsic(llvm::Intrinsic::instrprof_cover),
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+index fe09bb8177c28..51e97458825ac 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+@@ -502,6 +502,9 @@ __OMP_RTL(__kmpc_barrier_simple_generic, false, Void, IdentPtr, Int32)
+ __OMP_RTL(__kmpc_warp_active_thread_mask, false, Int64,)
+ __OMP_RTL(__kmpc_syncwarp, false, Void, Int64)
+ 
++__OMP_RTL(__llvm_profile_register_function, false, Void, VoidPtr)
++__OMP_RTL(__llvm_profile_register_names_function, false, Void, VoidPtr, Int64)
++
+ __OMP_RTL(__last, false, Void, )
+ 
+ #undef __OMP_RTL
+diff --git a/llvm/include/llvm/ProfileData/InstrProf.h b/llvm/include/llvm/ProfileData/InstrProf.h
+index 15b9eb688e27e..06658b95b075a 100644
+--- a/llvm/include/llvm/ProfileData/InstrProf.h
++++ b/llvm/include/llvm/ProfileData/InstrProf.h
+@@ -177,6 +177,10 @@ inline StringRef getInstrProfCounterBiasVarName() {
+ /// Return the marker used to separate PGO names during serialization.
+ inline StringRef getInstrProfNameSeparator() { return "\01"; }
+ 
++/// Determines whether module targets a GPU eligable for PGO
++/// instrumentation
++bool isGPUProfTarget(const Module &M);
++
+ /// Please use getIRPGOFuncName for LLVM IR instrumentation. This function is
+ /// for front-end (Clang, etc) instrumentation.
+ /// Return the modified name for function \c F suitable to be
+diff --git a/llvm/lib/ProfileData/InstrProf.cpp b/llvm/lib/ProfileData/InstrProf.cpp
+index ad63086430bf6..6742435c9d065 100644
+--- a/llvm/lib/ProfileData/InstrProf.cpp
++++ b/llvm/lib/ProfileData/InstrProf.cpp
+@@ -432,13 +432,31 @@ std::string getPGOFuncNameVarName(StringRef FuncName,
+   return VarName;
+ }
+ 
++bool isGPUProfTarget(const Module &M) {
++  const auto &T = Triple(M.getTargetTriple());
++  return T.isAMDGPU() || T.isNVPTX();
++}
++
++void setPGOFuncVisibility(Module &M, GlobalVariable *FuncNameVar) {
++  // If the target is a GPU, make the symbol protected so it can
++  // be read from the host device
++  if (isGPUProfTarget(M))
++    FuncNameVar->setVisibility(GlobalValue::ProtectedVisibility);
++  // Hide the symbol so that we correctly get a copy for each executable.
++  else if (!GlobalValue::isLocalLinkage(FuncNameVar->getLinkage()))
++    FuncNameVar->setVisibility(GlobalValue::HiddenVisibility);
++}
++
+ GlobalVariable *createPGOFuncNameVar(Module &M,
+                                      GlobalValue::LinkageTypes Linkage,
+                                      StringRef PGOFuncName) {
++  // Ensure profiling variables on GPU are visible to be read from host
++  if (isGPUProfTarget(M))
++    Linkage = GlobalValue::ExternalLinkage;
+   // We generally want to match the function's linkage, but available_externally
+   // and extern_weak both have the wrong semantics, and anything that doesn't
+   // need to link across compilation units doesn't need to be visible at all.
+-  if (Linkage == GlobalValue::ExternalWeakLinkage)
++  else if (Linkage == GlobalValue::ExternalWeakLinkage)
+     Linkage = GlobalValue::LinkOnceAnyLinkage;
+   else if (Linkage == GlobalValue::AvailableExternallyLinkage)
+     Linkage = GlobalValue::LinkOnceODRLinkage;
+@@ -452,10 +470,7 @@ GlobalVariable *createPGOFuncNameVar(Module &M,
+       new GlobalVariable(M, Value->getType(), true, Linkage, Value,
+                          getPGOFuncNameVarName(PGOFuncName, Linkage));
+ 
+-  // Hide the symbol so that we correctly get a copy for each executable.
+-  if (!GlobalValue::isLocalLinkage(FuncNameVar->getLinkage()))
+-    FuncNameVar->setVisibility(GlobalValue::HiddenVisibility);
+-
++  setPGOFuncVisibility(M, FuncNameVar);
+   return FuncNameVar;
+ }
+ 
+diff --git a/llvm/lib/Transforms/Instrumentation/InstrProfiling.cpp b/llvm/lib/Transforms/Instrumentation/InstrProfiling.cpp
+index f9b58d9f27821..05cef1236f087 100644
+--- a/llvm/lib/Transforms/Instrumentation/InstrProfiling.cpp
++++ b/llvm/lib/Transforms/Instrumentation/InstrProfiling.cpp
+@@ -869,6 +869,8 @@ void InstrLowerer::lowerValueProfileInst(InstrProfValueProfileInst *Ind) {
+                       llvm::InstrProfValueKind::IPVK_MemOPSize);
+   CallInst *Call = nullptr;
+   auto *TLI = &GetTLI(*Ind->getFunction());
++  auto *NormalizedDataVarPtr = ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++      DataVar, PointerType::get(M.getContext(), 0));
+ 
+   // To support value profiling calls within Windows exception handlers, funclet
+   // information contained within operand bundles needs to be copied over to
+@@ -877,11 +879,13 @@ void InstrLowerer::lowerValueProfileInst(InstrProfValueProfileInst *Ind) {
+   SmallVector<OperandBundleDef, 1> OpBundles;
+   Ind->getOperandBundlesAsDefs(OpBundles);
+   if (!IsMemOpSize) {
+-    Value *Args[3] = {Ind->getTargetValue(), DataVar, Builder.getInt32(Index)};
++    Value *Args[3] = {Ind->getTargetValue(), NormalizedDataVarPtr,
++                      Builder.getInt32(Index)};
+     Call = Builder.CreateCall(getOrInsertValueProfilingCall(M, *TLI), Args,
+                               OpBundles);
+   } else {
+-    Value *Args[3] = {Ind->getTargetValue(), DataVar, Builder.getInt32(Index)};
++    Value *Args[3] = {Ind->getTargetValue(), NormalizedDataVarPtr,
++                      Builder.getInt32(Index)};
+     Call = Builder.CreateCall(
+         getOrInsertValueProfilingCall(M, *TLI, ValueProfilingCallType::MemOp),
+         Args, OpBundles);
+@@ -1575,7 +1579,8 @@ void InstrLowerer::createDataVariable(InstrProfCntrInstBase *Inc) {
+         getInstrProfSectionName(IPSK_vals, TT.getObjectFormat()));
+     ValuesVar->setAlignment(Align(8));
+     maybeSetComdat(ValuesVar, Fn, CntsVarName);
+-    ValuesPtrExpr = ValuesVar;
++    ValuesPtrExpr = ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++        ValuesVar, PointerType::get(Fn->getContext(), 0));
+   }
+ 
+   uint64_t NumCounters = Inc->getNumCounters()->getZExtValue();
+@@ -1599,6 +1604,10 @@ void InstrLowerer::createDataVariable(InstrProfCntrInstBase *Inc) {
+   for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
+     Int16ArrayVals[Kind] = ConstantInt::get(Int16Ty, PD.NumValueSites[Kind]);
+ 
++  if (isGPUProfTarget(M)) {
++    Linkage = GlobalValue::ExternalLinkage;
++    Visibility = GlobalValue::ProtectedVisibility;
++  }
+   // If the data variable is not referenced by code (if we don't emit
+   // @llvm.instrprof.value.profile, NS will be 0), and the counter keeps the
+   // data variable live under linker GC, the data variable can be private. This
+@@ -1610,9 +1619,9 @@ void InstrLowerer::createDataVariable(InstrProfCntrInstBase *Inc) {
+   // If profd is in a deduplicate comdat, NS==0 with a hash suffix guarantees
+   // that other copies must have the same CFG and cannot have value profiling.
+   // If no hash suffix, other profd copies may be referenced by code.
+-  if (NS == 0 && !(DataReferencedByCode && NeedComdat && !Renamed) &&
+-      (TT.isOSBinFormatELF() ||
+-       (!DataReferencedByCode && TT.isOSBinFormatCOFF()))) {
++  else if (NS == 0 && !(DataReferencedByCode && NeedComdat && !Renamed) &&
++           (TT.isOSBinFormatELF() ||
++            (!DataReferencedByCode && TT.isOSBinFormatCOFF()))) {
+     Linkage = GlobalValue::PrivateLinkage;
+     Visibility = GlobalValue::DefaultVisibility;
+   }
+@@ -1735,6 +1744,13 @@ void InstrLowerer::emitNameData() {
+   NamesVar = new GlobalVariable(M, NamesVal->getType(), true,
+                                 GlobalValue::PrivateLinkage, NamesVal,
+                                 getInstrProfNamesVarName());
++
++  // Make names variable public if current target is a GPU
++  if (isGPUProfTarget(M)) {
++    NamesVar->setLinkage(GlobalValue::ExternalLinkage);
++    NamesVar->setVisibility(GlobalValue::VisibilityTypes::ProtectedVisibility);
++  }
++
+   NamesSize = CompressedNameStr.size();
+   setGlobalVariableLargeSection(TT, *NamesVar);
+   NamesVar->setSection(
+@@ -1801,10 +1817,13 @@ void InstrLowerer::emitRegistration() {
+   IRBuilder<> IRB(BasicBlock::Create(M.getContext(), "", RegisterF));
+   for (Value *Data : CompilerUsedVars)
+     if (!isa<Function>(Data))
+-      IRB.CreateCall(RuntimeRegisterF, Data);
++      // Check for addrspace cast when profiling GPU
++      IRB.CreateCall(RuntimeRegisterF,
++                     IRB.CreatePointerBitCastOrAddrSpaceCast(Data, VoidPtrTy));
+   for (Value *Data : UsedVars)
+     if (Data != NamesVar && !isa<Function>(Data))
+-      IRB.CreateCall(RuntimeRegisterF, Data);
++      IRB.CreateCall(RuntimeRegisterF,
++                     IRB.CreatePointerBitCastOrAddrSpaceCast(Data, VoidPtrTy));
+ 
+   if (NamesVar) {
+     Type *ParamTypes[] = {VoidPtrTy, Int64Ty};
+@@ -1813,7 +1832,9 @@ void InstrLowerer::emitRegistration() {
+     auto *NamesRegisterF =
+         Function::Create(NamesRegisterTy, GlobalVariable::ExternalLinkage,
+                          getInstrProfNamesRegFuncName(), M);
+-    IRB.CreateCall(NamesRegisterF, {NamesVar, IRB.getInt64(NamesSize)});
++    IRB.CreateCall(NamesRegisterF, {IRB.CreatePointerBitCastOrAddrSpaceCast(
++                                        NamesVar, VoidPtrTy),
++                                    IRB.getInt64(NamesSize)});
+   }
+ 
+   IRB.CreateRetVoid();
+@@ -1834,7 +1855,10 @@ bool InstrLowerer::emitRuntimeHook() {
+   auto *Var =
+       new GlobalVariable(M, Int32Ty, false, GlobalValue::ExternalLinkage,
+                          nullptr, getInstrProfRuntimeHookVarName());
+-  Var->setVisibility(GlobalValue::HiddenVisibility);
++  if (isGPUProfTarget(M))
++    Var->setVisibility(GlobalValue::ProtectedVisibility);
++  else
++    Var->setVisibility(GlobalValue::HiddenVisibility);
+ 
+   if (TT.isOSBinFormatELF() && !TT.isPS()) {
+     // Mark the user variable as used so that it isn't stripped out.
+diff --git a/llvm/lib/Transforms/Instrumentation/PGOInstrumentation.cpp b/llvm/lib/Transforms/Instrumentation/PGOInstrumentation.cpp
+index 2269c2e0fffae..f8f34ea25597f 100644
+--- a/llvm/lib/Transforms/Instrumentation/PGOInstrumentation.cpp
++++ b/llvm/lib/Transforms/Instrumentation/PGOInstrumentation.cpp
+@@ -882,6 +882,10 @@ static void instrumentOneFunc(
+   auto Name = FuncInfo.FuncNameVar;
+   auto CFGHash = ConstantInt::get(Type::getInt64Ty(M->getContext()),
+                                   FuncInfo.FunctionHash);
++  // Make sure that pointer to global is passed in with zero addrspace
++  // This is relevant during GPU profiling
++  auto *NormalizedNamePtr = ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++      Name, PointerType::get(M->getContext(), 0));
+   if (PGOFunctionEntryCoverage) {
+     auto &EntryBB = F.getEntryBlock();
+     IRBuilder<> Builder(&EntryBB, EntryBB.getFirstInsertionPt());
+@@ -889,7 +893,7 @@ static void instrumentOneFunc(
+     //                      i32 <index>)
+     Builder.CreateCall(
+         Intrinsic::getDeclaration(M, Intrinsic::instrprof_cover),
+-        {Name, CFGHash, Builder.getInt32(1), Builder.getInt32(0)});
++        {NormalizedNamePtr, CFGHash, Builder.getInt32(1), Builder.getInt32(0)});
+     return;
+   }
+ 
+@@ -944,7 +948,8 @@ static void instrumentOneFunc(
+     //                          i32 <index>)
+     Builder.CreateCall(
+         Intrinsic::getDeclaration(M, Intrinsic::instrprof_timestamp),
+-        {Name, CFGHash, Builder.getInt32(NumCounters), Builder.getInt32(I)});
++        {NormalizedNamePtr, CFGHash, Builder.getInt32(NumCounters),
++         Builder.getInt32(I)});
+     I += PGOBlockCoverage ? 8 : 1;
+   }
+ 
+@@ -958,7 +963,8 @@ static void instrumentOneFunc(
+         Intrinsic::getDeclaration(M, PGOBlockCoverage
+                                          ? Intrinsic::instrprof_cover
+                                          : Intrinsic::instrprof_increment),
+-        {Name, CFGHash, Builder.getInt32(NumCounters), Builder.getInt32(I++)});
++        {NormalizedNamePtr, CFGHash, Builder.getInt32(NumCounters),
++         Builder.getInt32(I++)});
+   }
+ 
+   // Now instrument select instructions:
+@@ -1001,11 +1007,14 @@ static void instrumentOneFunc(
+         ToProfile = Builder.CreatePtrToInt(Cand.V, Builder.getInt64Ty());
+       assert(ToProfile && "value profiling Value is of unexpected type");
+ 
++      auto *NormalizedNamePtr = ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++          Name, PointerType::get(M->getContext(), 0));
++
+       SmallVector<OperandBundleDef, 1> OpBundles;
+       populateEHOperandBundle(Cand, BlockColors, OpBundles);
+       Builder.CreateCall(
+           Intrinsic::getDeclaration(M, Intrinsic::instrprof_value_profile),
+-          {FuncInfo.FuncNameVar, Builder.getInt64(FuncInfo.FunctionHash),
++          {NormalizedNamePtr, Builder.getInt64(FuncInfo.FunctionHash),
+            ToProfile, Builder.getInt32(Kind), Builder.getInt32(SiteIndex++)},
+           OpBundles);
+     }
+@@ -1679,10 +1688,13 @@ void SelectInstVisitor::instrumentOneSelectInst(SelectInst &SI) {
+   IRBuilder<> Builder(&SI);
+   Type *Int64Ty = Builder.getInt64Ty();
+   auto *Step = Builder.CreateZExt(SI.getCondition(), Int64Ty);
++  auto *NormalizedFuncNameVarPtr =
++      ConstantExpr::getPointerBitCastOrAddrSpaceCast(
++          FuncNameVar, PointerType::get(M->getContext(), 0));
+   Builder.CreateCall(
+       Intrinsic::getDeclaration(M, Intrinsic::instrprof_increment_step),
+-      {FuncNameVar, Builder.getInt64(FuncHash), Builder.getInt32(TotalNumCtrs),
+-       Builder.getInt32(*CurCtrIdx), Step});
++      {NormalizedFuncNameVarPtr, Builder.getInt64(FuncHash),
++       Builder.getInt32(TotalNumCtrs), Builder.getInt32(*CurCtrIdx), Step});
+   ++(*CurCtrIdx);
+ }
+ 
+diff --git a/offload/DeviceRTL/CMakeLists.txt b/offload/DeviceRTL/CMakeLists.txt
+index b356003672760..e01a858dc92cf 100644
+--- a/offload/DeviceRTL/CMakeLists.txt
++++ b/offload/DeviceRTL/CMakeLists.txt
+@@ -77,6 +77,7 @@ set(include_files
+   ${include_directory}/Interface.h
+   ${include_directory}/LibC.h
+   ${include_directory}/Mapping.h
++  ${include_directory}/Profiling.h
+   ${include_directory}/State.h
+   ${include_directory}/Synchronization.h
+   ${include_directory}/Types.h
+@@ -92,6 +93,7 @@ set(src_files
+   ${source_directory}/Mapping.cpp
+   ${source_directory}/Misc.cpp
+   ${source_directory}/Parallelism.cpp
++  ${source_directory}/Profiling.cpp
+   ${source_directory}/Reduction.cpp
+   ${source_directory}/State.cpp
+   ${source_directory}/Synchronization.cpp
+diff --git a/offload/DeviceRTL/include/Profiling.h b/offload/DeviceRTL/include/Profiling.h
+new file mode 100644
+index 0000000000000..d994752254121
+--- /dev/null
++++ b/offload/DeviceRTL/include/Profiling.h
+@@ -0,0 +1,21 @@
++//===-------- Profiling.h - OpenMP interface ---------------------- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef OMPTARGET_DEVICERTL_PROFILING_H
++#define OMPTARGET_DEVICERTL_PROFILING_H
++
++extern "C" {
++void __llvm_profile_register_function(void *Ptr);
++void __llvm_profile_register_names_function(void *Ptr, long int I);
++void __llvm_profile_instrument_memop(long int I, void *Ptr, int I2);
++}
++
++#endif
+diff --git a/offload/DeviceRTL/src/Profiling.cpp b/offload/DeviceRTL/src/Profiling.cpp
+new file mode 100644
+index 0000000000000..bb3caaadcc03d
+--- /dev/null
++++ b/offload/DeviceRTL/src/Profiling.cpp
+@@ -0,0 +1,22 @@
++//===------- Profiling.cpp ---------------------------------------- C++ ---===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "Profiling.h"
++
++#pragma omp begin declare target device_type(nohost)
++
++extern "C" {
++
++// Provides empty implementations for certain functions in compiler-rt
++// that are emitted by the PGO instrumentation.
++void __llvm_profile_register_function(void *Ptr) {}
++void __llvm_profile_register_names_function(void *Ptr, long int I) {}
++void __llvm_profile_instrument_memop(long int I, void *Ptr, int I2) {}
++}
++
++#pragma omp end declare target
+diff --git a/offload/plugins-nextgen/common/include/GlobalHandler.h b/offload/plugins-nextgen/common/include/GlobalHandler.h
+index 829b4b7291193..d2914e7cd0eb4 100644
+--- a/offload/plugins-nextgen/common/include/GlobalHandler.h
++++ b/offload/plugins-nextgen/common/include/GlobalHandler.h
+@@ -13,10 +13,11 @@
+ #ifndef LLVM_OPENMP_LIBOMPTARGET_PLUGINS_NEXTGEN_COMMON_GLOBALHANDLER_H
+ #define LLVM_OPENMP_LIBOMPTARGET_PLUGINS_NEXTGEN_COMMON_GLOBALHANDLER_H
+ 
+-#include <string>
++#include <type_traits>
+ 
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/Object/ELFObjectFile.h"
++#include "llvm/ProfileData/InstrProf.h"
+ 
+ #include "Shared/Debug.h"
+ #include "Shared/Utils.h"
+@@ -55,6 +56,23 @@ class GlobalTy {
+   void setPtr(void *P) { Ptr = P; }
+ };
+ 
++using IntPtrT = void *;
++struct __llvm_profile_data {
++#define INSTR_PROF_DATA(Type, LLVMType, Name, Initializer)                     \
++  std::remove_const<Type>::type Name;
++#include "llvm/ProfileData/InstrProfData.inc"
++};
++
++/// PGO profiling data extracted from a GPU device
++struct GPUProfGlobals {
++  SmallVector<uint8_t> NamesData;
++  SmallVector<SmallVector<int64_t>> Counts;
++  SmallVector<__llvm_profile_data> Data;
++  Triple TargetTriple;
++
++  void dump() const;
++};
++
+ /// Subclass of GlobalTy that holds the memory for a global of \p Ty.
+ template <typename Ty> class StaticGlobalTy : public GlobalTy {
+   Ty Data;
+@@ -164,6 +182,15 @@ class GenericGlobalHandlerTy {
+     return moveGlobalBetweenDeviceAndHost(Device, Image, HostGlobal,
+                                           /*D2H=*/false);
+   }
++
++  /// Checks whether a given image contains profiling globals.
++  bool hasProfilingGlobals(GenericDeviceTy &Device, DeviceImageTy &Image);
++
++  /// Reads profiling data from a GPU image to supplied profdata struct.
++  /// Iterates through the image symbol table and stores global values
++  /// with profiling prefixes.
++  Expected<GPUProfGlobals> readProfilingGlobals(GenericDeviceTy &Device,
++                                                DeviceImageTy &Image);
+ };
+ 
+ } // namespace plugin
+diff --git a/offload/plugins-nextgen/common/src/GlobalHandler.cpp b/offload/plugins-nextgen/common/src/GlobalHandler.cpp
+index ba0aa47f8e51c..7717e19a5b677 100644
+--- a/offload/plugins-nextgen/common/src/GlobalHandler.cpp
++++ b/offload/plugins-nextgen/common/src/GlobalHandler.cpp
+@@ -19,6 +19,7 @@
+ #include "llvm/Support/Error.h"
+ 
+ #include <cstring>
++#include <string>
+ 
+ using namespace llvm;
+ using namespace omp;
+@@ -161,3 +162,98 @@ Error GenericGlobalHandlerTy::readGlobalFromImage(GenericDeviceTy &Device,
+ 
+   return Plugin::success();
+ }
++
++bool GenericGlobalHandlerTy::hasProfilingGlobals(GenericDeviceTy &Device,
++                                                 DeviceImageTy &Image) {
++  GlobalTy global(getInstrProfNamesVarName().str(), 0);
++  if (auto Err = getGlobalMetadataFromImage(Device, Image, global)) {
++    consumeError(std::move(Err));
++    return false;
++  }
++  return true;
++}
++
++Expected<GPUProfGlobals>
++GenericGlobalHandlerTy::readProfilingGlobals(GenericDeviceTy &Device,
++                                             DeviceImageTy &Image) {
++  GPUProfGlobals DeviceProfileData;
++  auto ObjFile = getELFObjectFile(Image);
++  if (!ObjFile)
++    return ObjFile.takeError();
++
++  std::unique_ptr<ELFObjectFileBase> ELFObj(
++      static_cast<ELFObjectFileBase *>(ObjFile->release()));
++  DeviceProfileData.TargetTriple = ELFObj->makeTriple();
++
++  // Iterate through elf symbols
++  for (auto &Sym : ELFObj->symbols()) {
++    auto NameOrErr = Sym.getName();
++    if (!NameOrErr)
++      return NameOrErr.takeError();
++
++    // Check if given current global is a profiling global based
++    // on name
++    if (NameOrErr->equals(getInstrProfNamesVarName())) {
++      // Read in profiled function names
++      DeviceProfileData.NamesData = SmallVector<uint8_t>(Sym.getSize(), 0);
++      GlobalTy NamesGlobal(NameOrErr->str(), Sym.getSize(),
++                           DeviceProfileData.NamesData.data());
++      if (auto Err = readGlobalFromDevice(Device, Image, NamesGlobal))
++        return Err;
++    } else if (NameOrErr->starts_with(getInstrProfCountersVarPrefix())) {
++      // Read global variable profiling counts
++      SmallVector<int64_t> Counts(Sym.getSize() / sizeof(int64_t), 0);
++      GlobalTy CountGlobal(NameOrErr->str(), Sym.getSize(), Counts.data());
++      if (auto Err = readGlobalFromDevice(Device, Image, CountGlobal))
++        return Err;
++      DeviceProfileData.Counts.push_back(std::move(Counts));
++    } else if (NameOrErr->starts_with(getInstrProfDataVarPrefix())) {
++      // Read profiling data for this global variable
++      __llvm_profile_data Data{};
++      GlobalTy DataGlobal(NameOrErr->str(), Sym.getSize(), &Data);
++      if (auto Err = readGlobalFromDevice(Device, Image, DataGlobal))
++        return Err;
++      DeviceProfileData.Data.push_back(std::move(Data));
++    }
++  }
++  return DeviceProfileData;
++}
++
++void GPUProfGlobals::dump() const {
++  outs() << "======= GPU Profile =======\nTarget: " << TargetTriple.str()
++         << "\n";
++
++  outs() << "======== Counters =========\n";
++  for (const auto &Count : Counts) {
++    outs() << "[";
++    for (size_t i = 0; i < Count.size(); i++) {
++      if (i == 0)
++        outs() << " ";
++      outs() << Count[i] << " ";
++    }
++    outs() << "]\n";
++  }
++
++  outs() << "========== Data ===========\n";
++  for (const auto &ProfData : Data) {
++    outs() << "{ ";
++#define INSTR_PROF_DATA(Type, LLVMType, Name, Initializer)                     \
++  outs() << ProfData.Name << " ";
++#include "llvm/ProfileData/InstrProfData.inc"
++    outs() << "}\n";
++  }
++
++  outs() << "======== Functions ========\n";
++  std::string s;
++  s.reserve(NamesData.size());
++  for (uint8_t Name : NamesData) {
++    s.push_back((char)Name);
++  }
++
++  InstrProfSymtab Symtab;
++  if (Error Err = Symtab.create(StringRef(s))) {
++    consumeError(std::move(Err));
++  }
++  Symtab.dumpNames(outs());
++  outs() << "===========================\n";
++}
+diff --git a/offload/plugins-nextgen/common/src/PluginInterface.cpp b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+index 913721a15d713..a3e52179597fa 100644
+--- a/offload/plugins-nextgen/common/src/PluginInterface.cpp
++++ b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+@@ -829,6 +829,20 @@ Error GenericDeviceTy::deinit(GenericPluginTy &Plugin) {
+            DeviceMemoryPoolTracking.AllocationMax);
+   }
+ 
++  for (auto *Image : LoadedImages) {
++    GenericGlobalHandlerTy &Handler = Plugin.getGlobalHandler();
++    if (!Handler.hasProfilingGlobals(*this, *Image))
++      continue;
++
++    GPUProfGlobals profdata;
++    auto ProfOrErr = Handler.readProfilingGlobals(*this, *Image);
++    if (!ProfOrErr)
++      return ProfOrErr.takeError();
++
++    // TODO: write data to profiling file
++    ProfOrErr->dump();
++  }
++
+   // Delete the memory manager before deinitializing the device. Otherwise,
+   // we may delete device allocations after the device is deinitialized.
+   if (MemoryManager)
+diff --git a/offload/test/CMakeLists.txt b/offload/test/CMakeLists.txt
+index 58cd56911f241..41ab339147791 100644
+--- a/offload/test/CMakeLists.txt
++++ b/offload/test/CMakeLists.txt
+@@ -12,6 +12,12 @@ else()
+   set(LIBOMPTARGET_DEBUG False)
+ endif()
+ 
++if (NOT OPENMP_STANDALONE_BUILD AND "compiler-rt" IN_LIST LLVM_ENABLE_RUNTIMES)
++  set(LIBOMPTARGET_TEST_GPU_PGO True)
++else()
++  set(LIBOMPTARGET_TEST_GPU_PGO False)
++endif()
++
+ # Replace the space from user's input with ";" in case that CMake add escape
+ # char into the lit command.
+ string(REPLACE " " ";" LIBOMPTARGET_LIT_ARG_LIST "${LIBOMPTARGET_LIT_ARGS}")
+diff --git a/offload/test/lit.cfg b/offload/test/lit.cfg
+index 6c590603079c4..069110dc69a6e 100644
+--- a/offload/test/lit.cfg
++++ b/offload/test/lit.cfg
+@@ -112,6 +112,9 @@ config.available_features.add(config.libomptarget_current_target)
+ if config.libomptarget_has_libc:
+   config.available_features.add('libc')
+ 
++if config.libomptarget_test_pgo:
++  config.available_features.add('pgo')
++
+ # Determine whether the test system supports unified memory.
+ # For CUDA, this is the case with compute capability 70 (Volta) or higher.
+ # For all other targets, we currently assume it is.
+diff --git a/offload/test/lit.site.cfg.in b/offload/test/lit.site.cfg.in
+index 7c75aaa18fa77..dda6a01799609 100644
+--- a/offload/test/lit.site.cfg.in
++++ b/offload/test/lit.site.cfg.in
+@@ -26,6 +26,6 @@ config.libomptarget_not = "@OPENMP_NOT_EXECUTABLE@"
+ config.libomptarget_debug = @LIBOMPTARGET_DEBUG@
+ config.has_libomptarget_ompt = @LIBOMPTARGET_OMPT_SUPPORT@
+ config.libomptarget_has_libc = @LIBOMPTARGET_GPU_LIBC_SUPPORT@
+-
++config.libomptarget_test_pgo = @LIBOMPTARGET_TEST_GPU_PGO@
+ # Let the main config do the real work.
+ lit_config.load_config(config, "@CMAKE_CURRENT_SOURCE_DIR@/lit.cfg")
+diff --git a/offload/test/offloading/pgo1.c b/offload/test/offloading/pgo1.c
+new file mode 100644
+index 0000000000000..d95793b508dcf
+--- /dev/null
++++ b/offload/test/offloading/pgo1.c
+@@ -0,0 +1,77 @@
++// RUN: %libomptarget-compile-generic -fprofile-instr-generate \
++// RUN:     -Xclang "-fprofile-instrument=clang"
++// RUN: %libomptarget-run-generic 2>&1 | %fcheck-generic \
++// RUN:     --check-prefix="CLANG-PGO"
++// RUN: %libomptarget-compile-generic -fprofile-generate \
++// RUN:     -Xclang "-fprofile-instrument=llvm"
++// RUN: %libomptarget-run-generic 2>&1 | %fcheck-generic \
++// RUN:     --check-prefix="LLVM-PGO"
++
++// UNSUPPORTED: x86_64-pc-linux-gnu
++// UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++// UNSUPPORTED: aarch64-unknown-linux-gnu
++// UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++// REQUIRES: pgo
++
++#ifdef _OPENMP
++#include <omp.h>
++#endif
++
++int test1(int a) { return a / 2; }
++int test2(int a) { return a * 2; }
++
++int main() {
++  int m = 2;
++#pragma omp target
++  for (int i = 0; i < 10; i++) {
++    m = test1(m);
++    for (int j = 0; j < 2; j++) {
++      m = test2(m);
++    }
++  }
++}
++
++// CLANG-PGO: ======== Counters =========
++// CLANG-PGO-NEXT: [ 0 11 20 ]
++// CLANG-PGO-NEXT: [ 10 ]
++// CLANG-PGO-NEXT: [ 20 ]
++// CLANG-PGO-NEXT: ========== Data ===========
++// CLANG-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// CLANG-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// CLANG-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// CLANG-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// CLANG-PGO-NEXT: ======== Functions ========
++// CLANG-PGO-NEXT: pgo1.c:
++// CLANG-PGO-SAME: __omp_offloading_{{[_0-9a-zA-Z]*}}_main_{{[_0-9a-zA-Z]*}}
++// CLANG-PGO-NEXT: test1
++// CLANG-PGO-NEXT: test2
++
++// LLVM-PGO: ======== Counters =========
++// LLVM-PGO-NEXT: [ 20 ]
++// LLVM-PGO-NEXT: [ 10 ]
++// LLVM-PGO-NEXT: [ 20 10 1 1 ]
++// LLVM-PGO-NEXT: ========== Data ===========
++// LLVM-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// LLVM-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// LLVM-PGO-NEXT: { {{[0-9]*}} {{[0-9]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{0x[0-9a-fA-F]*}} {{0x[0-9a-fA-F]*}}
++// LLVM-PGO-SAME: {{[0-9]*}} {{[0-9]*}} {{[0-9]*}} }
++// LLVM-PGO-NEXT: ======== Functions ========
++// LLVM-PGO-NEXT: __omp_offloading_{{[_0-9a-zA-Z]*}}_main_{{[_0-9a-zA-Z]*}}
++// LLVM-PGO-NEXT: test1
++// LLVM-PGO-NEXT: test2

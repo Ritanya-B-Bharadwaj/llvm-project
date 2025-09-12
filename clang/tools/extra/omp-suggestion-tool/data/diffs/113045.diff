@@ -1,0 +1,128 @@
+diff --git a/flang/lib/Lower/DirectivesCommon.h b/flang/lib/Lower/DirectivesCommon.h
+index da192ded4aa97..421a44b128c01 100644
+--- a/flang/lib/Lower/DirectivesCommon.h
++++ b/flang/lib/Lower/DirectivesCommon.h
+@@ -126,12 +126,8 @@ static void processOmpAtomicTODO(mlir::Type elementType,
+     return;
+   if constexpr (std::is_same<AtomicListT,
+                              Fortran::parser::OmpAtomicClauseList>()) {
+-    // Based on assertion for supported element types in OMPIRBuilder.cpp
+-    // createAtomicRead
+-    mlir::Type unwrappedEleTy = fir::unwrapRefType(elementType);
+-    bool supportedAtomicType = fir::isa_trivial(unwrappedEleTy);
+-    if (!supportedAtomicType)
+-      TODO(loc, "Unsupported atomic type");
++    assert(fir::isa_trivial(fir::unwrapRefType(elementType)) &&
++           "is supported type for omp atomic");
+   }
+ }
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 461a99f59e4ce..6479d15821d14 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1888,16 +1888,21 @@ inline void OmpStructureChecker::ErrIfLHSAndRHSSymbolsMatch(
+ inline void OmpStructureChecker::ErrIfNonScalarAssignmentStmt(
+     const parser::Variable &var, const parser::Expr &expr) {
+   // Err out if either the variable on the LHS or the expression on the RHS of
+-  // the assignment statement are non-scalar (i.e. have rank > 0)
++  // the assignment statement are non-scalar (i.e. have rank > 0 or is of
++  // CHARACTER type)
+   const auto *e{GetExpr(context_, expr)};
+   const auto *v{GetExpr(context_, var)};
+   if (e && v) {
+-    if (e->Rank() != 0)
++    if (e->Rank() != 0 ||
++        (e->GetType().has_value() &&
++            e->GetType().value().category() == common::TypeCategory::Character))
+       context_.Say(expr.source,
+           "Expected scalar expression "
+           "on the RHS of atomic assignment "
+           "statement"_err_en_US);
+-    if (v->Rank() != 0)
++    if (v->Rank() != 0 ||
++        (v->GetType().has_value() &&
++            v->GetType()->category() == common::TypeCategory::Character))
+       context_.Say(var.GetSource(),
+           "Expected scalar variable "
+           "on the LHS of atomic assignment "
+@@ -2008,12 +2013,16 @@ void OmpStructureChecker::CheckAtomicUpdateStmt(
+       expr.u);
+   if (const auto *e{GetExpr(context_, expr)}) {
+     const auto *v{GetExpr(context_, var)};
+-    if (e->Rank() != 0)
++    if (e->Rank() != 0 ||
++        (e->GetType().has_value() &&
++            e->GetType().value().category() == common::TypeCategory::Character))
+       context_.Say(expr.source,
+           "Expected scalar expression "
+           "on the RHS of atomic update assignment "
+           "statement"_err_en_US);
+-    if (v->Rank() != 0)
++    if (v->Rank() != 0 ||
++        (v->GetType().has_value() &&
++            v->GetType()->category() == common::TypeCategory::Character))
+       context_.Say(var.GetSource(),
+           "Expected scalar variable "
+           "on the LHS of atomic update assignment "
+diff --git a/flang/test/Lower/OpenMP/Todo/atomic-character.f90 b/flang/test/Lower/OpenMP/Todo/atomic-character.f90
+deleted file mode 100644
+index 88effa4a2a515..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/atomic-character.f90
++++ /dev/null
+@@ -1,8 +0,0 @@
+-! RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-! CHECK: not yet implemented: Unsupported atomic type
+-subroutine character_atomic
+-  character :: l, r
+-  !$omp atomic read
+-    l = r
+-end subroutine
+diff --git a/flang/test/Semantics/OpenMP/atomic02.f90 b/flang/test/Semantics/OpenMP/atomic02.f90
+index b823bc4c33b23..57a97d88b9e9b 100644
+--- a/flang/test/Semantics/OpenMP/atomic02.f90
++++ b/flang/test/Semantics/OpenMP/atomic02.f90
+@@ -32,6 +32,7 @@ program OmpAtomic
+    a = a**4
+    !$omp atomic
+    !ERROR: Invalid or missing operator in atomic update statement
++   !ERROR: Expected scalar expression on the RHS of atomic update assignment statement
+    c = c//d
+    !$omp atomic
+    !ERROR: Atomic update statement should be of form `l = l operator expr` OR `l = expr operator l`
+@@ -78,6 +79,7 @@ program OmpAtomic
+    a = a**4
+    !$omp atomic update
+    !ERROR: Invalid or missing operator in atomic update statement
++   !ERROR: Expected scalar expression on the RHS of atomic update assignment statement
+    c = c//d
+    !$omp atomic update
+    !ERROR: Atomic update statement should be of form `l = l operator expr` OR `l = expr operator l`
+diff --git a/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90 b/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
+index 9701c1db92c1c..505cbc48fef90 100644
+--- a/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
++++ b/flang/test/Semantics/OpenMP/omp-atomic-assignment-stmt.f90
+@@ -14,6 +14,7 @@ program sample
+         integer :: m
+     endtype
+     type(sample_type) :: z
++    character :: l, r
+     !$omp atomic read
+         v = x
+ 
+@@ -148,4 +149,14 @@ program sample
+         y(1) = y(1) + 1
+         x = y(2)
+     !$omp end atomic
++
++    !$omp atomic read
++    !ERROR: Expected scalar variable on the LHS of atomic assignment statement
++    !ERROR: Expected scalar expression on the RHS of atomic assignment statement
++        l = r
++
++    !$omp atomic write
++    !ERROR: Expected scalar variable on the LHS of atomic assignment statement
++    !ERROR: Expected scalar expression on the RHS of atomic assignment statement
++        l = r
+ end program

@@ -1,0 +1,201 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 5ca0702218e9f..1193dc81e8860 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1348,8 +1348,8 @@ static void genTaskClauses(lower::AbstractConverter &converter,
+   cp.processUntied(clauseOps);
+   // TODO Support delayed privatization.
+ 
+-  cp.processTODO<clause::Affinity, clause::Detach, clause::InReduction,
+-                 clause::Mergeable>(loc, llvm::omp::Directive::OMPD_task);
++  cp.processTODO<clause::Affinity, clause::Detach, clause::InReduction>(
++      loc, llvm::omp::Directive::OMPD_task);
+ }
+ 
+ static void genTaskgroupClauses(lower::AbstractConverter &converter,
+diff --git a/flang/test/Lower/OpenMP/Todo/task_mergeable.f90 b/flang/test/Lower/OpenMP/Todo/task_mergeable.f90
+deleted file mode 100644
+index ddc27487abfe9..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/task_mergeable.f90
++++ /dev/null
+@@ -1,13 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!===============================================================================
+-! `mergeable` clause
+-!===============================================================================
+-
+-! CHECK: not yet implemented: Unhandled clause MERGEABLE in TASK construct
+-subroutine omp_task_mergeable()
+-  !$omp task mergeable
+-  call foo()
+-  !$omp end task
+-end subroutine omp_task_mergeable
+diff --git a/flang/test/Lower/OpenMP/task.f90 b/flang/test/Lower/OpenMP/task.f90
+index 7ad260cba84df..6e525a044b011 100644
+--- a/flang/test/Lower/OpenMP/task.f90
++++ b/flang/test/Lower/OpenMP/task.f90
+@@ -234,3 +234,11 @@ subroutine task_multiple_clauses()
+   !CHECK: omp.terminator
+   !$omp end task
+ end subroutine task_multiple_clauses
++
++subroutine task_mergeable()
++!CHECK: omp.task mergeable {
++!CHECK: omp.terminator
++!CHECK: }
++ !$omp task mergeable
++ !$omp end task
++end subroutine
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index 3afb9d84278e8..a97deafa3683c 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -1262,12 +1262,12 @@ class OpenMPIRBuilder {
+   ///                    cannot be resumed until execution of the structured
+   ///                    block that is associated with the generated task is
+   ///                    completed.
+-  InsertPointOrErrorTy createTask(const LocationDescription &Loc,
+-                                  InsertPointTy AllocaIP,
+-                                  BodyGenCallbackTy BodyGenCB, bool Tied = true,
+-                                  Value *Final = nullptr,
+-                                  Value *IfCondition = nullptr,
+-                                  SmallVector<DependData> Dependencies = {});
++  /// \param Mergeable	 If the given task is `mergeable`
++  InsertPointOrErrorTy
++  createTask(const LocationDescription &Loc, InsertPointTy AllocaIP,
++             BodyGenCallbackTy BodyGenCB, bool Tied = true,
++             Value *Final = nullptr, Value *IfCondition = nullptr,
++             SmallVector<DependData> Dependencies = {}, bool Mergeable = false);
+ 
+   /// Generator for the taskgroup construct
+   ///
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index d2e4dc1c85dfd..d5d5a39897229 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1816,11 +1816,10 @@ static Value *emitTaskDependencies(
+   return DepArray;
+ }
+ 
+-OpenMPIRBuilder::InsertPointOrErrorTy
+-OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+-                            InsertPointTy AllocaIP, BodyGenCallbackTy BodyGenCB,
+-                            bool Tied, Value *Final, Value *IfCondition,
+-                            SmallVector<DependData> Dependencies) {
++OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTask(
++    const LocationDescription &Loc, InsertPointTy AllocaIP,
++    BodyGenCallbackTy BodyGenCB, bool Tied, Value *Final, Value *IfCondition,
++    SmallVector<DependData> Dependencies, bool Mergeable) {
+ 
+   if (!updateToLocation(Loc))
+     return InsertPointTy();
+@@ -1866,7 +1865,8 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+       Builder, AllocaIP, ToBeDeleted, TaskAllocaIP, "global.tid", false));
+ 
+   OI.PostOutlineCB = [this, Ident, Tied, Final, IfCondition, Dependencies,
+-                      TaskAllocaBB, ToBeDeleted](Function &OutlinedFn) mutable {
++                      Mergeable, TaskAllocaBB,
++                      ToBeDeleted](Function &OutlinedFn) mutable {
+     // Replace the Stale CI by appropriate RTL function call.
+     assert(OutlinedFn.getNumUses() == 1 &&
+            "there must be a single user for the outlined function");
+@@ -1891,6 +1891,8 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+     // Task is untied iff (Flags & 1) == 0.
+     // Task is final iff (Flags & 2) == 2.
+     // Task is not final iff (Flags & 2) == 0.
++    // Task is mergeable iff (Flags & 4) == 4.
++    // Task is not mergeable iff (Flags & 4) == 0.
+     // TODO: Handle the other flags.
+     Value *Flags = Builder.getInt32(Tied);
+     if (Final) {
+@@ -1899,6 +1901,9 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+       Flags = Builder.CreateOr(FinalFlag, Flags);
+     }
+ 
++    if (Mergeable)
++      Flags = Builder.CreateOr(Builder.getInt32(4), Flags);
++
+     // Argument - `sizeof_kmp_task_t` (TaskSize)
+     // Tasksize refers to the size in bytes of kmp_task_t data structure
+     // including private vars accessed in task.
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index a39b27aa9e12d..3760184d24185 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -191,10 +191,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+     if (!op.getLinearVars().empty() || !op.getLinearStepVars().empty())
+       result = todo("linear");
+   };
+-  auto checkMergeable = [&todo](auto op, LogicalResult &result) {
+-    if (op.getMergeable())
+-      result = todo("mergeable");
+-  };
+   auto checkNontemporal = [&todo](auto op, LogicalResult &result) {
+     if (!op.getNontemporalVars().empty())
+       result = todo("nontemporal");
+@@ -257,7 +253,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+       .Case([&](omp::TaskOp op) {
+         checkAllocate(op, result);
+         checkInReduction(op, result);
+-        checkMergeable(op, result);
+         checkPriority(op, result);
+         checkUntied(op, result);
+       })
+@@ -1665,7 +1660,8 @@ convertOmpTaskOp(omp::TaskOp taskOp, llvm::IRBuilderBase &builder,
+       moduleTranslation.getOpenMPBuilder()->createTask(
+           ompLoc, allocaIP, bodyCB, !taskOp.getUntied(),
+           moduleTranslation.lookupValue(taskOp.getFinal()),
+-          moduleTranslation.lookupValue(taskOp.getIfExpr()), dds);
++          moduleTranslation.lookupValue(taskOp.getIfExpr()), dds,
++          taskOp.getMergeable());
+ 
+   if (failed(handleError(afterIP, *taskOp)))
+     return failure();
+diff --git a/mlir/test/Target/LLVMIR/openmp-llvm.mlir b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+index cdf94b1ceae11..b40ec0a831d2e 100644
+--- a/mlir/test/Target/LLVMIR/openmp-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-llvm.mlir
+@@ -3003,6 +3003,19 @@ module attributes {omp.is_target_device = true} {
+ 
+ // -----
+ 
++// Third argument is 5: essentially (4 || 1)
++// signifying this task is TIED and MERGEABLE
++
++// CHECK: {{.*}} = call ptr @__kmpc_omp_task_alloc(ptr @1, i32 %omp_global_thread_num, i32 5, i64 40, i64 0, ptr @omp_task_mergeable..omp_par)
++llvm.func @omp_task_mergeable() {
++  omp.task mergeable {
++    omp.terminator
++  }
++  llvm.return
++}
++
++// -----
++
+ llvm.func external @foo_before() -> ()
+ llvm.func external @foo() -> ()
+ llvm.func external @foo_after() -> ()
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index f81d73fed5001..de797ea2aa364 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -447,17 +447,6 @@ llvm.func @task_in_reduction(%x : !llvm.ptr) {
+ 
+ // -----
+ 
+-llvm.func @task_mergeable() {
+-  // expected-error@below {{not yet implemented: Unhandled clause mergeable in omp.task operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.task}}
+-  omp.task mergeable {
+-    omp.terminator
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ llvm.func @task_priority(%x : i32) {
+   // expected-error@below {{not yet implemented: Unhandled clause priority in omp.task operation}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.task}}

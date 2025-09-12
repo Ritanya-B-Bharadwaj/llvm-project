@@ -1,0 +1,341 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 11725991e9c9a..a501ae658a382 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -679,6 +679,9 @@ class ParseTreeDumper {
+   NODE_ENUM(common, OmpAtomicDefaultMemOrderType)
+   NODE(parser, OpenMPDepobjConstruct)
+   NODE(parser, OpenMPUtilityConstruct)
++  NODE(parser, OpenMPDispatchConstruct)
++  NODE(parser, OmpDispatchDirective)
++  NODE(parser, OmpEndDispatchDirective)
+   NODE(parser, OpenMPFlushConstruct)
+   NODE(parser, OpenMPLoopConstruct)
+   NODE(parser, OpenMPExecutableAllocate)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 00d85aa05fb3a..78962db8a84de 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4685,6 +4685,31 @@ struct OpenMPDepobjConstruct {
+   std::tuple<Verbatim, OmpObject, OmpClause> t;
+ };
+ 
++// Ref: [5.2: 200-201]
++//
++// dispatch-construct -> DISPATCH dispatch-clause
++// dispatch-clause -> depend-clause |
++//                    device-clause |
++//                    is_device_ptr-clause |
++//                    nocontext-clause |
++//                    novariants-clause |
++//                    nowait-clause
++struct OmpDispatchDirective {
++  TUPLE_CLASS_BOILERPLATE(OmpDispatchDirective);
++  CharBlock source;
++  std::tuple<Verbatim, OmpClauseList> t;
++};
++
++EMPTY_CLASS(OmpEndDispatchDirective);
++
++struct OpenMPDispatchConstruct {
++  TUPLE_CLASS_BOILERPLATE(OpenMPDispatchConstruct);
++  CharBlock source;
++  std::tuple<OmpDispatchDirective, Block,
++      std::optional<OmpEndDispatchDirective>>
++      t;
++};
++
+ // 2.17.8 flush -> FLUSH [memory-order-clause] [(variable-name-list)]
+ struct OpenMPFlushConstruct {
+   TUPLE_CLASS_BOILERPLATE(OpenMPFlushConstruct);
+@@ -4757,9 +4782,9 @@ struct OpenMPConstruct {
+   UNION_CLASS_BOILERPLATE(OpenMPConstruct);
+   std::variant<OpenMPStandaloneConstruct, OpenMPSectionsConstruct,
+       OpenMPSectionConstruct, OpenMPLoopConstruct, OpenMPBlockConstruct,
+-      OpenMPAtomicConstruct, OpenMPDeclarativeAllocate, OpenMPUtilityConstruct,
+-      OpenMPExecutableAllocate, OpenMPAllocatorsConstruct,
+-      OpenMPCriticalConstruct>
++      OpenMPAtomicConstruct, OpenMPDeclarativeAllocate, OpenMPDispatchConstruct,
++      OpenMPUtilityConstruct, OpenMPExecutableAllocate,
++      OpenMPAllocatorsConstruct, OpenMPCriticalConstruct>
+       u;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 1434bcd6330e0..7c8d292e90f01 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -381,6 +381,9 @@ extractOmpDirective(const parser::OpenMPConstruct &ompConstruct) {
+           [](const parser::OpenMPDeclarativeAllocate &c) {
+             return llvm::omp::OMPD_allocate;
+           },
++          [](const parser::OpenMPDispatchConstruct &c) {
++            return llvm::omp::OMPD_dispatch;
++          },
+           [](const parser::OpenMPExecutableAllocate &c) {
+             return llvm::omp::OMPD_allocate;
+           },
+@@ -3388,6 +3391,13 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   TODO(converter.getCurrentLocation(), "OpenMPUtilityConstruct");
+ }
+ 
++static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
++                   semantics::SemanticsContext &semaCtx,
++                   lower::pft::Evaluation &eval,
++                   const parser::OpenMPDispatchConstruct &) {
++  TODO(converter.getCurrentLocation(), "OpenMPDispatchConstruct");
++}
++
+ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    semantics::SemanticsContext &semaCtx,
+                    lower::pft::Evaluation &eval,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 5ff91da082c85..aa2fec01bc640 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -740,11 +740,15 @@ TYPE_PARSER(
+     "MERGEABLE" >> construct<OmpClause>(construct<OmpClause::Mergeable>()) ||
+     "MESSAGE" >> construct<OmpClause>(construct<OmpClause::Message>(
+                      parenthesized(Parser<OmpMessageClause>{}))) ||
++    "NOCONTEXT" >> construct<OmpClause>(construct<OmpClause::Nocontext>(
++                       parenthesized(scalarLogicalExpr))) ||
+     "NOGROUP" >> construct<OmpClause>(construct<OmpClause::Nogroup>()) ||
+     "NONTEMPORAL" >> construct<OmpClause>(construct<OmpClause::Nontemporal>(
+                          parenthesized(nonemptyList(name)))) ||
+     "NOTINBRANCH" >>
+         construct<OmpClause>(construct<OmpClause::Notinbranch>()) ||
++    "NOVARIANTS" >> construct<OmpClause>(construct<OmpClause::Novariants>(
++                        parenthesized(scalarLogicalExpr))) ||
+     "NOWAIT" >> construct<OmpClause>(construct<OmpClause::Nowait>()) ||
+     "NUM_TASKS" >> construct<OmpClause>(construct<OmpClause::NumTasks>(
+                        parenthesized(Parser<OmpNumTasksClause>{}))) ||
+@@ -1119,6 +1123,16 @@ TYPE_PARSER(sourced(construct<OmpCriticalDirective>(verbatim("CRITICAL"_tok),
+ TYPE_PARSER(construct<OpenMPCriticalConstruct>(
+     Parser<OmpCriticalDirective>{}, block, Parser<OmpEndCriticalDirective>{}))
+ 
++TYPE_PARSER(sourced(construct<OmpDispatchDirective>(
++    verbatim("DISPATCH"_tok), Parser<OmpClauseList>{})))
++
++TYPE_PARSER(
++    construct<OmpEndDispatchDirective>(startOmpLine >> "END DISPATCH"_tok))
++
++TYPE_PARSER(sourced(construct<OpenMPDispatchConstruct>(
++    Parser<OmpDispatchDirective>{} / endOmpLine, block,
++    maybe(Parser<OmpEndDispatchDirective>{} / endOmpLine))))
++
+ // 2.11.3 Executable Allocate directive
+ TYPE_PARSER(
+     sourced(construct<OpenMPExecutableAllocate>(verbatim("ALLOCATE"_tok),
+@@ -1219,6 +1233,7 @@ TYPE_CONTEXT_PARSER("OpenMP construct"_en_US,
+                 construct<OpenMPConstruct>(Parser<OpenMPStandaloneConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPAtomicConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPUtilityConstruct>{}),
++                construct<OpenMPConstruct>(Parser<OpenMPDispatchConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPExecutableAllocate>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPAllocatorsConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPDeclarativeAllocate>{}),
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 7bf404bba2c3e..5b1ff07382c4d 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2725,6 +2725,15 @@ class UnparseVisitor {
+     Walk(x.v);
+     return false;
+   }
++  void Unparse(const OmpDispatchDirective &x) {
++    Word("!$OMP DISPATCH");
++    Walk(x.t);
++    Put("\n");
++  }
++  void Unparse(const OmpEndDispatchDirective &) {
++    Word("!$OMP END DISPATCH");
++    Put("\n");
++  }
+   void Unparse(const OmpErrorDirective &x) {
+     Word("!$OMP ERROR ");
+     Walk(x.t);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index d3f2d3fd2f9dc..c7ad9cc085a21 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1748,6 +1748,36 @@ void OmpStructureChecker::Enter(const parser::OmpErrorDirective &x) {
+   PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_error);
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OpenMPDispatchConstruct &x) {
++  PushContextAndClauseSets(x.source, llvm::omp::Directive::OMPD_dispatch);
++  const auto &block{std::get<parser::Block>(x.t)};
++  if (block.empty() || block.size() > 1) {
++    context_.Say(x.source,
++        "The DISPATCH construct is empty or contains more than one statement"_err_en_US);
++    return;
++  }
++
++  auto it{block.begin()};
++  bool passChecks{false};
++  if (const parser::AssignmentStmt *
++      assignStmt{parser::Unwrap<parser::AssignmentStmt>(*it)}) {
++    if (parser::Unwrap<parser::FunctionReference>(assignStmt->t)) {
++      passChecks = true;
++    }
++  } else if (parser::Unwrap<parser::CallStmt>(*it)) {
++    passChecks = true;
++  }
++
++  if (!passChecks) {
++    context_.Say(x.source,
++        "The DISPATCH construct does not contain a SUBROUTINE or FUNCTION"_err_en_US);
++  }
++}
++
++void OmpStructureChecker::Leave(const parser::OpenMPDispatchConstruct &x) {
++  dirContext_.pop_back();
++}
++
+ void OmpStructureChecker::Leave(const parser::OmpErrorDirective &x) {
+   dirContext_.pop_back();
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index dc360957c873b..2b8304cb17037 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -105,6 +105,8 @@ class OmpStructureChecker
+   void Enter(const parser::OmpDeclareTargetWithList &);
+   void Enter(const parser::OmpDeclareTargetWithClause &);
+   void Leave(const parser::OmpDeclareTargetWithClause &);
++  void Enter(const parser::OpenMPDispatchConstruct &);
++  void Leave(const parser::OpenMPDispatchConstruct &);
+   void Enter(const parser::OmpErrorDirective &);
+   void Leave(const parser::OmpErrorDirective &);
+   void Enter(const parser::OpenMPExecutableAllocate &);
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index ea102371334a6..4e6d819f545a2 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -441,6 +441,9 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+   bool Pre(const parser::OpenMPDeclarativeAllocate &);
+   void Post(const parser::OpenMPDeclarativeAllocate &) { PopContext(); }
+ 
++  bool Pre(const parser::OpenMPDispatchConstruct &);
++  void Post(const parser::OpenMPDispatchConstruct &) { PopContext(); }
++
+   bool Pre(const parser::OpenMPExecutableAllocate &);
+   void Post(const parser::OpenMPExecutableAllocate &);
+ 
+@@ -1976,6 +1979,11 @@ bool OmpAttributeVisitor::Pre(const parser::OpenMPDeclarativeAllocate &x) {
+   return false;
+ }
+ 
++bool OmpAttributeVisitor::Pre(const parser::OpenMPDispatchConstruct &x) {
++  PushContext(x.source, llvm::omp::Directive::OMPD_dispatch);
++  return true;
++}
++
+ bool OmpAttributeVisitor::Pre(const parser::OpenMPExecutableAllocate &x) {
+   PushContext(x.source, llvm::omp::Directive::OMPD_allocate);
+   const auto &list{std::get<std::optional<parser::OmpObjectList>>(x.t)};
+diff --git a/flang/test/Lower/OpenMP/Todo/dispatch.f90 b/flang/test/Lower/OpenMP/Todo/dispatch.f90
+new file mode 100644
+index 0000000000000..380dfa14eaae1
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/dispatch.f90
+@@ -0,0 +1,12 @@
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -fopenmp-version=51 -o - %s 2>&1 | FileCheck %s
++
++! CHECK: not yet implemented: OpenMPDispatchConstruct
++program p
++  integer r
++  r = 1
++!$omp dispatch nowait
++  call foo()
++contains
++  subroutine foo
++  end subroutine
++end program p
+diff --git a/flang/test/Parser/OpenMP/dispatch.f90 b/flang/test/Parser/OpenMP/dispatch.f90
+new file mode 100644
+index 0000000000000..98cd6090334f3
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/dispatch.f90
+@@ -0,0 +1,51 @@
++! RUN: %flang_fc1 -fopenmp -fdebug-dump-parse-tree %s | FileCheck %s
++! RUN: %flang_fc1 -fopenmp -fdebug-unparse %s | FileCheck %s --check-prefix="UNPARSE"
++
++integer function func(a, b, c)
++  integer  :: a, b, c
++  func = a + b + c
++end function func
++
++subroutine sub(x)
++  use iso_c_binding
++  integer :: func
++  integer :: r
++  type(c_ptr) :: x
++  integer :: a = 14, b = 7, c = 21
++!UNPARSE: !$OMP DISPATCH DEVICE(3_4) NOWAIT NOCONTEXT(.false._4) NOVARIANTS(.true._4)
++!CHECK: | | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPDispatchConstruct
++!CHECK-NEXT: | | | OmpDispatchDirective
++!CHECK: | | | | OmpClauseList -> OmpClause -> Device -> OmpDeviceClause
++!CHECK-NEXT: | | | | | Scalar -> Integer -> Expr = '3_4'
++!CHECK-NEXT: | | | | | | LiteralConstant -> IntLiteralConstant = '3'
++!CHECK-NEXT: | | | | OmpClause -> Nowait
++!CHECK-NEXT: | | | | OmpClause -> Nocontext -> Scalar -> Logical -> Expr = '.false._4'
++!CHECK-NEXT: | | | | | LiteralConstant -> LogicalLiteralConstant
++!CHECK-NEXT: | | | | | | bool = 'false'
++!CHECK-NEXT: | | | | OmpClause -> Novariants -> Scalar -> Logical -> Expr = '.true._4'
++!CHECK-NEXT: | | | | | EQ
++!CHECK-NEXT: | | | | | | Expr = '1_4'
++!CHECK-NEXT: | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!CHECK-NEXT: | | | | | | Expr = '1_4'
++!CHECK-NEXT: | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!CHECK-NEXT: | | | Block
++ 
++  !$omp dispatch device(3) nowait nocontext(.false.) novariants(1.eq.1)
++  r = func(a, b, c)
++!UNPARSE: !$OMP END DISPATCH
++!CHECK: | | | OmpEndDispatchDirective
++  !$omp end dispatch
++
++!! Test the "no end dispatch" option.
++!UNPARSE: !$OMP DISPATCH  DEVICE(3_4) IS_DEVICE_PTR(x)
++!CHECK: | | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPDispatchConstruct
++!CHECK-NEXT: | | | OmpDispatchDirective
++!CHECK: | | | | OmpClause -> IsDevicePtr ->  OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'  
++  !$omp dispatch device(3) is_device_ptr(x)
++  r = func(a+1, b+2, c+3)
++!CHECK-NOT: | | | OmpEndDispatchDirective
++
++end subroutine sub
++
++
++
+diff --git a/flang/test/Semantics/OpenMP/dispatch.f90 b/flang/test/Semantics/OpenMP/dispatch.f90
+new file mode 100644
+index 0000000000000..7dfbeecb2fc1d
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/dispatch.f90
+@@ -0,0 +1,24 @@
++! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++
++subroutine sb1
++  integer :: r
++  r = 1
++  !ERROR: The DISPATCH construct does not contain a SUBROUTINE or FUNCTION
++  !$omp dispatch nowait
++  print *,r
++end subroutine
++subroutine sb2
++  integer :: r
++!ERROR: The DISPATCH construct is empty or contains more than one statement
++  !$omp dispatch
++  call foo()
++  r = bar()
++  !$omp end dispatch
++contains
++  subroutine foo
++  end subroutine foo
++  function bar
++    integer :: bar
++    bar = 2
++  end function
++end subroutine

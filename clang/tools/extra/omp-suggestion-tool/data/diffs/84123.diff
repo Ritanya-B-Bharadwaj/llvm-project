@@ -1,0 +1,265 @@
+diff --git a/flang/include/flang/Optimizer/Builder/HLFIRTools.h b/flang/include/flang/Optimizer/Builder/HLFIRTools.h
+index 170e134baef61..ce87941d5382c 100644
+--- a/flang/include/flang/Optimizer/Builder/HLFIRTools.h
++++ b/flang/include/flang/Optimizer/Builder/HLFIRTools.h
+@@ -230,7 +230,8 @@ translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+ /// on the IR.
+ fir::ExtendedValue
+ translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                         fir::FortranVariableOpInterface fortranVariable);
++                         fir::FortranVariableOpInterface fortranVariable,
++                         bool forceHlfirBase = false);
+ 
+ /// Generate declaration for a fir::ExtendedValue in memory.
+ fir::FortranVariableOpInterface
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index 8048693119b4c..a668ba4116faa 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -618,7 +618,8 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+     assert(details && "No host-association found");
+     const Fortran::semantics::Symbol &hsym = details->symbol();
+     mlir::Type hSymType = genType(hsym);
+-    Fortran::lower::SymbolBox hsb = lookupSymbol(hsym);
++    Fortran::lower::SymbolBox hsb =
++        lookupSymbol(hsym, /*symMap=*/nullptr, /*forceHlfirBase=*/true);
+ 
+     auto allocate = [&](llvm::ArrayRef<mlir::Value> shape,
+                         llvm::ArrayRef<mlir::Value> typeParams) -> mlir::Value {
+@@ -727,7 +728,8 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+   void createHostAssociateVarCloneDealloc(
+       const Fortran::semantics::Symbol &sym) override final {
+     mlir::Location loc = genLocation(sym.name());
+-    Fortran::lower::SymbolBox hsb = lookupSymbol(sym);
++    Fortran::lower::SymbolBox hsb =
++        lookupSymbol(sym, /*symMap=*/nullptr, /*forceHlfirBase=*/true);
+ 
+     fir::ExtendedValue hexv = symBoxToExtendedValue(hsb);
+     hexv.match(
+@@ -960,13 +962,14 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+   /// Find the symbol in the local map or return null.
+   Fortran::lower::SymbolBox
+   lookupSymbol(const Fortran::semantics::Symbol &sym,
+-               Fortran::lower::SymMap *symMap = nullptr) {
++               Fortran::lower::SymMap *symMap = nullptr,
++               bool forceHlfirBase = false) {
+     symMap = symMap ? symMap : &localSymbols;
+     if (lowerToHighLevelFIR()) {
+       if (std::optional<fir::FortranVariableOpInterface> var =
+               symMap->lookupVariableDefinition(sym)) {
+-        auto exv =
+-            hlfir::translateToExtendedValue(toLocation(), *builder, *var);
++        auto exv = hlfir::translateToExtendedValue(toLocation(), *builder, *var,
++                                                   forceHlfirBase);
+         return exv.match(
+             [](mlir::Value x) -> Fortran::lower::SymbolBox {
+               return Fortran::lower::SymbolBox::Intrinsic{x};
+diff --git a/flang/lib/Optimizer/Builder/HLFIRTools.cpp b/flang/lib/Optimizer/Builder/HLFIRTools.cpp
+index 4ffa303f27103..0e0b14e8d6909 100644
+--- a/flang/lib/Optimizer/Builder/HLFIRTools.cpp
++++ b/flang/lib/Optimizer/Builder/HLFIRTools.cpp
+@@ -848,36 +848,38 @@ hlfir::LoopNest hlfir::genLoopNest(mlir::Location loc,
+ 
+ static fir::ExtendedValue
+ translateVariableToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                                 hlfir::Entity variable) {
++                                 hlfir::Entity variable,
++                                 bool forceHlfirBase = false) {
+   assert(variable.isVariable() && "must be a variable");
+   /// When going towards FIR, use the original base value to avoid
+   /// introducing descriptors at runtime when they are not required.
+-  mlir::Value firBase = variable.getFirBase();
++  mlir::Value base =
++      forceHlfirBase ? variable.getBase() : variable.getFirBase();
+   if (variable.isMutableBox())
+-    return fir::MutableBoxValue(firBase, getExplicitTypeParams(variable),
++    return fir::MutableBoxValue(base, getExplicitTypeParams(variable),
+                                 fir::MutableProperties{});
+ 
+-  if (firBase.getType().isa<fir::BaseBoxType>()) {
++  if (base.getType().isa<fir::BaseBoxType>()) {
+     if (!variable.isSimplyContiguous() || variable.isPolymorphic() ||
+         variable.isDerivedWithLengthParameters() || variable.isOptional()) {
+       llvm::SmallVector<mlir::Value> nonDefaultLbounds =
+           getNonDefaultLowerBounds(loc, builder, variable);
+-      return fir::BoxValue(firBase, nonDefaultLbounds,
++      return fir::BoxValue(base, nonDefaultLbounds,
+                            getExplicitTypeParams(variable));
+     }
+     // Otherwise, the variable can be represented in a fir::ExtendedValue
+     // without the overhead of a fir.box.
+-    firBase = genVariableRawAddress(loc, builder, variable);
++    base = genVariableRawAddress(loc, builder, variable);
+   }
+ 
+   if (variable.isScalar()) {
+     if (variable.isCharacter()) {
+-      if (firBase.getType().isa<fir::BoxCharType>())
+-        return genUnboxChar(loc, builder, firBase);
++      if (base.getType().isa<fir::BoxCharType>())
++        return genUnboxChar(loc, builder, base);
+       mlir::Value len = genCharacterVariableLength(loc, builder, variable);
+-      return fir::CharBoxValue{firBase, len};
++      return fir::CharBoxValue{base, len};
+     }
+-    return firBase;
++    return base;
+   }
+   llvm::SmallVector<mlir::Value> extents;
+   llvm::SmallVector<mlir::Value> nonDefaultLbounds;
+@@ -893,15 +895,16 @@ translateVariableToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+   }
+   if (variable.isCharacter())
+     return fir::CharArrayBoxValue{
+-        firBase, genCharacterVariableLength(loc, builder, variable), extents,
++        base, genCharacterVariableLength(loc, builder, variable), extents,
+         nonDefaultLbounds};
+-  return fir::ArrayBoxValue{firBase, extents, nonDefaultLbounds};
++  return fir::ArrayBoxValue{base, extents, nonDefaultLbounds};
+ }
+ 
+ fir::ExtendedValue
+ hlfir::translateToExtendedValue(mlir::Location loc, fir::FirOpBuilder &builder,
+-                                fir::FortranVariableOpInterface var) {
+-  return translateVariableToExtendedValue(loc, builder, var);
++                                fir::FortranVariableOpInterface var,
++                                bool forceHlfirBase) {
++  return translateVariableToExtendedValue(loc, builder, var, forceHlfirBase);
+ }
+ 
+ std::pair<fir::ExtendedValue, std::optional<hlfir::CleanupFunction>>
+diff --git a/flang/test/Lower/OpenMP/parallel-private-clause-str.f90 b/flang/test/Lower/OpenMP/parallel-private-clause-str.f90
+index f668957624b49..025e51e066176 100644
+--- a/flang/test/Lower/OpenMP/parallel-private-clause-str.f90
++++ b/flang/test/Lower/OpenMP/parallel-private-clause-str.f90
+@@ -10,7 +10,7 @@
+ !CHECK:    %[[C_DECL:.*]]:2 = hlfir.declare %[[C_BOX_REF]] typeparams %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFtest_allocatable_stringEc"} : (!fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>, i32) -> (!fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>, !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>)
+ !CHECK:    omp.parallel {
+ !CHECK:      %[[C_PVT_BOX_REF:.*]] = fir.alloca !fir.box<!fir.heap<!fir.char<1,?>>> {bindc_name = "c", pinned, uniq_name = "_QFtest_allocatable_stringEc"}
+-!CHECK:      %[[C_BOX:.*]] = fir.load %[[C_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>
++!CHECK:      %[[C_BOX:.*]] = fir.load %[[C_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>
+ !CHECK:      fir.if %{{.*}} {
+ !CHECK:        %[[C_PVT_MEM:.*]] = fir.allocmem !fir.char<1,?>(%{{.*}} : index) {fir.must_be_heap = true, uniq_name = "_QFtest_allocatable_stringEc.alloc"}
+ !CHECK:        %[[C_PVT_BOX:.*]] = fir.embox %[[C_PVT_MEM]] typeparams %{{.*}} : (!fir.heap<!fir.char<1,?>>, index) -> !fir.box<!fir.heap<!fir.char<1,?>>>
+@@ -18,7 +18,7 @@
+ !CHECK:      }
+ !CHECK:      %[[C_PVT_DECL:.*]]:2 = hlfir.declare %[[C_PVT_BOX_REF]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFtest_allocatable_stringEc"} : (!fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>, !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>)
+ !CHECK:      fir.if %{{.*}} {
+-!CHECK:        %[[C_PVT_BOX:.*]] = fir.load %[[C_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>
++!CHECK:        %[[C_PVT_BOX:.*]] = fir.load %[[C_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.char<1,?>>>>
+ !CHECK:        %[[C_PVT_BOX_ADDR:.*]] = fir.box_addr %[[C_PVT_BOX]] : (!fir.box<!fir.heap<!fir.char<1,?>>>) -> !fir.heap<!fir.char<1,?>>
+ !CHECK:        fir.freemem %[[C_PVT_BOX_ADDR]] : !fir.heap<!fir.char<1,?>>
+ !CHECK:      }
+@@ -38,16 +38,16 @@ subroutine test_allocatable_string(n)
+ !CHECK:    %[[C_DECL:.*]]:2 = hlfir.declare %[[C_BOX_REF]] typeparams %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFtest_allocatable_string_arrayEc"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>, i32) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>)
+ !CHECK:    omp.parallel {
+ !CHECK:      %[[C_PVT_BOX_REF:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>> {bindc_name = "c", pinned, uniq_name = "_QFtest_allocatable_string_arrayEc"}
+-!CHECK:      %{{.*}} = fir.load %[[C_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
++!CHECK:      %{{.*}} = fir.load %[[C_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
+ !CHECK:      fir.if %{{.*}} {
+ !CHECK:        %[[C_PVT_ALLOC:.*]] = fir.allocmem !fir.array<?x!fir.char<1,?>>(%{{.*}} : index), %{{.*}} {fir.must_be_heap = true, uniq_name = "_QFtest_allocatable_string_arrayEc.alloc"}
+ !CHECK:        %[[C_PVT_BOX:.*]] = fir.embox %[[C_PVT_ALLOC]](%{{.*}}) typeparams %{{.*}} : (!fir.heap<!fir.array<?x!fir.char<1,?>>>, !fir.shapeshift<1>, index) -> !fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>
+ !CHECK:        fir.store %[[C_PVT_BOX]] to %[[C_PVT_BOX_REF]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
+ !CHECK:      }
+ !CHECK:      %[[C_PVT_DECL:.*]]:2 = hlfir.declare %[[C_PVT_BOX_REF]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFtest_allocatable_string_arrayEc"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>)
+-!CHECK:      %{{.*}} = fir.load %[[C_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
++!CHECK:      %{{.*}} = fir.load %[[C_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
+ !CHECK:      fir.if %{{.*}} {
+-!CHECK:        %[[C_PVT_BOX:.*]] = fir.load %[[C_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
++!CHECK:        %[[C_PVT_BOX:.*]] = fir.load %[[C_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>>
+ !CHECK:        %[[C_PVT_ADDR:.*]] = fir.box_addr %[[C_PVT_BOX]] : (!fir.box<!fir.heap<!fir.array<?x!fir.char<1,?>>>>) -> !fir.heap<!fir.array<?x!fir.char<1,?>>>
+ !CHECK:        fir.freemem %[[C_PVT_ADDR]] : !fir.heap<!fir.array<?x!fir.char<1,?>>>
+ !CHECK:      }
+diff --git a/flang/test/Lower/OpenMP/parallel-private-clause.f90 b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+index 3e46d315f8cc4..5578b6710da7c 100644
+--- a/flang/test/Lower/OpenMP/parallel-private-clause.f90
++++ b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+@@ -150,8 +150,8 @@ subroutine private_clause_derived_type()
+ !FIRDialect-DAG:    %[[X4_PVT:.*]] = fir.alloca !fir.box<!fir.heap<!fir.array<?xi32>>> {bindc_name = "x4", pinned, uniq_name = "{{.*}}Ex4"}
+ !FIRDialect-DAG:    %[[X4_PVT_DECL:.*]]:2 = hlfir.declare %[[X4_PVT]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "{{.*}}Ex4"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ 
+-!FIRDialect-DAG:    %[[TMP58:.*]] = fir.load %[[X4_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-!FIRDialect-DAG:    %[[TMP97:.*]] = fir.load %[[X4_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!FIRDialect-DAG:    %[[TMP58:.*]] = fir.load %[[X4_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!FIRDialect-DAG:    %[[TMP97:.*]] = fir.load %[[X4_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ !FIRDialect-DAG:    %[[TMP98:.*]]:3 = fir.box_dims %[[TMP97]], {{.*}} : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+ 
+ !FIRDialect-DAG:    %[[TMP101:.*]] = fir.allocmem !fir.array<?xi32>, {{.*}} {fir.must_be_heap = true, uniq_name = "{{.*}}Ex4.alloc"}
+@@ -192,12 +192,12 @@ subroutine private_clause_allocatable()
+ !FIRDialect-DAG: }
+ !FIRDialect-DAG: %[[X5_PVT_DECL:.*]]:2 = hlfir.declare %[[X5_PVT]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFprivate_clause_real_call_allocatableEx5"} : (!fir.ref<!fir.box<!fir.heap<f32>>>) -> (!fir.ref<!fir.box<!fir.heap<f32>>>, !fir.ref<!fir.box<!fir.heap<f32>>>)
+ !FIRDialect-DAG: fir.call @_QFprivate_clause_real_call_allocatablePhelper_private_clause_real_call_allocatable(%[[X5_PVT_DECL]]#0) fastmath<contract> : (!fir.ref<!fir.box<!fir.heap<f32>>>) -> ()
+-!FIRDialect-DAG: %{{.*}} = fir.load %[[X5_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++!FIRDialect-DAG: %{{.*}} = fir.load %[[X5_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+ 
+ !FIRDialect-DAG: fir.if %{{.*}} {
+-!FIRDialect-DAG:   %{{.*}} = fir.load %[[X5_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++!FIRDialect-DAG:   %{{.*}} = fir.load %[[X5_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+ 
+-!FIRDialect-DAG:     fir.store %{{.*}} to %[[X5_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++!FIRDialect-DAG:     fir.store %{{.*}} to %[[X5_PVT_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+ !FIRDialect-DAG:   }
+ !FIRDialect-DAG:   omp.terminator
+ !FIRDialect-DAG:   }
+@@ -313,12 +313,12 @@ subroutine simple_loop_1
+     print*, i
+   end do
+   ! FIRDialect:     omp.yield
+-  ! FIRDialect:     {{%.*}} = fir.load %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     {{%.*}} = fir.load %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     fir.if {{%.*}} {
+-  ! FIRDialect:     [[LD:%.*]] = fir.load %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     [[LD:%.*]] = fir.load %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     [[AD:%.*]] = fir.box_addr [[LD]] : (!fir.box<!fir.heap<f32>>) -> !fir.heap<f32>
+   ! FIRDialect:     fir.freemem [[AD]] : !fir.heap<f32>
+-  ! FIRDialect:     fir.store {{%.*}} to %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     fir.store {{%.*}} to %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   !$OMP END DO
+   ! FIRDialect:  omp.terminator
+   !$OMP END PARALLEL
+@@ -351,12 +351,12 @@ subroutine simple_loop_2
+     print*, i
+   end do
+   ! FIRDialect:     omp.yield
+-  ! FIRDialect:     {{%.*}} = fir.load %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     {{%.*}} = fir.load %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     fir.if {{%.*}} {
+-  ! FIRDialect:     [[LD:%.*]] = fir.load %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     [[LD:%.*]] = fir.load %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     [[AD:%.*]] = fir.box_addr [[LD]] : (!fir.box<!fir.heap<f32>>) -> !fir.heap<f32>
+   ! FIRDialect:     fir.freemem [[AD]] : !fir.heap<f32>
+-  ! FIRDialect:     fir.store {{%.*}} to %[[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     fir.store {{%.*}} to %[[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   !$OMP END DO
+   ! FIRDialect:  omp.terminator
+   !$OMP END PARALLEL
+@@ -388,12 +388,12 @@ subroutine simple_loop_3
+     print*, i
+   end do
+   ! FIRDialect:     omp.yield
+-  ! FIRDialect:     {{%.*}} = fir.load [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     {{%.*}} = fir.load [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     fir.if {{%.*}} {
+-  ! FIRDialect:     [[LD:%.*]] = fir.load [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     [[LD:%.*]] = fir.load [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     [[AD:%.*]] = fir.box_addr [[LD]] : (!fir.box<!fir.heap<f32>>) -> !fir.heap<f32>
+   ! FIRDialect:     fir.freemem [[AD]] : !fir.heap<f32>
+-  ! FIRDialect:     fir.store {{%.*}} to [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     fir.store {{%.*}} to [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   !$OMP END PARALLEL DO
+   ! FIRDialect:  omp.terminator
+ end subroutine
+@@ -421,10 +421,10 @@ subroutine simd_loop_1
+   end do
+   !$OMP END SIMD
+   ! FIRDialect:     omp.yield
+-  ! FIRDialect:     {{%.*}} = fir.load [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     {{%.*}} = fir.load [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     fir.if {{%.*}} {
+-  ! FIRDialect:     [[LD:%.*]] = fir.load [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     [[LD:%.*]] = fir.load [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+   ! FIRDialect:     [[AD:%.*]] = fir.box_addr [[LD]] : (!fir.box<!fir.heap<f32>>) -> !fir.heap<f32>
+   ! FIRDialect:     fir.freemem [[AD]] : !fir.heap<f32>
+-  ! FIRDialect:     fir.store {{%.*}} to [[R_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<f32>>>
++  ! FIRDialect:     fir.store {{%.*}} to [[R_DECL]]#0 : !fir.ref<!fir.box<!fir.heap<f32>>>
+ end subroutine

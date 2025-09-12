@@ -1,0 +1,758 @@
+diff --git a/openmp/runtime/src/dllexports b/openmp/runtime/src/dllexports
+index 0d49643709e0a..747b828093156 100644
+--- a/openmp/runtime/src/dllexports
++++ b/openmp/runtime/src/dllexports
+@@ -1268,6 +1268,11 @@ kmp_set_disp_num_buffers                    890
+     __kmpc_atomic_val_8_cas_cpt            2158
+     %endif
+ 
++    # No longer need to put ordinal numbers
++    __kmpc_push_num_threads_list
++    __kmpc_push_num_threads_strict
++    __kmpc_push_num_threads_list_strict
++
+ %endif
+ 
+ __kmpc_set_thread_limit
+diff --git a/openmp/runtime/src/kmp.h b/openmp/runtime/src/kmp.h
+index 64a3ea6d5be5d..d1ec43fabcda6 100644
+--- a/openmp/runtime/src/kmp.h
++++ b/openmp/runtime/src/kmp.h
+@@ -532,6 +532,15 @@ enum clock_function_type {
+ enum mic_type { non_mic, mic1, mic2, mic3, dummy };
+ #endif
+ 
++// OpenMP 3.1 - Nested num threads array
++typedef struct kmp_nested_nthreads_t {
++  int *nth;
++  int size;
++  int used;
++} kmp_nested_nthreads_t;
++
++extern kmp_nested_nthreads_t __kmp_nested_nth;
++
+ /* -- fast reduction stuff ------------------------------------------------ */
+ 
+ #undef KMP_FAST_REDUCTION_BARRIER
+@@ -2963,6 +2972,12 @@ typedef struct KMP_ALIGN_CACHE kmp_base_info {
+   /* The data set by the primary thread at reinit, then R/W by the worker */
+   KMP_ALIGN_CACHE int
+       th_set_nproc; /* if > 0, then only use this request for the next fork */
++  int *th_set_nested_nth;
++  bool th_nt_strict; // num_threads clause has strict modifier
++  ident_t *th_nt_loc; // loc for strict modifier
++  int th_nt_sev; // error severity for strict modifier
++  const char *th_nt_msg; // error message for strict modifier
++  int th_set_nested_nth_sz;
+ #if KMP_NESTED_HOT_TEAMS
+   kmp_hot_team_ptr_t *th_hot_teams; /* array of hot teams */
+ #endif
+@@ -3204,6 +3219,7 @@ typedef struct KMP_ALIGN_CACHE kmp_base_team {
+   void *t_stack_id; // team specific stack stitching id (for ittnotify)
+ #endif /* USE_ITT_BUILD */
+   distributedBarrier *b; // Distributed barrier data associated with team
++  kmp_nested_nthreads_t *t_nested_nth;
+ } kmp_base_team_t;
+ 
+ // Assert that the list structure fits and aligns within
+@@ -3540,15 +3556,6 @@ extern enum mic_type __kmp_mic_type;
+ extern double __kmp_load_balance_interval; // load balance algorithm interval
+ #endif /* USE_LOAD_BALANCE */
+ 
+-// OpenMP 3.1 - Nested num threads array
+-typedef struct kmp_nested_nthreads_t {
+-  int *nth;
+-  int size;
+-  int used;
+-} kmp_nested_nthreads_t;
+-
+-extern kmp_nested_nthreads_t __kmp_nested_nth;
+-
+ #if KMP_USE_ADAPTIVE_LOCKS
+ 
+ // Parameters for the speculative lock backoff system.
+@@ -3783,6 +3790,11 @@ extern void ___kmp_thread_free(kmp_info_t *th, void *ptr KMP_SRC_LOC_DECL);
+   ___kmp_thread_free((th), (ptr)KMP_SRC_LOC_CURR)
+ 
+ extern void __kmp_push_num_threads(ident_t *loc, int gtid, int num_threads);
++extern void __kmp_push_num_threads_list(ident_t *loc, int gtid,
++                                        kmp_uint32 list_length,
++                                        int *num_threads_list);
++extern void __kmp_set_strict_num_threads(ident_t *loc, int gtid, int sev,
++                                         const char *msg);
+ 
+ extern void __kmp_push_proc_bind(ident_t *loc, int gtid,
+                                  kmp_proc_bind_t proc_bind);
+@@ -4421,6 +4433,18 @@ KMP_EXPORT kmp_int32 __kmpc_in_parallel(ident_t *loc);
+ KMP_EXPORT void __kmpc_pop_num_threads(ident_t *loc, kmp_int32 global_tid);
+ KMP_EXPORT void __kmpc_push_num_threads(ident_t *loc, kmp_int32 global_tid,
+                                         kmp_int32 num_threads);
++KMP_EXPORT void __kmpc_push_num_threads_strict(ident_t *loc,
++                                               kmp_int32 global_tid,
++                                               kmp_int32 num_threads,
++                                               int severity,
++                                               const char *message);
++
++KMP_EXPORT void __kmpc_push_num_threads_list(ident_t *loc, kmp_int32 global_tid,
++                                             kmp_uint32 list_length,
++                                             kmp_int32 *num_threads_list);
++KMP_EXPORT void __kmpc_push_num_threads_list_strict(
++    ident_t *loc, kmp_int32 global_tid, kmp_uint32 list_length,
++    kmp_int32 *num_threads_list, int severity, const char *message);
+ 
+ KMP_EXPORT void __kmpc_push_proc_bind(ident_t *loc, kmp_int32 global_tid,
+                                       int proc_bind);
+diff --git a/openmp/runtime/src/kmp_csupport.cpp b/openmp/runtime/src/kmp_csupport.cpp
+index f45fe646d1d9a..d638acd85116d 100644
+--- a/openmp/runtime/src/kmp_csupport.cpp
++++ b/openmp/runtime/src/kmp_csupport.cpp
+@@ -237,6 +237,50 @@ void __kmpc_push_num_threads(ident_t *loc, kmp_int32 global_tid,
+   __kmp_push_num_threads(loc, global_tid, num_threads);
+ }
+ 
++void __kmpc_push_num_threads_strict(ident_t *loc, kmp_int32 global_tid,
++                                    kmp_int32 num_threads, int severity,
++                                    const char *message) {
++  __kmp_push_num_threads(loc, global_tid, num_threads);
++  __kmp_set_strict_num_threads(loc, global_tid, severity, message);
++}
++
++/*!
++@ingroup PARALLEL
++@param loc source location information
++@param global_tid global thread number
++@param list_length number of entries in the num_threads_list array
++@param num_threads_list array of numbers of threads requested for this parallel
++construct and subsequent nested parallel constructs
++
++Set the number of threads to be used by the next fork spawned by this thread,
++and some nested forks as well.
++This call is only required if the parallel construct has a `num_threads` clause
++that has a list of integers as the argument.
++*/
++void __kmpc_push_num_threads_list(ident_t *loc, kmp_int32 global_tid,
++                                  kmp_uint32 list_length,
++                                  kmp_int32 *num_threads_list) {
++  KA_TRACE(20, ("__kmpc_push_num_threads_list: enter T#%d num_threads_list=",
++                global_tid));
++  KA_TRACE(20, ("%d", num_threads_list[0]));
++#ifdef KMP_DEBUG
++  for (kmp_uint32 i = 1; i < list_length; ++i)
++    KA_TRACE(20, (", %d", num_threads_list[i]));
++#endif
++  KA_TRACE(20, ("/n"));
++
++  __kmp_assert_valid_gtid(global_tid);
++  __kmp_push_num_threads_list(loc, global_tid, list_length, num_threads_list);
++}
++
++void __kmpc_push_num_threads_list_strict(ident_t *loc, kmp_int32 global_tid,
++                                         kmp_uint32 list_length,
++                                         kmp_int32 *num_threads_list,
++                                         int severity, const char *message) {
++  __kmp_push_num_threads_list(loc, global_tid, list_length, num_threads_list);
++  __kmp_set_strict_num_threads(loc, global_tid, severity, message);
++}
++
+ void __kmpc_pop_num_threads(ident_t *loc, kmp_int32 global_tid) {
+   KA_TRACE(20, ("__kmpc_pop_num_threads: enter\n"));
+   /* the num_threads are automatically popped */
+diff --git a/openmp/runtime/src/kmp_runtime.cpp b/openmp/runtime/src/kmp_runtime.cpp
+index 4be67f3b59873..22cd559aa97f5 100644
+--- a/openmp/runtime/src/kmp_runtime.cpp
++++ b/openmp/runtime/src/kmp_runtime.cpp
+@@ -113,6 +113,21 @@ void __kmp_resize_dist_barrier(kmp_team_t *team, int old_nthreads,
+                                int new_nthreads);
+ void __kmp_add_threads_to_team(kmp_team_t *team, int new_nthreads);
+ 
++static kmp_nested_nthreads_t *__kmp_override_nested_nth(kmp_info_t *thr,
++                                                        int level) {
++  kmp_nested_nthreads_t *new_nested_nth =
++      (kmp_nested_nthreads_t *)KMP_INTERNAL_MALLOC(
++          sizeof(kmp_nested_nthreads_t));
++  int new_size = level + thr->th.th_set_nested_nth_sz;
++  new_nested_nth->nth = (int *)KMP_INTERNAL_MALLOC(new_size * sizeof(int));
++  for (int i = 0; i < level + 1; ++i)
++    new_nested_nth->nth[i] = 0;
++  for (int i = level + 1, j = 1; i < new_size; ++i, ++j)
++    new_nested_nth->nth[i] = thr->th.th_set_nested_nth[j];
++  new_nested_nth->size = new_nested_nth->used = new_size;
++  return new_nested_nth;
++}
++
+ /* Calculate the identifier of the current thread */
+ /* fast (and somewhat portable) way to get unique identifier of executing
+    thread. Returns KMP_GTID_DNE if we haven't been assigned a gtid. */
+@@ -930,6 +945,11 @@ static int __kmp_reserve_threads(kmp_root_t *root, kmp_team_t *parent_team,
+                   __kmp_get_gtid(), new_nthreads, set_nthreads));
+   }
+ #endif // KMP_DEBUG
++
++  if (this_thr->th.th_nt_strict && new_nthreads < set_nthreads) {
++    __kmpc_error(this_thr->th.th_nt_loc, this_thr->th.th_nt_sev,
++                 this_thr->th.th_nt_msg);
++  }
+   return new_nthreads;
+ }
+ 
+@@ -1265,6 +1285,10 @@ void __kmp_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
+     serial_team->t.t_serialized = 1;
+     serial_team->t.t_nproc = 1;
+     serial_team->t.t_parent = this_thr->th.th_team;
++    if (this_thr->th.th_team->t.t_nested_nth)
++      serial_team->t.t_nested_nth = this_thr->th.th_team->t.t_nested_nth;
++    else
++      serial_team->t.t_nested_nth = &__kmp_nested_nth;
+     // Save previous team's task state on serial team structure
+     serial_team->t.t_primary_task_state = this_thr->th.th_task_state;
+     serial_team->t.t_sched.sched = this_thr->th.th_team->t.t_sched.sched;
+@@ -1286,9 +1310,11 @@ void __kmp_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
+ 
+     // Thread value exists in the nested nthreads array for the next nested
+     // level
+-    if (__kmp_nested_nth.used && (level + 1 < __kmp_nested_nth.used)) {
+-      this_thr->th.th_current_task->td_icvs.nproc =
+-          __kmp_nested_nth.nth[level + 1];
++    kmp_nested_nthreads_t *nested_nth = &__kmp_nested_nth;
++    if (this_thr->th.th_team->t.t_nested_nth)
++      nested_nth = this_thr->th.th_team->t.t_nested_nth;
++    if (nested_nth->used && (level + 1 < nested_nth->used)) {
++      this_thr->th.th_current_task->td_icvs.nproc = nested_nth->nth[level + 1];
+     }
+ 
+     if (__kmp_nested_proc_bind.used &&
+@@ -1339,10 +1365,14 @@ void __kmp_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
+     int level = this_thr->th.th_team->t.t_level;
+     // Thread value exists in the nested nthreads array for the next nested
+     // level
+-    if (__kmp_nested_nth.used && (level + 1 < __kmp_nested_nth.used)) {
+-      this_thr->th.th_current_task->td_icvs.nproc =
+-          __kmp_nested_nth.nth[level + 1];
++
++    kmp_nested_nthreads_t *nested_nth = &__kmp_nested_nth;
++    if (serial_team->t.t_nested_nth)
++      nested_nth = serial_team->t.t_nested_nth;
++    if (nested_nth->used && (level + 1 < nested_nth->used)) {
++      this_thr->th.th_current_task->td_icvs.nproc = nested_nth->nth[level + 1];
+     }
++
+     serial_team->t.t_level++;
+     KF_TRACE(10, ("__kmpc_serialized_parallel: T#%d increasing nesting level "
+                   "of serial team %p to %d\n",
+@@ -2093,9 +2123,18 @@ int __kmp_fork_call(ident_t *loc, int gtid,
+ 
+     // See if we need to make a copy of the ICVs.
+     int nthreads_icv = master_th->th.th_current_task->td_icvs.nproc;
+-    if ((level + 1 < __kmp_nested_nth.used) &&
+-        (__kmp_nested_nth.nth[level + 1] != nthreads_icv)) {
+-      nthreads_icv = __kmp_nested_nth.nth[level + 1];
++    kmp_nested_nthreads_t *nested_nth = NULL;
++    if (!master_th->th.th_set_nested_nth &&
++        (level + 1 < parent_team->t.t_nested_nth->used) &&
++        (parent_team->t.t_nested_nth->nth[level + 1] != nthreads_icv)) {
++      nthreads_icv = parent_team->t.t_nested_nth->nth[level + 1];
++    } else if (master_th->th.th_set_nested_nth) {
++      nested_nth = __kmp_override_nested_nth(master_th, level);
++      if ((level + 1 < nested_nth->used) &&
++          (nested_nth->nth[level + 1] != nthreads_icv))
++        nthreads_icv = nested_nth->nth[level + 1];
++      else
++        nthreads_icv = 0; // don't update
+     } else {
+       nthreads_icv = 0; // don't update
+     }
+@@ -2204,6 +2243,24 @@ int __kmp_fork_call(ident_t *loc, int gtid,
+     KMP_CHECK_UPDATE(team->t.t_cancel_request, cancel_noreq);
+     KMP_CHECK_UPDATE(team->t.t_def_allocator, master_th->th.th_def_allocator);
+ 
++    // Check if hot team has potentially outdated list, and if so, free it
++    if (team->t.t_nested_nth &&
++        team->t.t_nested_nth != parent_team->t.t_nested_nth) {
++      KMP_INTERNAL_FREE(team->t.t_nested_nth->nth);
++      KMP_INTERNAL_FREE(team->t.t_nested_nth);
++      team->t.t_nested_nth = NULL;
++    }
++    team->t.t_nested_nth = parent_team->t.t_nested_nth;
++    if (master_th->th.th_set_nested_nth) {
++      if (!nested_nth)
++        nested_nth = __kmp_override_nested_nth(master_th, level);
++      team->t.t_nested_nth = nested_nth;
++      KMP_INTERNAL_FREE(master_th->th.th_set_nested_nth);
++      master_th->th.th_set_nested_nth = NULL;
++      master_th->th.th_set_nested_nth_sz = 0;
++      master_th->th.th_nt_strict = false;
++    }
++
+     // Update the floating point rounding in the team if required.
+     propagateFPControl(team);
+ #if OMPD_SUPPORT
+@@ -3337,6 +3394,7 @@ static void __kmp_initialize_root(kmp_root_t *root) {
+   root_team->t.t_serialized = 1;
+   // TODO???: root_team->t.t_max_active_levels = __kmp_dflt_max_active_levels;
+   root_team->t.t_sched.sched = r_sched.sched;
++  root_team->t.t_nested_nth = &__kmp_nested_nth;
+   KA_TRACE(
+       20,
+       ("__kmp_initialize_root: init root team %d arrived: join=%u, plain=%u\n",
+@@ -3374,6 +3432,7 @@ static void __kmp_initialize_root(kmp_root_t *root) {
+   // TODO???: hot_team->t.t_max_active_levels = __kmp_dflt_max_active_levels;
+   hot_team->t.t_sched.sched = r_sched.sched;
+   hot_team->t.t_size_changed = 0;
++  hot_team->t.t_nested_nth = &__kmp_nested_nth;
+ }
+ 
+ #ifdef KMP_DEBUG
+@@ -4240,6 +4299,7 @@ static void __kmp_initialize_info(kmp_info_t *this_thr, kmp_team_t *team,
+   else // no tasking --> always safe to reap
+     this_thr->th.th_reap_state = KMP_SAFE_TO_REAP;
+   this_thr->th.th_set_proc_bind = proc_bind_default;
++
+ #if KMP_AFFINITY_SUPPORTED
+   this_thr->th.th_new_place = this_thr->th.th_current_place;
+ #endif
+@@ -4492,6 +4552,11 @@ kmp_info_t *__kmp_allocate_thread(kmp_root_t *root, kmp_team_t *team,
+   /* allocate space for it. */
+   new_thr = (kmp_info_t *)__kmp_allocate(sizeof(kmp_info_t));
+ 
++  new_thr->th.th_nt_strict = false;
++  new_thr->th.th_nt_loc = NULL;
++  new_thr->th.th_nt_sev = severity_fatal;
++  new_thr->th.th_nt_msg = NULL;
++
+   TCW_SYNC_PTR(__kmp_threads[new_gtid], new_thr);
+ 
+ #if USE_ITT_BUILD && USE_ITT_NOTIFY && KMP_DEBUG
+@@ -4602,6 +4667,9 @@ kmp_info_t *__kmp_allocate_thread(kmp_root_t *root, kmp_team_t *team,
+   new_thr->th.th_active_in_pool = FALSE;
+   TCW_4(new_thr->th.th_active, TRUE);
+ 
++  new_thr->th.th_set_nested_nth = NULL;
++  new_thr->th.th_set_nested_nth_sz = 0;
++
+   /* adjust the global counters */
+   __kmp_all_nth++;
+   __kmp_nth++;
+@@ -5398,7 +5466,6 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
+       }
+     } // Check changes in number of threads
+ 
+-    kmp_info_t *master = team->t.t_threads[0];
+     if (master->th.th_teams_microtask) {
+       for (f = 1; f < new_nproc; ++f) {
+         // propagate teams construct specific info to workers
+@@ -5504,6 +5571,8 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
+       __ompt_team_assign_id(team, ompt_parallel_data);
+ #endif
+ 
++      team->t.t_nested_nth = NULL;
++
+       KMP_MB();
+ 
+       return team;
+@@ -5575,6 +5644,8 @@ __kmp_allocate_team(kmp_root_t *root, int new_nproc, int max_nproc,
+ 
+   KMP_MB();
+ 
++  team->t.t_nested_nth = NULL;
++
+   KA_TRACE(20, ("__kmp_allocate_team: done creating a new team %d.\n",
+                 team->t.t_id));
+ 
+@@ -5677,6 +5748,14 @@ void __kmp_free_team(kmp_root_t *root,
+       }
+     }
+ 
++    // Before clearing parent pointer, check if nested_nth list should be freed
++    if (team->t.t_nested_nth && team->t.t_nested_nth != &__kmp_nested_nth &&
++        team->t.t_nested_nth != team->t.t_parent->t.t_nested_nth) {
++      KMP_INTERNAL_FREE(team->t.t_nested_nth->nth);
++      KMP_INTERNAL_FREE(team->t.t_nested_nth);
++    }
++    team->t.t_nested_nth = NULL;
++
+     // Reset pointer to parent team only for non-hot teams.
+     team->t.t_parent = NULL;
+     team->t.t_level = 0;
+@@ -7774,7 +7853,6 @@ int __kmp_invoke_teams_master(int gtid) {
+    encountered by this team. since this should be enclosed in the forkjoin
+    critical section it should avoid race conditions with asymmetrical nested
+    parallelism */
+-
+ void __kmp_push_num_threads(ident_t *id, int gtid, int num_threads) {
+   kmp_info_t *thr = __kmp_threads[gtid];
+ 
+@@ -7782,6 +7860,39 @@ void __kmp_push_num_threads(ident_t *id, int gtid, int num_threads) {
+     thr->th.th_set_nproc = num_threads;
+ }
+ 
++void __kmp_push_num_threads_list(ident_t *id, int gtid, kmp_uint32 list_length,
++                                 int *num_threads_list) {
++  kmp_info_t *thr = __kmp_threads[gtid];
++
++  KMP_DEBUG_ASSERT(list_length > 1);
++
++  if (num_threads_list[0] > 0)
++    thr->th.th_set_nproc = num_threads_list[0];
++  thr->th.th_set_nested_nth =
++      (int *)KMP_INTERNAL_MALLOC(list_length * sizeof(int));
++  for (kmp_uint32 i = 0; i < list_length; ++i)
++    thr->th.th_set_nested_nth[i] = num_threads_list[i];
++  thr->th.th_set_nested_nth_sz = list_length;
++}
++
++void __kmp_set_strict_num_threads(ident_t *loc, int gtid, int sev,
++                                  const char *msg) {
++  kmp_info_t *thr = __kmp_threads[gtid];
++  thr->th.th_nt_strict = true;
++  thr->th.th_nt_loc = loc;
++  // if sev is unset make fatal
++  if (sev == severity_warning)
++    thr->th.th_nt_sev = sev;
++  else
++    thr->th.th_nt_sev = severity_fatal;
++  // if msg is unset, use an appropriate message
++  if (msg)
++    thr->th.th_nt_msg = msg;
++  else
++    thr->th.th_nt_msg = "Cannot form team with number of threads specified by "
++                        "strict num_threads clause.";
++}
++
+ static void __kmp_push_thread_limit(kmp_info_t *thr, int num_teams,
+                                     int num_threads) {
+   KMP_DEBUG_ASSERT(thr);
+@@ -8238,6 +8349,7 @@ void __kmp_cleanup(void) {
+   __kmp_nested_nth.nth = NULL;
+   __kmp_nested_nth.size = 0;
+   __kmp_nested_nth.used = 0;
++
+   KMP_INTERNAL_FREE(__kmp_nested_proc_bind.bind_types);
+   __kmp_nested_proc_bind.bind_types = NULL;
+   __kmp_nested_proc_bind.size = 0;
+diff --git a/openmp/runtime/test/parallel/omp_parallel_num_threads_list.c b/openmp/runtime/test/parallel/omp_parallel_num_threads_list.c
+new file mode 100644
+index 0000000000000..b5abbc4c14de4
+--- /dev/null
++++ b/openmp/runtime/test/parallel/omp_parallel_num_threads_list.c
+@@ -0,0 +1,212 @@
++// RUN: %libomp-compile && env OMP_NUM_THREADS=2,2,2,2,2 %libomp-run
++#include <stdio.h>
++#include "omp_testsuite.h"
++
++// When compiler supports num_threads clause list format, remove the following
++// and use num_threads clause directly
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++int __kmpc_global_thread_num(void *loc);
++void __kmpc_push_num_threads_list(void *loc, int gtid, unsigned length,
++                                  int *list);
++
++#if defined(__cplusplus)
++}
++#endif
++
++int test_omp_parallel_num_threads_list() {
++  int num_failed = 0;
++
++// Initially, 5 levels specified via OMP_NUM_THREADS with 2 threads per level
++// Check top 3 levels
++#pragma omp parallel reduction(+ : num_failed) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 2);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 2);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 2);
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++// Make sure that basic single element num_threads clause works
++#pragma omp parallel reduction(+ : num_failed) num_threads(4) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 4);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++// Check that basic single element num_threads clause works on second level
++#pragma omp parallel reduction(+ : num_failed) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++#pragma omp parallel reduction(+ : num_failed) num_threads(4) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 4);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++  // Try a short list. It should completely overwrite the old settings.
++  // We need to use the compiler interface for now.
++  int threads[2] = {3, 3};
++  __kmpc_push_num_threads_list(NULL, __kmpc_global_thread_num(NULL), 2,
++                               threads);
++#pragma omp parallel reduction(+ : num_failed) // num_threads(3,3) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 3);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 3);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++// NOTE: should just keep using last element in list, to nesting depth
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 3);
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++// Similar,  but at a lower level.
++#pragma omp parallel reduction(+ : num_failed) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++    int threads[2] = {3, 3};
++    __kmpc_push_num_threads_list(NULL, __kmpc_global_thread_num(NULL), 2,
++                                 threads);
++#pragma omp parallel reduction(+ : num_failed) // num_clause(3,3) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 3);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++// NOTE: just keep using last element in list, to nesting depth
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 3);
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++// Make sure a second inner parallel is NOT affected by the clause
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        // NOTE: just keep using last element in list, to nesting depth
++        num_failed = num_failed + !(omp_get_num_threads() == 2); // Unaffected
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++  // Test lists at multiple levels
++  int threads2[2] = {4, 3};
++  __kmpc_push_num_threads_list(NULL, __kmpc_global_thread_num(NULL), 2,
++                               threads2);
++#pragma omp parallel reduction(+ : num_failed) // num_clause(4,3) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 4);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 3);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 3);
++        int threads3[2] = {2, 5};
++        __kmpc_push_num_threads_list(NULL, __kmpc_global_thread_num(NULL), 2,
++                                     threads3);
++#pragma omp parallel reduction(+ : num_failed) // num_clause(2,5) // 4th level
++        {
++#pragma omp single
++          num_failed = num_failed + !(omp_get_num_threads() == 2);
++#pragma omp parallel reduction(+ : num_failed) // 5th level
++          {
++#pragma omp single
++            num_failed = num_failed + !(omp_get_num_threads() == 5);
++#pragma omp parallel reduction(+ : num_failed) // 6th level
++            {
++#pragma omp single
++              num_failed = num_failed + !(omp_get_num_threads() == 5);
++            } // end 6th level parallel
++          } // end 5th level parallel
++        } // end 4th level parallel
++#pragma omp parallel reduction(+ : num_failed) // 4th level
++        {
++#pragma omp single
++          num_failed = num_failed + !(omp_get_num_threads() == 3);
++        } // end 4th level parallel
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 3);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 3);
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++// Now we should be back to the way we started.
++#pragma omp parallel reduction(+ : num_failed) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() == 2);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() == 2);
++#pragma omp parallel reduction(+ : num_failed) // 3rd level
++      {
++#pragma omp single
++        num_failed = num_failed + !(omp_get_num_threads() == 2);
++      } // end 3rd level parallel
++    } // end 2nd level parallel
++  } // end 1st level parallel
++
++  return (!num_failed);
++}
++
++int main() {
++  int i;
++  int num_failed = 0;
++
++  for (i = 0; i < REPETITIONS; i++) {
++    if (!test_omp_parallel_num_threads_list()) {
++      num_failed++;
++    }
++  }
++  return num_failed;
++}
+diff --git a/openmp/runtime/test/parallel/omp_parallel_num_threads_strict.c b/openmp/runtime/test/parallel/omp_parallel_num_threads_strict.c
+new file mode 100644
+index 0000000000000..577aa3a250578
+--- /dev/null
++++ b/openmp/runtime/test/parallel/omp_parallel_num_threads_strict.c
+@@ -0,0 +1,103 @@
++// RUN: %libomp-compile && env OMP_NUM_THREADS=2,2,2,2,2 OMP_THREAD_LIMIT=16 \
++// RUN: %libomp-run
++#include <stdio.h>
++#include "omp_testsuite.h"
++
++// When compiler supports num_threads clause list format and strict modifier,
++// remove the following and use num_threads clause directly
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++int __kmpc_global_thread_num(void *loc);
++void __kmpc_push_num_threads_list(void *loc, int gtid, unsigned length,
++                                  int *list);
++void __kmpc_push_num_threads_strict(void *loc, int gtid, int nth, int sev,
++                                    const char *msg);
++void __kmpc_push_num_threads_list_strict(void *loc, int gtid, unsigned length,
++                                         int *list, int sev, const char *msg);
++
++#if defined(__cplusplus)
++}
++#endif
++
++int test_omp_parallel_num_threads_strict() {
++  int num_failed = 0;
++
++// Test regular runtime warning about exceeding thread limit.
++// Tolerate whatever value was given.
++#pragma omp parallel reduction(+ : num_failed) num_threads(22)
++#pragma omp single
++  num_failed = num_failed + !(omp_get_num_threads() <= 22);
++
++  // Test with 4 threads and strict -- no problem, no warning.
++  __kmpc_push_num_threads_strict(NULL, __kmpc_global_thread_num(NULL), 4, 1,
++                                 "This warning shouldn't happen.");
++#pragma omp parallel reduction(+ : num_failed) // num_threads(strict:4)
++#pragma omp single
++  num_failed = num_failed + !(omp_get_num_threads() == 4);
++
++  // Exceed limit, specify user warning message. Tolerate whatever was given.
++  __kmpc_push_num_threads_strict(NULL, __kmpc_global_thread_num(NULL), 20, 1,
++                                 "User-supplied warning for strict.");
++#pragma omp parallel reduction(+ : num_failed)
++  // num_threads(strict:20) severity(warning)
++  // message("User-supplied warning for strict.")
++#pragma omp single
++  num_failed = num_failed + !(omp_get_num_threads() <= 20);
++
++  // Exceed limit, no user message, use runtime default message for strict.
++  // Tolerate whatever value was given.
++  __kmpc_push_num_threads_strict(NULL, __kmpc_global_thread_num(NULL), 21, 1,
++                                 NULL);
++#pragma omp parallel reduction(+ : num_failed) // num_threads(strict:21)
++#pragma omp single
++  num_failed = num_failed + !(omp_get_num_threads() <= 21);
++
++  // Exceed limit at top level. Should see user warning message.
++  int threads3[2] = {24, 2};
++  __kmpc_push_num_threads_list_strict(NULL, __kmpc_global_thread_num(NULL), 2,
++                                      threads3, 1,
++                                      "User-supplied warning on strict list.");
++#pragma omp parallel reduction(+ : num_failed)
++  // num_threads(strict:24,2)  severity(warning)
++  // message("User-supplied warning on strict. list") // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() <= 24);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() <= 2);
++    }
++  }
++
++  // No strict limit at top level. Regular runtime limiting applies.
++  __kmpc_push_num_threads_list(NULL, __kmpc_global_thread_num(NULL), 2,
++                               threads3);
++#pragma omp parallel reduction(+ : num_failed)
++  // num_threads(24,2) // 1st level
++  {
++#pragma omp single
++    num_failed = num_failed + !(omp_get_num_threads() <= 24);
++#pragma omp parallel reduction(+ : num_failed) // 2nd level
++    {
++#pragma omp single
++      num_failed = num_failed + !(omp_get_num_threads() <= 2);
++    }
++  }
++
++  return (!num_failed);
++}
++
++int main() {
++  int i;
++  int num_failed = 0;
++
++  for (i = 0; i < REPETITIONS; i++) {
++    if (!test_omp_parallel_num_threads_strict()) {
++      num_failed++;
++    }
++  }
++  return num_failed;
++}

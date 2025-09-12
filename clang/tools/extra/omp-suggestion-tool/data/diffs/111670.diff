@@ -1,0 +1,247 @@
+diff --git a/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp b/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
+index e88da5a8ebae1..6ee4f0ff71057 100644
+--- a/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
++++ b/flang/lib/Optimizer/Analysis/AliasAnalysis.cpp
+@@ -13,6 +13,8 @@
+ #include "flang/Optimizer/Dialect/FortranVariableInterface.h"
+ #include "flang/Optimizer/HLFIR/HLFIROps.h"
+ #include "mlir/Analysis/AliasAnalysis.h"
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/Dialect/OpenMP/OpenMPInterfaces.h"
+ #include "mlir/IR/BuiltinOps.h"
+ #include "mlir/IR/Value.h"
+ #include "mlir/Interfaces/SideEffectInterfaces.h"
+@@ -296,6 +298,17 @@ AliasAnalysis::Source AliasAnalysis::getSource(mlir::Value v,
+             defOp = v.getDefiningOp();
+             return;
+           }
++          // If load is inside target and it points to mapped item,
++          // continue tracking.
++          Operation *loadMemrefOp = op.getMemref().getDefiningOp();
++          bool isDeclareOp = llvm::isa<fir::DeclareOp>(loadMemrefOp) ||
++                             llvm::isa<hlfir::DeclareOp>(loadMemrefOp);
++          if (isDeclareOp &&
++              llvm::isa<omp::TargetOp>(loadMemrefOp->getParentOp())) {
++            v = op.getMemref();
++            defOp = v.getDefiningOp();
++            return;
++          }
+           // No further tracking for addresses loaded from memory for now.
+           type = SourceKind::Indirect;
+           breakFromLoop = true;
+@@ -319,6 +332,22 @@ AliasAnalysis::Source AliasAnalysis::getSource(mlir::Value v,
+           breakFromLoop = true;
+         })
+         .Case<hlfir::DeclareOp, fir::DeclareOp>([&](auto op) {
++          // If declare operation is inside omp target region,
++          // continue alias analysis outside the target region
++          if (auto targetOp =
++                  llvm::dyn_cast<omp::TargetOp>(op->getParentOp())) {
++            auto argIface = cast<omp::BlockArgOpenMPOpInterface>(*targetOp);
++            for (auto [opArg, blockArg] : llvm::zip_equal(
++                     targetOp.getMapVars(), argIface.getMapBlockArgs())) {
++              if (blockArg == op.getMemref()) {
++                omp::MapInfoOp mapInfo =
++                    llvm::cast<omp::MapInfoOp>(opArg.getDefiningOp());
++                v = mapInfo.getVarPtr();
++                defOp = v.getDefiningOp();
++                return;
++              }
++            }
++          }
+           auto varIf = llvm::cast<fir::FortranVariableOpInterface>(defOp);
+           // While going through a declare operation collect
+           // the variable attributes from it. Right now, some
+diff --git a/flang/lib/Optimizer/Analysis/CMakeLists.txt b/flang/lib/Optimizer/Analysis/CMakeLists.txt
+index 436d4d3f18969..c000a9da99f87 100644
+--- a/flang/lib/Optimizer/Analysis/CMakeLists.txt
++++ b/flang/lib/Optimizer/Analysis/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_flang_library(FIRAnalysis
+   FIRDialect
+   HLFIRDialect
+   MLIRIR
++  MLIROpenMPDialect
+ 
+   LINK_LIBS
+   FIRBuilder
+@@ -14,5 +15,6 @@ add_flang_library(FIRAnalysis
+   MLIRFuncDialect
+   MLIRLLVMDialect
+   MLIRMathTransforms
++  MLIROpenMPDialect
+   FIRSupport
+ )
+diff --git a/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-1.fir b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-1.fir
+new file mode 100644
+index 0000000000000..88f411847172a
+--- /dev/null
++++ b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-1.fir
+@@ -0,0 +1,66 @@
++// Use --mlir-disable-threading so that the AA queries are serialized
++// as well as its diagnostic output.
++// RUN: fir-opt %s -pass-pipeline='builtin.module(func.func(test-fir-alias-analysis))' -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
++
++// Fortran source code:
++//
++// program TestAllocatableArray
++// real(kind=8),  allocatable :: A(:)
++// real(kind=8),  allocatable :: B(:)
++// !$omp target
++//    A(0) = B(0)
++// !$omp end target
++// end TestAllocatableArray
++
++// CHECK-LABEL: Testing : "_QPTestAllocatableArray"
++// CHECK-DAG: targetArrayB#0 <-> targetArrayA#0: NoAlias
++func.func @_QPTestAllocatableArray() {
++  %0 = fir.address_of(@_QFEa) : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %1:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "ArrayA" } : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>)
++  %2 = fir.address_of(@_QFEb) : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %3:2 = hlfir.declare %2 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "ArrayB" } : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>)
++  %4 = fir.load %1#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %c1 = arith.constant 1 : index
++  %c0 = arith.constant 0 : index
++  %5 = fir.load %1#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %c0_0 = arith.constant 0 : index
++  %6:3 = fir.box_dims %5, %c0_0 : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> (index, index, index)
++  %7:3 = fir.box_dims %4, %c0 : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> (index, index, index)
++  %c0_1 = arith.constant 0 : index
++  %8 = arith.subi %7#1, %c1 : index
++  %9 = omp.map.bounds lower_bound(%c0_1 : index) upper_bound(%8 : index) extent(%7#1 : index) stride(%7#2 : index) start_idx(%6#0 : index) {stride_in_bytes = true}
++  %10 = fir.box_offset %1#1 base_addr : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>
++  %11 = omp.map.info var_ptr(%1#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.array<?xf64>) var_ptr_ptr(%10 : !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>) map_clauses(implicit, tofrom) capture(ByRef) bounds(%9) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>> {name = ""}
++  %12 = omp.map.info var_ptr(%1#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.box<!fir.heap<!fir.array<?xf64>>>) map_clauses(implicit, tofrom) capture(ByRef) members(%11 : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>> {name = "a"}
++  %13 = fir.load %3#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %c1_2 = arith.constant 1 : index
++  %c0_3 = arith.constant 0 : index
++  %14 = fir.load %3#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++  %c0_4 = arith.constant 0 : index
++  %15:3 = fir.box_dims %14, %c0_4 : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> (index, index, index)
++  %16:3 = fir.box_dims %13, %c0_3 : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> (index, index, index)
++  %c0_5 = arith.constant 0 : index
++  %17 = arith.subi %16#1, %c1_2 : index
++  %18 = omp.map.bounds lower_bound(%c0_5 : index) upper_bound(%17 : index) extent(%16#1 : index) stride(%16#2 : index) start_idx(%15#0 : index) {stride_in_bytes = true}
++  %19 = fir.box_offset %3#1 base_addr : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>
++  %20 = omp.map.info var_ptr(%3#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.array<?xf64>) var_ptr_ptr(%19 : !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>) map_clauses(implicit, tofrom) capture(ByRef) bounds(%18) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>> {name = ""}
++  %21 = omp.map.info var_ptr(%3#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.box<!fir.heap<!fir.array<?xf64>>>) map_clauses(implicit, tofrom) capture(ByRef) members(%20 : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>> {name = "b"}
++  omp.target map_entries(%11 -> %arg0, %12 -> %arg1, %20 -> %arg2, %21 -> %arg3 : !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf64>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) {
++    %22:2 = hlfir.declare %arg1 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFEa"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>)
++    %23:2 = hlfir.declare %arg3 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFEb"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>)
++    %24 = fir.load %23#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++    %c0_6 = arith.constant 0 : index
++    %25 = hlfir.designate %24 (%c0_6) {test.ptr = "targetArrayB"} : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> !fir.ref<f64>
++    %26 = fir.load %25 : !fir.ref<f64>
++    %27 = fir.load %22#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xf64>>>>
++    %c0_7 = arith.constant 0 : index
++    %28 = hlfir.designate %27 (%c0_7) {test.ptr = "targetArrayA"} : (!fir.box<!fir.heap<!fir.array<?xf64>>>, index) -> !fir.ref<f64>
++    hlfir.assign %26 to %28 : f64, !fir.ref<f64>
++    omp.terminator
++  }
++  return
++}
++fir.global internal @_QFEa : !fir.box<!fir.heap<!fir.array<?xf64>>> {
++}
++fir.global internal @_QFEb : !fir.box<!fir.heap<!fir.array<?xf64>>> {
++}
+diff --git a/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-2.fir b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-2.fir
+new file mode 100644
+index 0000000000000..c6b2e29a7188a
+--- /dev/null
++++ b/flang/test/Analysis/AliasAnalysis/alias-analysis-omp-target-2.fir
+@@ -0,0 +1,96 @@
++// Use --mlir-disable-threading so that the AA queries are serialized
++// as well as its diagnostic output.
++// RUN: fir-opt %s -pass-pipeline='builtin.module(func.func(test-fir-alias-analysis))' -split-input-file --mlir-disable-threading 2>&1 | FileCheck %s
++
++// Fortran source code:
++//
++// subroutine TestTargetData(p, a, b)
++//   real    ::  p(10), a(10), b(10)
++//   !$omp target data map(from: p)
++//      !$omp target map(to: a )
++//            p(1) = a(1)
++//      !$omp end target
++//      !$omp target map(to: b )
++//            p(1) = b(1)
++//      !$omp end target
++//   !$omp end target data
++// end subroutine
++
++// CHECK-LABEL: Testing : "_QPTestTargetData"
++
++// CHECK-DAG: targetArrayA#0 <-> targetArrayP#0: NoAlias
++// CHECK-DAG: targetArrayA#0 <-> targetArrayB#0: NoAlias
++// CHECK-DAG: targetArrayP#0 <-> targetArrayB#0: NoAlias
++
++func.func @_QPTestTargetData(%arg0: !fir.ref<!fir.array<10xf32>> {fir.bindc_name = "p"}, %arg1: !fir.ref<!fir.array<10xf32>> {fir.bindc_name = "a"}, %arg2: !fir.ref<!fir.array<10xf32>> {fir.bindc_name = "b"}) {
++  %0 = fir.dummy_scope : !fir.dscope
++  %c10 = arith.constant 10 : index
++  %1 = fir.shape %c10 : (index) -> !fir.shape<1>
++  %2:2 = hlfir.declare %arg1(%1) dummy_scope %0 {uniq_name = "_QFtest_target_dataEa"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++  %c10_0 = arith.constant 10 : index
++  %3 = fir.shape %c10_0 : (index) -> !fir.shape<1>
++  %4:2 = hlfir.declare %arg2(%3) dummy_scope %0 {uniq_name = "_QFtest_target_dataEb"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++  %c10_1 = arith.constant 10 : index
++  %5 = fir.shape %c10_1 : (index) -> !fir.shape<1>
++  %6:2 = hlfir.declare %arg0(%5) dummy_scope %0 {uniq_name = "_QFtest_target_dataEp"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>, !fir.dscope) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++  %c1 = arith.constant 1 : index
++  %c0 = arith.constant 0 : index
++  %7 = arith.subi %c10_1, %c1 : index
++  %8 = omp.map.bounds lower_bound(%c0 : index) upper_bound(%7 : index) extent(%c10_1 : index) stride(%c1 : index) start_idx(%c1 : index)
++  %9 = omp.map.info var_ptr(%6#1 : !fir.ref<!fir.array<10xf32>>, !fir.array<10xf32>) map_clauses(from) capture(ByRef) bounds(%8) -> !fir.ref<!fir.array<10xf32>> {name = "p"}
++  omp.target_data map_entries(%9 : !fir.ref<!fir.array<10xf32>>) {
++    %c1_2 = arith.constant 1 : index
++    %c0_3 = arith.constant 0 : index
++    %10 = arith.subi %c10, %c1_2 : index
++    %11 = omp.map.bounds lower_bound(%c0_3 : index) upper_bound(%10 : index) extent(%c10 : index) stride(%c1_2 : index) start_idx(%c1_2 : index)
++    %12 = omp.map.info var_ptr(%2#1 : !fir.ref<!fir.array<10xf32>>, !fir.array<10xf32>) map_clauses(to) capture(ByRef) bounds(%11) -> !fir.ref<!fir.array<10xf32>> {name = "a"}
++    %c1_4 = arith.constant 1 : index
++    %c0_5 = arith.constant 0 : index
++    %13 = arith.subi %c10_1, %c1_4 : index
++    %14 = omp.map.bounds lower_bound(%c0_5 : index) upper_bound(%13 : index) extent(%c10_1 : index) stride(%c1_4 : index) start_idx(%c1_4 : index)
++    %15 = omp.map.info var_ptr(%6#1 : !fir.ref<!fir.array<10xf32>>, !fir.array<10xf32>) map_clauses(implicit, tofrom) capture(ByRef) bounds(%14) -> !fir.ref<!fir.array<10xf32>> {name = "p"}
++    omp.target map_entries(%12 -> %arg3, %15 -> %arg4 : !fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>) {
++      %c10_10 = arith.constant 10 : index
++      %22 = fir.shape %c10_10 : (index) -> !fir.shape<1>
++      %23:2 = hlfir.declare %arg3(%22) {uniq_name = "_QFtest_target_dataEa"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++      %c10_11 = arith.constant 10 : index
++      %24 = fir.shape %c10_11 : (index) -> !fir.shape<1>
++      %25:2 = hlfir.declare %arg4(%24) {uniq_name = "_QFtest_target_dataEp"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++      %c1_12 = arith.constant 1 : index
++      %26 = hlfir.designate %23#0 (%c1_12) {test.ptr = "targetArrayA"}  : (!fir.ref<!fir.array<10xf32>>, index) -> !fir.ref<f32>
++      %27 = fir.load %26 : !fir.ref<f32>
++      %c1_13 = arith.constant 1 : index
++      %28 = hlfir.designate %25#0 (%c1_13) {test.ptr = "targetArrayP"}  : (!fir.ref<!fir.array<10xf32>>, index) -> !fir.ref<f32>
++      hlfir.assign %27 to %28 : f32, !fir.ref<f32>
++      omp.terminator
++    }
++    %c1_6 = arith.constant 1 : index
++    %c0_7 = arith.constant 0 : index
++    %16 = arith.subi %c10_0, %c1_6 : index
++    %17 = omp.map.bounds lower_bound(%c0_7 : index) upper_bound(%16 : index) extent(%c10_0 : index) stride(%c1_6 : index) start_idx(%c1_6 : index)
++    %18 = omp.map.info var_ptr(%4#1 : !fir.ref<!fir.array<10xf32>>, !fir.array<10xf32>) map_clauses(to) capture(ByRef) bounds(%17) -> !fir.ref<!fir.array<10xf32>> {name = "b"}
++    %c1_8 = arith.constant 1 : index
++    %c0_9 = arith.constant 0 : index
++    %19 = arith.subi %c10_1, %c1_8 : index
++    %20 = omp.map.bounds lower_bound(%c0_9 : index) upper_bound(%19 : index) extent(%c10_1 : index) stride(%c1_8 : index) start_idx(%c1_8 : index)
++    %21 = omp.map.info var_ptr(%6#1 : !fir.ref<!fir.array<10xf32>>, !fir.array<10xf32>) map_clauses(implicit, tofrom) capture(ByRef) bounds(%20) -> !fir.ref<!fir.array<10xf32>> {name = "p"}
++    omp.target map_entries(%18 -> %arg3, %21 -> %arg4 : !fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>) {
++      %c10_10 = arith.constant 10 : index
++      %22 = fir.shape %c10_10 : (index) -> !fir.shape<1>
++      %23:2 = hlfir.declare %arg3(%22) {uniq_name = "_QFtest_target_dataEb"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++      %c10_11 = arith.constant 10 : index
++      %24 = fir.shape %c10_11 : (index) -> !fir.shape<1>
++      %25:2 = hlfir.declare %arg4(%24) {uniq_name = "_QFtest_target_dataEp"} : (!fir.ref<!fir.array<10xf32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xf32>>, !fir.ref<!fir.array<10xf32>>)
++      %c1_12 = arith.constant 1 : index
++      %26 = hlfir.designate %23#0 (%c1_12) {test.ptr = "targetArrayB"}  : (!fir.ref<!fir.array<10xf32>>, index) -> !fir.ref<f32>
++      %27 = fir.load %26 : !fir.ref<f32>
++      %c1_13 = arith.constant 1 : index
++      %28 = hlfir.designate %25#0 (%c1_13) {test.ptr = "targetArrayP"}  : (!fir.ref<!fir.array<10xf32>>, index) -> !fir.ref<f32>
++      hlfir.assign %27 to %28 : f32, !fir.ref<f32>
++      omp.terminator
++    }
++    omp.terminator
++  }
++  return
++}
++

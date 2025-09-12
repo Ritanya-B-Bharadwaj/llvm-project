@@ -1,0 +1,907 @@
+diff --git a/flang/include/flang/Support/OpenMP-utils.h b/flang/include/flang/Support/OpenMP-utils.h
+index d8f82e1cf94f1..6d9db2b682c50 100644
+--- a/flang/include/flang/Support/OpenMP-utils.h
++++ b/flang/include/flang/Support/OpenMP-utils.h
+@@ -34,6 +34,7 @@ struct EntryBlockArgsEntry {
+ /// Structure holding the information needed to create and bind entry block
+ /// arguments associated to all clauses that can define them.
+ struct EntryBlockArgs {
++  EntryBlockArgsEntry hasDeviceAddr;
+   llvm::ArrayRef<mlir::Value> hostEvalVars;
+   EntryBlockArgsEntry inReduction;
+   EntryBlockArgsEntry map;
+@@ -44,21 +45,21 @@ struct EntryBlockArgs {
+   EntryBlockArgsEntry useDevicePtr;
+ 
+   bool isValid() const {
+-    return inReduction.isValid() && map.isValid() && priv.isValid() &&
+-        reduction.isValid() && taskReduction.isValid() &&
++    return hasDeviceAddr.isValid() && inReduction.isValid() && map.isValid() &&
++        priv.isValid() && reduction.isValid() && taskReduction.isValid() &&
+         useDeviceAddr.isValid() && useDevicePtr.isValid();
+   }
+ 
+   auto getSyms() const {
+-    return llvm::concat<const semantics::Symbol *const>(inReduction.syms,
+-        map.syms, priv.syms, reduction.syms, taskReduction.syms,
+-        useDeviceAddr.syms, useDevicePtr.syms);
++    return llvm::concat<const semantics::Symbol *const>(hasDeviceAddr.syms,
++        inReduction.syms, map.syms, priv.syms, reduction.syms,
++        taskReduction.syms, useDeviceAddr.syms, useDevicePtr.syms);
+   }
+ 
+   auto getVars() const {
+-    return llvm::concat<const mlir::Value>(hostEvalVars, inReduction.vars,
+-        map.vars, priv.vars, reduction.vars, taskReduction.vars,
+-        useDeviceAddr.vars, useDevicePtr.vars);
++    return llvm::concat<const mlir::Value>(hasDeviceAddr.vars, hostEvalVars,
++        inReduction.vars, map.vars, priv.vars, reduction.vars,
++        taskReduction.vars, useDeviceAddr.vars, useDevicePtr.vars);
+   }
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 2da0338200a3a..dab3182e0162f 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -849,14 +849,34 @@ bool ClauseProcessor::processDepend(mlir::omp::DependClauseOps &result) const {
+ }
+ 
+ bool ClauseProcessor::processHasDeviceAddr(
+-    mlir::omp::HasDeviceAddrClauseOps &result,
+-    llvm::SmallVectorImpl<const semantics::Symbol *> &isDeviceSyms) const {
+-  return findRepeatableClause<omp::clause::HasDeviceAddr>(
+-      [&](const omp::clause::HasDeviceAddr &devAddrClause,
+-          const parser::CharBlock &) {
+-        addUseDeviceClause(converter, devAddrClause.v, result.hasDeviceAddrVars,
+-                           isDeviceSyms);
++    lower::StatementContext &stmtCtx, mlir::omp::HasDeviceAddrClauseOps &result,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &hasDeviceSyms) const {
++  // For HAS_DEVICE_ADDR objects, implicitly map the top-level entities.
++  // Their address (or the whole descriptor, if the entity had one) will be
++  // passed to the target region.
++  std::map<Object, OmpMapParentAndMemberData> parentMemberIndices;
++  bool clauseFound = findRepeatableClause<omp::clause::HasDeviceAddr>(
++      [&](const omp::clause::HasDeviceAddr &clause,
++          const parser::CharBlock &source) {
++        mlir::Location location = converter.genLocation(source);
++        llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
++            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT;
++        omp::ObjectList baseObjects;
++        llvm::transform(clause.v, std::back_inserter(baseObjects),
++                        [&](const omp::Object &object) {
++                          if (auto maybeBase = getBaseObject(object, semaCtx))
++                            return *maybeBase;
++                          return object;
++                        });
++        processMapObjects(stmtCtx, location, baseObjects, mapTypeBits,
++                          parentMemberIndices, result.hasDeviceAddrVars,
++                          hasDeviceSyms);
+       });
++
++  insertChildMapInfoIntoParent(converter, semaCtx, stmtCtx, parentMemberIndices,
++                               result.hasDeviceAddrVars, hasDeviceSyms);
++  return clauseFound;
+ }
+ 
+ bool ClauseProcessor::processIf(
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index c2a136d620b29..aa203689ab560 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -72,8 +72,9 @@ class ClauseProcessor {
+   bool processFinal(lower::StatementContext &stmtCtx,
+                     mlir::omp::FinalClauseOps &result) const;
+   bool processHasDeviceAddr(
++      lower::StatementContext &stmtCtx,
+       mlir::omp::HasDeviceAddrClauseOps &result,
+-      llvm::SmallVectorImpl<const semantics::Symbol *> &isDeviceSyms) const;
++      llvm::SmallVectorImpl<const semantics::Symbol *> &hasDeviceSyms) const;
+   bool processHint(mlir::omp::HintClauseOps &result) const;
+   bool processInclusive(mlir::Location currentLocation,
+                         mlir::omp::InclusiveClauseOps &result) const;
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 84092b75e0b3c..322a848456dfa 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -159,7 +159,12 @@ std::optional<Object> getBaseObject(const Object &object,
+       return Object{SymbolAndDesignatorExtractor::symbol_addr(comp->symbol()),
+                     ea.Designate(evaluate::DataRef{
+                         SymbolAndDesignatorExtractor::AsRvalueRef(*comp)})};
+-    } else if (base.UnwrapSymbolRef()) {
++    } else if (auto *symRef = base.UnwrapSymbolRef()) {
++      // This is the base symbol of the array reference, which is the same
++      // as the symbol in the input object,
++      // e.g. A(i) is represented as {Symbol(A), Designator(ArrayRef(A, i))}.
++      // Here we have the Symbol(A), which is what we started with.
++      assert(&**symRef == object.sym());
+       return std::nullopt;
+     }
+   } else {
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index ca161bc2ba337..77786742b3e13 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -321,6 +321,7 @@ static void bindEntryBlockArgs(lower::AbstractConverter &converter,
+   // Process in clause name alphabetical order to match block arguments order.
+   // Do not bind host_eval variables because they cannot be used inside of the
+   // corresponding region, except for very specific cases handled separately.
++  bindMapLike(args.hasDeviceAddr.syms, op.getHasDeviceAddrBlockArgs());
+   bindPrivateLike(args.inReduction.syms, args.inReduction.vars,
+                   op.getInReductionBlockArgs());
+   bindMapLike(args.map.syms, op.getMapBlockArgs());
+@@ -1654,7 +1655,7 @@ static void genTargetClauses(
+   cp.processBare(clauseOps);
+   cp.processDepend(clauseOps);
+   cp.processDevice(stmtCtx, clauseOps);
+-  cp.processHasDeviceAddr(clauseOps, hasDeviceAddrSyms);
++  cp.processHasDeviceAddr(stmtCtx, clauseOps, hasDeviceAddrSyms);
+   if (!hostEvalInfo.empty()) {
+     // Only process host_eval if compiling for the host device.
+     processHostEvalClauses(converter, semaCtx, stmtCtx, eval, loc);
+@@ -2200,6 +2201,10 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+     if (dsp.getAllSymbolsToPrivatize().contains(&sym))
+       return;
+ 
++    // These symbols are mapped individually in processHasDeviceAddr.
++    if (llvm::is_contained(hasDeviceAddrSyms, &sym))
++      return;
++
+     // Structure component symbols don't have bindings, and can only be
+     // explicitly mapped individually. If a member is captured implicitly
+     // we map the entirety of the derived type when we find its symbol.
+@@ -2290,10 +2295,13 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ 
+   auto targetOp = firOpBuilder.create<mlir::omp::TargetOp>(loc, clauseOps);
+ 
+-  llvm::SmallVector<mlir::Value> mapBaseValues;
++  llvm::SmallVector<mlir::Value> hasDeviceAddrBaseValues, mapBaseValues;
++  extractMappedBaseValues(clauseOps.hasDeviceAddrVars, hasDeviceAddrBaseValues);
+   extractMappedBaseValues(clauseOps.mapVars, mapBaseValues);
+ 
+   EntryBlockArgs args;
++  args.hasDeviceAddr.syms = hasDeviceAddrSyms;
++  args.hasDeviceAddr.vars = hasDeviceAddrBaseValues;
+   args.hostEvalVars = clauseOps.hostEvalVars;
+   // TODO: Add in_reduction syms and vars.
+   args.map.syms = mapSyms;
+diff --git a/flang/lib/Lower/OpenMP/Utils.cpp b/flang/lib/Lower/OpenMP/Utils.cpp
+index 744c3bd04a0a7..f5bec97433a4a 100644
+--- a/flang/lib/Lower/OpenMP/Utils.cpp
++++ b/flang/lib/Lower/OpenMP/Utils.cpp
+@@ -303,7 +303,7 @@ mlir::Value createParentSymAndGenIntermediateMaps(
+   /// Checks if an omp::Object is an array expression with a subscript, e.g.
+   /// array(1,2).
+   auto isArrayExprWithSubscript = [](omp::Object obj) {
+-    if (auto maybeRef = evaluate::ExtractDataRef(*obj.ref())) {
++    if (auto maybeRef = evaluate::ExtractDataRef(obj.ref())) {
+       evaluate::DataRef ref = *maybeRef;
+       if (auto *arr = std::get_if<evaluate::ArrayRef>(&ref.u))
+         return !arr->subscript().empty();
+@@ -454,7 +454,7 @@ getComponentObject(std::optional<Object> object,
+   if (!object)
+     return std::nullopt;
+ 
+-  auto ref = evaluate::ExtractDataRef(*object.value().ref());
++  auto ref = evaluate::ExtractDataRef(object.value().ref());
+   if (!ref)
+     return std::nullopt;
+ 
+diff --git a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index 9ee066631d663..2f9c01a129210 100644
+--- a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -250,10 +250,24 @@ class MapInfoFinalizationPass
+ 
+     mapFlags flags = mapFlags::OMP_MAP_TO |
+                      (mapFlags(mapTypeFlag) &
+-                      (mapFlags::OMP_MAP_IMPLICIT | mapFlags::OMP_MAP_CLOSE));
++                      (mapFlags::OMP_MAP_IMPLICIT | mapFlags::OMP_MAP_CLOSE |
++                       mapFlags::OMP_MAP_ALWAYS));
+     return llvm::to_underlying(flags);
+   }
+ 
++  /// Check if the mapOp is present in the HasDeviceAddr clause on
++  /// the userOp. Only applies to TargetOp.
++  bool isHasDeviceAddr(mlir::omp::MapInfoOp mapOp, mlir::Operation *userOp) {
++    assert(userOp && "Expecting non-null argument");
++    if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(userOp)) {
++      for (mlir::Value hda : targetOp.getHasDeviceAddrVars()) {
++        if (hda.getDefiningOp() == mapOp)
++          return true;
++      }
++    }
++    return false;
++  }
++
+   mlir::omp::MapInfoOp genDescriptorMemberMaps(mlir::omp::MapInfoOp op,
+                                                fir::FirOpBuilder &builder,
+                                                mlir::Operation *target) {
+@@ -263,11 +277,11 @@ class MapInfoFinalizationPass
+     // TODO: map the addendum segment of the descriptor, similarly to the
+     // base address/data pointer member.
+     mlir::Value descriptor = getDescriptorFromBoxMap(op, builder);
+-    auto baseAddr = genBaseAddrMap(descriptor, op.getBounds(),
+-                                   op.getMapType().value_or(0), builder);
++
+     mlir::ArrayAttr newMembersAttr;
+     mlir::SmallVector<mlir::Value> newMembers;
+     llvm::SmallVector<llvm::SmallVector<int64_t>> memberIndices;
++    bool IsHasDeviceAddr = isHasDeviceAddr(op, target);
+ 
+     if (!mapMemberUsers.empty() || !op.getMembers().empty())
+       getMemberIndicesAsVectors(
+@@ -281,6 +295,12 @@ class MapInfoFinalizationPass
+     // member information to now have one new member for the base address, or
+     // we are expanding a parent that is a descriptor and we have to adjust
+     // all of its members to reflect the insertion of the base address.
++    //
++    // If we're expanding a top-level descriptor for a map operation that
++    // resulted from "has_device_addr" clause, then we want the base pointer
++    // from the descriptor to be used verbatim, i.e. without additional
++    // remapping. To avoid this remapping, simply don't generate any map
++    // information for the descriptor members.
+     if (!mapMemberUsers.empty()) {
+       // Currently, there should only be one user per map when this pass
+       // is executed. Either a parent map, holding the current map in its
+@@ -291,6 +311,8 @@ class MapInfoFinalizationPass
+       assert(mapMemberUsers.size() == 1 &&
+              "OMPMapInfoFinalization currently only supports single users of a "
+              "MapInfoOp");
++      auto baseAddr = genBaseAddrMap(descriptor, op.getBounds(),
++                                     op.getMapType().value_or(0), builder);
+       ParentAndPlacement mapUser = mapMemberUsers[0];
+       adjustMemberIndices(memberIndices, mapUser.index);
+       llvm::SmallVector<mlir::Value> newMemberOps;
+@@ -302,7 +324,9 @@ class MapInfoFinalizationPass
+       mapUser.parent.getMembersMutable().assign(newMemberOps);
+       mapUser.parent.setMembersIndexAttr(
+           builder.create2DI64ArrayAttr(memberIndices));
+-    } else {
++    } else if (!IsHasDeviceAddr) {
++      auto baseAddr = genBaseAddrMap(descriptor, op.getBounds(),
++                                     op.getMapType().value_or(0), builder);
+       newMembers.push_back(baseAddr);
+       if (!op.getMembers().empty()) {
+         for (auto &indices : memberIndices)
+@@ -316,15 +340,26 @@ class MapInfoFinalizationPass
+       }
+     }
+ 
++    // Descriptors for objects listed on the `has_device_addr` will always
++    // be copied. This is because the descriptor can be rematerialized by the
++    // compiler, and so the address of the descriptor for a given object at
++    // one place in the code may differ from that address in another place.
++    // The contents of the descriptor (the base address in particular) will
++    // remain unchanged though.
++    uint64_t MapType = op.getMapType().value_or(0);
++    if (IsHasDeviceAddr) {
++      MapType |= llvm::to_underlying(
++          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS);
++    }
++
+     mlir::omp::MapInfoOp newDescParentMapOp =
+         builder.create<mlir::omp::MapInfoOp>(
+             op->getLoc(), op.getResult().getType(), descriptor,
+             mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
+             /*varPtrPtr=*/mlir::Value{}, newMembers, newMembersAttr,
+             /*bounds=*/mlir::SmallVector<mlir::Value>{},
+-            builder.getIntegerAttr(
+-                builder.getIntegerType(64, false),
+-                getDescriptorMapType(op.getMapType().value_or(0), target)),
++            builder.getIntegerAttr(builder.getIntegerType(64, false),
++                                   getDescriptorMapType(MapType, target)),
+             /*mapperId*/ mlir::FlatSymbolRefAttr(), op.getMapCaptureTypeAttr(),
+             op.getNameAttr(),
+             /*partial_map=*/builder.getBoolAttr(false));
+@@ -443,6 +478,12 @@ class MapInfoFinalizationPass
+       addOperands(useDevPtrMutableOpRange, target,
+                   argIface.getUseDevicePtrBlockArgsStart() +
+                       argIface.numUseDevicePtrBlockArgs());
++    } else if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target)) {
++      mlir::MutableOperandRange hasDevAddrMutableOpRange =
++          targetOp.getHasDeviceAddrVarsMutable();
++      addOperands(hasDevAddrMutableOpRange, target,
++                  argIface.getHasDeviceAddrBlockArgsStart() +
++                      argIface.numHasDeviceAddrBlockArgs());
+     }
+   }
+ 
+diff --git a/flang/lib/Support/OpenMP-utils.cpp b/flang/lib/Support/OpenMP-utils.cpp
+index 178a6e38dc0f2..97e7723f0be8c 100644
+--- a/flang/lib/Support/OpenMP-utils.cpp
++++ b/flang/lib/Support/OpenMP-utils.cpp
+@@ -18,10 +18,11 @@ mlir::Block *genEntryBlock(mlir::OpBuilder &builder, const EntryBlockArgs &args,
+ 
+   llvm::SmallVector<mlir::Type> types;
+   llvm::SmallVector<mlir::Location> locs;
+-  unsigned numVars = args.hostEvalVars.size() + args.inReduction.vars.size() +
+-      args.map.vars.size() + args.priv.vars.size() +
+-      args.reduction.vars.size() + args.taskReduction.vars.size() +
+-      args.useDeviceAddr.vars.size() + args.useDevicePtr.vars.size();
++  unsigned numVars = args.hasDeviceAddr.vars.size() + args.hostEvalVars.size() +
++      args.inReduction.vars.size() + args.map.vars.size() +
++      args.priv.vars.size() + args.reduction.vars.size() +
++      args.taskReduction.vars.size() + args.useDeviceAddr.vars.size() +
++      args.useDevicePtr.vars.size();
+   types.reserve(numVars);
+   locs.reserve(numVars);
+ 
+@@ -34,6 +35,7 @@ mlir::Block *genEntryBlock(mlir::OpBuilder &builder, const EntryBlockArgs &args,
+ 
+   // Populate block arguments in clause name alphabetical order to match
+   // expected order by the BlockArgOpenMPOpInterface.
++  extractTypeLoc(args.hasDeviceAddr.vars);
+   extractTypeLoc(args.hostEvalVars);
+   extractTypeLoc(args.inReduction.vars);
+   extractTypeLoc(args.map.vars);
+diff --git a/flang/test/Lower/OpenMP/has_device_addr-mapinfo.f90 b/flang/test/Lower/OpenMP/has_device_addr-mapinfo.f90
+new file mode 100644
+index 0000000000000..8d8c0433758ee
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/has_device_addr-mapinfo.f90
+@@ -0,0 +1,23 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=51 %s -mmlir -mlir-print-op-generic -o - | FileCheck %s
++!RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=51 %s -mlir-print-op-generic -o - | FileCheck %s
++
++! Check that we don't generate member information for the descriptor of `a`
++! on entry to the target region.
++
++integer function s(a)
++  integer :: a(:)
++  integer :: t
++  !$omp target data map(to:a) use_device_addr(a)
++  !$omp target map(from:t) has_device_addr(a)
++  t = size(a, 1)
++  !$omp end target
++  !$omp end target data
++  s = t
++end
++
++! Check that the map.info for `a` only takes a single parameter.
++
++!CHECK-DAG: %[[MAP_A:[0-9]+]] = "omp.map.info"(%[[STORAGE_A:[0-9#]+]]) <{map_capture_type = #omp<variable_capture_kind(ByRef)>, map_type = 517 : ui64, name = "a", operandSegmentSizes = array<i32: 1, 0, 0, 0>, partial_map = false, var_type = !fir.box<!fir.array<?xi32>>}> : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>>
++!CHECK-DAG: %[[MAP_T:[0-9]+]] = "omp.map.info"(%[[STORAGE_T:[0-9#]+]]) <{map_capture_type = #omp<variable_capture_kind(ByRef)>, map_type = 2 : ui64, name = "t", operandSegmentSizes = array<i32: 1, 0, 0, 0>, partial_map = false, var_type = i32}> : (!fir.ref<i32>) -> !fir.ref<i32>
++
++!CHECK: "omp.target"(%[[MAP_A]], %[[MAP_T]])
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
+index 32c28f72ec8e5..098c33c11c030 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
+@@ -462,13 +462,18 @@ class OpenMP_HasDeviceAddrClauseSkip<
+     bit description = false, bit extraClassDeclaration = false
+   > : OpenMP_Clause<traits, arguments, assemblyFormat, description,
+                     extraClassDeclaration> {
++  let traits = [
++    BlockArgOpenMPOpInterface
++  ];
++
+   let arguments = (ins
+     Variadic<OpenMP_PointerLikeType>:$has_device_addr_vars
+   );
+ 
+-  let optAssemblyFormat = [{
+-    `has_device_addr` `(` $has_device_addr_vars `:` type($has_device_addr_vars)
+-                      `)`
++  let extraClassDeclaration = [{
++    unsigned numHasDeviceAddrBlockArgs() {
++      return getHasDeviceAddrVars().size();
++    }
+   }];
+ 
+   let description = [{
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index f5a8a7ba04375..c1dae8d543eef 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -1326,8 +1326,9 @@ def TargetOp : OpenMP_Op<"target", traits = [
+   }] # clausesExtraClassDeclaration;
+ 
+   let assemblyFormat = clausesAssemblyFormat # [{
+-    custom<HostEvalInReductionMapPrivateRegion>(
+-        $region, $host_eval_vars, type($host_eval_vars), $in_reduction_vars,
++    custom<TargetOpRegion>(
++        $region, $has_device_addr_vars, type($has_device_addr_vars),
++        $host_eval_vars, type($host_eval_vars), $in_reduction_vars,
+         type($in_reduction_vars), $in_reduction_byref, $in_reduction_syms,
+         $map_vars, type($map_vars), $private_vars, type($private_vars),
+         $private_syms, $private_maps) attr-dict
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+index ad5580a161568..85996368fd946 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+@@ -76,7 +76,10 @@ class BlockArgOpenMPClause<string clauseNameSnake, string clauseNameCamel,
+   >;
+ }
+ 
+-def BlockArgHostEvalClause : BlockArgOpenMPClause<"host_eval", "HostEval", ?>;
++def BlockArgHasDeviceAddrClause : BlockArgOpenMPClause<
++    "has_device_addr", "HasDeviceAddr", ?>;
++def BlockArgHostEvalClause : BlockArgOpenMPClause<
++    "host_eval", "HostEval", BlockArgHasDeviceAddrClause>;
+ def BlockArgInReductionClause : BlockArgOpenMPClause<
+     "in_reduction", "InReduction", BlockArgHostEvalClause>;
+ def BlockArgMapClause : BlockArgOpenMPClause<
+@@ -100,10 +103,10 @@ def BlockArgOpenMPOpInterface : OpInterface<"BlockArgOpenMPOpInterface"> {
+ 
+   let cppNamespace = "::mlir::omp";
+ 
+-  defvar clauses = [ BlockArgHostEvalClause, BlockArgInReductionClause,
+-    BlockArgMapClause, BlockArgPrivateClause, BlockArgReductionClause,
+-    BlockArgTaskReductionClause, BlockArgUseDeviceAddrClause,
+-    BlockArgUseDevicePtrClause ];
++  defvar clauses = [ BlockArgHasDeviceAddrClause, BlockArgHostEvalClause,
++    BlockArgInReductionClause, BlockArgMapClause, BlockArgPrivateClause,
++    BlockArgReductionClause, BlockArgTaskReductionClause,
++    BlockArgUseDeviceAddrClause, BlockArgUseDevicePtrClause ];
+ 
+   let methods = !listconcat(
+     !foreach(clause, clauses, clause.numArgsMethod),
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 077fd0d1e2f53..65a296c5d4829 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -601,6 +601,7 @@ struct ReductionParseArgs {
+ };
+ 
+ struct AllRegionParseArgs {
++  std::optional<MapParseArgs> hasDeviceAddrArgs;
+   std::optional<MapParseArgs> hostEvalArgs;
+   std::optional<ReductionParseArgs> inReductionArgs;
+   std::optional<MapParseArgs> mapArgs;
+@@ -759,6 +760,11 @@ static ParseResult parseBlockArgRegion(OpAsmParser &parser, Region &region,
+                                        AllRegionParseArgs args) {
+   llvm::SmallVector<OpAsmParser::Argument> entryBlockArgs;
+ 
++  if (failed(parseBlockArgClause(parser, entryBlockArgs, "has_device_addr",
++                                 args.hasDeviceAddrArgs)))
++    return parser.emitError(parser.getCurrentLocation())
++           << "invalid `has_device_addr` format";
++
+   if (failed(parseBlockArgClause(parser, entryBlockArgs, "host_eval",
+                                  args.hostEvalArgs)))
+     return parser.emitError(parser.getCurrentLocation())
+@@ -802,8 +808,12 @@ static ParseResult parseBlockArgRegion(OpAsmParser &parser, Region &region,
+   return parser.parseRegion(region, entryBlockArgs);
+ }
+ 
+-static ParseResult parseHostEvalInReductionMapPrivateRegion(
++// These parseXyz functions correspond to the custom<Xyz> definitions
++// in the .td file(s).
++static ParseResult parseTargetOpRegion(
+     OpAsmParser &parser, Region &region,
++    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &hasDeviceAddrVars,
++    SmallVectorImpl<Type> &hasDeviceAddrTypes,
+     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &hostEvalVars,
+     SmallVectorImpl<Type> &hostEvalTypes,
+     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &inReductionVars,
+@@ -815,6 +825,7 @@ static ParseResult parseHostEvalInReductionMapPrivateRegion(
+     llvm::SmallVectorImpl<Type> &privateTypes, ArrayAttr &privateSyms,
+     DenseI64ArrayAttr &privateMaps) {
+   AllRegionParseArgs args;
++  args.hasDeviceAddrArgs.emplace(hasDeviceAddrVars, hasDeviceAddrTypes);
+   args.hostEvalArgs.emplace(hostEvalVars, hostEvalTypes);
+   args.inReductionArgs.emplace(inReductionVars, inReductionTypes,
+                                inReductionByref, inReductionSyms);
+@@ -935,6 +946,7 @@ struct ReductionPrintArgs {
+       : vars(vars), types(types), byref(byref), syms(syms), modifier(mod) {}
+ };
+ struct AllRegionPrintArgs {
++  std::optional<MapPrintArgs> hasDeviceAddrArgs;
+   std::optional<MapPrintArgs> hostEvalArgs;
+   std::optional<ReductionPrintArgs> inReductionArgs;
+   std::optional<MapPrintArgs> mapArgs;
+@@ -1028,6 +1040,9 @@ static void printBlockArgRegion(OpAsmPrinter &p, Operation *op, Region &region,
+   auto iface = llvm::cast<mlir::omp::BlockArgOpenMPOpInterface>(op);
+   MLIRContext *ctx = op->getContext();
+ 
++  printBlockArgClause(p, ctx, "has_device_addr",
++                      iface.getHasDeviceAddrBlockArgs(),
++                      args.hasDeviceAddrArgs);
+   printBlockArgClause(p, ctx, "host_eval", iface.getHostEvalBlockArgs(),
+                       args.hostEvalArgs);
+   printBlockArgClause(p, ctx, "in_reduction", iface.getInReductionBlockArgs(),
+@@ -1050,14 +1065,20 @@ static void printBlockArgRegion(OpAsmPrinter &p, Operation *op, Region &region,
+   p.printRegion(region, /*printEntryBlockArgs=*/false);
+ }
+ 
+-static void printHostEvalInReductionMapPrivateRegion(
+-    OpAsmPrinter &p, Operation *op, Region &region, ValueRange hostEvalVars,
+-    TypeRange hostEvalTypes, ValueRange inReductionVars,
+-    TypeRange inReductionTypes, DenseBoolArrayAttr inReductionByref,
+-    ArrayAttr inReductionSyms, ValueRange mapVars, TypeRange mapTypes,
+-    ValueRange privateVars, TypeRange privateTypes, ArrayAttr privateSyms,
+-    DenseI64ArrayAttr privateMaps) {
++// These parseXyz functions correspond to the custom<Xyz> definitions
++// in the .td file(s).
++static void
++printTargetOpRegion(OpAsmPrinter &p, Operation *op, Region &region,
++                    ValueRange hasDeviceAddrVars, TypeRange hasDeviceAddrTypes,
++                    ValueRange hostEvalVars, TypeRange hostEvalTypes,
++                    ValueRange inReductionVars, TypeRange inReductionTypes,
++                    DenseBoolArrayAttr inReductionByref,
++                    ArrayAttr inReductionSyms, ValueRange mapVars,
++                    TypeRange mapTypes, ValueRange privateVars,
++                    TypeRange privateTypes, ArrayAttr privateSyms,
++                    DenseI64ArrayAttr privateMaps) {
+   AllRegionPrintArgs args;
++  args.hasDeviceAddrArgs.emplace(hasDeviceAddrVars, hasDeviceAddrTypes);
+   args.hostEvalArgs.emplace(hostEvalVars, hostEvalTypes);
+   args.inReductionArgs.emplace(inReductionVars, inReductionTypes,
+                                inReductionByref, inReductionSyms);
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 842308807cf02..3373f19a006ba 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -168,10 +168,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+     if (op.getDistScheduleChunkSize())
+       result = todo("dist_schedule with chunk_size");
+   };
+-  auto checkHasDeviceAddr = [&todo](auto op, LogicalResult &result) {
+-    if (!op.getHasDeviceAddrVars().empty())
+-      result = todo("has_device_addr");
+-  };
+   auto checkHint = [](auto op, LogicalResult &) {
+     if (op.getHint())
+       op.emitWarning("hint clause discarded");
+@@ -311,7 +307,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+         checkAllocate(op, result);
+         checkBare(op, result);
+         checkDevice(op, result);
+-        checkHasDeviceAddr(op, result);
+         checkInReduction(op, result);
+         checkIsDevicePtr(op, result);
+         checkPrivate(op, result);
+@@ -3183,8 +3178,9 @@ llvm::Value *getSizeInBytes(DataLayout &dl, const mlir::Type &type,
+ static void collectMapDataFromMapOperands(
+     MapInfoData &mapData, SmallVectorImpl<Value> &mapVars,
+     LLVM::ModuleTranslation &moduleTranslation, DataLayout &dl,
+-    llvm::IRBuilderBase &builder, const ArrayRef<Value> &useDevPtrOperands = {},
+-    const ArrayRef<Value> &useDevAddrOperands = {}) {
++    llvm::IRBuilderBase &builder, ArrayRef<Value> useDevPtrOperands = {},
++    ArrayRef<Value> useDevAddrOperands = {},
++    ArrayRef<Value> hasDevAddrOperands = {}) {
+   auto checkIsAMember = [](const auto &mapVars, auto mapOp) {
+     // Check if this is a member mapping and correctly assign that it is, if
+     // it is a member of a larger object.
+@@ -3290,6 +3286,52 @@ static void collectMapDataFromMapOperands(
+ 
+   addDevInfos(useDevAddrOperands, llvm::OpenMPIRBuilder::DeviceInfoTy::Address);
+   addDevInfos(useDevPtrOperands, llvm::OpenMPIRBuilder::DeviceInfoTy::Pointer);
++
++  for (Value mapValue : hasDevAddrOperands) {
++    auto mapOp = cast<omp::MapInfoOp>(mapValue.getDefiningOp());
++    Value offloadPtr =
++        mapOp.getVarPtrPtr() ? mapOp.getVarPtrPtr() : mapOp.getVarPtr();
++    llvm::Value *origValue = moduleTranslation.lookupValue(offloadPtr);
++    auto mapType = static_cast<llvm::omp::OpenMPOffloadMappingFlags>(
++        mapOp.getMapType().value());
++    auto mapTypeAlways = llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
++
++    mapData.OriginalValue.push_back(origValue);
++    mapData.BasePointers.push_back(origValue);
++    mapData.Pointers.push_back(origValue);
++    mapData.IsDeclareTarget.push_back(false);
++    mapData.BaseType.push_back(
++        moduleTranslation.convertType(mapOp.getVarType()));
++    mapData.Sizes.push_back(
++        builder.getInt64(dl.getTypeSize(mapOp.getVarType())));
++    mapData.MapClause.push_back(mapOp.getOperation());
++    if (llvm::to_underlying(mapType & mapTypeAlways)) {
++      // Descriptors are mapped with the ALWAYS flag, since they can get
++      // rematerialized, so the address of the decriptor for a given object
++      // may change from one place to another.
++      mapData.Types.push_back(mapType);
++      // Technically it's possible for a non-descriptor mapping to have
++      // both has-device-addr and ALWAYS, so lookup the mapper in case it
++      // exists.
++      if (mapOp.getMapperId()) {
++        mapData.Mappers.push_back(
++            SymbolTable::lookupNearestSymbolFrom<omp::DeclareMapperOp>(
++                mapOp, mapOp.getMapperIdAttr()));
++      } else {
++        mapData.Mappers.push_back(nullptr);
++      }
++    } else {
++      mapData.Types.push_back(
++          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_LITERAL);
++      mapData.Mappers.push_back(nullptr);
++    }
++    mapData.Names.push_back(LLVM::createMappingInformation(
++        mapOp.getLoc(), *moduleTranslation.getOpenMPBuilder()));
++    mapData.DevicePointers.push_back(
++        llvm::OpenMPIRBuilder::DeviceInfoTy::Address);
++    mapData.IsAMapping.push_back(false);
++    mapData.IsAMember.push_back(checkIsAMember(hasDevAddrOperands, mapOp));
++  }
+ }
+ 
+ static int getMapDataMemberIdx(MapInfoData &mapData, omp::MapInfoOp memberOp) {
+@@ -3992,7 +4034,6 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+     return failure();
+ 
+   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+-
+   MapInfoData mapData;
+   collectMapDataFromMapOperands(mapData, mapVars, moduleTranslation, DL,
+                                 builder, useDevicePtrVars, useDeviceAddrVars);
+@@ -4705,7 +4746,9 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   llvm::DenseMap<Value, Value> mappedPrivateVars;
+   DataLayout dl = DataLayout(opInst.getParentOfType<ModuleOp>());
+   SmallVector<Value> mapVars = targetOp.getMapVars();
++  SmallVector<Value> hdaVars = targetOp.getHasDeviceAddrVars();
+   ArrayRef<BlockArgument> mapBlockArgs = argIface.getMapBlockArgs();
++  ArrayRef<BlockArgument> hdaBlockArgs = argIface.getHasDeviceAddrBlockArgs();
+   llvm::Function *llvmOutlinedFn = nullptr;
+ 
+   // TODO: It can also be false if a compile-time constant `false` IF clause is
+@@ -4790,6 +4833,12 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+           moduleTranslation.lookupValue(mapInfoOp.getVarPtr());
+       moduleTranslation.mapValue(arg, mapOpValue);
+     }
++    for (auto [arg, mapOp] : llvm::zip_equal(hdaBlockArgs, hdaVars)) {
++      auto mapInfoOp = cast<omp::MapInfoOp>(mapOp.getDefiningOp());
++      llvm::Value *mapOpValue =
++          moduleTranslation.lookupValue(mapInfoOp.getVarPtr());
++      moduleTranslation.mapValue(arg, mapOpValue);
++    }
+ 
+     // Do privatization after moduleTranslation has already recorded
+     // mapped values.
+@@ -4857,7 +4906,8 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   MapInfoData mapData;
+   collectMapDataFromMapOperands(mapData, mapVars, moduleTranslation, dl,
+-                                builder);
++                                builder, /*useDevPtrOperands=*/{},
++                                /*useDevAddrOperands=*/{}, hdaVars);
+ 
+   MapInfosTy combinedInfos;
+   auto genMapInfoCB =
+@@ -4911,7 +4961,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+       kernelInput.push_back(value);
+   }
+ 
+-  for (size_t i = 0; i < mapVars.size(); ++i) {
++  for (size_t i = 0, e = mapData.OriginalValue.size(); i != e; ++i) {
+     // declare target arguments are not passed to kernels as arguments
+     // TODO: We currently do not handle cases where a member is explicitly
+     // passed in as an argument, this will likley need to be handled in
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index f7356f7271af4..654db471e05b6 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -761,7 +761,6 @@ func.func @omp_distribute(%chunk_size : i32, %data_var : memref<i32>, %arg0 : i3
+   return
+ }
+ 
+-
+ // CHECK-LABEL: omp_target
+ func.func @omp_target(%if_cond : i1, %device : si32,  %num_threads : i32, %device_ptr: memref<i32>, %device_addr: memref<?xi32>, %map1: memref<?xi32>, %map2: memref<?xi32>) -> () {
+ 
+@@ -773,17 +772,19 @@ func.func @omp_target(%if_cond : i1, %device : si32,  %num_threads : i32, %devic
+     }) {nowait, operandSegmentSizes = array<i32: 0,0,0,1,0,0,1,0,0,0,0,1>} : ( si32, i1, i32 ) -> ()
+ 
+     // Test with optional map clause.
+-    // CHECK: %[[MAP_A:.*]] = omp.map.info var_ptr(%[[VAL_1:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(tofrom) capture(ByRef) -> memref<?xi32> {name = ""}
+-    // CHECK: %[[MAP_B:.*]] = omp.map.info var_ptr(%[[VAL_2:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(exit_release_or_enter_alloc) capture(ByRef) -> memref<?xi32> {name = ""}
+-    // CHECK: omp.target has_device_addr(%[[VAL_5:.*]] : memref<?xi32>) is_device_ptr(%[[VAL_4:.*]] : memref<i32>) map_entries(%[[MAP_A]] -> {{.*}}, %[[MAP_B]] -> {{.*}} : memref<?xi32>, memref<?xi32>) {
++    // CHECK: %[[MAP_A:.*]] = omp.map.info var_ptr(%[[VAL_1:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(always, to) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: %[[MAP_B:.*]] = omp.map.info var_ptr(%[[VAL_2:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(tofrom) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: %[[MAP_C:.*]] = omp.map.info var_ptr(%[[VAL_3:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(exit_release_or_enter_alloc) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: omp.target is_device_ptr(%[[VAL_4:.*]] : memref<i32>) has_device_addr(%[[MAP_A]] -> {{.*}} : memref<?xi32>) map_entries(%[[MAP_B]] -> {{.*}}, %[[MAP_C]] -> {{.*}} : memref<?xi32>, memref<?xi32>) {
++    %mapv0 = omp.map.info var_ptr(%device_addr : memref<?xi32>, tensor<?xi32>)   map_clauses(always, to) capture(ByRef) -> memref<?xi32> {name = ""}
+     %mapv1 = omp.map.info var_ptr(%map1 : memref<?xi32>, tensor<?xi32>)   map_clauses(tofrom) capture(ByRef) -> memref<?xi32> {name = ""}
+     %mapv2 = omp.map.info var_ptr(%map2 : memref<?xi32>, tensor<?xi32>)   map_clauses(exit_release_or_enter_alloc) capture(ByRef) -> memref<?xi32> {name = ""}
+-    omp.target is_device_ptr(%device_ptr : memref<i32>) has_device_addr(%device_addr : memref<?xi32>) map_entries(%mapv1 -> %arg0, %mapv2 -> %arg1 : memref<?xi32>, memref<?xi32>) {
++    omp.target is_device_ptr(%device_ptr : memref<i32>) has_device_addr(%mapv0 -> %arg0 : memref<?xi32>) map_entries(%mapv1 -> %arg1, %mapv2 -> %arg2 : memref<?xi32>, memref<?xi32>) {
+       omp.terminator
+     }
+-    // CHECK: %[[MAP_C:.*]] = omp.map.info var_ptr(%[[VAL_1:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(to) capture(ByRef) -> memref<?xi32> {name = ""}
+-    // CHECK: %[[MAP_D:.*]] = omp.map.info var_ptr(%[[VAL_2:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(always, from) capture(ByRef) -> memref<?xi32> {name = ""}
+-    // CHECK: omp.target map_entries(%[[MAP_C]] -> {{.*}}, %[[MAP_D]] -> {{.*}} : memref<?xi32>, memref<?xi32>) {
++    // CHECK: %[[MAP_D:.*]] = omp.map.info var_ptr(%[[VAL_1:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(to) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: %[[MAP_E:.*]] = omp.map.info var_ptr(%[[VAL_2:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(always, from) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: omp.target map_entries(%[[MAP_D]] -> {{.*}}, %[[MAP_E]] -> {{.*}} : memref<?xi32>, memref<?xi32>) {
+     %mapv3 = omp.map.info var_ptr(%map1 : memref<?xi32>, tensor<?xi32>)   map_clauses(to) capture(ByRef) -> memref<?xi32> {name = ""}
+     %mapv4 = omp.map.info var_ptr(%map2 : memref<?xi32>, tensor<?xi32>)   map_clauses(always, from) capture(ByRef) -> memref<?xi32> {name = ""}
+     omp.target map_entries(%mapv3 -> %arg0, %mapv4 -> %arg1 : memref<?xi32>, memref<?xi32>) {
+diff --git a/mlir/test/Target/LLVMIR/openmp-target-has-device-addr.mlir b/mlir/test/Target/LLVMIR/openmp-target-has-device-addr.mlir
+new file mode 100644
+index 0000000000000..be592242ef6c5
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-target-has-device-addr.mlir
+@@ -0,0 +1,20 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// integer :: x(:)
++// omp target has_device_addr(x)
++
++// CHECK-LABEL: ModuleID
++// CHECK: @.offload_sizes = private unnamed_addr constant [1 x i64] [i64 48]
++// CHECK: @.offload_maptypes = private unnamed_addr constant [1 x i64] [i64 549]
++
++module attributes { llvm.target_triple = "x86_64-unknown-linux-gnu", omp.target_triples = ["amdgcn-amd-amdhsa"], omp.version = #omp.version<version = 52>} {
++  llvm.func @has_device_addr(%arg0: !llvm.ptr) attributes {target_cpu = "x86-64"} {
++    %0 = llvm.mlir.constant(1 : i32) : i32
++    %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++    %41 = omp.map.info var_ptr(%1 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>) map_clauses(always, implicit, to) capture(ByRef) -> !llvm.ptr {name = "x"}
++    omp.target has_device_addr(%41 -> %arg1 : !llvm.ptr) {
++      omp.terminator
++    }
++    llvm.return
++  }
++}
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index f907bb3f94a2a..7a4d304f2d2d5 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -308,17 +308,6 @@ llvm.func @target_device(%x : i32) {
+ 
+ // -----
+ 
+-llvm.func @target_has_device_addr(%x : !llvm.ptr) {
+-  // expected-error@below {{not yet implemented: Unhandled clause has_device_addr in omp.target operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.target}}
+-  omp.target has_device_addr(%x : !llvm.ptr) {
+-    omp.terminator
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ omp.declare_reduction @add_f32 : f32
+ init {
+ ^bb0(%arg: f32):
+diff --git a/offload/test/offloading/fortran/target-has-device-addr1.f90 b/offload/test/offloading/fortran/target-has-device-addr1.f90
+new file mode 100644
+index 0000000000000..b97e5a99de82d
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-has-device-addr1.f90
+@@ -0,0 +1,45 @@
++!REQUIRES: flang, amdgpu
++
++!Test derived from the sollve test for has-device-addr.
++
++!RUN: %libomptarget-compile-fortran-run-and-check-generic
++
++module m
++  use iso_c_binding
++
++contains
++  subroutine target_has_device_addr()
++    integer, target :: x
++    integer, pointer :: first_scalar_device_addr
++    type(c_ptr) :: cptr_scalar1
++
++    integer :: res1, res2
++
++    nullify (first_scalar_device_addr)
++    x = 10
++
++    !$omp target enter data map(to: x)
++    !$omp target data use_device_addr(x)
++      x = 11
++      cptr_scalar1 = c_loc(x)
++    !$omp end target data
++
++    call c_f_pointer (cptr_scalar1, first_scalar_device_addr)
++
++    !$omp target map(to: x) map(from: res1, res2) &
++    !$omp & has_device_addr(first_scalar_device_addr)
++      res1 = first_scalar_device_addr
++      res2 = x
++    !$omp end target
++    print *, "res1", res1, "res2", res2
++  end subroutine
++end module
++
++
++program p
++  use m
++
++  call target_has_device_addr()
++end
++
++!CHECK: res1 11 res2 11
+diff --git a/offload/test/offloading/fortran/target-has-device-addr2.f90 b/offload/test/offloading/fortran/target-has-device-addr2.f90
+new file mode 100644
+index 0000000000000..993ac2e251305
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-has-device-addr2.f90
+@@ -0,0 +1,57 @@
++!REQUIRES: flang, amdgpu
++
++!RUN: %libomptarget-compile-fortran-run-and-check-generic
++
++subroutine f
++  type :: t1
++    integer :: x, y, z
++  end type
++
++  integer, parameter :: n = 9
++  type(t1) :: b(n)
++
++  integer :: i
++  do i = 1, n
++    b(i)%x = 0
++    b(i)%y = 0
++    b(i)%z = 0
++  enddo
++
++  !$omp target data map(tofrom: b(1:3)) use_device_addr(b)
++  !$omp target has_device_addr(b(2)%x)
++    b(2)%x = 1
++  !$omp end target
++  !$omp end target data
++  print *, "b1", b
++end
++
++subroutine g
++  type :: t1
++    integer :: x(3), y(7), z(5)
++  end type
++
++  integer, parameter :: n = 5
++  type(t1) :: b(n)
++
++  integer :: i
++  do i = 1, n
++    b(i)%x = 0
++    b(i)%y = 0
++    b(i)%z = 0
++  enddo
++
++  !$omp target data map(tofrom: b(1:3)) use_device_addr(b)
++  !$omp target has_device_addr(b(2)%x)
++    b(2)%x(3) = 1
++  !$omp end target
++  !$omp end target data
++  print *, "b2", b
++end
++
++call f()
++call g()
++end
++
++!CHECK: b1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
++!CHECK: b2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
++
+diff --git a/offload/test/offloading/fortran/target-has-device-addr3.f90 b/offload/test/offloading/fortran/target-has-device-addr3.f90
+new file mode 100644
+index 0000000000000..b4f3fd2c84efb
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-has-device-addr3.f90
+@@ -0,0 +1,30 @@
++!REQUIRES: flang, amdgpu
++
++!RUN: %libomptarget-compile-fortran-run-and-check-generic
++
++function f(x) result(y)
++  integer :: x(:)
++  integer :: y, z
++  x = 0
++  y = 11
++  !$omp target data map(tofrom: x) use_device_addr(x)
++  !$omp target has_device_addr(x) map(tofrom: y)
++  y = size(x)
++  !$omp end target
++  !$omp end target data
++end
++
++program main
++  interface
++    function f(x) result(y)
++      integer :: x(:)
++      integer :: y
++    end function
++  end interface
++  integer :: x(13)
++  integer :: y
++  y = f(x)
++  print *, "y=", y
++end
++
++!CHECK: y= 13

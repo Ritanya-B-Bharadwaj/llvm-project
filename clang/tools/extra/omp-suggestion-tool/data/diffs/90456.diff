@@ -1,0 +1,219 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 8ab116ce391e2..a40676d071e62 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -158,8 +158,9 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove]> {
+   let description = [{
+     This operation provides a declaration of how to implement the
+     [first]privatization of a variable. The dialect users should provide
+-    information about how to create an instance of the type in the alloc region
+-    and how to initialize the copy from the original item in the copy region.
++    information about how to create an instance of the type in the alloc region,
++    how to initialize the copy from the original item in the copy region, and if
++    needed, how to deallocate allocated memory in the dealloc region.
+ 
+     Examples:
+ 
+@@ -187,13 +188,26 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove]> {
+     }
+     ```
+ 
++    * `private(x)` for "allocatables" would be emitted as:
++    ```mlir
++    omp.private {type = private} @x.privatizer : !some.type alloc {
++    ^bb0(%arg0: !some.type):
++    %0 = ... allocate proper memory for the private clone ...
++    omp.yield(%0 : !fir.ref<i32>)
++    } dealloc {
++    ^bb0(%arg0: !some.type):
++    ... deallocate allocated memory ...
++    omp.yield
++    }
++    ```
++
+     There are no restrictions on the body except for:
+-    - The `alloc` region has a single argument.
++    - The `alloc` & `dealloc` regions have a single argument.
+     - The `copy` region has 2 arguments.
+-    - Both regions are terminated by `omp.yield` ops.
++    - All three regions are terminated by `omp.yield` ops.
+     The above restrictions and other obvious restrictions (e.g. verifying the
+     type of yielded values) are verified by the custom op verifier. The actual
+-    contents of the blocks inside both regions are not verified.
++    contents of the blocks inside all regions are not verified.
+ 
+     Instances of this op would then be used by ops that model directives that
+     accept data-sharing attribute clauses.
+@@ -212,12 +226,14 @@ def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove]> {
+                        DataSharingClauseTypeAttr:$data_sharing_type);
+ 
+   let regions = (region MinSizedRegion<1>:$alloc_region,
+-                        AnyRegion:$copy_region);
++                        AnyRegion:$copy_region,
++                        AnyRegion:$dealloc_region);
+ 
+   let assemblyFormat = [{
+     $data_sharing_type $sym_name `:` $type
+       `alloc` $alloc_region
+       (`copy` $copy_region^)?
++      (`dealloc` $dealloc_region^)?
+       attr-dict
+   }];
+ 
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index f60668dd0cf99..0799090cdea98 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2258,7 +2258,8 @@ void PrivateClauseOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+ LogicalResult PrivateClauseOp::verify() {
+   Type symType = getType();
+ 
+-  auto verifyTerminator = [&](Operation *terminator) -> LogicalResult {
++  auto verifyTerminator = [&](Operation *terminator,
++                              bool yieldsValue) -> LogicalResult {
+     if (!terminator->getBlock()->getSuccessors().empty())
+       return success();
+ 
+@@ -2269,6 +2270,14 @@ LogicalResult PrivateClauseOp::verify() {
+     YieldOp yieldOp = llvm::cast<YieldOp>(terminator);
+     TypeRange yieldedTypes = yieldOp.getResults().getTypes();
+ 
++    if (!yieldsValue) {
++      if (yieldedTypes.empty())
++        return success();
++
++      return mlir::emitError(terminator->getLoc())
++             << "Did not expect any values to be yielded.";
++    }
++
+     if (yieldedTypes.size() == 1 && yieldedTypes.front() == symType)
+       return success();
+ 
+@@ -2285,7 +2294,8 @@ LogicalResult PrivateClauseOp::verify() {
+   };
+ 
+   auto verifyRegion = [&](Region &region, unsigned expectedNumArgs,
+-                          StringRef regionName) -> LogicalResult {
++                          StringRef regionName,
++                          bool yieldsValue) -> LogicalResult {
+     assert(!region.empty());
+ 
+     if (region.getNumArguments() != expectedNumArgs)
+@@ -2299,14 +2309,15 @@ LogicalResult PrivateClauseOp::verify() {
+       if (!block.mightHaveTerminator())
+         continue;
+ 
+-      if (failed(verifyTerminator(block.getTerminator())))
++      if (failed(verifyTerminator(block.getTerminator(), yieldsValue)))
+         return failure();
+     }
+ 
+     return success();
+   };
+ 
+-  if (failed(verifyRegion(getAllocRegion(), /*expectedNumArgs=*/1, "alloc")))
++  if (failed(verifyRegion(getAllocRegion(), /*expectedNumArgs=*/1, "alloc",
++                          /*yieldsValue=*/true)))
+     return failure();
+ 
+   DataSharingClauseType dsType = getDataSharingType();
+@@ -2319,7 +2330,13 @@ LogicalResult PrivateClauseOp::verify() {
+         "`firstprivate` clauses require both `alloc` and `copy` regions.");
+ 
+   if (dsType == DataSharingClauseType::FirstPrivate &&
+-      failed(verifyRegion(getCopyRegion(), /*expectedNumArgs=*/2, "copy")))
++      failed(verifyRegion(getCopyRegion(), /*expectedNumArgs=*/2, "copy",
++                          /*yieldsValue=*/true)))
++    return failure();
++
++  if (!getDeallocRegion().empty() &&
++      failed(verifyRegion(getDeallocRegion(), /*expectedNumArgs=*/1, "dealloc",
++                          /*yieldsValue=*/false)))
+     return failure();
+ 
+   return success();
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index e329b3010017c..511e7d396c687 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -2151,6 +2151,17 @@ omp.private {type = private} @x.privatizer : i32 alloc {
+ 
+ // -----
+ 
++omp.private {type = private} @x.privatizer : f32 alloc {
++^bb0(%arg0: f32):
++  omp.yield(%arg0 : f32)
++} dealloc {
++^bb0(%arg0: f32):
++  // expected-error @below {{Did not expect any values to be yielded.}}
++  omp.yield(%arg0 : f32)
++}
++
++// -----
++
+ omp.private {type = private} @x.privatizer : i32 alloc {
+ ^bb0(%arg0: i32):
+   // expected-error @below {{expected exit block terminator to be an `omp.yield` op.}}
+@@ -2178,6 +2189,17 @@ omp.private {type = firstprivate} @x.privatizer : f32 alloc {
+ 
+ // -----
+ 
++// expected-error @below {{`dealloc`: expected 1 region arguments, got: 2}}
++omp.private {type = private} @x.privatizer : f32 alloc {
++^bb0(%arg0: f32):
++  omp.yield(%arg0 : f32)
++} dealloc {
++^bb0(%arg0: f32, %arg1: f32):
++  omp.yield
++}
++
++// -----
++
+ // expected-error @below {{`private` clauses require only an `alloc` region.}}
+ omp.private {type = private} @x.privatizer : f32 alloc {
+ ^bb0(%arg0: f32):
+@@ -2249,4 +2271,4 @@ func.func @undefined_privatizer(%arg0: !llvm.ptr) {
+       omp.terminator
+     }) : (!llvm.ptr) -> ()
+   return
+-}
+\ No newline at end of file
++}
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index a012588f0b552..60fc10f9d64b7 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -2492,11 +2492,22 @@ func.func @parallel_op_privatizers(%arg0: !llvm.ptr, %arg1: !llvm.ptr) {
+   return
+ }
+ 
++// CHECK-LABEL: omp.private {type = private} @a.privatizer : !llvm.ptr alloc {
++omp.private {type = private} @a.privatizer : !llvm.ptr alloc {
++// CHECK: ^bb0(%{{.*}}: {{.*}}):
++^bb0(%arg0: !llvm.ptr):
++  omp.yield(%arg0 : !llvm.ptr)
++}
++
+ // CHECK-LABEL: omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
+ omp.private {type = private} @x.privatizer : !llvm.ptr alloc {
+ // CHECK: ^bb0(%{{.*}}: {{.*}}):
+ ^bb0(%arg0: !llvm.ptr):
+   omp.yield(%arg0 : !llvm.ptr)
++} dealloc {
++// CHECK: ^bb0(%{{.*}}: {{.*}}):
++^bb0(%arg0: !llvm.ptr):
++  omp.yield
+ }
+ 
+ // CHECK-LABEL: omp.private {type = firstprivate} @y.privatizer : !llvm.ptr alloc {
+@@ -2509,6 +2520,10 @@ omp.private {type = firstprivate} @y.privatizer : !llvm.ptr alloc {
+ // CHECK: ^bb0(%{{.*}}: {{.*}}, %{{.*}}: {{.*}}):
+ ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
+   omp.yield(%arg0 : !llvm.ptr)
++} dealloc {
++// CHECK: ^bb0(%{{.*}}: {{.*}}):
++^bb0(%arg0: !llvm.ptr):
++  omp.yield
+ }
+ 
+ // CHECK-LABEL: parallel_op_reduction_and_private

@@ -1,0 +1,596 @@
+diff --git a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index 7ebeb51cf3dec..099f3823303da 100644
+--- a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -125,61 +125,86 @@ class MapInfoFinalizationPass
+     // TODO: map the addendum segment of the descriptor, similarly to the
+     // above base address/data pointer member.
+ 
+-    auto addOperands = [&](mlir::OperandRange &operandsArr,
+-                           mlir::MutableOperandRange &mutableOpRange,
+-                           auto directiveOp) {
++    mlir::omp::MapInfoOp newDescParentMapOp =
++        builder.create<mlir::omp::MapInfoOp>(
++            op->getLoc(), op.getResult().getType(), descriptor,
++            mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
++            /*varPtrPtr=*/mlir::Value{},
++            /*members=*/mlir::SmallVector<mlir::Value>{baseAddr},
++            /*members_index=*/
++            mlir::DenseIntElementsAttr::get(
++                mlir::VectorType::get(
++                    llvm::ArrayRef<int64_t>({1, 1}),
++                    mlir::IntegerType::get(builder.getContext(), 32)),
++                llvm::ArrayRef<int32_t>({0})),
++            /*bounds=*/mlir::SmallVector<mlir::Value>{},
++            builder.getIntegerAttr(builder.getIntegerType(64, false),
++                                   op.getMapType().value()),
++            op.getMapCaptureTypeAttr(), op.getNameAttr(),
++            op.getPartialMapAttr());
++    op.replaceAllUsesWith(newDescParentMapOp.getResult());
++    op->erase();
++
++    auto addOperands = [&](mlir::MutableOperandRange &mutableOpRange,
++                           mlir::Operation *directiveOp,
++                           unsigned blockArgInsertIndex = 0) {
++      if (!llvm::is_contained(mutableOpRange.getAsOperandRange(),
++                              newDescParentMapOp.getResult()))
++        return;
++
++      // There doesn't appear to be a simple way to convert MutableOperandRange
++      // to a vector currently, so we instead use a for_each to populate our
++      // vector.
+       llvm::SmallVector<mlir::Value> newMapOps;
+-      for (size_t i = 0; i < operandsArr.size(); ++i) {
+-        if (operandsArr[i] == op) {
+-          // Push new implicit maps generated for the descriptor.
+-          newMapOps.push_back(baseAddr);
++      newMapOps.reserve(mutableOpRange.size());
++      llvm::for_each(
++          mutableOpRange.getAsOperandRange(),
++          [&newMapOps](mlir::Value oper) { newMapOps.push_back(oper); });
+ 
+-          // for TargetOp's which have IsolatedFromAbove we must align the
+-          // new additional map operand with an appropriate BlockArgument,
+-          // as the printing and later processing currently requires a 1:1
+-          // mapping of BlockArgs to MapInfoOp's at the same placement in
+-          // each array (BlockArgs and MapOperands).
+-          if (directiveOp) {
+-            directiveOp.getRegion().insertArgument(i, baseAddr.getType(), loc);
+-          }
++      for (auto mapMember : newDescParentMapOp.getMembers()) {
++        if (llvm::is_contained(mutableOpRange.getAsOperandRange(), mapMember))
++          continue;
++        newMapOps.push_back(mapMember);
++        if (directiveOp) {
++          directiveOp->getRegion(0).insertArgument(
++              blockArgInsertIndex, mapMember.getType(), mapMember.getLoc());
++          blockArgInsertIndex++;
+         }
+-        newMapOps.push_back(operandsArr[i]);
+       }
++
+       mutableOpRange.assign(newMapOps);
+     };
++
++    auto argIface =
++        llvm::dyn_cast<mlir::omp::BlockArgOpenMPOpInterface>(target);
++
+     if (auto mapClauseOwner =
+             llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
+-      mlir::OperandRange mapOperandsArr = mapClauseOwner.getMapVars();
+       mlir::MutableOperandRange mapMutableOpRange =
+           mapClauseOwner.getMapVarsMutable();
+-      mlir::omp::TargetOp targetOp =
+-          llvm::dyn_cast<mlir::omp::TargetOp>(target);
+-      addOperands(mapOperandsArr, mapMutableOpRange, targetOp);
++      unsigned blockArgInsertIndex =
++          argIface
++              ? argIface.getMapBlockArgsStart() + argIface.numMapBlockArgs()
++              : 0;
++      addOperands(
++          mapMutableOpRange,
++          llvm::dyn_cast_or_null<mlir::omp::TargetOp>(argIface.getOperation()),
++          blockArgInsertIndex);
+     }
++
+     if (auto targetDataOp = llvm::dyn_cast<mlir::omp::TargetDataOp>(target)) {
+-      mlir::OperandRange useDevAddrArr = targetDataOp.getUseDeviceAddrVars();
+       mlir::MutableOperandRange useDevAddrMutableOpRange =
+           targetDataOp.getUseDeviceAddrVarsMutable();
+-      addOperands(useDevAddrArr, useDevAddrMutableOpRange, targetDataOp);
+-    }
++      addOperands(useDevAddrMutableOpRange, target,
++                  argIface.getUseDeviceAddrBlockArgsStart() +
++                      argIface.numUseDeviceAddrBlockArgs());
+ 
+-    mlir::Value newDescParentMapOp = builder.create<mlir::omp::MapInfoOp>(
+-        op->getLoc(), op.getResult().getType(), descriptor,
+-        mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
+-        /*varPtrPtr=*/mlir::Value{},
+-        /*members=*/mlir::SmallVector<mlir::Value>{baseAddr},
+-        /*members_index=*/
+-        mlir::DenseIntElementsAttr::get(
+-            mlir::VectorType::get(
+-                llvm::ArrayRef<int64_t>({1, 1}),
+-                mlir::IntegerType::get(builder.getContext(), 32)),
+-            llvm::ArrayRef<int32_t>({0})),
+-        /*bounds=*/mlir::SmallVector<mlir::Value>{},
+-        builder.getIntegerAttr(builder.getIntegerType(64, false),
+-                               op.getMapType().value()),
+-        op.getMapCaptureTypeAttr(), op.getNameAttr(), op.getPartialMapAttr());
+-    op.replaceAllUsesWith(newDescParentMapOp);
+-    op->erase();
++      mlir::MutableOperandRange useDevPtrMutableOpRange =
++          targetDataOp.getUseDevicePtrVarsMutable();
++      addOperands(useDevPtrMutableOpRange, target,
++                  argIface.getUseDevicePtrBlockArgsStart() +
++                      argIface.numUseDevicePtrBlockArgs());
++    }
+   }
+ 
+   // We add all mapped record members not directly used in the target region
+diff --git a/flang/test/Lower/OpenMP/allocatable-map.f90 b/flang/test/Lower/OpenMP/allocatable-map.f90
+index a9f576a6f0999..c1f94f4190148 100644
+--- a/flang/test/Lower/OpenMP/allocatable-map.f90
++++ b/flang/test/Lower/OpenMP/allocatable-map.f90
+@@ -4,7 +4,7 @@
+ !HLFIRDIALECT: %[[BOX_OFF:.*]] = fir.box_offset %[[POINTER]]#1 base_addr : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> !fir.llvm_ptr<!fir.ref<i32>>
+ !HLFIRDIALECT: %[[POINTER_MAP_MEMBER:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr(%[[BOX_OFF]] : !fir.llvm_ptr<!fir.ref<i32>>)  map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+ !HLFIRDIALECT: %[[POINTER_MAP:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[POINTER_MAP_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "point"}
+-!HLFIRDIALECT: omp.target map_entries(%[[POINTER_MAP_MEMBER]] -> {{.*}}, %[[POINTER_MAP]] -> {{.*}} : !fir.llvm_ptr<!fir.ref<i32>>, !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++!HLFIRDIALECT: omp.target map_entries(%[[POINTER_MAP]] -> {{.*}}, %[[POINTER_MAP_MEMBER]] -> {{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.llvm_ptr<!fir.ref<i32>>) {
+ subroutine pointer_routine()
+     integer, pointer :: point 
+ !$omp target map(tofrom:point)
+diff --git a/flang/test/Lower/OpenMP/array-bounds.f90 b/flang/test/Lower/OpenMP/array-bounds.f90
+index 09498ca6cdde9..40fd276f10462 100644
+--- a/flang/test/Lower/OpenMP/array-bounds.f90
++++ b/flang/test/Lower/OpenMP/array-bounds.f90
+@@ -53,7 +53,7 @@ module assumed_array_routines
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %0 base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
+ !HOST: %[[MAP:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>> {name = "arr_read_write(2:5)"}
+-!HOST: omp.target   map_entries(%[[MAP_INFO_MEMBER]] -> %{{.*}}, %[[MAP]] -> %{{.*}}, {{.*}} -> {{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.array<?xi32>>, !fir.ref<i32>) {
++!HOST: omp.target   map_entries(%[[MAP]] -> %{{.*}}, {{.*}} -> {{.*}}, %[[MAP_INFO_MEMBER]] -> %{{.*}} : !fir.ref<!fir.array<?xi32>>, !fir.ref<i32>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) {
+     subroutine assumed_shape_array(arr_read_write)
+             integer, intent(inout) :: arr_read_write(:)
+ 
+diff --git a/flang/test/Lower/OpenMP/target.f90 b/flang/test/Lower/OpenMP/target.f90
+index 54189cdef1e81..f5140643b00eb 100644
+--- a/flang/test/Lower/OpenMP/target.f90
++++ b/flang/test/Lower/OpenMP/target.f90
+@@ -528,9 +528,9 @@ subroutine omp_target_device_addr
+    !CHECK: %[[MAP:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBERS]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
+    !CHECK: %[[DEV_ADDR_MEMBERS:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr({{.*}} : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+    !CHECK: %[[DEV_ADDR:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[DEV_ADDR_MEMBERS]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
+-   !CHECK: omp.target_data map_entries(%[[MAP_MEMBERS]], %[[MAP]] : {{.*}}) use_device_addr(%[[DEV_ADDR_MEMBERS]] -> %[[ARG_0:.*]], %[[DEV_ADDR]] -> %[[ARG_1:.*]] : !fir.llvm_ptr<!fir.ref<i32>>, !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++   !CHECK: omp.target_data map_entries(%[[MAP]], %[[MAP_MEMBERS]] : {{.*}}) use_device_addr(%[[DEV_ADDR]] -> %[[ARG_0:.*]], %[[DEV_ADDR_MEMBERS]] -> %[[ARG_1:.*]] : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.llvm_ptr<!fir.ref<i32>>) {
+    !$omp target data map(tofrom: a) use_device_addr(a)
+-   !CHECK: %[[VAL_1_DECL:.*]]:2 = hlfir.declare %[[ARG_1]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++   !CHECK: %[[VAL_1_DECL:.*]]:2 = hlfir.declare %[[ARG_0]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+    !CHECK: %[[C10:.*]] = arith.constant 10 : i32
+    !CHECK: %[[A_BOX:.*]] = fir.load %[[VAL_1_DECL]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+    !CHECK: %[[A_ADDR:.*]] = fir.box_addr %[[A_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+diff --git a/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90 b/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
+index cb26246a6e80f..8c1abad8eaa8d 100644
+--- a/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
++++ b/flang/test/Lower/OpenMP/use-device-ptr-to-use-device-addr.f90
+@@ -6,7 +6,8 @@
+ ! use_device_ptr to use_device_addr works, without breaking any functionality.
+ 
+ !CHECK: func.func @{{.*}}only_use_device_ptr()
+-!CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) use_device_ptr(%{{.*}} -> %{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++
++!CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) use_device_ptr(%{{.*}} -> %{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+ subroutine only_use_device_ptr
+     use iso_c_binding
+     integer, pointer, dimension(:) :: array
+@@ -18,7 +19,7 @@ subroutine only_use_device_ptr
+      end subroutine
+ 
+ !CHECK: func.func @{{.*}}mix_use_device_ptr_and_addr()
+-!CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr({{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++!CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>) use_device_ptr({{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+ subroutine mix_use_device_ptr_and_addr
+     use iso_c_binding
+     integer, pointer, dimension(:) :: array
+@@ -30,7 +31,7 @@ subroutine mix_use_device_ptr_and_addr
+      end subroutine
+ 
+      !CHECK: func.func @{{.*}}only_use_device_addr()
+-     !CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
++     !CHECK: omp.target_data use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) {
+      subroutine only_use_device_addr
+         use iso_c_binding
+         integer, pointer, dimension(:) :: array
+@@ -42,7 +43,7 @@ subroutine only_use_device_addr
+      end subroutine
+ 
+      !CHECK: func.func @{{.*}}mix_use_device_ptr_and_addr_and_map()
+-     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}} : !fir.ref<i32>, !fir.ref<i32>) use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
++     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}} : !fir.ref<i32>, !fir.ref<i32>) use_device_addr(%{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}}, %{{.*}} -> %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>) use_device_ptr(%{{.*}} : !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>) {
+      subroutine mix_use_device_ptr_and_addr_and_map
+         use iso_c_binding
+         integer :: i, j
+@@ -55,7 +56,7 @@ subroutine mix_use_device_ptr_and_addr_and_map
+      end subroutine
+ 
+      !CHECK: func.func @{{.*}}only_use_map()
+-     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) {
++     !CHECK: omp.target_data map_entries(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf32>>>>, !fir.ref<!fir.type<_QM__fortran_builtinsT__builtin_c_ptr{__address:i64}>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xf32>>>, !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) {
+      subroutine only_use_map
+         use iso_c_binding
+         integer, pointer, dimension(:) :: array
+diff --git a/flang/test/Transforms/omp-map-info-finalization.fir b/flang/test/Transforms/omp-map-info-finalization.fir
+index fa7b65d41929b..de0ad2143fc85 100644
+--- a/flang/test/Transforms/omp-map-info-finalization.fir
++++ b/flang/test/Transforms/omp-map-info-finalization.fir
+@@ -39,7 +39,7 @@ module attributes {omp.is_target_device = false} {
+ // CHECK: %[[BASE_ADDR_OFF_2:.*]] = fir.box_offset %[[ALLOCA]] base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ // CHECK: %[[DESC_MEMBER_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[BASE_ADDR_OFF_2]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(from) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
+ // CHECK: %[[DESC_PARENT_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(from) capture(ByRef) members(%[[DESC_MEMBER_MAP_2]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>>
+-// CHECK: omp.target map_entries(%[[DESC_MEMBER_MAP]] -> %[[ARG1:.*]], %[[DESC_PARENT_MAP]] -> %[[ARG2:.*]], %[[DESC_MEMBER_MAP_2]] -> %[[ARG3:.*]], %[[DESC_PARENT_MAP_2]] -> %[[ARG4:.*]] : {{.*}}) {
++// CHECK: omp.target map_entries(%[[DESC_PARENT_MAP]] -> %[[ARG1:.*]], %[[DESC_PARENT_MAP_2]] -> %[[ARG2:.*]], %[[DESC_MEMBER_MAP]] -> %[[ARG3:.*]], %[[DESC_MEMBER_MAP_2]] -> %[[ARG4:.*]] : {{.*}}) {
+ 
+ // -----
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index da11ee9960e1f..5bf99535295c4 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -3491,23 +3491,32 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+       [&moduleTranslation](
+           llvm::OpenMPIRBuilder::DeviceInfoTy type,
+           llvm::ArrayRef<BlockArgument> blockArgs,
+-          llvm::OpenMPIRBuilder::MapValuesArrayTy &basePointers,
+-          llvm::OpenMPIRBuilder::MapDeviceInfoArrayTy &devicePointers,
++          llvm::SmallVectorImpl<Value> &useDeviceVars, MapInfoData &mapInfoData,
+           llvm::function_ref<llvm::Value *(llvm::Value *)> mapper = nullptr) {
+-        // Get a range to iterate over `basePointers` after filtering based on
+-        // `devicePointers` and the given device info type.
+-        auto basePtrRange = llvm::map_range(
+-            llvm::make_filter_range(
+-                llvm::zip_equal(basePointers, devicePointers),
+-                [type](auto x) { return std::get<1>(x) == type; }),
+-            [](auto x) { return std::get<0>(x); });
+-
+-        // Map block arguments to the corresponding processed base pointer. If
+-        // a mapper is not specified, map the block argument to the base pointer
+-        // directly.
+-        for (auto [arg, basePointer] : llvm::zip_equal(blockArgs, basePtrRange))
+-          moduleTranslation.mapValue(arg, mapper ? mapper(basePointer)
+-                                                 : basePointer);
++        for (auto [arg, useDevVar] :
++             llvm::zip_equal(blockArgs, useDeviceVars)) {
++
++          auto getMapBasePtr = [](omp::MapInfoOp mapInfoOp) {
++            return mapInfoOp.getVarPtrPtr() ? mapInfoOp.getVarPtrPtr()
++                                            : mapInfoOp.getVarPtr();
++          };
++
++          auto useDevMap = cast<omp::MapInfoOp>(useDevVar.getDefiningOp());
++          for (auto [mapClause, devicePointer, basePointer] : llvm::zip_equal(
++                   mapInfoData.MapClause, mapInfoData.DevicePointers,
++                   mapInfoData.BasePointers)) {
++            auto mapOp = cast<omp::MapInfoOp>(mapClause);
++            if (getMapBasePtr(mapOp) != getMapBasePtr(useDevMap) ||
++                devicePointer != type)
++              continue;
++
++            if (llvm::Value *devPtrInfoMap =
++                    mapper ? mapper(basePointer) : basePointer) {
++              moduleTranslation.mapValue(arg, devPtrInfoMap);
++              break;
++            }
++          }
++        }
+       };
+ 
+   using BodyGenTy = llvm::OpenMPIRBuilder::BodyGenTy;
+@@ -3525,16 +3534,17 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+ 
+         mapUseDevice(llvm::OpenMPIRBuilder::DeviceInfoTy::Address,
+                      blockArgIface.getUseDeviceAddrBlockArgs(),
+-                     combinedInfo.BasePointers, combinedInfo.DevicePointers,
++                     useDeviceAddrVars, mapData,
+                      [&](llvm::Value *basePointer) -> llvm::Value * {
++                       if (!info.DevicePtrInfoMap[basePointer].second)
++                         return nullptr;
+                        return builder.CreateLoad(
+                            builder.getPtrTy(),
+                            info.DevicePtrInfoMap[basePointer].second);
+                      });
+         mapUseDevice(llvm::OpenMPIRBuilder::DeviceInfoTy::Pointer,
+-                     blockArgIface.getUseDevicePtrBlockArgs(),
+-                     combinedInfo.BasePointers, combinedInfo.DevicePointers,
+-                     [&](llvm::Value *basePointer) {
++                     blockArgIface.getUseDevicePtrBlockArgs(), useDevicePtrVars,
++                     mapData, [&](llvm::Value *basePointer) {
+                        return info.DevicePtrInfoMap[basePointer].second;
+                      });
+ 
+@@ -3554,10 +3564,10 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+         if (ompBuilder->Config.IsTargetDevice.value_or(false)) {
+           mapUseDevice(llvm::OpenMPIRBuilder::DeviceInfoTy::Address,
+                        blockArgIface.getUseDeviceAddrBlockArgs(),
+-                       mapData.BasePointers, mapData.DevicePointers);
++                       useDeviceAddrVars, mapData);
+           mapUseDevice(llvm::OpenMPIRBuilder::DeviceInfoTy::Pointer,
+                        blockArgIface.getUseDevicePtrBlockArgs(),
+-                       mapData.BasePointers, mapData.DevicePointers);
++                       useDevicePtrVars, mapData);
+         }
+ 
+         if (failed(inlineConvertOmpRegions(region, "omp.data.region", builder,
+@@ -3945,6 +3955,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+     if (!mapData.IsDeclareTarget[i] && !mapData.IsAMember[i])
+       kernelInput.push_back(mapData.OriginalValue[i]);
+   }
++
+   SmallVector<llvm::OpenMPIRBuilder::DependData> dds;
+   buildDependData(targetOp.getDependKinds(), targetOp.getDependVars(),
+                   moduleTranslation, dds);
+diff --git a/mlir/test/Target/LLVMIR/omptarget-data-use-dev-ordering.mlir b/mlir/test/Target/LLVMIR/omptarget-data-use-dev-ordering.mlir
+new file mode 100644
+index 0000000000000..750bcbd5dbb9e
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-data-use-dev-ordering.mlir
+@@ -0,0 +1,116 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
++
++// The intent of these tests are to check that re-ordering the arguments of use_device_addr/ptr do
++// not negatively impact the code generation. It's important to note that this test is missing
++// components that'd generate a fully funcitoning executeable, as the IR was reduced to keep the
++// primary components for the tests.
++
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"], omp.version = #omp.version<version = 50>} {
++  llvm.func @mix_use_device_ptr_and_addr_and_map_(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg11: !llvm.ptr, %arg12: !llvm.ptr) {
++    %0 = llvm.mlir.constant(0 : index) : i64
++    %1 = llvm.mlir.constant(2 : index) : i64
++    %2 = llvm.mlir.constant(1 : index) : i64
++    %3 = omp.map.bounds lower_bound(%0 : i64) upper_bound(%1 : i64) extent(%1 : i64) stride(%2 : i64) start_idx(%0 : i64) {stride_in_bytes = true}
++    %4 = omp.map.info var_ptr(%arg0 : !llvm.ptr, !llvm.struct<(i64)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %5 = omp.map.info var_ptr(%arg1 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %6 = omp.map.info var_ptr(%arg2 : !llvm.ptr, i32) var_ptr_ptr(%arg3 : !llvm.ptr) map_clauses(tofrom) capture(ByRef) bounds(%3) -> !llvm.ptr
++    %7 = omp.map.info var_ptr(%arg2 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>) map_clauses(tofrom) capture(ByRef) members(%6 : [0] : !llvm.ptr) -> !llvm.ptr
++    %8 = omp.map.info var_ptr(%arg4 : !llvm.ptr, f32) var_ptr_ptr(%arg5 : !llvm.ptr) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %9 = omp.map.info var_ptr(%arg4 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(tofrom) capture(ByRef) members(%8 : [0] : !llvm.ptr) -> !llvm.ptr
++    %10 = omp.map.info var_ptr(%arg0 : !llvm.ptr, !llvm.struct<(i64)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    omp.target_data map_entries(%4, %5 : !llvm.ptr, !llvm.ptr) use_device_addr(%7 -> %arg6, %9 -> %arg7, %6 -> %arg8, %8 -> %arg9 : !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr) use_device_ptr(%10 -> %arg10 : !llvm.ptr) {
++      %11 = llvm.getelementptr %arg4[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64)>
++      %12 = llvm.getelementptr %arg12[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64)>
++      %13 = llvm.load %11 : !llvm.ptr -> i64
++      llvm.store %13, %12 : i64, !llvm.ptr
++      %14 = llvm.mlir.constant(48 : i32) : i32
++      "llvm.intr.memcpy"(%arg11, %arg6, %14) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++      %15 = llvm.getelementptr %arg11[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++      %16 = llvm.load %15 : !llvm.ptr -> !llvm.ptr
++      %17 = llvm.getelementptr %16[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++      %18 = llvm.load %17 : !llvm.ptr -> i32
++      llvm.store %18, %arg1 : i32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++
++  llvm.func @mix_use_device_ptr_and_addr_and_map_2(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr, %arg4: !llvm.ptr, %arg5: !llvm.ptr, %arg11: !llvm.ptr, %arg12: !llvm.ptr) {
++    %0 = llvm.mlir.constant(0 : index) : i64
++    %1 = llvm.mlir.constant(2 : index) : i64
++    %2 = llvm.mlir.constant(1 : index) : i64
++    %3 = omp.map.bounds lower_bound(%0 : i64) upper_bound(%1 : i64) extent(%1 : i64) stride(%2 : i64) start_idx(%0 : i64) {stride_in_bytes = true}
++    %4 = omp.map.info var_ptr(%arg0 : !llvm.ptr, !llvm.struct<(i64)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %5 = omp.map.info var_ptr(%arg1 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %6 = omp.map.info var_ptr(%arg2 : !llvm.ptr, i32) var_ptr_ptr(%arg3 : !llvm.ptr) map_clauses(tofrom) capture(ByRef) bounds(%3) -> !llvm.ptr
++    %7 = omp.map.info var_ptr(%arg2 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>) map_clauses(tofrom) capture(ByRef) members(%6 : [0] : !llvm.ptr) -> !llvm.ptr
++    %8 = omp.map.info var_ptr(%arg4 : !llvm.ptr, f32) var_ptr_ptr(%arg5 : !llvm.ptr) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %9 = omp.map.info var_ptr(%arg4 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(tofrom) capture(ByRef) members(%8 : [0] : !llvm.ptr) -> !llvm.ptr
++    %10 = omp.map.info var_ptr(%arg0 : !llvm.ptr, !llvm.struct<(i64)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    omp.target_data map_entries(%5, %4 : !llvm.ptr, !llvm.ptr) use_device_addr(%8 -> %arg6, %6 -> %arg7, %7 -> %arg8, %9 -> %arg9 : !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr) use_device_ptr(%10 -> %arg10 : !llvm.ptr) {
++      %11 = llvm.getelementptr %arg4[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64)>
++      %12 = llvm.getelementptr %arg12[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64)>
++      %13 = llvm.load %11 : !llvm.ptr -> i64
++      llvm.store %13, %12 : i64, !llvm.ptr
++      %14 = llvm.mlir.constant(48 : i32) : i32
++      "llvm.intr.memcpy"(%arg11, %arg8, %14) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++      %15 = llvm.getelementptr %arg11[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++      %16 = llvm.load %15 : !llvm.ptr -> !llvm.ptr
++      %17 = llvm.getelementptr %16[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++      %18 = llvm.load %17 : !llvm.ptr -> i32
++      llvm.store %18, %arg1 : i32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++}
++
++// CHECK: define void @mix_use_device_ptr_and_addr_and_map_(ptr %[[ARG_0:.*]], ptr %[[ARG_1:.*]], ptr %[[ARG_2:.*]], ptr %[[ARG_3:.*]], ptr %[[ARG_4:.*]], ptr %[[ARG_5:.*]], ptr %[[ARG_6:.*]], ptr %[[ARG_7:.*]]) {
++// CHECK: %[[ALLOCA:.*]] = alloca ptr, align 8
++// CHECK: %[[BASEPTR_0_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++// CHECK: store ptr %[[ARG_0]], ptr %[[BASEPTR_0_GEP]], align 8
++// CHECK: %[[BASEPTR_4_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 4
++// CHECK: store ptr %[[ARG_2]], ptr %[[BASEPTR_4_GEP]], align 8
++// CHECK: %[[BASEPTR_7_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 7
++// CHECK: store ptr %[[ARG_4]], ptr %[[BASEPTR_7_GEP]], align 8
++// CHECK: call void @__tgt_target_data_begin_mapper({{.*}})
++// CHECK: %[[LOAD_BASEPTR_0:.*]] = load ptr, ptr %[[BASEPTR_0_GEP]], align 8
++// store ptr %[[LOAD_BASEPTR_0]], ptr %[[ALLOCA]], align 8
++// CHECK: %[[LOAD_BASEPTR_4:.*]] = load ptr, ptr %[[BASEPTR_4_GEP]], align 8
++// CHECK: %[[LOAD_BASEPTR_7:.*]] = load ptr, ptr %[[BASEPTR_7_GEP]], align 8
++// CHECK: %[[GEP_A4:.*]] = getelementptr { i64 }, ptr %[[ARG_4]], i32 0, i32 0
++// CHECK: %[[GEP_A7:.*]] = getelementptr { i64 }, ptr %[[ARG_7]], i32 0, i32 0
++// CHECK: %[[LOAD_A4:.*]] = load i64, ptr %[[GEP_A4]], align 4
++// CHECK: store i64 %[[LOAD_A4]], ptr %[[GEP_A7]], align 4
++// CHECK: call void @llvm.memcpy.p0.p0.i32(ptr %[[ARG_6]], ptr %[[LOAD_BASEPTR_4]], i32 48, i1 false)
++// CHECK: %[[GEP_A6:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[ARG_6]], i32 0, i32 0
++// CHECK: %[[LOAD_A6:.*]] = load ptr, ptr %[[GEP_A6]], align 8
++// CHECK: %[[GEP_A6_2:.*]] = getelementptr i8, ptr %[[LOAD_A6]], i64 2
++// CHECK: %[[LOAD_A6_2:.*]] = load i32, ptr %[[GEP_A6_2]], align 4
++// CHECK: store i32 %[[LOAD_A6_2]], ptr %[[ARG_1]], align 4
++// CHECK: call void @__tgt_target_data_end_mapper({{.*}})
++
++// CHECK: define void @mix_use_device_ptr_and_addr_and_map_2(ptr %[[ARG_0:.*]], ptr %[[ARG_1:.*]], ptr %[[ARG_2:.*]], ptr %[[ARG_3:.*]], ptr %[[ARG_4:.*]], ptr %[[ARG_5:.*]], ptr %[[ARG_6:.*]], ptr %[[ARG_7:.*]]) {
++// CHECK: %[[ALLOCA:.*]] = alloca ptr, align 8
++// CHECK: %[[BASEPTR_1_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++// CHECK: store ptr %[[ARG_0]], ptr %[[BASEPTR_1_GEP]], align 8
++// CHECK: %[[BASEPTR_4_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 4
++// CHECK: store ptr %[[ARG_2]], ptr %[[BASEPTR_4_GEP]], align 8
++// CHECK: %[[BASEPTR_7_GEP:.*]] = getelementptr inbounds [8 x ptr], ptr %.offload_baseptrs, i32 0, i32 7
++// CHECK: store ptr %[[ARG_4]], ptr %[[BASEPTR_7_GEP]], align 8
++// CHECK: call void @__tgt_target_data_begin_mapper({{.*}})
++// CHECK: %[[LOAD_BASEPTR_1:.*]] = load ptr, ptr %[[BASEPTR_1_GEP]], align 8
++// store ptr %[[LOAD_BASEPTR_1]], ptr %[[ALLOCA]], align 8
++// CHECK: %[[LOAD_BASEPTR_4:.*]] = load ptr, ptr %[[BASEPTR_4_GEP]], align 8
++// CHECK: %[[LOAD_BASEPTR_7:.*]] = load ptr, ptr %[[BASEPTR_7_GEP]], align 8
++// CHECK: %[[GEP_A4:.*]] = getelementptr { i64 }, ptr %[[ARG_4]], i32 0, i32 0
++// CHECK: %[[GEP_A7:.*]] = getelementptr { i64 }, ptr %[[ARG_7]], i32 0, i32 0
++// CHECK: %[[LOAD_A4:.*]] = load i64, ptr %[[GEP_A4]], align 4
++// CHECK: store i64 %[[LOAD_A4]], ptr %[[GEP_A7]], align 4
++// CHECK: call void @llvm.memcpy.p0.p0.i32(ptr %[[ARG_6]], ptr %[[LOAD_BASEPTR_4]], i32 48, i1 false)
++// CHECK: %[[GEP_A6:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[ARG_6]], i32 0, i32 0
++// CHECK: %[[LOAD_A6:.*]] = load ptr, ptr %[[GEP_A6]], align 8
++// CHECK: %[[GEP_A6_2:.*]] = getelementptr i8, ptr %[[LOAD_A6]], i64 2
++// CHECK: %[[LOAD_A6_2:.*]] = load i32, ptr %[[GEP_A6_2]], align 4
++// CHECK: store i32 %[[LOAD_A6_2]], ptr %[[ARG_1]], align 4
++// CHECK: call void @__tgt_target_data_end_mapper({{.*}})
+diff --git a/mlir/test/Target/LLVMIR/omptarget-llvm.mlir b/mlir/test/Target/LLVMIR/omptarget-llvm.mlir
+index 654763c577d1a..7f21095763a39 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-llvm.mlir
+@@ -237,14 +237,14 @@ llvm.func @_QPopenmp_target_use_dev_ptr() {
+ // CHECK:         store ptr null, ptr %[[VAL_9]], align 8
+ // CHECK:         %[[VAL_10:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_11:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_10]], ptr %[[VAL_11]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_10]], ptr %[[VAL_11]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         %[[VAL_12:.*]] = load ptr, ptr %[[VAL_7]], align 8
+ // CHECK:         store ptr %[[VAL_12]], ptr %[[VAL_3]], align 8
+ // CHECK:         %[[VAL_13:.*]] = load ptr, ptr %[[VAL_3]], align 8
+ // CHECK:         store i32 10, ptr %[[VAL_13]], align 4
+ // CHECK:         %[[VAL_14:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_15:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_end_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_14]], ptr %[[VAL_15]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_14]], ptr %[[VAL_15]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         ret void
+ 
+ // -----
+@@ -280,13 +280,13 @@ llvm.func @_QPopenmp_target_use_dev_addr() {
+ // CHECK:         store ptr null, ptr %[[VAL_8]], align 8
+ // CHECK:         %[[VAL_9:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_10:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_9]], ptr %[[VAL_10]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_9]], ptr %[[VAL_10]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         %[[VAL_11:.*]] = load ptr, ptr %[[VAL_6]], align 8
+ // CHECK:         %[[VAL_12:.*]] = load ptr, ptr %[[VAL_11]], align 8
+ // CHECK:         store i32 10, ptr %[[VAL_12]], align 4
+ // CHECK:         %[[VAL_13:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_14:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_end_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_13]], ptr %[[VAL_14]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_13]], ptr %[[VAL_14]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         ret void
+ 
+ // -----
+@@ -321,12 +321,12 @@ llvm.func @_QPopenmp_target_use_dev_addr_no_ptr() {
+ // CHECK:         store ptr null, ptr %[[VAL_8]], align 8
+ // CHECK:         %[[VAL_9:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_10:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_9]], ptr %[[VAL_10]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_9]], ptr %[[VAL_10]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         %[[VAL_11:.*]] = load ptr, ptr %[[VAL_6]], align 8
+ // CHECK:         store i32 10, ptr %[[VAL_11]], align 4
+ // CHECK:         %[[VAL_12:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_13:.*]] = getelementptr inbounds [1 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_end_mapper(ptr @2, i64 -1, i32 1, ptr %[[VAL_12]], ptr %[[VAL_13]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 1, ptr %[[VAL_12]], ptr %[[VAL_13]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         ret void
+ 
+ // -----
+@@ -433,7 +433,7 @@ llvm.func @_QPopenmp_target_use_dev_both() {
+ // CHECK:         store ptr null, ptr %[[VAL_13]], align 8
+ // CHECK:         %[[VAL_14:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_15:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @3, i64 -1, i32 2, ptr %[[VAL_14]], ptr %[[VAL_15]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 2, ptr %[[VAL_14]], ptr %[[VAL_15]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         %[[VAL_16:.*]] = load ptr, ptr %[[VAL_8]], align 8
+ // CHECK:         store ptr %[[VAL_16]], ptr %[[VAL_3]], align 8
+ // CHECK:         %[[VAL_17:.*]] = load ptr, ptr %[[VAL_11]], align 8
+@@ -443,7 +443,7 @@ llvm.func @_QPopenmp_target_use_dev_both() {
+ // CHECK:         store i32 20, ptr %[[VAL_19]], align 4
+ // CHECK:         %[[VAL_20:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_0]], i32 0, i32 0
+ // CHECK:         %[[VAL_21:.*]] = getelementptr inbounds [2 x ptr], ptr %[[VAL_1]], i32 0, i32 0
+-// CHECK:         call void @__tgt_target_data_end_mapper(ptr @3, i64 -1, i32 2, ptr %[[VAL_20]], ptr %[[VAL_21]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
++// CHECK:         call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 2, ptr %[[VAL_20]], ptr %[[VAL_21]], ptr @.offload_sizes, ptr @.offload_maptypes, ptr @.offload_mapnames, ptr null)
+ // CHECK:         ret void
+ 
+ // -----
+diff --git a/offload/test/Inputs/target-use-dev-ptr.c b/offload/test/Inputs/target-use-dev-ptr.c
+new file mode 100644
+index 0000000000000..e1430a93fbc7d
+--- /dev/null
++++ b/offload/test/Inputs/target-use-dev-ptr.c
+@@ -0,0 +1,23 @@
++// Helper function used in Offload Fortran test
++// target-use-dev-ptr.f90 to allocate data and
++// check resulting addresses.
++
++#include <assert.h>
++#include <malloc.h>
++#include <stdio.h>
++
++int *get_ptr() {
++  int *ptr = malloc(sizeof(int));
++  assert(ptr && "malloc returned null");
++  return ptr;
++}
++
++int check_result(int *host_ptr, int *dev_ptr) {
++  if (dev_ptr == NULL || dev_ptr == host_ptr) {
++    printf("FAILURE\n");
++    return -1;
++  } else {
++    printf("SUCCESS\n");
++    return 0;
++  }
++}
+diff --git a/offload/test/offloading/fortran/target-use-dev-ptr.f90 b/offload/test/offloading/fortran/target-use-dev-ptr.f90
+new file mode 100644
+index 0000000000000..4476f45699d6e
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-use-dev-ptr.f90
+@@ -0,0 +1,37 @@
++! Basic test of use_device_ptr, checking if the appropriate
++! addresses are maintained across target boundaries
++! REQUIRES: clang, flang, amdgcn-amd-amdhsa
++
++! RUN: %clang -c -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa \
++! RUN:   %S/../../Inputs/target-use-dev-ptr.c -o target-use-dev-ptr_c.o
++! RUN: %libomptarget-compile-fortran-generic target-use-dev-ptr_c.o
++! RUN: %t | %fcheck-generic
++
++program use_device_test
++   use iso_c_binding
++   interface
++      type(c_ptr) function get_ptr() BIND(C)
++         USE, intrinsic :: iso_c_binding
++         implicit none
++      end function get_ptr
++
++      integer(c_int) function check_result(host, dev) BIND(C)
++         USE, intrinsic :: iso_c_binding
++         implicit none
++         type(c_ptr), intent(in) :: host, dev
++      end function check_result
++   end interface
++
++   type(c_ptr) :: device_ptr, x
++
++   x = get_ptr()
++   device_ptr = x
++
++   !$omp target data map(tofrom: x) use_device_ptr(x)
++   device_ptr = x
++   !$omp end target data
++
++   print *, check_result(x, device_ptr)
++end program use_device_test
++
++! CHECK: SUCCESS

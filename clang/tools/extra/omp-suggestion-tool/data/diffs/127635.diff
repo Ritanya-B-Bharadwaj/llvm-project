@@ -1,0 +1,222 @@
+diff --git a/flang/docs/DoConcurrentConversionToOpenMP.md b/flang/docs/DoConcurrentConversionToOpenMP.md
+index ecb4428d7d3ba..76c54f5bbf587 100644
+--- a/flang/docs/DoConcurrentConversionToOpenMP.md
++++ b/flang/docs/DoConcurrentConversionToOpenMP.md
+@@ -202,6 +202,57 @@ variables: `i` and `j`. These are locally allocated inside the parallel/target
+ OpenMP region similar to what the single-range example in previous section
+ shows.
+ 
++### Data environment
++
++By default, variables that are used inside a `do concurrent` loop nest are
++either treated as `shared` in case of mapping to `host`, or mapped into the
++`target` region using a `map` clause in case of mapping to `device`. The only
++exceptions to this are:
++  1. the loop's iteration variable(s) (IV) of **perfect** loop nests. In that
++     case, for each IV, we allocate a local copy as shown by the mapping
++     examples above.
++  1. any values that are from allocations outside the loop nest and used
++     exclusively inside of it. In such cases, a local privatized
++     copy is created in the OpenMP region to prevent multiple teams of threads
++     from accessing and destroying the same memory block, which causes runtime
++     issues. For an example of such cases, see
++     `flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90`.
++
++Implicit mapping detection (for mapping to the target device) is still quite
++limited and work to make it smarter is underway for both OpenMP in general 
++and `do concurrent` mapping.
++
++#### Non-perfectly-nested loops' IVs
++
++For non-perfectly-nested loops, the IVs are still treated as `shared` or
++`map` entries as pointed out above. This **might not** be consistent with what
++the Fortran specification tells us. In particular, taking the following
++snippets from the spec (version 2023) into account:
++
++> § 3.35
++> ------
++> construct entity
++> entity whose identifier has the scope of a construct
++
++> § 19.4
++> ------
++>  A variable that appears as an index-name in a FORALL or DO CONCURRENT
++>  construct [...] is a construct entity. A variable that has LOCAL or
++>  LOCAL_INIT locality in a DO CONCURRENT construct is a construct entity.
++> [...]
++> The name of a variable that appears as an index-name in a DO CONCURRENT
++> construct, FORALL statement, or FORALL construct has a scope of the statement
++> or construct. A variable that has LOCAL or LOCAL_INIT locality in a DO
++> CONCURRENT construct has the scope of that construct.
++
++From the above quotes, it seems there is an equivalence between the IV of a `do
++concurrent` loop and a variable with a `LOCAL` locality specifier (equivalent
++to OpenMP's `private` clause). Which means that we should probably
++localize/privatize a `do concurrent` loop's IV even if it is not perfectly
++nested in the nest we are parallelizing. For now, however, we **do not** do
++that as pointed out previously. In the near future, we propose a middle-ground
++solution (see the Next steps section for more details).
++
+ <!--
+ More details about current status will be added along with relevant parts of the
+ implementation in later upstreaming patches.
+diff --git a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+index 6160c642767c0..4610ebf088aed 100644
+--- a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
++++ b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+@@ -313,6 +313,64 @@ void sinkLoopIVArgs(mlir::ConversionPatternRewriter &rewriter,
+     ++idx;
+   }
+ }
++
++/// Collects values that are local to a loop: "loop-local values". A loop-local
++/// value is one that is used exclusively inside the loop but allocated outside
++/// of it. This usually corresponds to temporary values that are used inside the
++/// loop body for initialzing other variables for example.
++///
++/// See `flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90` for an
++/// example of why we need this.
++///
++/// \param [in] doLoop - the loop within which the function searches for values
++/// used exclusively inside.
++///
++/// \param [out] locals - the list of loop-local values detected for \p doLoop.
++void collectLoopLocalValues(fir::DoLoopOp doLoop,
++                            llvm::SetVector<mlir::Value> &locals) {
++  doLoop.walk([&](mlir::Operation *op) {
++    for (mlir::Value operand : op->getOperands()) {
++      if (locals.contains(operand))
++        continue;
++
++      bool isLocal = true;
++
++      if (!mlir::isa_and_present<fir::AllocaOp>(operand.getDefiningOp()))
++        continue;
++
++      // Values defined inside the loop are not interesting since they do not
++      // need to be localized.
++      if (doLoop->isAncestor(operand.getDefiningOp()))
++        continue;
++
++      for (auto *user : operand.getUsers()) {
++        if (!doLoop->isAncestor(user)) {
++          isLocal = false;
++          break;
++        }
++      }
++
++      if (isLocal)
++        locals.insert(operand);
++    }
++  });
++}
++
++/// For a "loop-local" value \p local within a loop's scope, localizes that
++/// value within the scope of the parallel region the loop maps to. Towards that
++/// end, this function moves the allocation of \p local within \p allocRegion.
++///
++/// \param local - the value used exclusively within a loop's scope (see
++/// collectLoopLocalValues).
++///
++/// \param allocRegion - the parallel region where \p local's allocation will be
++/// privatized.
++///
++/// \param rewriter - builder used for updating \p allocRegion.
++static void localizeLoopLocalValue(mlir::Value local, mlir::Region &allocRegion,
++                                   mlir::ConversionPatternRewriter &rewriter) {
++  rewriter.moveOpBefore(local.getDefiningOp(), &allocRegion.front().front());
++}
+ } // namespace looputils
+ 
+ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+@@ -339,13 +397,21 @@ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+                         "Some `do concurent` loops are not perfectly-nested. "
+                         "These will be serialized.");
+ 
++    llvm::SetVector<mlir::Value> locals;
++    looputils::collectLoopLocalValues(loopNest.back().first, locals);
+     looputils::sinkLoopIVArgs(rewriter, loopNest);
++
+     mlir::IRMapping mapper;
+-    genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper);
++    mlir::omp::ParallelOp parallelOp =
++        genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper);
+     mlir::omp::LoopNestOperands loopNestClauseOps;
+     genLoopNestClauseOps(doLoop.getLoc(), rewriter, loopNest, mapper,
+                          loopNestClauseOps);
+ 
++    for (mlir::Value local : locals)
++      looputils::localizeLoopLocalValue(local, parallelOp.getRegion(),
++                                        rewriter);
++
+     mlir::omp::LoopNestOp ompLoopNest =
+         genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps,
+                     /*isComposite=*/mapToDevice);
+diff --git a/flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90 b/flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90
+new file mode 100644
+index 0000000000000..f82696669eca6
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/locally_destroyed_temp.f90
+@@ -0,0 +1,62 @@
++! Tests that "loop-local values" are properly handled by localizing them to the
++! body of the loop nest. See `collectLoopLocalValues` and `localizeLoopLocalValue`
++! for a definition of "loop-local values" and how they are handled.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
++! RUN:   | FileCheck %s
++module struct_mod
++    type test_struct
++        integer, allocatable :: x_
++    end type
++
++    interface test_struct
++        pure module function construct_from_components(x) result(struct)
++            implicit none
++            integer, intent(in) :: x
++            type(test_struct) struct
++        end function
++    end interface
++end module
++
++submodule(struct_mod) struct_sub
++    implicit none
++
++contains
++    module procedure construct_from_components
++        struct%x_ = x
++    end procedure
++end submodule struct_sub
++
++program main
++    use struct_mod, only : test_struct
++
++    implicit none
++    type(test_struct), dimension(10) :: a
++    integer :: i
++    integer :: total
++
++    do concurrent (i=1:10)
++        a(i) = test_struct(i)
++    end do
++
++    do i=1,10
++        total = total + a(i)%x_
++    end do
++
++    print *, "total =", total
++end program main
++
++! CHECK: omp.parallel {
++! CHECK:   %[[LOCAL_TEMP:.*]] = fir.alloca !fir.type<_QMstruct_modTtest_struct{x_:!fir.box<!fir.heap<i32>>}> {bindc_name = ".result"}
++! CHECK:   omp.wsloop {
++! CHECK:     omp.loop_nest {{.*}} {
++! CHECK:       %[[TEMP_VAL:.*]] = fir.call @_QMstruct_modPconstruct_from_components
++! CHECK:       fir.save_result %[[TEMP_VAL]] to %[[LOCAL_TEMP]]
++! CHECK:       %[[EMBOXED_LOCAL:.*]] = fir.embox %[[LOCAL_TEMP]]
++! CHECK:       %[[CONVERTED_LOCAL:.*]] = fir.convert %[[EMBOXED_LOCAL]]
++! CHECK:       fir.call @_FortranADestroy(%[[CONVERTED_LOCAL]])
++! CHECK:       omp.yield
++! CHECK:     }
++! CHECK:   }
++! CHECK:   omp.terminator
++! CHECK: }

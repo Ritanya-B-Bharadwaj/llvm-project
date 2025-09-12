@@ -1,0 +1,419 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index f654fe6e4681a..025b0ea4ec66d 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1605,7 +1605,7 @@ void OmpStructureChecker::Leave(const parser::OpenMPThreadprivate &c) {
+   const auto &dir{std::get<parser::Verbatim>(c.t)};
+   const auto &objectList{std::get<parser::OmpObjectList>(c.t)};
+   CheckSymbolNames(dir.source, objectList);
+-  CheckIsVarPartOfAnotherVar(dir.source, objectList);
++  CheckVarIsNotPartOfAnotherVar(dir.source, objectList);
+   CheckThreadprivateOrDeclareTargetVar(objectList);
+   dirContext_.pop_back();
+ }
+@@ -1736,7 +1736,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPDeclarativeAllocate &x) {
+   for (const auto &clause : clauseList.v) {
+     CheckAlignValue(clause);
+   }
+-  CheckIsVarPartOfAnotherVar(dir.source, objectList);
++  CheckVarIsNotPartOfAnotherVar(dir.source, objectList);
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OpenMPDeclarativeAllocate &x) {
+@@ -1902,7 +1902,7 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareTargetConstruct &x) {
+   if (const auto *objectList{parser::Unwrap<parser::OmpObjectList>(spec.u)}) {
+     deviceConstructFound_ = true;
+     CheckSymbolNames(dir.source, *objectList);
+-    CheckIsVarPartOfAnotherVar(dir.source, *objectList);
++    CheckVarIsNotPartOfAnotherVar(dir.source, *objectList);
+     CheckThreadprivateOrDeclareTargetVar(*objectList);
+   } else if (const auto *clauseList{
+                  parser::Unwrap<parser::OmpClauseList>(spec.u)}) {
+@@ -1915,18 +1915,18 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareTargetConstruct &x) {
+                 toClauseFound = true;
+                 auto &objList{std::get<parser::OmpObjectList>(toClause.v.t)};
+                 CheckSymbolNames(dir.source, objList);
+-                CheckIsVarPartOfAnotherVar(dir.source, objList);
++                CheckVarIsNotPartOfAnotherVar(dir.source, objList);
+                 CheckThreadprivateOrDeclareTargetVar(objList);
+               },
+               [&](const parser::OmpClause::Link &linkClause) {
+                 CheckSymbolNames(dir.source, linkClause.v);
+-                CheckIsVarPartOfAnotherVar(dir.source, linkClause.v);
++                CheckVarIsNotPartOfAnotherVar(dir.source, linkClause.v);
+                 CheckThreadprivateOrDeclareTargetVar(linkClause.v);
+               },
+               [&](const parser::OmpClause::Enter &enterClause) {
+                 enterClauseFound = true;
+                 CheckSymbolNames(dir.source, enterClause.v);
+-                CheckIsVarPartOfAnotherVar(dir.source, enterClause.v);
++                CheckVarIsNotPartOfAnotherVar(dir.source, enterClause.v);
+                 CheckThreadprivateOrDeclareTargetVar(enterClause.v);
+               },
+               [&](const parser::OmpClause::DeviceType &deviceTypeClause) {
+@@ -2009,7 +2009,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPExecutableAllocate &x) {
+     CheckAlignValue(clause);
+   }
+   if (objectList) {
+-    CheckIsVarPartOfAnotherVar(dir.source, *objectList);
++    CheckVarIsNotPartOfAnotherVar(dir.source, *objectList);
+   }
+ }
+ 
+@@ -2029,7 +2029,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPAllocatorsConstruct &x) {
+   for (const auto &clause : clauseList.v) {
+     if (const auto *allocClause{
+             parser::Unwrap<parser::OmpClause::Allocate>(clause)}) {
+-      CheckIsVarPartOfAnotherVar(
++      CheckVarIsNotPartOfAnotherVar(
+           dir.source, std::get<parser::OmpObjectList>(allocClause->v.t));
+     }
+   }
+@@ -3146,6 +3146,65 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
+   // clause
+   CheckMultListItems();
+ 
++  if (GetContext().directive == llvm::omp::Directive::OMPD_task) {
++    if (auto *detachClause{FindClause(llvm::omp::Clause::OMPC_detach)}) {
++      unsigned version{context_.langOptions().OpenMPVersion};
++      if (version == 50 || version == 51) {
++        // OpenMP 5.0: 2.10.1 Task construct restrictions
++        CheckNotAllowedIfClause(llvm::omp::Clause::OMPC_detach,
++            {llvm::omp::Clause::OMPC_mergeable});
++      } else if (version >= 52) {
++        // OpenMP 5.2: 12.5.2 Detach construct restrictions
++        if (FindClause(llvm::omp::Clause::OMPC_final)) {
++          context_.Say(GetContext().clauseSource,
++              "If a DETACH clause appears on a directive, then the encountering task must not be a FINAL task"_err_en_US);
++        }
++
++        const auto &detach{
++            std::get<parser::OmpClause::Detach>(detachClause->u)};
++        if (const auto *name{parser::Unwrap<parser::Name>(detach.v.v)}) {
++          Symbol *eventHandleSym{name->symbol};
++          auto checkVarAppearsInDataEnvClause = [&](const parser::OmpObjectList
++                                                        &objs,
++                                                    std::string clause) {
++            for (const auto &obj : objs.v) {
++              if (const parser::Name *
++                  objName{parser::Unwrap<parser::Name>(obj)}) {
++                if (&objName->symbol->GetUltimate() == eventHandleSym) {
++                  context_.Say(GetContext().clauseSource,
++                      "A variable: `%s` that appears in a DETACH clause cannot appear on %s clause on the same construct"_err_en_US,
++                      objName->source, clause);
++                }
++              }
++            }
++          };
++          if (auto *dataEnvClause{
++                  FindClause(llvm::omp::Clause::OMPC_private)}) {
++            const auto &pClause{
++                std::get<parser::OmpClause::Private>(dataEnvClause->u)};
++            checkVarAppearsInDataEnvClause(pClause.v, "PRIVATE");
++          } else if (auto *dataEnvClause{
++                         FindClause(llvm::omp::Clause::OMPC_shared)}) {
++            const auto &sClause{
++                std::get<parser::OmpClause::Shared>(dataEnvClause->u)};
++            checkVarAppearsInDataEnvClause(sClause.v, "SHARED");
++          } else if (auto *dataEnvClause{
++                         FindClause(llvm::omp::Clause::OMPC_firstprivate)}) {
++            const auto &fpClause{
++                std::get<parser::OmpClause::Firstprivate>(dataEnvClause->u)};
++            checkVarAppearsInDataEnvClause(fpClause.v, "FIRSTPRIVATE");
++          } else if (auto *dataEnvClause{
++                         FindClause(llvm::omp::Clause::OMPC_in_reduction)}) {
++            const auto &irClause{
++                std::get<parser::OmpClause::InReduction>(dataEnvClause->u)};
++            checkVarAppearsInDataEnvClause(
++                std::get<parser::OmpObjectList>(irClause.v.t), "IN_REDUCTION");
++          }
++        }
++      }
++    }
++  }
++
+   auto testThreadprivateVarErr = [&](Symbol sym, parser::Name name,
+                                      llvmOmpClause clauseTy) {
+     if (sym.test(Symbol::Flag::OmpThreadprivate))
+@@ -3228,7 +3287,6 @@ CHECK_SIMPLE_CLAUSE(Capture, OMPC_capture)
+ CHECK_SIMPLE_CLAUSE(Contains, OMPC_contains)
+ CHECK_SIMPLE_CLAUSE(Default, OMPC_default)
+ CHECK_SIMPLE_CLAUSE(Depobj, OMPC_depobj)
+-CHECK_SIMPLE_CLAUSE(Detach, OMPC_detach)
+ CHECK_SIMPLE_CLAUSE(DeviceType, OMPC_device_type)
+ CHECK_SIMPLE_CLAUSE(DistSchedule, OMPC_dist_schedule)
+ CHECK_SIMPLE_CLAUSE(Exclusive, OMPC_exclusive)
+@@ -3735,14 +3793,14 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Ordered &x) {
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Shared &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_shared);
+-  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "SHARED");
++  CheckVarIsNotPartOfAnotherVar(GetContext().clauseSource, x.v, "SHARED");
+   CheckCrayPointee(x.v, "SHARED");
+ }
+ void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
+   SymbolSourceMap symbols;
+   GetSymbolsInObjectList(x.v, symbols);
+   CheckAllowedClause(llvm::omp::Clause::OMPC_private);
+-  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "PRIVATE");
++  CheckVarIsNotPartOfAnotherVar(GetContext().clauseSource, x.v, "PRIVATE");
+   CheckIntentInPointer(symbols, llvm::omp::Clause::OMPC_private);
+   CheckCrayPointee(x.v, "PRIVATE");
+ }
+@@ -3771,50 +3829,50 @@ bool OmpStructureChecker::IsDataRefTypeParamInquiry(
+   return dataRefIsTypeParamInquiry;
+ }
+ 
+-void OmpStructureChecker::CheckIsVarPartOfAnotherVar(
++void OmpStructureChecker::CheckVarIsNotPartOfAnotherVar(
+     const parser::CharBlock &source, const parser::OmpObjectList &objList,
+     llvm::StringRef clause) {
+   for (const auto &ompObject : objList.v) {
+-    common::visit(
+-        common::visitors{
+-            [&](const parser::Designator &designator) {
+-              if (const auto *dataRef{
+-                      std::get_if<parser::DataRef>(&designator.u)}) {
+-                if (IsDataRefTypeParamInquiry(dataRef)) {
++    CheckVarIsNotPartOfAnotherVar(source, ompObject, clause);
++  }
++}
++
++void OmpStructureChecker::CheckVarIsNotPartOfAnotherVar(
++    const parser::CharBlock &source, const parser::OmpObject &ompObject,
++    llvm::StringRef clause) {
++  common::visit(
++      common::visitors{
++          [&](const parser::Designator &designator) {
++            if (const auto *dataRef{
++                    std::get_if<parser::DataRef>(&designator.u)}) {
++              if (IsDataRefTypeParamInquiry(dataRef)) {
++                context_.Say(source,
++                    "A type parameter inquiry cannot appear on the %s directive"_err_en_US,
++                    ContextDirectiveAsFortran());
++              } else if (parser::Unwrap<parser::StructureComponent>(
++                             ompObject) ||
++                  parser::Unwrap<parser::ArrayElement>(ompObject)) {
++                if (llvm::omp::nonPartialVarSet.test(GetContext().directive)) {
+                   context_.Say(source,
+-                      "A type parameter inquiry cannot appear on the %s "
+-                      "directive"_err_en_US,
++                      "A variable that is part of another variable (as an array or structure element) cannot appear on the %s directive"_err_en_US,
+                       ContextDirectiveAsFortran());
+-                } else if (parser::Unwrap<parser::StructureComponent>(
+-                               ompObject) ||
+-                    parser::Unwrap<parser::ArrayElement>(ompObject)) {
+-                  if (llvm::omp::nonPartialVarSet.test(
+-                          GetContext().directive)) {
+-                    context_.Say(source,
+-                        "A variable that is part of another variable (as an "
+-                        "array or structure element) cannot appear on the %s "
+-                        "directive"_err_en_US,
+-                        ContextDirectiveAsFortran());
+-                  } else {
+-                    context_.Say(source,
+-                        "A variable that is part of another variable (as an "
+-                        "array or structure element) cannot appear in a "
+-                        "%s clause"_err_en_US,
+-                        clause.data());
+-                  }
++                } else {
++                  context_.Say(source,
++                      "A variable that is part of another variable (as an array or structure element) cannot appear in a %s clause"_err_en_US,
++                      clause.data());
+                 }
+               }
+-            },
+-            [&](const parser::Name &name) {},
+-        },
+-        ompObject.u);
+-  }
++            }
++          },
++          [&](const parser::Name &name) {},
++      },
++      ompObject.u);
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Firstprivate &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_firstprivate);
+ 
+-  CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "FIRSTPRIVATE");
++  CheckVarIsNotPartOfAnotherVar(GetContext().clauseSource, x.v, "FIRSTPRIVATE");
+   CheckCrayPointee(x.v, "FIRSTPRIVATE");
+   CheckIsLoopIvPartOfClause(llvmOmpClause::OMPC_firstprivate, x.v);
+ 
+@@ -4137,6 +4195,33 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Linear &x) {
+   }
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OmpClause::Detach &x) {
++  unsigned version{context_.langOptions().OpenMPVersion};
++  if (version >= 52) {
++    SetContextClauseInfo(llvm::omp::Clause::OMPC_detach);
++  } else {
++    // OpenMP 5.0: 2.10.1 Task construct restrictions
++    CheckAllowedClause(llvm::omp::Clause::OMPC_detach);
++  }
++  // OpenMP 5.2: 12.5.2 Detach clause restrictions
++  if (version >= 52) {
++    CheckVarIsNotPartOfAnotherVar(GetContext().clauseSource, x.v.v, "DETACH");
++  }
++
++  if (const auto *name{parser::Unwrap<parser::Name>(x.v.v)}) {
++    if (version >= 52 && IsPointer(*name->symbol)) {
++      context_.Say(GetContext().clauseSource,
++          "The event-handle: `%s` must not have the POINTER attribute"_err_en_US,
++          name->ToString());
++    }
++    if (!name->symbol->GetType()->IsNumeric(TypeCategory::Integer)) {
++      context_.Say(GetContext().clauseSource,
++          "The event-handle: `%s` must be of type integer(kind=omp_event_handle_kind)"_err_en_US,
++          name->ToString());
++    }
++  }
++}
++
+ void OmpStructureChecker::CheckAllowedMapTypes(
+     const parser::OmpMapType::Value &type,
+     const std::list<parser::OmpMapType::Value> &allowedMapTypeList) {
+@@ -4485,7 +4570,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_lastprivate);
+ 
+   const auto &objectList{std::get<parser::OmpObjectList>(x.v.t)};
+-  CheckIsVarPartOfAnotherVar(
++  CheckVarIsNotPartOfAnotherVar(
+       GetContext().clauseSource, objectList, "LASTPRIVATE");
+   CheckCrayPointee(objectList, "LASTPRIVATE");
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 5ea2039a83c3f..be420332d491c 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -231,7 +231,9 @@ class OmpStructureChecker
+       const common::Indirection<parser::ArrayElement> &, const parser::Name &);
+   void CheckDoacross(const parser::OmpDoacross &doa);
+   bool IsDataRefTypeParamInquiry(const parser::DataRef *dataRef);
+-  void CheckIsVarPartOfAnotherVar(const parser::CharBlock &source,
++  void CheckVarIsNotPartOfAnotherVar(const parser::CharBlock &source,
++      const parser::OmpObject &obj, llvm::StringRef clause = "");
++  void CheckVarIsNotPartOfAnotherVar(const parser::CharBlock &source,
+       const parser::OmpObjectList &objList, llvm::StringRef clause = "");
+   void CheckThreadprivateOrDeclareTargetVar(
+       const parser::OmpObjectList &objList);
+diff --git a/flang/test/Semantics/OpenMP/detach01.f90 b/flang/test/Semantics/OpenMP/detach01.f90
+new file mode 100644
+index 0000000000000..7729c85ea1128
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/detach01.f90
+@@ -0,0 +1,63 @@
++! REQUIRES: openmp_runtime
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=52
++
++! OpenMP Version 5.2: 12.5.2
++! Various checks for DETACH Clause
++
++program detach01
++    use omp_lib, only: omp_event_handle_kind
++    implicit none
++    real                                    :: e, x
++    integer(omp_event_handle_kind)          :: event_01, event_02(2)
++    integer(omp_event_handle_kind), pointer :: event_03
++
++    type :: t
++        integer(omp_event_handle_kind) :: event
++    end type
++    type(t) :: t_01
++
++    !ERROR: The event-handle: `e` must be of type integer(kind=omp_event_handle_kind)
++    !$omp task detach(e)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: If a DETACH clause appears on a directive, then the encountering task must not be a FINAL task
++    !$omp task detach(event_01) final(.false.)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable: `event_01` that appears in a DETACH clause cannot appear on PRIVATE clause on the same construct
++    !$omp task detach(event_01) private(event_01)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable: `event_01` that appears in a DETACH clause cannot appear on FIRSTPRIVATE clause on the same construct
++    !$omp task detach(event_01) firstprivate(event_01)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable: `event_01` that appears in a DETACH clause cannot appear on SHARED clause on the same construct
++    !$omp task detach(event_01) shared(event_01)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable: `event_01` that appears in a DETACH clause cannot appear on IN_REDUCTION clause on the same construct
++    !$omp task detach(event_01) in_reduction(+:event_01)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable that is part of another variable (as an array or structure element) cannot appear in a DETACH clause
++    !$omp task detach(event_02(1))
++        x = x + 1
++    !$omp end task
++
++    !ERROR: A variable that is part of another variable (as an array or structure element) cannot appear in a DETACH clause
++    !$omp task detach(t_01%event)
++        x = x + 1
++    !$omp end task
++
++    !ERROR: The event-handle: `event_03` must not have the POINTER attribute
++    !$omp task detach(event_03)
++        x = x + 1
++    !$omp end task
++end program
+diff --git a/flang/test/Semantics/OpenMP/detach02.f90 b/flang/test/Semantics/OpenMP/detach02.f90
+new file mode 100644
+index 0000000000000..49d80358fcdb6
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/detach02.f90
+@@ -0,0 +1,21 @@
++! REQUIRES: openmp_runtime
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=50
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=51
++
++! OpenMP Version 5.0: 2.10.1
++! Various checks for DETACH Clause
++
++program detach02
++    use omp_lib, only: omp_event_handle_kind
++    integer(omp_event_handle_kind)          :: event_01, event_02
++
++    !ERROR: At most one DETACH clause can appear on the TASK directive
++    !$omp task detach(event_01) detach(event_02)
++       x = x + 1
++    !$omp end task
++
++    !ERROR: Clause MERGEABLE is not allowed if clause DETACH appears on the TASK directive
++    !$omp task detach(event_01) mergeable
++        x = x + 1
++    !$omp end task
++end program
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index f4e400b651c31..4ca64b1e69289 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -1139,7 +1139,6 @@ def OMP_Task : Directive<"task"> {
+     VersionedClause<OMPC_Affinity, 50>,
+     VersionedClause<OMPC_Allocate>,
+     VersionedClause<OMPC_Depend>,
+-    VersionedClause<OMPC_Detach, 50>,
+     VersionedClause<OMPC_FirstPrivate>,
+     VersionedClause<OMPC_InReduction>,
+     VersionedClause<OMPC_Mergeable>,
+@@ -1149,6 +1148,7 @@ def OMP_Task : Directive<"task"> {
+   ];
+   let allowedOnceClauses = [
+     VersionedClause<OMPC_Default>,
++    VersionedClause<OMPC_Detach, 50>,
+     VersionedClause<OMPC_Final>,
+     VersionedClause<OMPC_If>,
+     VersionedClause<OMPC_Priority>,

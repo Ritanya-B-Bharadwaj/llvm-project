@@ -1,0 +1,135 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 67f7e1aac40ed..9bd88dceab271 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -510,6 +510,7 @@ class ParseTreeDumper {
+   NODE_ENUM(OmpDefaultmapClause, ImplicitBehavior)
+   NODE_ENUM(OmpDefaultmapClause, VariableCategory)
+   NODE(parser, OmpDependClause)
++  NODE(parser, OmpDetachClause)
+   NODE(OmpDependClause, InOut)
+   NODE(OmpDependClause, Sink)
+   NODE(OmpDependClause, Source)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 13c3353512208..6456edca636dd 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3597,6 +3597,11 @@ struct OmpIfClause {
+   std::tuple<std::optional<DirectiveNameModifier>, ScalarLogicalExpr> t;
+ };
+ 
++// OpenMPv5.2 12.5.2 detach-clause -> DETACH (event-handle)
++struct OmpDetachClause {
++  WRAPPER_CLASS_BOILERPLATE(OmpDetachClause, OmpObject);
++};
++
+ // OMP 5.0 2.19.5.6 in_reduction-clause -> IN_REDUCTION (reduction-identifier:
+ //                                         variable-name-list)
+ struct OmpInReductionClause {
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 45b89de023a4b..16f7fa35bca77 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -635,8 +635,8 @@ Destroy make(const parser::OmpClause::Destroy &inp,
+ 
+ Detach make(const parser::OmpClause::Detach &inp,
+             semantics::SemanticsContext &semaCtx) {
+-  // inp -> empty
+-  llvm_unreachable("Empty: detach");
++  // inp.v -> parser::OmpDetachClause
++  return Detach{makeObject(inp.v.v, semaCtx)};
+ }
+ 
+ Device make(const parser::OmpClause::Device &inp,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 6fde70fc5c387..764e61fbe1bb8 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -398,6 +398,9 @@ TYPE_CONTEXT_PARSER("Omp LINEAR clause"_en_US,
+         construct<OmpLinearClause>(construct<OmpLinearClause::WithoutModifier>(
+             nonemptyList(name), maybe(":" >> scalarIntConstantExpr)))))
+ 
++// OpenMPv5.2 12.5.2 detach-clause -> DETACH (event-handle)
++TYPE_PARSER(construct<OmpDetachClause>(Parser<OmpObject>{}))
++
+ // 2.8.1 ALIGNED (list: alignment)
+ TYPE_PARSER(construct<OmpAlignedClause>(
+     Parser<OmpObjectList>{}, maybe(":" >> scalarIntConstantExpr)))
+@@ -529,6 +532,8 @@ TYPE_PARSER(
+                        parenthesized(Parser<OmpReductionClause>{}))) ||
+     "IN_REDUCTION" >> construct<OmpClause>(construct<OmpClause::InReduction>(
+                           parenthesized(Parser<OmpInReductionClause>{}))) ||
++    "DETACH" >> construct<OmpClause>(construct<OmpClause::Detach>(
++                    parenthesized(Parser<OmpDetachClause>{}))) ||
+     "TASK_REDUCTION" >>
+         construct<OmpClause>(construct<OmpClause::TaskReduction>(
+             parenthesized(Parser<OmpReductionClause>{}))) ||
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 3b0824f80161f..78303dedd3e51 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2157,6 +2157,7 @@ class UnparseVisitor {
+     Put(":");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
++  void Unparse(const OmpDetachClause &x) { Walk(x.v); }
+   void Unparse(const OmpInReductionClause &x) {
+     Walk(std::get<OmpReductionOperator>(x.t));
+     Put(":");
+diff --git a/flang/test/Lower/OpenMP/Todo/task_detach.f90 b/flang/test/Lower/OpenMP/Todo/task_detach.f90
+new file mode 100644
+index 0000000000000..8d0f1c6b8bc5f
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/task_detach.f90
+@@ -0,0 +1,16 @@
++! REQUIRES: openmp_runtime
++! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++!===============================================================================
++! `detach` clause
++!===============================================================================
++
++! CHECK: not yet implemented: OpenMP Block construct clause
++subroutine omp_task_detach()
++  use omp_lib
++  integer (kind=omp_event_handle_kind) :: event
++  !$omp task detach(event)
++  call foo()
++  !$omp end task
++end subroutine omp_task_detach
+diff --git a/flang/test/Parser/OpenMP/task.f90 b/flang/test/Parser/OpenMP/task.f90
+new file mode 100644
+index 0000000000000..c89f9aaf031ca
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/task.f90
+@@ -0,0 +1,17 @@
++! REQUIRES: openmp_runtime
++! RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=50  %s | FileCheck --ignore-case %s
++! RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=50  %s | FileCheck --ignore-case --check-prefix="CHECK-UNPARSE" %s
++
++!CHECK: OmpBlockDirective -> llvm::omp::Directive = task
++!CHECK: OmpClauseList -> OmpClause -> Detach -> OmpDetachClause -> OmpObject -> Designator -> DataRef -> Name = 'event'
++
++!CHECK-UNPARSE: INTEGER(KIND=8_4) event
++!CHECK-UNPARSE: !$OMP TASK  DETACH(event)
++!CHECK-UNPARSE: !$OMP END TASK
++subroutine task_detach
++  use omp_lib
++  implicit none
++  integer(kind=omp_event_handle_kind) :: event
++  !$omp task detach(event)
++  !$omp end task
++end subroutine
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 97496d4aae5ae..0d237aafc9481 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -135,6 +135,7 @@ def OMPC_Destroy : Clause<"destroy"> {
+ }
+ def OMPC_Detach : Clause<"detach"> {
+   let clangClass = "OMPDetachClause";
++  let flangClass = "OmpDetachClause";
+ }
+ def OMPC_Device : Clause<"device"> {
+   let clangClass = "OMPDeviceClause";

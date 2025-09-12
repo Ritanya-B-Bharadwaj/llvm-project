@@ -1,0 +1,71 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 84985b880b1ec..329cbf3d7539f 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -589,10 +589,27 @@ static void genLoopVars(
+   llvm::SmallVector<mlir::Location> locs(args.size(), loc);
+   firOpBuilder.createBlock(&region, {}, tiv, locs);
+ 
++  // Update nested wrapper operands if parent wrappers have mapped these values
++  // to block arguments.
++  //
++  // Binding these values earlier would take care of this, but we cannot rely on
++  // that approach because binding in between the creation of a wrapper and the
++  // next one would result in 'hlfir.declare' operations being introduced inside
++  // of a wrapper, which is illegal.
++  mlir::IRMapping mapper;
++  for (auto [argGeneratingOp, blockArgs] : wrapperArgs) {
++    for (mlir::OpOperand &operand : argGeneratingOp->getOpOperands())
++      operand.set(mapper.lookupOrDefault(operand.get()));
++
++    for (const auto [arg, var] : llvm::zip_equal(
++             argGeneratingOp->getRegion(0).getArguments(), blockArgs.getVars()))
++      mapper.map(var, arg);
++  }
++
+   // Bind the entry block arguments of parent wrappers to the corresponding
+   // symbols.
+-  for (auto [argGeneratingOp, args] : wrapperArgs)
+-    bindEntryBlockArgs(converter, argGeneratingOp, args);
++  for (auto [argGeneratingOp, blockArgs] : wrapperArgs)
++    bindEntryBlockArgs(converter, argGeneratingOp, blockArgs);
+ 
+   // The argument is not currently in memory, so make a temporary for the
+   // argument, and store it there, then bind that location to the argument.
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index b47b2cfb29eb9..dca29f55661b0 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -536,6 +536,7 @@ convertIgnoredWrapper(omp::LoopWrapperInterface &opInst,
+         forwardArgs(blockArgIface.getPrivateBlockArgs(), op.getPrivateVars());
+         forwardArgs(blockArgIface.getReductionBlockArgs(),
+                     op.getReductionVars());
++        op.emitWarning() << "simd information on composite construct discarded";
+         return success();
+       })
+       .Default([&](Operation *op) {
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index 5a7d8193bdeca..3c9bd9031c3e8 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -52,6 +52,20 @@ llvm.func @cancellation_point() {
+ 
+ // -----
+ 
++llvm.func @do_simd(%lb : i32, %ub : i32, %step : i32) {
++  omp.wsloop {
++    // expected-warning@below {{simd information on composite construct discarded}}
++    omp.simd {
++      omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++    } {omp.composite}
++  } {omp.composite}
++  llvm.return
++}
++
++// -----
++
+ llvm.func @distribute(%lb : i32, %ub : i32, %step : i32) {
+   // expected-error@below {{unsupported OpenMP operation: omp.distribute}}
+   // expected-error@below {{LLVM Translation failed for operation: omp.distribute}}

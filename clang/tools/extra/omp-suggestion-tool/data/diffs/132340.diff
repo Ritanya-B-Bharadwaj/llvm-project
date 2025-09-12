@@ -1,0 +1,95 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 67fff1aac084c..2e5ce5308eea5 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1844,6 +1844,8 @@ static Value *emitTaskDependencies(
+   Type *DepArrayTy = ArrayType::get(DependInfo, Dependencies.size());
+   DepArray = Builder.CreateAlloca(DepArrayTy, nullptr, ".dep.arr.addr");
+ 
++  Builder.restoreIP(OldIP);
++
+   for (const auto &[DepIdx, Dep] : enumerate(Dependencies)) {
+     Value *Base =
+         Builder.CreateConstInBoundsGEP2_64(DepArrayTy, DepArray, 0, DepIdx);
+@@ -1868,7 +1870,6 @@ static Value *emitTaskDependencies(
+                          static_cast<unsigned int>(Dep.DepKind)),
+         Flags);
+   }
+-  Builder.restoreIP(OldIP);
+   return DepArray;
+ }
+ 
+@@ -2047,46 +2048,7 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTask(
+       Builder.CreateStore(Priority, CmplrData);
+     }
+ 
+-    Value *DepArray = nullptr;
+-    if (Dependencies.size()) {
+-      InsertPointTy OldIP = Builder.saveIP();
+-      Builder.SetInsertPoint(
+-          &OldIP.getBlock()->getParent()->getEntryBlock().back());
+-
+-      Type *DepArrayTy = ArrayType::get(DependInfo, Dependencies.size());
+-      DepArray = Builder.CreateAlloca(DepArrayTy, nullptr, ".dep.arr.addr");
+-
+-      Builder.restoreIP(OldIP);
+-
+-      unsigned P = 0;
+-      for (const DependData &Dep : Dependencies) {
+-        Value *Base =
+-            Builder.CreateConstInBoundsGEP2_64(DepArrayTy, DepArray, 0, P);
+-        // Store the pointer to the variable
+-        Value *Addr = Builder.CreateStructGEP(
+-            DependInfo, Base,
+-            static_cast<unsigned int>(RTLDependInfoFields::BaseAddr));
+-        Value *DepValPtr =
+-            Builder.CreatePtrToInt(Dep.DepVal, Builder.getInt64Ty());
+-        Builder.CreateStore(DepValPtr, Addr);
+-        // Store the size of the variable
+-        Value *Size = Builder.CreateStructGEP(
+-            DependInfo, Base,
+-            static_cast<unsigned int>(RTLDependInfoFields::Len));
+-        Builder.CreateStore(Builder.getInt64(M.getDataLayout().getTypeStoreSize(
+-                                Dep.DepValueType)),
+-                            Size);
+-        // Store the dependency kind
+-        Value *Flags = Builder.CreateStructGEP(
+-            DependInfo, Base,
+-            static_cast<unsigned int>(RTLDependInfoFields::Flags));
+-        Builder.CreateStore(
+-            ConstantInt::get(Builder.getInt8Ty(),
+-                             static_cast<unsigned int>(Dep.DepKind)),
+-            Flags);
+-        ++P;
+-      }
+-    }
++    Value *DepArray = emitTaskDependencies(*this, Dependencies);
+ 
+     // In the presence of the `if` clause, the following IR is generated:
+     //    ...
+diff --git a/mlir/test/Target/LLVMIR/omptarget-depend.mlir b/mlir/test/Target/LLVMIR/omptarget-depend.mlir
+index 71fecd0fa5fd0..f2948c6510138 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-depend.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-depend.mlir
+@@ -124,6 +124,11 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
+ // CHECK: define void @_QQmain() {
+ // CHECK-DAG: %[[STRUCTARG:.+]] = alloca { ptr, ptr, ptr }, align 8
+ // CHECK-DAG:  %[[DEP_ARRAY:.+]] = alloca [1 x %struct.kmp_dep_info], align 8
++
++// CHECK: %[[TASKDATA:.+]] = call ptr @__kmpc_omp_task_alloc({{.+}}, ptr @.omp_target_task_proxy_func)
++// CHECK: %[[SHARED_DATA:.+]] = load ptr, ptr %[[TASKDATA]], align 8
++// CHECK: call void @llvm.memcpy.p0.p0.i64(ptr align 1 %[[SHARED_DATA]], ptr align 1 %[[STRUCTARG]], i64 24, i1 false)
++
+ // CHECK: %[[DEP_INFO:.+]]  = getelementptr inbounds [1 x %struct.kmp_dep_info], ptr %[[DEP_ARRAY]], i64 0, i64 0
+ // CHECK: %[[PTR0:.+]] = getelementptr inbounds nuw %struct.kmp_dep_info, ptr %[[DEP_INFO]], i32 0, i32 0
+ // CHECK: store i64 ptrtoint (ptr @_QFEa to i64), ptr %[[PTR0]], align 4
+@@ -132,9 +137,6 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
+ // CHECK: %[[PTR2:.+]] = getelementptr inbounds nuw %struct.kmp_dep_info, ptr %[[DEP_INFO]], i32 0, i32 2
+ // CHECK: store i8 1, ptr %[[PTR2]], align 1
+ 
+-// CHECK: %[[TASKDATA:.+]] = call ptr @__kmpc_omp_task_alloc({{.+}}, ptr @.omp_target_task_proxy_func)
+-// CHECK: %[[SHARED_DATA:.+]] = load ptr, ptr %[[TASKDATA]], align 8
+-// CHECK: call void @llvm.memcpy.p0.p0.i64(ptr align 1 %[[SHARED_DATA]], ptr align 1 %[[STRUCTARG]], i64 24, i1 false)
+ // CHECK: call void @__kmpc_omp_wait_deps({{.+}}, i32 1, ptr %[[DEP_ARRAY]], i32 0, ptr null)
+ // CHECK: call void @__kmpc_omp_task_begin_if0({{.+}}, ptr  %[[TASKDATA]])
+ // CHECK: call void @.omp_target_task_proxy_func({{.+}}, ptr %[[TASKDATA]])

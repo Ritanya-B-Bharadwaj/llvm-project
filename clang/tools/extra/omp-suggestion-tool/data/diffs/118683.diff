@@ -1,0 +1,712 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index c6f35a07d81ea..13825eb7ba41e 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -546,6 +546,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpEndCriticalDirective)
+   NODE(parser, OmpEndLoopDirective)
+   NODE(parser, OmpEndSectionsDirective)
++  NODE(parser, OmpFailClause)
+   NODE(parser, OmpFromClause)
+   NODE(OmpFromClause, Modifier)
+   NODE(parser, OmpExpectation)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 8160b095f06dd..2b4cb21017fa0 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -269,6 +269,7 @@ struct OpenACCRoutineConstruct;
+ struct OpenMPConstruct;
+ struct OpenMPDeclarativeConstruct;
+ struct OmpEndLoopDirective;
++struct OmpMemoryOrderClause;
+ struct CUFKernelDoConstruct;
+ 
+ // Cooked character stream locations
+@@ -3914,6 +3915,14 @@ struct OmpDeviceTypeClause {
+   WRAPPER_CLASS_BOILERPLATE(OmpDeviceTypeClause, DeviceTypeDescription);
+ };
+ 
++// OMP 5.2 15.8.3 extended-atomic, fail-clause ->
++//    FAIL(memory-order)
++struct OmpFailClause {
++  WRAPPER_CLASS_BOILERPLATE(
++      OmpFailClause, common::Indirection<OmpMemoryOrderClause>);
++  CharBlock source;
++};
++
+ // Ref: [4.5:107-109], [5.0:176-180], [5.1:205-210], [5.2:167-168]
+ //
+ // from-clause ->
+@@ -4317,11 +4326,12 @@ struct OmpMemoryOrderClause {
+ };
+ 
+ // 2.17.7 Atomic construct
+-//        atomic-clause -> memory-order-clause | HINT(hint-expression)
++//        atomic-clause -> memory-order-clause | HINT(hint-expression) |
++//        FAIL(memory-order)
+ struct OmpAtomicClause {
+   UNION_CLASS_BOILERPLATE(OmpAtomicClause);
+   CharBlock source;
+-  std::variant<OmpMemoryOrderClause, OmpClause> u;
++  std::variant<OmpMemoryOrderClause, OmpFailClause, OmpClause> u;
+ };
+ 
+ // atomic-clause-list -> [atomic-clause, [atomic-clause], ...]
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 86d475c1a1542..f8fda92d5ac2b 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -739,6 +739,9 @@ TYPE_PARSER(sourced(construct<OpenMPCancellationPointConstruct>(
+ TYPE_PARSER(sourced(construct<OpenMPCancelConstruct>(verbatim("CANCEL"_tok),
+     Parser<OmpCancelType>{}, maybe("IF" >> parenthesized(scalarLogicalExpr)))))
+ 
++TYPE_PARSER(sourced(construct<OmpFailClause>(
++    parenthesized(indirect(Parser<OmpMemoryOrderClause>{})))))
++
+ // 2.17.7 Atomic construct/2.17.8 Flush construct [OpenMP 5.0]
+ //        memory-order-clause ->
+ //                               seq_cst
+@@ -767,6 +770,7 @@ TYPE_PARSER(construct<OmpAtomicDefaultMemOrderClause>(
+ //        atomic-clause -> memory-order-clause | HINT(hint-expression)
+ TYPE_PARSER(sourced(construct<OmpAtomicClause>(
+     construct<OmpAtomicClause>(Parser<OmpMemoryOrderClause>{}) ||
++    construct<OmpAtomicClause>("FAIL" >> Parser<OmpFailClause>{}) ||
+     construct<OmpAtomicClause>("HINT" >>
+         sourced(construct<OmpClause>(
+             construct<OmpClause::Hint>(parenthesized(constantExpr))))))))
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4782cc1f2d7d7..a10be3f1c797d 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2702,10 +2702,16 @@ class UnparseVisitor {
+     Put("\n");
+     EndOpenMP();
+   }
++  void Unparse(const OmpFailClause &x) {
++    Word("FAIL(");
++    Walk(x.v);
++    Put(")");
++  }
+   void Unparse(const OmpMemoryOrderClause &x) { Walk(x.v); }
+   void Unparse(const OmpAtomicClause &x) {
+     common::visit(common::visitors{
+                       [&](const OmpMemoryOrderClause &y) { Walk(y); },
++                      [&](const OmpFailClause &y) { Walk(y); },
+                       [&](const OmpClause &z) { Walk(z); },
+                   },
+         x.u);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 27e2b946732ab..f9397785c1b98 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2485,18 +2485,27 @@ void OmpStructureChecker::CheckAtomicCaptureConstruct(
+ void OmpStructureChecker::CheckAtomicMemoryOrderClause(
+     const parser::OmpAtomicClauseList *leftHandClauseList,
+     const parser::OmpAtomicClauseList *rightHandClauseList) {
+-  int numMemoryOrderClause = 0;
++  int numMemoryOrderClause{0};
++  int numFailClause{0};
+   auto checkForValidMemoryOrderClause =
+       [&](const parser::OmpAtomicClauseList *clauseList) {
+         for (const auto &clause : clauseList->v) {
+-          if (std::get_if<Fortran::parser::OmpMemoryOrderClause>(&clause.u)) {
+-            numMemoryOrderClause++;
+-            if (numMemoryOrderClause > 1) {
++          if (std::get_if<parser::OmpFailClause>(&clause.u)) {
++            numFailClause++;
++            if (numFailClause > 1) {
+               context_.Say(clause.source,
+-                  "More than one memory order clause not allowed on "
+-                  "OpenMP Atomic construct"_err_en_US);
++                  "More than one FAIL clause not allowed on OpenMP ATOMIC construct"_err_en_US);
+               return;
+             }
++          } else {
++            if (std::get_if<Fortran::parser::OmpMemoryOrderClause>(&clause.u)) {
++              numMemoryOrderClause++;
++              if (numMemoryOrderClause > 1) {
++                context_.Say(clause.source,
++                    "More than one memory order clause not allowed on OpenMP ATOMIC construct"_err_en_US);
++                return;
++              }
++            }
+           }
+         }
+       };
+@@ -2771,8 +2780,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause &x) {
+ 
+ // Following clauses do not have a separate node in parse-tree.h.
+ CHECK_SIMPLE_CLAUSE(Absent, OMPC_absent)
+-CHECK_SIMPLE_CLAUSE(AcqRel, OMPC_acq_rel)
+-CHECK_SIMPLE_CLAUSE(Acquire, OMPC_acquire)
+ CHECK_SIMPLE_CLAUSE(Affinity, OMPC_affinity)
+ CHECK_SIMPLE_CLAUSE(Capture, OMPC_capture)
+ CHECK_SIMPLE_CLAUSE(Contains, OMPC_contains)
+@@ -2808,9 +2815,6 @@ CHECK_SIMPLE_CLAUSE(Nogroup, OMPC_nogroup)
+ CHECK_SIMPLE_CLAUSE(Notinbranch, OMPC_notinbranch)
+ CHECK_SIMPLE_CLAUSE(Partial, OMPC_partial)
+ CHECK_SIMPLE_CLAUSE(ProcBind, OMPC_proc_bind)
+-CHECK_SIMPLE_CLAUSE(Release, OMPC_release)
+-CHECK_SIMPLE_CLAUSE(Relaxed, OMPC_relaxed)
+-CHECK_SIMPLE_CLAUSE(SeqCst, OMPC_seq_cst)
+ CHECK_SIMPLE_CLAUSE(Simd, OMPC_simd)
+ CHECK_SIMPLE_CLAUSE(Sizes, OMPC_sizes)
+ CHECK_SIMPLE_CLAUSE(Permutation, OMPC_permutation)
+@@ -2838,7 +2842,6 @@ CHECK_SIMPLE_CLAUSE(Compare, OMPC_compare)
+ CHECK_SIMPLE_CLAUSE(CancellationConstructType, OMPC_cancellation_construct_type)
+ CHECK_SIMPLE_CLAUSE(OmpxAttribute, OMPC_ompx_attribute)
+ CHECK_SIMPLE_CLAUSE(OmpxBare, OMPC_ompx_bare)
+-CHECK_SIMPLE_CLAUSE(Fail, OMPC_fail)
+ CHECK_SIMPLE_CLAUSE(Weak, OMPC_weak)
+ 
+ CHECK_REQ_SCALAR_INT_CLAUSE(NumTeams, OMPC_num_teams)
+@@ -2851,6 +2854,53 @@ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Collapse, OMPC_collapse)
+ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Safelen, OMPC_safelen)
+ CHECK_REQ_CONSTANT_SCALAR_INT_CLAUSE(Simdlen, OMPC_simdlen)
+ 
++void OmpStructureChecker::Enter(const parser::OmpClause::AcqRel &) {
++  if (!isFailClause)
++    CheckAllowedClause(llvm::omp::Clause::OMPC_acq_rel);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::Acquire &) {
++  if (!isFailClause)
++    CheckAllowedClause(llvm::omp::Clause::OMPC_acquire);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::Release &) {
++  if (!isFailClause)
++    CheckAllowedClause(llvm::omp::Clause::OMPC_release);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::Relaxed &) {
++  if (!isFailClause)
++    CheckAllowedClause(llvm::omp::Clause::OMPC_relaxed);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::SeqCst &) {
++  if (!isFailClause)
++    CheckAllowedClause(llvm::omp::Clause::OMPC_seq_cst);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::Fail &) {
++  assert(!isFailClause && "Unexpected FAIL clause inside a FAIL clause?");
++  isFailClause = true;
++  CheckAllowedClause(llvm::omp::Clause::OMPC_fail);
++}
++
++void OmpStructureChecker::Leave(const parser::OmpClause::Fail &) {
++  assert(isFailClause && "Expected to be inside a FAIL clause here");
++  isFailClause = false;
++}
++
++void OmpStructureChecker::Enter(const parser::OmpFailClause &) {
++  assert(!isFailClause && "Unexpected FAIL clause inside a FAIL clause?");
++  isFailClause = true;
++  CheckAllowedClause(llvm::omp::Clause::OMPC_fail);
++}
++
++void OmpStructureChecker::Leave(const parser::OmpFailClause &) {
++  assert(isFailClause && "Expected to be inside a FAIL clause here");
++  isFailClause = false;
++}
++
+ // Restrictions specific to each clause are implemented apart from the
+ // generalized restrictions.
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 1411a9271d466..b3ecd24484060 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -142,6 +142,10 @@ class OmpStructureChecker
+ #define GEN_FLANG_CLAUSE_CHECK_ENTER
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+ 
++  void Leave(const parser::OmpClause::Fail &);
++  void Enter(const parser::OmpFailClause &);
++  void Leave(const parser::OmpFailClause &);
++
+ private:
+   bool CheckAllowedClause(llvmOmpClause clause);
+   bool IsVariableListItem(const Symbol &sym);
+@@ -272,6 +276,7 @@ class OmpStructureChecker
+   using LoopConstruct = std::variant<const parser::DoConstruct *,
+       const parser::OpenMPLoopConstruct *>;
+   std::vector<LoopConstruct> loopStack_;
++  bool isFailClause{false};
+ };
+ 
+ /// Find a duplicate entry in the range, and return an iterator to it.
+diff --git a/flang/test/Lower/OpenMP/Todo/atomic-compare-fail.f90 b/flang/test/Lower/OpenMP/Todo/atomic-compare-fail.f90
+new file mode 100644
+index 0000000000000..b82bd13622764
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/atomic-compare-fail.f90
+@@ -0,0 +1,11 @@
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -fopenmp-version=51 -o - %s 2>&1 | FileCheck %s
++
++! CHECK: not yet implemented: OpenMP atomic compare
++program p
++  integer :: x
++  logical :: r
++  !$omp atomic compare fail(relaxed)
++  if (x .eq. 0) then
++     x = 2
++  end if
++end program p
+diff --git a/flang/test/Parser/OpenMP/atomic-unparse.f90 b/flang/test/Parser/OpenMP/atomic-unparse.f90
+index 64fa79fb1d1a2..16dc7a1a92bf9 100644
+--- a/flang/test/Parser/OpenMP/atomic-unparse.f90
++++ b/flang/test/Parser/OpenMP/atomic-unparse.f90
+@@ -165,6 +165,20 @@ program main
+       i = j
+    end if
+ 
++
++!$omp atomic compare fail(relaxed)
++   if (i .eq. k) then
++      i = j
++   end if
++!$omp atomic fail(relaxed) compare
++   if (i .eq. k) then
++      i = j
++   end if
++!$omp atomic fail(relaxed) compare acquire
++   if (i .eq. k) then
++      i = j
++   end if
++   
+ !ATOMIC
+ !$omp atomic
+    i = j
+@@ -262,6 +276,9 @@ end program main
+ !CHECK: !$OMP ATOMIC COMPARE ACQUIRE
+ !CHECK: !$OMP ATOMIC RELAXED COMPARE
+ !CHECK: !$OMP ATOMIC COMPARE RELAXED
++!CHECK: !$OMP ATOMIC COMPARE FAIL(RELAXED)
++!CHECK: !$OMP ATOMIC FAIL(RELAXED) COMPARE
++!CHECK: !$OMP ATOMIC FAIL(RELAXED) COMPARE ACQUIRE
+ 
+ !ATOMIC
+ !CHECK: !$OMP ATOMIC
+@@ -270,3 +287,5 @@ end program main
+ !CHECK: !$OMP ATOMIC ACQ_REL
+ !CHECK: !$OMP ATOMIC ACQUIRE
+ !CHECK: !$OMP ATOMIC RELAXED
++
++
+diff --git a/flang/test/Semantics/OpenMP/atomic-compare.f90 b/flang/test/Semantics/OpenMP/atomic-compare.f90
+index 85644ad909107..54492bf6a22a6 100644
+--- a/flang/test/Semantics/OpenMP/atomic-compare.f90
++++ b/flang/test/Semantics/OpenMP/atomic-compare.f90
+@@ -35,45 +35,58 @@
+   if (b .eq. a) b = c
+   !$omp end atomic
+ 
++  !$omp atomic hint(1) acq_rel compare fail(release)
++  if (c .eq. a) a = b
++  !$omp end atomic
++
++  !$omp atomic compare fail(release)
++  if (c .eq. a) a = b
++  !$omp end atomic
++
+   ! Check for error conditions:
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
+   !$omp atomic seq_cst seq_cst compare
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
+   !$omp atomic compare seq_cst seq_cst
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
+   !$omp atomic seq_cst compare seq_cst
+   if (b .eq. c) b = a
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
+   !$omp atomic acquire acquire compare
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
+   !$omp atomic compare acquire acquire
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
+   !$omp atomic acquire compare acquire
+   if (b .eq. c) b = a
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the COMPARE directive
+   !$omp atomic relaxed relaxed compare
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the COMPARE directive
+   !$omp atomic compare relaxed relaxed
+   if (b .eq. c) b = a
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the COMPARE directive
+   !$omp atomic relaxed compare relaxed
+   if (b .eq. c) b = a
+ 
++  !ERROR: More than one FAIL clause not allowed on OpenMP ATOMIC construct
++  !$omp atomic fail(release) compare fail(release)
++  if (c .eq. a) a = b
++  !$omp end atomic
++
+   !$omp end parallel
+ end
+diff --git a/flang/test/Semantics/OpenMP/atomic01.f90 b/flang/test/Semantics/OpenMP/atomic01.f90
+index 538db316f6e7f..173effe86b69c 100644
+--- a/flang/test/Semantics/OpenMP/atomic01.f90
++++ b/flang/test/Semantics/OpenMP/atomic01.f90
+@@ -14,193 +14,193 @@
+ ! At most one memory-order-clause may appear on the construct.
+ 
+ !READ
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the READ directive
+   !$omp atomic seq_cst seq_cst read
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the READ directive
+   !$omp atomic read seq_cst seq_cst
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the READ directive
+   !$omp atomic seq_cst read seq_cst
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the READ directive
+   !$omp atomic acquire acquire read
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the READ directive
+   !$omp atomic read acquire acquire
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the READ directive
+   !$omp atomic acquire read acquire
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the READ directive
+   !$omp atomic relaxed relaxed read
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the READ directive
+   !$omp atomic read relaxed relaxed
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the READ directive
+   !$omp atomic relaxed read relaxed
+     i = j
+ 
+ !UPDATE
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the UPDATE directive
+   !$omp atomic seq_cst seq_cst update
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the UPDATE directive
+   !$omp atomic update seq_cst seq_cst
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the UPDATE directive
+   !$omp atomic seq_cst update seq_cst
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the UPDATE directive
+   !$omp atomic release release update
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the UPDATE directive
+   !$omp atomic update release release
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the UPDATE directive
+   !$omp atomic release update release
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the UPDATE directive
+   !$omp atomic relaxed relaxed update
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the UPDATE directive
+   !$omp atomic update relaxed relaxed
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the UPDATE directive
+   !$omp atomic relaxed update relaxed
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+ 
+ !CAPTURE
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the CAPTURE directive
+   !$omp atomic seq_cst seq_cst capture
+     i = j
+     j = k
+   !$omp end atomic
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the CAPTURE directive
+   !$omp atomic capture seq_cst seq_cst
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the CAPTURE directive
+   !$omp atomic seq_cst capture seq_cst
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the CAPTURE directive
+   !$omp atomic release release capture
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the CAPTURE directive
+   !$omp atomic capture release release
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the CAPTURE directive
+   !$omp atomic release capture release
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the CAPTURE directive
+   !$omp atomic relaxed relaxed capture
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the CAPTURE directive
+   !$omp atomic capture relaxed relaxed
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the CAPTURE directive
+   !$omp atomic relaxed capture relaxed
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQ_REL clause can appear on the CAPTURE directive
+   !$omp atomic acq_rel acq_rel capture
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQ_REL clause can appear on the CAPTURE directive
+   !$omp atomic capture acq_rel acq_rel
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQ_REL clause can appear on the CAPTURE directive
+   !$omp atomic acq_rel capture acq_rel
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the CAPTURE directive
+   !$omp atomic acquire acquire capture
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the CAPTURE directive
+   !$omp atomic capture acquire acquire
+     i = j
+     j = k
+   !$omp end atomic
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one ACQUIRE clause can appear on the CAPTURE directive
+   !$omp atomic acquire capture acquire
+     i = j
+@@ -208,57 +208,57 @@
+   !$omp end atomic
+ 
+ !WRITE
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the WRITE directive
+   !$omp atomic seq_cst seq_cst write
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the WRITE directive
+   !$omp atomic write seq_cst seq_cst
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the WRITE directive
+   !$omp atomic seq_cst write seq_cst
+     i = j
+ 
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the WRITE directive
+   !$omp atomic release release write
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the WRITE directive
+   !$omp atomic write release release
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the WRITE directive
+   !$omp atomic release write release
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the WRITE directive
+   !$omp atomic relaxed relaxed write
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the WRITE directive
+   !$omp atomic write relaxed relaxed
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the WRITE directive
+   !$omp atomic relaxed write relaxed
+     i = j
+ 
+ !No atomic-clause
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELAXED clause can appear on the ATOMIC directive
+   !$omp atomic relaxed relaxed
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one SEQ_CST clause can appear on the ATOMIC directive
+   !$omp atomic seq_cst seq_cst
+   !ERROR: Invalid or missing operator in atomic update statement
+     i = j
+-  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+   !ERROR: At most one RELEASE clause can appear on the ATOMIC directive
+   !$omp atomic release release
+   !ERROR: Invalid or missing operator in atomic update statement
+diff --git a/flang/test/Semantics/OpenMP/atomic05.f90 b/flang/test/Semantics/OpenMP/atomic05.f90
+index f37aabcfce06e..266268a212440 100644
+--- a/flang/test/Semantics/OpenMP/atomic05.f90
++++ b/flang/test/Semantics/OpenMP/atomic05.f90
+@@ -8,20 +8,20 @@ program OmpAtomic
+     use omp_lib
+     integer :: g, x
+ 
+-    !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++    !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+     !$omp atomic relaxed, seq_cst
+         x = x + 1
+-    !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++    !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+     !$omp atomic read seq_cst, relaxed
+         x = g
+-    !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++    !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+     !$omp atomic write relaxed, release
+         x = 2 * 4
+-    !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++    !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+     !$omp atomic update release, seq_cst
+     !ERROR: Invalid or missing operator in atomic update statement
+         x = 10
+-    !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++    !ERROR: More than one memory order clause not allowed on OpenMP ATOMIC construct
+     !$omp atomic capture release, seq_cst
+         x = g
+         g = x * 10
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index bd7fb2361aaeb..772f60343c634 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -177,6 +177,7 @@ def OMPC_Exclusive : Clause<"exclusive"> {
+ }
+ def OMPC_Fail : Clause<"fail"> {
+   let clangClass = "OMPFailClause";
++  let flangClass = "OmpFailClause";
+ }
+ def OMPC_Filter : Clause<"filter"> {
+   let clangClass = "OMPFilterClause";

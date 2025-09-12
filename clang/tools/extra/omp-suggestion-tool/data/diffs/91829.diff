@@ -1,0 +1,921 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 7d75e6f67dc1b..23f27496091a5 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -776,6 +776,33 @@ static void genBodyOfTargetDataOp(
+   }
+ }
+ 
++// This generates intermediate common block member accesses within a region
++// and then rebinds the members symbol to the intermediate accessors we have
++// generated so that subsequent code generation will utilise these instead.
++//
++// When the scope changes, the bindings to the intermediate accessors should
++// be dropped in place of the original symbol bindings.
++//
++// This is for utilisation with TargetOp.
++static void genIntermediateCommonBlockAccessors(
++    Fortran::lower::AbstractConverter &converter,
++    const mlir::Location &currentLocation, mlir::Region &region,
++    llvm::ArrayRef<const Fortran::semantics::Symbol *> mapSyms) {
++  for (auto [argIndex, argSymbol] : llvm::enumerate(mapSyms)) {
++    if (auto *details =
++            argSymbol->detailsIf<Fortran::semantics::CommonBlockDetails>()) {
++      for (auto obj : details->objects()) {
++        auto targetCBMemberBind = Fortran::lower::genCommonBlockMember(
++            converter, currentLocation, *obj, region.getArgument(argIndex));
++        fir::ExtendedValue sexv = converter.getSymbolExtendedValue(*obj);
++        fir::ExtendedValue targetCBExv =
++            getExtendedValue(sexv, targetCBMemberBind);
++        converter.bindSymbol(*obj, targetCBExv);
++      }
++    }
++  }
++}
++
+ // This functions creates a block for the body of the targetOp's region. It adds
+ // all the symbols present in mapSymbols as block arguments to this block.
+ static void
+@@ -955,6 +982,16 @@ genBodyOfTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   // Create the insertion point after the marker.
+   firOpBuilder.setInsertionPointAfter(undefMarker.getDefiningOp());
+ 
++  // If we map a common block using it's symbol e.g. map(tofrom: /common_block/)
++  // and accessing it's members within the target region, there is a large
++  // chance we will end up with uses external to the region accessing the common
++  // resolve these, we do so by generating new common block member accesses
++  // within the region, binding them to the member symbol for the scope of the
++  // region so that subsequent code generation within the region will utilise
++  // our new member accesses we have created.
++  genIntermediateCommonBlockAccessors(converter, currentLocation, region,
++                                      mapSyms);
++
+   if (ConstructQueue::iterator next = std::next(item); next != queue.end()) {
+     genOMPDispatch(converter, symTable, semaCtx, eval, currentLocation, queue,
+                    next);
+@@ -1670,6 +1707,13 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+     if (dsp.getAllSymbolsToPrivatize().contains(&sym))
+       return;
+ 
++    // if the symbol is part of an already mapped common block, do not make a
++    // map for it.
++    if (const Fortran::semantics::Symbol *common =
++            Fortran::semantics::FindCommonBlockContaining(sym.GetUltimate()))
++      if (llvm::find(mapSyms, common) != mapSyms.end())
++        return;
++
+     if (llvm::find(mapSyms, &sym) == mapSyms.end()) {
+       mlir::Value baseOp = converter.getSymbolAddress(sym);
+       if (!baseOp)
+diff --git a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+index 396fbaeacf39f..8b62787bb3094 100644
+--- a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
++++ b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+@@ -1006,3 +1006,77 @@ func.func @omp_map_info_nested_derived_type_explicit_member_conversion(%arg0 : !
+ }
+ 
+ // -----
++
++// CHECK-LABEL:  llvm.func @omp_map_common_block_using_common_block_symbol
++
++// CHECK: %[[ADDR_OF:.*]] = llvm.mlir.addressof @var_common_ : !llvm.ptr
++// CHECK: %[[CB_MAP:.*]] = omp.map.info var_ptr(%[[ADDR_OF]] : !llvm.ptr, !llvm.array<8 x i8>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var_common"}
++// CHECK:    omp.target map_entries(%[[CB_MAP]] -> %[[ARG0:.*]] : !llvm.ptr) {
++// CHECK:    ^bb0(%[[ARG0]]: !llvm.ptr):
++// CHECK:      %[[VAR_2_OFFSET:.*]] = llvm.mlir.constant(4 : index) : i64
++// CHECK:      %[[VAR_1_OFFSET:.*]] = llvm.mlir.constant(0 : index) : i64
++// CHECK:      %{{.*}} = llvm.getelementptr %[[ARG0]][%[[VAR_1_OFFSET]]] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++// CHECK:      %{{.*}} = llvm.getelementptr %[[ARG0]][%[[VAR_2_OFFSET]]] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++
++func.func @omp_map_common_block_using_common_block_symbol() {
++  %0 = fir.address_of(@var_common_) : !fir.ref<!fir.array<8xi8>>
++  %1 = omp.map.info var_ptr(%0 : !fir.ref<!fir.array<8xi8>>, !fir.array<8xi8>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.array<8xi8>> {name = "var_common"}
++  omp.target map_entries(%1 -> %arg0 : !fir.ref<!fir.array<8xi8>>) {
++  ^bb0(%arg0: !fir.ref<!fir.array<8xi8>>):
++    %c4 = arith.constant 4 : index
++    %c0 = arith.constant 0 : index
++    %c20_i32 = arith.constant 20 : i32
++    %2 = fir.convert %arg0 : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++    %3 = fir.coordinate_of %2, %c0 : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++    %4 = fir.convert %3 : (!fir.ref<i8>) -> !fir.ref<i32>
++    %5 = fir.convert %arg0 : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++    %6 = fir.coordinate_of %5, %c4 : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++    %7 = fir.convert %6 : (!fir.ref<i8>) -> !fir.ref<i32>
++    %8 = fir.load %4 : !fir.ref<i32>
++    %9 = arith.addi %8, %c20_i32 : i32
++    fir.store %9 to %7 : !fir.ref<i32>
++    omp.terminator
++  }
++  return
++}
++
++fir.global common @var_common_(dense<0> : vector<8xi8>) {alignment = 4 : i64} : !fir.array<8xi8>
++
++// -----
++
++// CHECK-LABEL:  llvm.func @omp_map_common_block_using_common_block_members
++
++// CHECK:    %[[VAR_2_OFFSET:.*]] = llvm.mlir.constant(4 : index) : i64
++// CHECK:    %[[VAR_1_OFFSET:.*]] = llvm.mlir.constant(0 : index) : i64
++// CHECK:    %[[ADDR_OF:.*]] = llvm.mlir.addressof @var_common_ : !llvm.ptr
++// CHECK:    %[[VAR_1_CB_GEP:.*]] = llvm.getelementptr %[[ADDR_OF]][%[[VAR_1_OFFSET]]] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++// CHECK:    %[[VAR_2_CB_GEP:.*]] = llvm.getelementptr %[[ADDR_OF]][%[[VAR_2_OFFSET]]] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++// CHECK:    %[[MAP_CB_VAR_1:.*]] = omp.map.info var_ptr(%[[VAR_1_CB_GEP]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var1"}
++// CHECK:    %[[MAP_CB_VAR_2:.*]] = omp.map.info var_ptr(%[[VAR_2_CB_GEP]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var2"}
++// CHECK:    omp.target map_entries(%[[MAP_CB_VAR_1]] -> %[[ARG0:.*]], %[[MAP_CB_VAR_2]] -> %[[ARG1:.*]] : !llvm.ptr, !llvm.ptr) {
++// CHECK:     ^bb0(%[[ARG0]]: !llvm.ptr, %[[ARG1]]: !llvm.ptr):
++
++func.func @omp_map_common_block_using_common_block_members() {
++  %c4 = arith.constant 4 : index
++  %c0 = arith.constant 0 : index
++  %0 = fir.address_of(@var_common_) : !fir.ref<!fir.array<8xi8>>
++  %1 = fir.convert %0 : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++  %2 = fir.coordinate_of %1, %c0 : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++  %3 = fir.convert %2 : (!fir.ref<i8>) -> !fir.ref<i32>
++  %4 = fir.convert %0 : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++  %5 = fir.coordinate_of %4, %c4 : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++  %6 = fir.convert %5 : (!fir.ref<i8>) -> !fir.ref<i32>
++  %7 = omp.map.info var_ptr(%3 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "var1"}
++  %8 = omp.map.info var_ptr(%6 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "var2"}
++  omp.target map_entries(%7 -> %arg0, %8 -> %arg1 : !fir.ref<i32>, !fir.ref<i32>) {
++  ^bb0(%arg0: !fir.ref<i32>, %arg1: !fir.ref<i32>):
++    %c10_i32 = arith.constant 10 : i32
++    %9 = fir.load %arg0 : !fir.ref<i32>
++    %10 = arith.muli %9, %c10_i32 : i32
++    fir.store %10 to %arg1 : !fir.ref<i32>
++    omp.terminator
++  }
++  return
++}
++
++fir.global common @var_common_(dense<0> : vector<8xi8>) {alignment = 4 : i64} : !fir.array<8xi8>
+diff --git a/flang/test/Integration/OpenMP/map-types-and-sizes.f90 b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+index f3a20690f05a9..591be0b680a51 100644
+--- a/flang/test/Integration/OpenMP/map-types-and-sizes.f90
++++ b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+@@ -231,6 +231,31 @@ subroutine mapType_char
+   !$omp end target
+ end subroutine mapType_char
+ 
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 8]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_common_block
++  implicit none
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: /var_common/)
++  var1 = var1 + 20
++  var2 = var2 + 30
++!$omp end target
++end subroutine mapType_common_block
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [2 x i64] [i64 4, i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [2 x i64] [i64 35, i64 35]
++subroutine mapType_common_block_members
++  implicit none
++  common /var_common/ var1, var2
++  integer :: var1, var2
++
++!$omp target map(tofrom: var1, var2)
++  var2 = var1
++!$omp end target
++end subroutine mapType_common_block_members
++
++
+ !CHECK-LABEL: define {{.*}} @{{.*}}maptype_ptr_explicit_{{.*}}
+ !CHECK: %[[ALLOCA:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1, align 8
+ !CHECK: %[[ALLOCA_GEP:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8 }, ptr %[[ALLOCA]], i32 1
+@@ -346,3 +371,19 @@ end subroutine mapType_char
+ !CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
+ !CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
+ !CHECK: store ptr %[[ARR_OFF]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_common_block_{{.*}}
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr @var_common_, ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr @var_common_, ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_common_block_members_{{.*}}
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr @var_common_, ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr @var_common_, ptr %[[OFFLOAD_PTR_ARR]], align 8
++!CHECK: %[[BASE_PTR_ARR_1:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++!CHECK: store ptr getelementptr (i8, ptr @var_common_, i64 4), ptr %[[BASE_PTR_ARR_1]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR_1:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++!CHECK: store ptr getelementptr (i8, ptr @var_common_, i64 4), ptr %[[OFFLOAD_PTR_ARR_1]], align 8
+diff --git a/flang/test/Lower/OpenMP/common-block-map.f90 b/flang/test/Lower/OpenMP/common-block-map.f90
+new file mode 100644
+index 0000000000000..5033129683a8e
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/common-block-map.f90
+@@ -0,0 +1,83 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++!CHECK: fir.global common @var_common_(dense<0> : vector<8xi8>) {{.*}} : !fir.array<8xi8>
++!CHECK: fir.global common @var_common_link_(dense<0> : vector<8xi8>) {{{.*}} omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (link)>} : !fir.array<8xi8>
++
++!CHECK-LABEL: func.func @_QPmap_full_block
++!CHECK: %[[CB_ADDR:.*]] = fir.address_of(@var_common_) : !fir.ref<!fir.array<8xi8>>
++!CHECK: %[[MAP:.*]] = omp.map.info var_ptr(%[[CB_ADDR]] : !fir.ref<!fir.array<8xi8>>, !fir.array<8xi8>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.array<8xi8>> {name = "var_common"}
++!CHECK: omp.target map_entries(%[[MAP]] -> %[[MAP_ARG:.*]] : !fir.ref<!fir.array<8xi8>>) {
++!CHECK:  ^bb0(%[[MAP_ARG]]: !fir.ref<!fir.array<8xi8>>):
++!CHECK:    %[[CONV:.*]] = fir.convert %[[MAP_ARG]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK:    %[[INDEX:.*]] = arith.constant 0 : index
++!CHECK:    %[[COORD:.*]] = fir.coordinate_of %[[CONV]], %[[INDEX]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK:    %[[CONV2:.*]] = fir.convert %[[COORD]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK:    %[[CB_MEMBER_1:.*]]:2 = hlfir.declare %[[CONV2]] {uniq_name = "_QFmap_full_blockEvar1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:    %[[CONV3:.*]] = fir.convert %[[MAP_ARG]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK:    %[[INDEX2:.*]] = arith.constant 4 : index
++!CHECK:    %[[COORD2:.*]] = fir.coordinate_of %[[CONV3]], %[[INDEX2]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK:    %[[CONV4:.*]] = fir.convert %[[COORD2]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK:    %[[CB_MEMBER_2:.*]]:2 = hlfir.declare %[[CONV4]] {uniq_name = "_QFmap_full_blockEvar2"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++subroutine map_full_block
++    implicit none
++    common /var_common/ var1, var2
++    integer :: var1, var2
++!$omp target map(tofrom: /var_common/)
++    var1 = var1 + 20
++    var2 = var2 + 30
++!$omp end target
++end
++
++!CHECK-LABEL: @_QPmap_mix_of_members
++!CHECK: %[[COMMON_BLOCK:.*]] = fir.address_of(@var_common_) : !fir.ref<!fir.array<8xi8>>
++!CHECK: %[[CB_CONV:.*]] = fir.convert %[[COMMON_BLOCK]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK: %[[INDEX:.*]] = arith.constant 0 : index
++!CHECK: %[[COORD:.*]] = fir.coordinate_of %[[CB_CONV]], %[[INDEX]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK: %[[CONV:.*]] = fir.convert %[[COORD]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK: %[[CB_MEMBER_1:.*]]:2 = hlfir.declare %[[CONV]] {uniq_name = "_QFmap_mix_of_membersEvar1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[CB_CONV:.*]] = fir.convert %[[COMMON_BLOCK]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK: %[[INDEX:.*]] = arith.constant 4 : index
++!CHECK: %[[COORD:.*]] = fir.coordinate_of %[[CB_CONV]], %[[INDEX]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK: %[[CONV:.*]] = fir.convert %[[COORD]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK: %[[CB_MEMBER_2:.*]]:2 = hlfir.declare %[[CONV]] {uniq_name = "_QFmap_mix_of_membersEvar2"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[MAP_EXP:.*]] = omp.map.info var_ptr(%[[CB_MEMBER_2]]#0 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "var2"}
++!CHECK: %[[MAP_IMP:.*]] = omp.map.info var_ptr(%[[CB_MEMBER_1]]#1 : !fir.ref<i32>, i32) map_clauses(implicit, exit_release_or_enter_alloc) capture(ByCopy) -> !fir.ref<i32> {name = "var1"}
++!CHECK: omp.target map_entries(%[[MAP_EXP]] -> %[[ARG_EXP:.*]], %[[MAP_IMP]] -> %[[ARG_IMP:.*]] : !fir.ref<i32>, !fir.ref<i32>) {
++!CHECK: ^bb0(%[[ARG_EXP]]: !fir.ref<i32>, %[[ARG_IMP]]: !fir.ref<i32>):
++!CHECK:  %[[EXP_MEMBER:.*]]:2 = hlfir.declare %[[ARG_EXP]] {uniq_name = "_QFmap_mix_of_membersEvar2"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:  %[[IMP_MEMBER:.*]]:2 = hlfir.declare %[[ARG_IMP]] {uniq_name = "_QFmap_mix_of_membersEvar1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++subroutine map_mix_of_members
++    implicit none
++    common /var_common/ var1, var2
++    integer :: var1, var2
++
++!$omp target map(tofrom: var2)
++  var2 = var1
++!$omp end target
++end
++
++!CHECK-LABEL: @_QQmain
++!CHECK: %[[DECL_TAR_CB:.*]] = fir.address_of(@var_common_link_) : !fir.ref<!fir.array<8xi8>>
++!CHECK: %[[MAP_DECL_TAR_CB:.*]] = omp.map.info var_ptr(%[[DECL_TAR_CB]] : !fir.ref<!fir.array<8xi8>>, !fir.array<8xi8>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.array<8xi8>> {name = "var_common_link"}
++!CHECK: omp.target map_entries(%[[MAP_DECL_TAR_CB]] -> %[[MAP_DECL_TAR_ARG:.*]] : !fir.ref<!fir.array<8xi8>>) {
++!CHECK: ^bb0(%[[MAP_DECL_TAR_ARG]]: !fir.ref<!fir.array<8xi8>>):
++!CHECK:  %[[CONV:.*]] = fir.convert %[[MAP_DECL_TAR_ARG]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK:  %[[INDEX:.*]] = arith.constant 0 : index
++!CHECK:  %[[COORD:.*]] = fir.coordinate_of %[[CONV]], %[[INDEX]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK:  %[[CONV:.*]] = fir.convert %[[COORD]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK:  %[[MEMBER_ONE:.*]]:2 = hlfir.declare %[[CONV]] {uniq_name = "_QFElink1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:  %[[CONV:.*]] = fir.convert %[[MAP_DECL_TAR_ARG]] : (!fir.ref<!fir.array<8xi8>>) -> !fir.ref<!fir.array<?xi8>>
++!CHECK:  %[[INDEX:.*]] = arith.constant 4 : index
++!CHECK:  %[[COORD:.*]] = fir.coordinate_of %[[CONV]], %[[INDEX]] : (!fir.ref<!fir.array<?xi8>>, index) -> !fir.ref<i8>
++!CHECK:  %[[CONV:.*]] = fir.convert %[[COORD]] : (!fir.ref<i8>) -> !fir.ref<i32>
++!CHECK:  %[[MEMBER_TWO:.*]]:2 = hlfir.declare %[[CONV]] {uniq_name = "_QFElink2"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++program main
++    implicit none
++    common /var_common_link/ link1, link2
++    integer :: link1, link2
++    !$omp declare target link(/var_common_link/)
++
++!$omp target map(tofrom: /var_common_link/)
++    link1 = link2 + 20
++!$omp end target
++end program
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index dbf7154229d38..65231f50566c3 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -5164,15 +5164,7 @@ static Function *createOutlinedFunction(
+           ? make_range(Func->arg_begin() + 1, Func->arg_end())
+           : Func->args();
+ 
+-  // Rewrite uses of input valus to parameters.
+-  for (auto InArg : zip(Inputs, ArgRange)) {
+-    Value *Input = std::get<0>(InArg);
+-    Argument &Arg = std::get<1>(InArg);
+-    Value *InputCopy = nullptr;
+-
+-    Builder.restoreIP(
+-        ArgAccessorFuncCB(Arg, Input, InputCopy, AllocaIP, Builder.saveIP()));
+-
++  auto ReplaceValue = [](Value *Input, Value *InputCopy, Function *Func) {
+     // Things like GEP's can come in the form of Constants. Constants and
+     // ConstantExpr's do not have access to the knowledge of what they're
+     // contained in, so we must dig a little to find an instruction so we
+@@ -5198,8 +5190,49 @@ static Function *createOutlinedFunction(
+       if (auto *Instr = dyn_cast<Instruction>(User))
+         if (Instr->getFunction() == Func)
+           Instr->replaceUsesOfWith(Input, InputCopy);
++  };
++
++  SmallVector<std::pair<Value *, Value *>> DeferredReplacement;
++
++  // Rewrite uses of input valus to parameters.
++  for (auto InArg : zip(Inputs, ArgRange)) {
++    Value *Input = std::get<0>(InArg);
++    Argument &Arg = std::get<1>(InArg);
++    Value *InputCopy = nullptr;
++
++    Builder.restoreIP(
++        ArgAccessorFuncCB(Arg, Input, InputCopy, AllocaIP, Builder.saveIP()));
++
++    // In certain cases a Global may be set up for replacement, however, this
++    // Global may be used in multiple arguments to the kernel, just segmented
++    // apart, for example, if we have a global array, that is sectioned into
++    // multiple mappings (technically not legal in OpenMP, but there is a case
++    // in Fortran for Common Blocks where this is neccesary), we will end up
++    // with GEP's into this array inside the kernel, that refer to the Global
++    // but are technically seperate arguments to the kernel for all intents and
++    // purposes. If we have mapped a segment that requires a GEP into the 0-th
++    // index, it will fold into an referal to the Global, if we then encounter
++    // this folded GEP during replacement all of the references to the
++    // Global in the kernel will be replaced with the argument we have generated
++    // that corresponds to it, including any other GEP's that refer to the
++    // Global that may be other arguments. This will invalidate all of the other
++    // preceding mapped arguments that refer to the same global that may be
++    // seperate segments. To prevent this, we defer global processing until all
++    // other processing has been performed.
++    if (llvm::isa<llvm::GlobalValue>(std::get<0>(InArg)) ||
++        llvm::isa<llvm::GlobalObject>(std::get<0>(InArg)) ||
++        llvm::isa<llvm::GlobalVariable>(std::get<0>(InArg))) {
++      DeferredReplacement.push_back(std::make_pair(Input, InputCopy));
++      continue;
++    }
++
++    ReplaceValue(Input, InputCopy, Func);
+   }
+ 
++  // Replace all of our deferred Input values, currently just Globals.
++  for (auto Deferred : DeferredReplacement)
++    ReplaceValue(std::get<0>(Deferred), std::get<1>(Deferred), Func);
++
+   // Restore insert point.
+   Builder.restoreIP(OldInsertPoint);
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 35d992e574535..8832828a49e57 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -30,6 +30,7 @@
+ #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
+ #include "llvm/IR/DebugInfoMetadata.h"
+ #include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/ReplaceConstant.h"
+ #include "llvm/Support/FileSystem.h"
+ #include "llvm/TargetParser/Triple.h"
+ #include "llvm/Transforms/Utils/ModuleUtils.h"
+@@ -1976,12 +1977,6 @@ llvm::Value *getSizeInBytes(DataLayout &dl, const mlir::Type &type,
+                             Operation *clauseOp, llvm::Value *basePointer,
+                             llvm::Type *baseType, llvm::IRBuilderBase &builder,
+                             LLVM::ModuleTranslation &moduleTranslation) {
+-  // utilising getTypeSizeInBits instead of getTypeSize as getTypeSize gives
+-  // the size in inconsistent byte or bit format.
+-  uint64_t underlyingTypeSzInBits = dl.getTypeSizeInBits(type);
+-  if (auto arrTy = llvm::dyn_cast_if_present<LLVM::LLVMArrayType>(type))
+-    underlyingTypeSzInBits = getArrayElementSizeInBits(arrTy, dl);
+-
+   if (auto memberClause =
+           mlir::dyn_cast_if_present<mlir::omp::MapInfoOp>(clauseOp)) {
+     // This calculates the size to transfer based on bounds and the underlying
+@@ -2007,6 +2002,12 @@ llvm::Value *getSizeInBytes(DataLayout &dl, const mlir::Type &type,
+         }
+       }
+ 
++      // utilising getTypeSizeInBits instead of getTypeSize as getTypeSize gives
++      // the size in inconsistent byte or bit format.
++      uint64_t underlyingTypeSzInBits = dl.getTypeSizeInBits(type);
++      if (auto arrTy = llvm::dyn_cast_if_present<LLVM::LLVMArrayType>(type))
++        underlyingTypeSzInBits = getArrayElementSizeInBits(arrTy, dl);
++
+       // The size in bytes x number of elements, the sizeInBytes stored is
+       // the underyling types size, e.g. if ptr<i32>, it'll be the i32's
+       // size, so we do some on the fly runtime math to get the size in
+@@ -2017,7 +2018,7 @@ llvm::Value *getSizeInBytes(DataLayout &dl, const mlir::Type &type,
+     }
+   }
+ 
+-  return builder.getInt64(underlyingTypeSzInBits / 8);
++  return builder.getInt64(dl.getTypeSizeInBits(type) / 8);
+ }
+ 
+ void collectMapDataFromMapOperands(MapInfoData &mapData,
+@@ -2898,7 +2899,7 @@ static bool targetOpSupported(Operation &opInst) {
+ static void
+ handleDeclareTargetMapVar(MapInfoData &mapData,
+                           LLVM::ModuleTranslation &moduleTranslation,
+-                          llvm::IRBuilderBase &builder) {
++                          llvm::IRBuilderBase &builder, llvm::Function *func) {
+   for (size_t i = 0; i < mapData.MapClause.size(); ++i) {
+     // In the case of declare target mapped variables, the basePointer is
+     // the reference pointer generated by the convertDeclareTargetAttr
+@@ -2913,19 +2914,31 @@ handleDeclareTargetMapVar(MapInfoData &mapData,
+     // reference pointer and the pointer are assigned in the kernel argument
+     // structure for the host.
+     if (mapData.IsDeclareTarget[i]) {
++      // If the original map value is a constant, then we have to make sure all
++      // of it's uses within the current kernel/function that we are going to
++      // rewrite are converted to instructions, as we will be altering the old
++      // use (OriginalValue) from a constant to an instruction, which will be
++      // illegal and ICE the compiler if the user is a constant expression of
++      // some kind e.g. a constant GEP.
++      if (auto *constant = dyn_cast<llvm::Constant>(mapData.OriginalValue[i]))
++        convertUsersOfConstantsToInstructions(constant, func, false);
++
+       // The users iterator will get invalidated if we modify an element,
+-      // so we populate this vector of uses to alter each user on an individual
+-      // basis to emit its own load (rather than one load for all).
++      // so we populate this vector of uses to alter each user on an
++      // individual basis to emit its own load (rather than one load for
++      // all).
+       llvm::SmallVector<llvm::User *> userVec;
+       for (llvm::User *user : mapData.OriginalValue[i]->users())
+         userVec.push_back(user);
+ 
+       for (llvm::User *user : userVec) {
+         if (auto *insn = dyn_cast<llvm::Instruction>(user)) {
+-          auto *load = builder.CreateLoad(mapData.BasePointers[i]->getType(),
+-                                          mapData.BasePointers[i]);
+-          load->moveBefore(insn);
+-          user->replaceUsesOfWith(mapData.OriginalValue[i], load);
++          if (insn->getFunction() == func) {
++            auto *load = builder.CreateLoad(mapData.BasePointers[i]->getType(),
++                                            mapData.BasePointers[i]);
++            load->moveBefore(insn);
++            user->replaceUsesOfWith(mapData.OriginalValue[i], load);
++          }
+         }
+       }
+     }
+@@ -3043,6 +3056,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   auto &targetRegion = targetOp.getRegion();
+   DataLayout dl = DataLayout(opInst.getParentOfType<ModuleOp>());
+   SmallVector<Value> mapOperands = targetOp.getMapOperands();
++  llvm::Function *llvmOutlinedFn = nullptr;
+ 
+   LogicalResult bodyGenStatus = success();
+   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+@@ -3052,7 +3066,7 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+     // original function to the new outlined function.
+     llvm::Function *llvmParentFn =
+         moduleTranslation.lookupFunction(parentFn.getName());
+-    llvm::Function *llvmOutlinedFn = codeGenIP.getBlock()->getParent();
++    llvmOutlinedFn = codeGenIP.getBlock()->getParent();
+     assert(llvmParentFn && llvmOutlinedFn &&
+            "Both parent and outlined functions must exist at this point");
+ 
+@@ -3147,7 +3161,8 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   // Remap access operations to declare target reference pointers for the
+   // device, essentially generating extra loadop's as necessary
+   if (moduleTranslation.getOpenMPBuilder()->Config.isTargetDevice())
+-    handleDeclareTargetMapVar(mapData, moduleTranslation, builder);
++    handleDeclareTargetMapVar(mapData, moduleTranslation, builder,
++                              llvmOutlinedFn);
+ 
+   return bodyGenStatus;
+ }
+diff --git a/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir b/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir
+new file mode 100644
+index 0000000000000..7273f53d0a3db
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir
+@@ -0,0 +1,59 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// This test checks the offload sizes, map types and base pointers and pointers
++// provided to the OpenMP kernel argument structure are correct when lowering
++// to LLVM-IR from MLIR when a fortran common block is lowered alongside
++// the omp.map.info.
++
++module attributes {omp.is_target_device = false} {
++  llvm.func @omp_map_common_block_using_common_block_members() {
++    %0 = llvm.mlir.constant(4 : index) : i64
++    %1 = llvm.mlir.constant(0 : index) : i64
++    %2 = llvm.mlir.addressof @var_common_ : !llvm.ptr
++    %3 = llvm.getelementptr %2[%1] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++    %4 = llvm.getelementptr %2[%0] : (!llvm.ptr, i64) -> !llvm.ptr, i8
++    %5 = omp.map.info var_ptr(%3 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var1"}
++    %6 = omp.map.info var_ptr(%4 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var2"}
++    omp.target map_entries(%5 -> %arg0, %6 -> %arg1 : !llvm.ptr, !llvm.ptr) {
++    ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++      omp.terminator
++    }
++    llvm.return
++  }
++
++  llvm.func @omp_map_common_block_using_common_block_symbol() {
++    %0 = llvm.mlir.addressof @var_common_ : !llvm.ptr
++    %1 = omp.map.info var_ptr(%0 : !llvm.ptr, !llvm.array<8 x i8>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "var_common"}
++    omp.target map_entries(%1 -> %arg0 : !llvm.ptr) {
++    ^bb0(%arg0: !llvm.ptr):
++      omp.terminator
++    }
++    llvm.return
++  }
++
++  llvm.mlir.global common @var_common_(dense<0> : vector<8xi8>) {addr_space = 0 : i32, alignment = 4 : i64} : !llvm.array<8 x i8>
++}
++
++// CHECK: @[[GLOBAL_BYTE_ARRAY:.*]] = common global [8 x i8] zeroinitializer, align 4
++
++// CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [2 x i64] [i64 4, i64 4]
++// CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [2 x i64] [i64 35, i64 35]
++
++// CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 8]
++// CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++
++// CHECK: define void @omp_map_common_block_using_common_block_members()
++// CHECK:  %[[BASEPTRS:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++// CHECK:  store ptr @[[GLOBAL_BYTE_ARRAY]], ptr %[[BASEPTRS]], align 8
++// CHECK:  %[[OFFLOADPTRS:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++// CHECK:  store ptr @[[GLOBAL_BYTE_ARRAY]], ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[BASEPTRS:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++// CHECK: store ptr getelementptr (i8, ptr @[[GLOBAL_BYTE_ARRAY]], i64 4), ptr %[[BASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [2 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++// CHECK: store ptr getelementptr (i8, ptr @[[GLOBAL_BYTE_ARRAY]], i64 4), ptr %[[OFFLOADPTRS]], align 8
++
++// CHECK: define void @omp_map_common_block_using_common_block_symbol()
++// CHECK:  %[[BASEPTRS:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++// CHECK:  store ptr @[[GLOBAL_BYTE_ARRAY]], ptr %[[BASEPTRS]], align 8
++// CHECK:  %[[OFFLOADPTRS:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++// CHECK:  store ptr @[[GLOBAL_BYTE_ARRAY]], ptr %[[OFFLOADPTRS]], align 8
+\ No newline at end of file
+diff --git a/offload/test/offloading/fortran/target-map-all-common-block-members.f90 b/offload/test/offloading/fortran/target-map-all-common-block-members.f90
+new file mode 100644
+index 0000000000000..def1e7c663073
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-all-common-block-members.f90
+@@ -0,0 +1,55 @@
++! Offloading test checking interaction of
++! mapping all the members of a common block
++! to a target region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2, var3
++    integer :: var1, var2, var3
++
++    call modify_1
++
++  !$omp target map(tofrom: var1, var2, var3)
++    var3 = var3 * 10
++    var2 = var2 * 10
++    var1 = var1 * 10
++  !$omp end target
++
++  call modify_2
++
++  print *, var1
++  print *, var2
++  print *, var3
++end program
++
++subroutine modify_1
++  common /var_common/ var1, var2, var3
++  integer :: var1, var2, var3
++!$omp target map(tofrom: var2, var1, var3)
++  var3 = var3 + 40
++  var2 = var2 + 20
++  var1 = var1 + 30
++!$omp end target
++end
++
++subroutine modify_2
++  common /var_common/ var1, var2, var3
++  integer :: var1, var2, var3
++!$omp target map(tofrom: var2, var3, var1)
++  var3 = var3 + 20
++  var1 = var1 + 10
++  var2 = var2 + 15
++!$omp end target
++end
++
++!CHECK: 310
++!CHECK: 215
++!CHECK: 420
+diff --git a/offload/test/offloading/fortran/target-map-common-block.f90 b/offload/test/offloading/fortran/target-map-common-block.f90
+new file mode 100644
+index 0000000000000..8fcd504950515
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-common-block.f90
+@@ -0,0 +1,50 @@
++! Offloading test checking interaction of
++! mapping a full common block in a target
++! region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2
++    integer :: var1, var2
++
++    call modify_1
++
++  !$omp target map(tofrom: /var_common/)
++      var1 = var1 + 20
++      var2 = var2 + 50
++  !$omp end target
++
++    call modify_2
++
++    print *, var1
++    print *, var2
++end program
++
++subroutine modify_1
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: /var_common/)
++  var1 = var1 + 20
++  var2 = var2 + 30
++!$omp end target
++end
++
++subroutine modify_2
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: /var_common/)
++  var1 = var1 * 10
++  var2 = var2 * 10
++!$omp end target
++end
++
++!CHECK: 400
++!CHECK: 800
+diff --git a/offload/test/offloading/fortran/target-map-declare-target-link-common-block.f90 b/offload/test/offloading/fortran/target-map-declare-target-link-common-block.f90
+new file mode 100644
+index 0000000000000..47f50840befd3
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-declare-target-link-common-block.f90
+@@ -0,0 +1,72 @@
++! Offloading test checking interaction of
++! mapping a declare target link common
++! block with device_type any to a target
++! region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2, var3
++    integer :: var1, var2, var3
++    !$omp declare target link(/var_common/)
++
++    call modify_1
++
++  !$omp target map(tofrom: var2)
++    var2 = var2 + var3
++  !$omp end target
++
++  call modify_2
++  call modify_3
++
++  print *, var1
++  print *, var2
++  print *, var3
++end program
++
++subroutine modify_1
++  common /var_common/ var1, var2, var3
++  integer :: var1, var2, var3
++
++!$omp target map(tofrom: /var_common/)
++  var1 = 10
++  var2 = 20
++  var3 = 30
++!$omp end target
++
++end
++
++subroutine modify_2
++  common /var_common/ var1, var2, var3
++  integer :: var1, var2, var3
++  integer :: copy
++
++!$omp target map(tofrom: copy)
++  copy =  var2 + var3
++!$omp end target
++
++  print *, copy
++end
++
++subroutine modify_3
++  common /var_common/ var1, var2, var3
++  integer :: var1, var2, var3
++
++!$omp target map(tofrom: /var_common/)
++  var1 = var1 + var1
++  var2 = var2 + var2
++  var3 = var3 + var3
++!$omp end target
++end
++
++!CHECK: 80
++!CHECK: 20
++!CHECK: 100
++!CHECK: 60
+\ No newline at end of file
+diff --git a/offload/test/offloading/fortran/target-map-first-common-block-member.f90 b/offload/test/offloading/fortran/target-map-first-common-block-member.f90
+new file mode 100644
+index 0000000000000..69c1fa13501d2
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-first-common-block-member.f90
+@@ -0,0 +1,47 @@
++! Offloading test checking interaction of
++! mapping a member of a common block to a
++! target region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2
++    integer :: var1, var2
++
++    call modify_1
++
++  !$omp target map(tofrom: var1)
++      var1 = var1 + 20
++  !$omp end target
++
++    call modify_2
++
++      print *, var1
++      print *, var2
++end program
++
++subroutine modify_1
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: var1)
++  var1 = var1 + 20
++!$omp end target
++end
++
++subroutine modify_2
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: var1)
++  var1 = var1 * 10
++!$omp end target
++end
++
++!CHECK: 400
++!CHECK: 0
+\ No newline at end of file
+diff --git a/offload/test/offloading/fortran/target-map-mix-imp-exp-common-block-members.f90 b/offload/test/offloading/fortran/target-map-mix-imp-exp-common-block-members.f90
+new file mode 100644
+index 0000000000000..672630aec7d7c
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-mix-imp-exp-common-block-members.f90
+@@ -0,0 +1,58 @@
++! Offloading test checking interaction of
++! mapping all the members of a common block
++! with a mix of explicit and implicit
++! mapping to a target region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2, var3
++    integer :: var1, var2, var3
++
++    call modify_1
++
++    !$omp target map(tofrom: var2)
++      var2 = var2 + var3
++    !$omp end target
++
++    call modify_2
++
++    print *, var1
++    print *, var2
++    print *, var3
++end program
++
++subroutine modify_1
++    common /var_common/ var1, var2, var3
++    integer :: var1, var2, var3
++
++  !$omp target map(tofrom: /var_common/)
++    var1 = 10
++    var2 = 20
++    var3 = 30
++  !$omp end target
++end
++
++subroutine modify_2
++    common /var_common/ var1, var2, var3
++    integer :: var1, var2, var3
++    integer :: copy
++
++  !$omp target map(tofrom: copy)
++    copy =  var2 + var3
++  !$omp end target
++
++    print *, copy
++end
++
++!CHECK: 80
++!CHECK: 10
++!CHECK: 50
++!CHECK: 30
+diff --git a/offload/test/offloading/fortran/target-map-second-common-block-member.f90 b/offload/test/offloading/fortran/target-map-second-common-block-member.f90
+new file mode 100644
+index 0000000000000..3aa937eb9adc6
+--- /dev/null
++++ b/offload/test/offloading/fortran/target-map-second-common-block-member.f90
+@@ -0,0 +1,47 @@
++! Offloading test checking interaction of
++! mapping a member of a common block to a
++! target region
++! REQUIRES: flang, amdgcn-amd-amdhsa
++! UNSUPPORTED: nvptx64-nvidia-cuda
++! UNSUPPORTED: nvptx64-nvidia-cuda-LTO
++! UNSUPPORTED: aarch64-unknown-linux-gnu
++! UNSUPPORTED: aarch64-unknown-linux-gnu-LTO
++! UNSUPPORTED: x86_64-pc-linux-gnu
++! UNSUPPORTED: x86_64-pc-linux-gnu-LTO
++
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++program main
++    implicit none
++    common /var_common/ var1, var2
++    integer :: var1, var2
++
++    call modify_1
++
++  !$omp target map(tofrom: var2)
++      var2 = var2 + 20
++  !$omp end target
++
++    call modify_2
++
++      print *, var1
++      print *, var2
++end program
++
++subroutine modify_1
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: var2)
++  var2 = var2 + 20
++!$omp end target
++end
++
++subroutine modify_2
++  common /var_common/ var1, var2
++  integer :: var1, var2
++!$omp target map(tofrom: var2)
++  var2 = var2 * 10
++!$omp end target
++end
++
++!CHECK: 0
++!CHECK: 400

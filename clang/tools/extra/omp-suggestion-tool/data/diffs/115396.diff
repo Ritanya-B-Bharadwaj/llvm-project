@@ -1,0 +1,1329 @@
+diff --git a/flang/examples/FeatureList/FeatureList.cpp b/flang/examples/FeatureList/FeatureList.cpp
+index 62f8d39a8abaa..dc68f160f5d92 100644
+--- a/flang/examples/FeatureList/FeatureList.cpp
++++ b/flang/examples/FeatureList/FeatureList.cpp
+@@ -470,13 +470,17 @@ struct NodeVisitor {
+   READ_FEATURE(OmpDefaultmapClause::ImplicitBehavior)
+   READ_FEATURE(OmpDefaultmapClause::VariableCategory)
+   READ_FEATURE(OmpDependClause)
+-  READ_FEATURE(OmpDependClause::InOut)
+-  READ_FEATURE(OmpDependClause::Sink)
+-  READ_FEATURE(OmpDependClause::Source)
++  READ_FEATURE(OmpDependClause::TaskDep)
++  READ_FEATURE(OmpDoacross::Sink)
++  READ_FEATURE(OmpDoacross::Source)
++  READ_FEATURE(OmpDoacrossClause)
++  READ_FEATURE(OmpDependenceType)
++  READ_FEATURE(OmpDependenceType::Type)
+   READ_FEATURE(OmpTaskDependenceType)
+   READ_FEATURE(OmpTaskDependenceType::Type)
+-  READ_FEATURE(OmpDependSinkVec)
+-  READ_FEATURE(OmpDependSinkVecLength)
++  READ_FEATURE(OmpIteration)
++  READ_FEATURE(OmpIterationOffset)
++  READ_FEATURE(OmpIterationVector)
+   READ_FEATURE(OmpEndAllocators)
+   READ_FEATURE(OmpEndAtomic)
+   READ_FEATURE(OmpEndBlockDirective)
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index bfeb23de53539..f7730141ecf92 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -509,15 +509,20 @@ class ParseTreeDumper {
+   NODE(parser, OmpDefaultmapClause)
+   NODE_ENUM(OmpDefaultmapClause, ImplicitBehavior)
+   NODE_ENUM(OmpDefaultmapClause, VariableCategory)
+-  NODE(parser, OmpDependClause)
+-  NODE(parser, OmpDetachClause)
+-  NODE(OmpDependClause, InOut)
+-  NODE(OmpDependClause, Sink)
+-  NODE(OmpDependClause, Source)
++  NODE(parser, OmpDependenceType)
++  NODE_ENUM(OmpDependenceType, Type)
+   NODE(parser, OmpTaskDependenceType)
+   NODE_ENUM(OmpTaskDependenceType, Type)
+-  NODE(parser, OmpDependSinkVec)
+-  NODE(parser, OmpDependSinkVecLength)
++  NODE(parser, OmpIterationOffset)
++  NODE(parser, OmpIteration)
++  NODE(parser, OmpIterationVector)
++  NODE(parser, OmpDoacross)
++  NODE(OmpDoacross, Sink)
++  NODE(OmpDoacross, Source)
++  NODE(parser, OmpDependClause)
++  NODE(OmpDependClause, TaskDep)
++  NODE(parser, OmpDetachClause)
++  NODE(parser, OmpDoacrossClause)
+   NODE(parser, OmpDestroyClause)
+   NODE(parser, OmpEndAllocators)
+   NODE(parser, OmpEndAtomic)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index d2c5b45d99581..e0369426364ed 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3439,16 +3439,35 @@ struct OmpObject {
+ 
+ WRAPPER_CLASS(OmpObjectList, std::list<OmpObject>);
+ 
++// Ref: [4.5:169-170], [5.0:255-256], [5.1:288-289]
++//
++// dependence-type ->
++//    SINK | SOURCE |           // since 4.5
++//    IN | OUT | INOUT |        // since 4.5, until 5.1
++//    MUTEXINOUTSET | DEPOBJ |  // since 5.0, until 5.1
++//    INOUTSET                  // since 5.1, until 5.1
++//
++// All of these, except SINK and SOURCE became task-dependence-type in 5.2.
++//
++// Keeping these two as separate types, since having them all together
++// creates conflicts when parsing the DEPEND clause. For DEPEND(SINK: ...),
++// the SINK may be parsed as 'task-dependence-type', and the list after
++// the ':' would then be parsed as OmpObjectList (instead of the iteration
++// vector). This would accept the vector "i, j, k" (although interpreted
++// incorrectly), while flagging a syntax error for "i+1, j, k".
++struct OmpDependenceType {
++  ENUM_CLASS(Type, Sink, Source);
++  WRAPPER_CLASS_BOILERPLATE(OmpDependenceType, Type);
++};
++
+ // Ref: [4.5:169-170], [5.0:254-256], [5.1:287-289], [5.2:321]
+ //
+ // task-dependence-type -> // "dependence-type" in 5.1 and before
+ //    IN | OUT | INOUT |        // since 4.5
+-//    SOURCE | SINK |           // since 4.5, until 5.1
+ //    MUTEXINOUTSET | DEPOBJ |  // since 5.0
+ //    INOUTSET                  // since 5.2
+ struct OmpTaskDependenceType {
+-  ENUM_CLASS(
+-      Type, In, Out, Inout, Inoutset, Mutexinoutset, Source, Sink, Depobj)
++  ENUM_CLASS(Type, In, Out, Inout, Inoutset, Mutexinoutset, Depobj)
+   WRAPPER_CLASS_BOILERPLATE(OmpTaskDependenceType, Type);
+ };
+ 
+@@ -3528,41 +3547,55 @@ struct OmpDefaultmapClause {
+   std::tuple<ImplicitBehavior, std::optional<VariableCategory>> t;
+ };
+ 
+-// 2.13.9 depend-vec-length -> +/- non-negative-constant
+-struct OmpDependSinkVecLength {
+-  TUPLE_CLASS_BOILERPLATE(OmpDependSinkVecLength);
++// 2.13.9 iteration-offset -> +/- non-negative-constant
++struct OmpIterationOffset {
++  TUPLE_CLASS_BOILERPLATE(OmpIterationOffset);
+   std::tuple<DefinedOperator, ScalarIntConstantExpr> t;
+ };
+ 
+-// 2.13.9 depend-vec -> induction-variable [depend-vec-length], ...
+-struct OmpDependSinkVec {
+-  TUPLE_CLASS_BOILERPLATE(OmpDependSinkVec);
+-  std::tuple<Name, std::optional<OmpDependSinkVecLength>> t;
++// 2.13.9 iteration -> induction-variable [iteration-offset]
++struct OmpIteration {
++  TUPLE_CLASS_BOILERPLATE(OmpIteration);
++  std::tuple<Name, std::optional<OmpIterationOffset>> t;
++};
++
++WRAPPER_CLASS(OmpIterationVector, std::list<OmpIteration>);
++
++// Extract this into a separate structure (instead of having it directly in
++// OmpDoacrossClause), so that the context in TYPE_CONTEXT_PARSER can be set
++// separately for OmpDependClause and OmpDoacrossClause.
++struct OmpDoacross {
++  OmpDependenceType::Type GetDepType() const;
++
++  WRAPPER_CLASS(Sink, OmpIterationVector);
++  EMPTY_CLASS(Source);
++  UNION_CLASS_BOILERPLATE(OmpDoacross);
++  std::variant<Sink, Source> u;
+ };
+ 
+ // Ref: [4.5:169-170], [5.0:255-256], [5.1:288-289], [5.2:323-324]
+ //
+ // depend-clause ->
+ //    DEPEND(SOURCE) |                               // since 4.5, until 5.1
+-//    DEPEND(SINK: depend-vec) |                     // since 4.5, until 5.1
+-//    DEPEND([depend-modifier,]dependence-type: locator-list)   // since 4.5
++//    DEPEND(SINK: iteration-vector) |               // since 4.5, until 5.1
++//    DEPEND([depend-modifier,]
++//           task-dependence-type: locator-list)     // since 4.5
+ //
+ // depend-modifier -> iterator-modifier              // since 5.0
+ struct OmpDependClause {
+-  OmpTaskDependenceType::Type GetDepType() const;
+-
+   UNION_CLASS_BOILERPLATE(OmpDependClause);
+-  EMPTY_CLASS(Source);
+-  WRAPPER_CLASS(Sink, std::list<OmpDependSinkVec>);
+-  struct InOut {
+-    TUPLE_CLASS_BOILERPLATE(InOut);
++  struct TaskDep {
++    OmpTaskDependenceType::Type GetTaskDepType() const;
++    TUPLE_CLASS_BOILERPLATE(TaskDep);
+     std::tuple<std::optional<OmpIteratorModifier>, OmpTaskDependenceType,
+         OmpObjectList>
+         t;
+   };
+-  std::variant<Source, Sink, InOut> u;
++  std::variant<TaskDep, OmpDoacross> u;
+ };
+ 
++WRAPPER_CLASS(OmpDoacrossClause, OmpDoacross);
++
+ // Ref: [5.0:254-255], [5.1:287-288], [5.2:73]
+ //
+ // destroy-clause ->
+@@ -3775,8 +3808,12 @@ struct OmpNumTasksClause {
+ 
+ // Ref: [5.0:254-255], [5.1:287-288], [5.2:321-322]
+ //
+-// update-clause -> UPDATE(task-dependence-type)    // since 5.0
+-WRAPPER_CLASS(OmpUpdateClause, OmpTaskDependenceType);
++// update-clause -> UPDATE(dependence-type)       // since 5.0, until 5.1
++// update-clause -> UPDATE(task-dependence-type)  // since 5.2
++struct OmpUpdateClause {
++  UNION_CLASS_BOILERPLATE(OmpUpdateClause);
++  std::variant<OmpDependenceType, OmpTaskDependenceType> u;
++};
+ 
+ // OpenMP Clauses
+ struct OmpClause {
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index e768c1cbc0784..72b9018f2d280 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -122,28 +122,28 @@ genProcBindKindAttr(fir::FirOpBuilder &firOpBuilder,
+ 
+ static mlir::omp::ClauseTaskDependAttr
+ genDependKindAttr(lower::AbstractConverter &converter,
+-                  const omp::clause::Depend::TaskDependenceType kind) {
++                  const omp::clause::DependenceType kind) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::Location currentLocation = converter.getCurrentLocation();
+ 
+   mlir::omp::ClauseTaskDepend pbKind;
+   switch (kind) {
+-  case omp::clause::Depend::TaskDependenceType::In:
++  case omp::clause::DependenceType::In:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependin;
+     break;
+-  case omp::clause::Depend::TaskDependenceType::Out:
++  case omp::clause::DependenceType::Out:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependout;
+     break;
+-  case omp::clause::Depend::TaskDependenceType::Inout:
++  case omp::clause::DependenceType::Inout:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependinout;
+     break;
+-  case omp::clause::Depend::TaskDependenceType::Mutexinoutset:
+-  case omp::clause::Depend::TaskDependenceType::Inoutset:
++  case omp::clause::DependenceType::Mutexinoutset:
++  case omp::clause::DependenceType::Inoutset:
+     TODO(currentLocation, "INOUTSET and MUTEXINOUTSET are not supported yet");
+     break;
+-  case omp::clause::Depend::TaskDependenceType::Depobj:
+-  case omp::clause::Depend::TaskDependenceType::Sink:
+-  case omp::clause::Depend::TaskDependenceType::Source:
++  case omp::clause::DependenceType::Depobj:
++  case omp::clause::DependenceType::Sink:
++  case omp::clause::DependenceType::Source:
+     llvm_unreachable("unhandled parser task dependence type");
+     break;
+   }
+@@ -803,20 +803,20 @@ bool ClauseProcessor::processDepend(mlir::omp::DependClauseOps &result) const {
+   auto process = [&](const omp::clause::Depend &clause,
+                      const parser::CharBlock &) {
+     using Depend = omp::clause::Depend;
+-    if (!std::holds_alternative<Depend::DepType>(clause.u)) {
++    if (!std::holds_alternative<Depend::TaskDep>(clause.u)) {
+       TODO(converter.getCurrentLocation(),
+            "DEPEND clause with SINK or SOURCE is not supported yet");
+     }
+-    auto &depType = std::get<Depend::DepType>(clause.u);
+-    auto kind = std::get<Depend::TaskDependenceType>(depType.t);
+-    auto &objects = std::get<omp::ObjectList>(depType.t);
++    auto &taskDep = std::get<Depend::TaskDep>(clause.u);
++    auto depType = std::get<clause::DependenceType>(taskDep.t);
++    auto &objects = std::get<omp::ObjectList>(taskDep.t);
+ 
+-    if (std::get<std::optional<omp::clause::Iterator>>(depType.t)) {
++    if (std::get<std::optional<omp::clause::Iterator>>(taskDep.t)) {
+       TODO(converter.getCurrentLocation(),
+            "Support for iterator modifiers is not implemented yet");
+     }
+     mlir::omp::ClauseTaskDependAttr dependTypeOperand =
+-        genDependKindAttr(converter, kind);
++        genDependKindAttr(converter, depType);
+     result.dependKinds.append(objects.size(), dependTypeOperand);
+ 
+     for (const omp::Object &object : objects) {
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 46caafeef8e4a..f6633dd53f6f2 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -338,27 +338,32 @@ ReductionOperator makeReductionOperator(const parser::OmpReductionOperator &inp,
+       inp.u);
+ }
+ 
+-clause::TaskDependenceType
+-makeDepType(const parser::OmpTaskDependenceType &inp) {
++clause::DependenceType makeDepType(const parser::OmpDependenceType &inp) {
++  switch (inp.v) {
++  case parser::OmpDependenceType::Type::Sink:
++    return clause::DependenceType::Sink;
++  case parser::OmpDependenceType::Type::Source:
++    return clause::DependenceType::Source;
++  }
++  llvm_unreachable("Unexpected dependence type");
++}
++
++clause::DependenceType makeDepType(const parser::OmpTaskDependenceType &inp) {
+   switch (inp.v) {
+   case parser::OmpTaskDependenceType::Type::Depobj:
+-    return clause::TaskDependenceType::Depobj;
++    return clause::DependenceType::Depobj;
+   case parser::OmpTaskDependenceType::Type::In:
+-    return clause::TaskDependenceType::In;
++    return clause::DependenceType::In;
+   case parser::OmpTaskDependenceType::Type::Inout:
+-    return clause::TaskDependenceType::Inout;
++    return clause::DependenceType::Inout;
+   case parser::OmpTaskDependenceType::Type::Inoutset:
+-    return clause::TaskDependenceType::Inoutset;
++    return clause::DependenceType::Inoutset;
+   case parser::OmpTaskDependenceType::Type::Mutexinoutset:
+-    return clause::TaskDependenceType::Mutexinoutset;
++    return clause::DependenceType::Mutexinoutset;
+   case parser::OmpTaskDependenceType::Type::Out:
+-    return clause::TaskDependenceType::Out;
+-  case parser::OmpTaskDependenceType::Type::Sink:
+-    return clause::TaskDependenceType::Sink;
+-  case parser::OmpTaskDependenceType::Type::Source:
+-    return clause::TaskDependenceType::Source;
++    return clause::DependenceType::Out;
+   }
+-  llvm_unreachable("Unexpected dependence type");
++  llvm_unreachable("Unexpected task dependence type");
+ }
+ 
+ // --------------------------------------------------------------------
+@@ -574,49 +579,52 @@ Depend make(const parser::OmpClause::Depend &inp,
+   // inp.v -> parser::OmpDependClause
+   using wrapped = parser::OmpDependClause;
+   using Variant = decltype(Depend::u);
+-  // Iteration is the equivalent of parser::OmpDependSinkVec
++  // Iteration is the equivalent of parser::OmpIteration
+   using Iteration = Doacross::Vector::value_type; // LoopIterationT
+ 
++  auto visitSource = [&](const parser::OmpDoacross::Source &) -> Variant {
++    return Doacross{{/*DependenceType=*/Doacross::DependenceType::Source,
++                     /*Vector=*/{}}};
++  };
++
++  auto visitSink = [&](const parser::OmpDoacross::Sink &s) -> Variant {
++    using IterOffset = parser::OmpIterationOffset;
++    auto convert2 = [&](const parser::OmpIteration &v) {
++      auto &t0 = std::get<parser::Name>(v.t);
++      auto &t1 = std::get<std::optional<IterOffset>>(v.t);
++
++      auto convert3 = [&](const IterOffset &u) {
++        auto &s0 = std::get<parser::DefinedOperator>(u.t);
++        auto &s1 = std::get<parser::ScalarIntConstantExpr>(u.t);
++        return Iteration::Distance{
++            {makeDefinedOperator(s0, semaCtx), makeExpr(s1, semaCtx)}};
++      };
++      return Iteration{{makeObject(t0, semaCtx), maybeApply(convert3, t1)}};
++    };
++    return Doacross{{/*DependenceType=*/Doacross::DependenceType::Sink,
++                     /*Vector=*/makeList(s.v.v, convert2)}};
++  };
++
++  auto visitTaskDep = [&](const wrapped::TaskDep &s) -> Variant {
++    auto &t0 = std::get<std::optional<parser::OmpIteratorModifier>>(s.t);
++    auto &t1 = std::get<parser::OmpTaskDependenceType>(s.t);
++    auto &t2 = std::get<parser::OmpObjectList>(s.t);
++
++    auto &&maybeIter =
++        maybeApply([&](auto &&s) { return makeIterator(s, semaCtx); }, t0);
++    return Depend::TaskDep{{/*DependenceType=*/makeDepType(t1),
++                            /*Iterator=*/std::move(maybeIter),
++                            /*LocatorList=*/makeObjects(t2, semaCtx)}};
++  };
++
+   return Depend{Fortran::common::visit( //
+       common::visitors{
+           // Doacross
+-          [&](const wrapped::Source &s) -> Variant {
+-            return Doacross{
+-                {/*DependenceType=*/Doacross::DependenceType::Source,
+-                 /*Vector=*/{}}};
+-          },
+-          // Doacross
+-          [&](const wrapped::Sink &s) -> Variant {
+-            using DependLength = parser::OmpDependSinkVecLength;
+-            auto convert2 = [&](const parser::OmpDependSinkVec &v) {
+-              auto &t0 = std::get<parser::Name>(v.t);
+-              auto &t1 = std::get<std::optional<DependLength>>(v.t);
+-
+-              auto convert3 = [&](const DependLength &u) {
+-                auto &s0 = std::get<parser::DefinedOperator>(u.t);
+-                auto &s1 = std::get<parser::ScalarIntConstantExpr>(u.t);
+-                return Iteration::Distance{
+-                    {makeDefinedOperator(s0, semaCtx), makeExpr(s1, semaCtx)}};
+-              };
+-              return Iteration{
+-                  {makeObject(t0, semaCtx), maybeApply(convert3, t1)}};
+-            };
+-            return Doacross{{/*DependenceType=*/Doacross::DependenceType::Sink,
+-                             /*Vector=*/makeList(s.v, convert2)}};
+-          },
+-          // Depend::DepType
+-          [&](const wrapped::InOut &s) -> Variant {
+-            auto &t0 =
+-                std::get<std::optional<parser::OmpIteratorModifier>>(s.t);
+-            auto &t1 = std::get<parser::OmpTaskDependenceType>(s.t);
+-            auto &t2 = std::get<parser::OmpObjectList>(s.t);
+-
+-            auto &&maybeIter = maybeApply(
+-                [&](auto &&s) { return makeIterator(s, semaCtx); }, t0);
+-            return Depend::DepType{{/*TaskDependenceType=*/makeDepType(t1),
+-                                    /*Iterator=*/std::move(maybeIter),
+-                                    /*LocatorList=*/makeObjects(t2, semaCtx)}};
++          [&](const parser::OmpDoacross &s) -> Variant {
++            return common::visit(common::visitors{visitSink, visitSource}, s.u);
+           },
++          // Depend::TaskDep
++          visitTaskDep,
+       },
+       inp.v.u)};
+ }
+@@ -1356,7 +1364,9 @@ Uniform make(const parser::OmpClause::Uniform &inp,
+ Update make(const parser::OmpClause::Update &inp,
+             semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpUpdateClause
+-  return Update{/*TaskDependenceType=*/makeDepType(inp.v.v)};
++  auto depType =
++      common::visit([](auto &&s) { return makeDepType(s); }, inp.v.u);
++  return Update{/*DependenceType=*/depType};
+ }
+ 
+ Use make(const parser::OmpClause::Use &inp,
+diff --git a/flang/lib/Lower/OpenMP/Clauses.h b/flang/lib/Lower/OpenMP/Clauses.h
+index 51180ebfe5745..514f0d1ee466a 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.h
++++ b/flang/lib/Lower/OpenMP/Clauses.h
+@@ -152,7 +152,7 @@ using IteratorSpecifier = tomp::type::IteratorSpecifierT<TypeTy, IdTy, ExprTy>;
+ using DefinedOperator = tomp::type::DefinedOperatorT<IdTy, ExprTy>;
+ using ProcedureDesignator = tomp::type::ProcedureDesignatorT<IdTy, ExprTy>;
+ using ReductionOperator = tomp::type::ReductionIdentifierT<IdTy, ExprTy>;
+-using TaskDependenceType = tomp::type::TaskDependenceType;
++using DependenceType = tomp::type::DependenceType;
+ 
+ // "Requires" clauses are handled early on, and the aggregated information
+ // is stored in the Symbol details of modules, programs, and subprograms.
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 7a0ecc59a2c5c..1a0f8acae4948 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -392,12 +392,9 @@ TYPE_PARSER(construct<OmpAllocateClause>(
+         ":"),
+     Parser<OmpObjectList>{}))
+ 
+-// 2.13.9 DEPEND (SOURCE | SINK : vec | (IN | OUT | INOUT) : list
+-TYPE_PARSER(construct<OmpDependSinkVecLength>(
+-    Parser<DefinedOperator>{}, scalarIntConstantExpr))
+-
+-TYPE_PARSER(
+-    construct<OmpDependSinkVec>(name, maybe(Parser<OmpDependSinkVecLength>{})))
++TYPE_PARSER(construct<OmpDependenceType>(
++    "SINK" >> pure(OmpDependenceType::Type::Sink) ||
++    "SOURCE" >> pure(OmpDependenceType::Type::Source)))
+ 
+ TYPE_PARSER(construct<OmpTaskDependenceType>(
+     "DEPOBJ" >> pure(OmpTaskDependenceType::Type::Depobj) ||
+@@ -405,18 +402,31 @@ TYPE_PARSER(construct<OmpTaskDependenceType>(
+     "INOUT"_id >> pure(OmpTaskDependenceType::Type::Inout) ||
+     "INOUTSET"_id >> pure(OmpTaskDependenceType::Type::Inoutset) ||
+     "MUTEXINOUTSET" >> pure(OmpTaskDependenceType::Type::Mutexinoutset) ||
+-    "OUT" >> pure(OmpTaskDependenceType::Type::Out) ||
+-    "SINK" >> pure(OmpTaskDependenceType::Type::Sink) ||
+-    "SOURCE" >> pure(OmpTaskDependenceType::Type::Source)))
++    "OUT" >> pure(OmpTaskDependenceType::Type::Out)))
++
++// iteration-offset -> +/- non-negative-constant-expr
++TYPE_PARSER(construct<OmpIterationOffset>(
++    Parser<DefinedOperator>{}, scalarIntConstantExpr))
++
++// iteration -> iteration-variable [+/- nonnegative-scalar-integer-constant]
++TYPE_PARSER(construct<OmpIteration>(name, maybe(Parser<OmpIterationOffset>{})))
++
++TYPE_PARSER(construct<OmpIterationVector>(nonemptyList(Parser<OmpIteration>{})))
++
++TYPE_PARSER(construct<OmpDoacross>(
++    construct<OmpDoacross>(construct<OmpDoacross::Sink>(
++        "SINK"_tok >> ":"_tok >> Parser<OmpIterationVector>{})) ||
++    construct<OmpDoacross>(construct<OmpDoacross::Source>("SOURCE"_tok))))
+ 
+ TYPE_CONTEXT_PARSER("Omp Depend clause"_en_US,
+-    construct<OmpDependClause>(construct<OmpDependClause::Sink>(
+-        "SINK :" >> nonemptyList(Parser<OmpDependSinkVec>{}))) ||
+-        construct<OmpDependClause>(
+-            construct<OmpDependClause::Source>("SOURCE"_tok)) ||
+-        construct<OmpDependClause>(construct<OmpDependClause::InOut>(
++    construct<OmpDependClause>(
++        construct<OmpDependClause>(construct<OmpDependClause::TaskDep>(
+             maybe(Parser<OmpIteratorModifier>{} / ","_tok),
+-            Parser<OmpTaskDependenceType>{} / ":", Parser<OmpObjectList>{})))
++            Parser<OmpTaskDependenceType>{} / ":", Parser<OmpObjectList>{})) ||
++        construct<OmpDependClause>(Parser<OmpDoacross>{})))
++
++TYPE_CONTEXT_PARSER("Omp Doacross clause"_en_US,
++    construct<OmpDoacrossClause>(Parser<OmpDoacross>{}))
+ 
+ TYPE_PARSER(construct<OmpFromClause::Expectation>(
+     "PRESENT" >> pure(OmpFromClause::Expectation::Present)))
+@@ -466,6 +476,10 @@ TYPE_PARSER(construct<OmpDetachClause>(Parser<OmpObject>{}))
+ TYPE_PARSER(construct<OmpAlignedClause>(
+     Parser<OmpObjectList>{}, maybe(":" >> scalarIntConstantExpr)))
+ 
++TYPE_PARSER(construct<OmpUpdateClause>(
++    construct<OmpUpdateClause>(Parser<OmpDependenceType>{}) ||
++    construct<OmpUpdateClause>(Parser<OmpTaskDependenceType>{})))
++
+ // 2.9.5 ORDER ([order-modifier :]concurrent)
+ TYPE_PARSER(construct<OmpOrderModifier>(
+     "REPRODUCIBLE" >> pure(OmpOrderModifier::Kind::Reproducible)) ||
+@@ -531,6 +545,8 @@ TYPE_PARSER(
+     "DIST_SCHEDULE" >>
+         construct<OmpClause>(construct<OmpClause::DistSchedule>(
+             parenthesized("STATIC" >> maybe("," >> scalarIntExpr)))) ||
++    "DOACROSS" >>
++        construct<OmpClause>(parenthesized(Parser<OmpDoacrossClause>{})) ||
+     "DYNAMIC_ALLOCATORS" >>
+         construct<OmpClause>(construct<OmpClause::DynamicAllocators>()) ||
+     "ENTER" >> construct<OmpClause>(construct<OmpClause::Enter>(
+@@ -634,7 +650,7 @@ TYPE_PARSER(
+                      parenthesized(nonemptyList(name)))) ||
+     "UNTIED" >> construct<OmpClause>(construct<OmpClause::Untied>()) ||
+     "UPDATE" >> construct<OmpClause>(construct<OmpClause::Update>(
+-                    parenthesized(Parser<OmpTaskDependenceType>{}))))
++                    parenthesized(Parser<OmpUpdateClause>{}))))
+ 
+ // [Clause, [Clause], ...]
+ TYPE_PARSER(sourced(construct<OmpClauseList>(
+diff --git a/flang/lib/Parser/parse-tree.cpp b/flang/lib/Parser/parse-tree.cpp
+index 60aef1666e9ba..574e5fd84862e 100644
+--- a/flang/lib/Parser/parse-tree.cpp
++++ b/flang/lib/Parser/parse-tree.cpp
+@@ -253,22 +253,23 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Name &x) {
+   return os << x.ToString();
+ }
+ 
+-OmpTaskDependenceType::Type OmpDependClause::GetDepType() const {
+-  return common::visit(
++OmpDependenceType::Type OmpDoacross::GetDepType() const {
++  return common::visit( //
+       common::visitors{
+-          [&](const parser::OmpDependClause::Source &) {
+-            return parser::OmpTaskDependenceType::Type::Source;
+-          },
+-          [&](const parser::OmpDependClause::Sink &) {
+-            return parser::OmpTaskDependenceType::Type::Sink;
++          [](const OmpDoacross::Sink &) {
++            return OmpDependenceType::Type::Sink;
+           },
+-          [&](const parser::OmpDependClause::InOut &y) {
+-            return std::get<parser::OmpTaskDependenceType>(y.t).v;
++          [](const OmpDoacross::Source &) {
++            return OmpDependenceType::Type::Source;
+           },
+       },
+       u);
+ }
+ 
++OmpTaskDependenceType::Type OmpDependClause::TaskDep::GetTaskDepType() const {
++  return std::get<parser::OmpTaskDependenceType>(t).v;
++}
++
+ } // namespace Fortran::parser
+ 
+ template <typename C> static llvm::omp::Clause getClauseIdForClass(C &&) {
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index bbb126dcdb6d5..14e128fb15bec 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2228,36 +2228,16 @@ class UnparseVisitor {
+         std::get<std::optional<OmpNumTasksClause::Prescriptiveness>>(x.t), ":");
+     Walk(std::get<ScalarIntExpr>(x.t));
+   }
+-  void Unparse(const OmpDependSinkVecLength &x) {
+-    Walk(std::get<DefinedOperator>(x.t));
+-    Walk(std::get<ScalarIntConstantExpr>(x.t));
++  void Unparse(const OmpDoacross::Sink &x) {
++    Word("SINK: ");
++    Walk(x.v.v);
+   }
+-  void Unparse(const OmpDependSinkVec &x) {
+-    Walk(std::get<Name>(x.t));
+-    Walk(std::get<std::optional<OmpDependSinkVecLength>>(x.t));
+-  }
+-  void Unparse(const OmpDependClause::InOut &x) {
++  void Unparse(const OmpDoacross::Source &) { Word("SOURCE"); }
++  void Unparse(const OmpDependClause::TaskDep &x) {
+     Walk(std::get<OmpTaskDependenceType>(x.t));
+     Put(":");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
+-  bool Pre(const OmpDependClause &x) {
+-    return common::visit(
+-        common::visitors{
+-            [&](const OmpDependClause::Source &) {
+-              Word("SOURCE");
+-              return false;
+-            },
+-            [&](const OmpDependClause::Sink &y) {
+-              Word("SINK:");
+-              Walk(y.v);
+-              Put(")");
+-              return false;
+-            },
+-            [&](const OmpDependClause::InOut &) { return true; },
+-        },
+-        x.u);
+-  }
+   void Unparse(const OmpDefaultmapClause &x) {
+     Walk(std::get<OmpDefaultmapClause::ImplicitBehavior>(x.t));
+     Walk(":",
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 014604627f2cd..132fb6484bcfc 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1623,36 +1623,37 @@ void OmpStructureChecker::ChecksOnOrderedAsStandalone() {
+         "standalone construct with no ORDERED region"_err_en_US);
+   }
+ 
+-  bool isSinkPresent{false};
+-  int dependSourceCount{0};
++  int dependSinkCount{0}, dependSourceCount{0};
++  bool exclusiveShown{false}, duplicateSourceShown{false};
++
++  auto visitDoacross = [&](const parser::OmpDoacross &doa,
++                           const parser::CharBlock &src) {
++    common::visit(
++        common::visitors{
++            [&](const parser::OmpDoacross::Source &) { dependSourceCount++; },
++            [&](const parser::OmpDoacross::Sink &) { dependSinkCount++; }},
++        doa.u);
++    if (!exclusiveShown && dependSinkCount > 0 && dependSourceCount > 0) {
++      exclusiveShown = true;
++      context_.Say(src,
++          "The SINK and SOURCE dependence types are mutually exclusive"_err_en_US);
++    }
++    if (!duplicateSourceShown && dependSourceCount > 1) {
++      duplicateSourceShown = true;
++      context_.Say(src,
++          "At most one SOURCE dependence type can appear on the ORDERED directive"_err_en_US);
++    }
++  };
++
+   auto clauseAll = FindClauses(llvm::omp::Clause::OMPC_depend);
+   for (auto itr = clauseAll.first; itr != clauseAll.second; ++itr) {
+     const auto &dependClause{
+         std::get<parser::OmpClause::Depend>(itr->second->u)};
+-    if (std::get_if<parser::OmpDependClause::Source>(&dependClause.v.u)) {
+-      dependSourceCount++;
+-      if (isSinkPresent) {
+-        context_.Say(itr->second->source,
+-            "DEPEND(SOURCE) is not allowed when DEPEND(SINK: vec) is present "
+-            "on ORDERED directive"_err_en_US);
+-      }
+-      if (dependSourceCount > 1) {
+-        context_.Say(itr->second->source,
+-            "At most one DEPEND(SOURCE) clause can appear on the ORDERED "
+-            "directive"_err_en_US);
+-      }
+-    } else if (std::get_if<parser::OmpDependClause::Sink>(&dependClause.v.u)) {
+-      isSinkPresent = true;
+-      if (dependSourceCount > 0) {
+-        context_.Say(itr->second->source,
+-            "DEPEND(SINK: vec) is not allowed when DEPEND(SOURCE) is present "
+-            "on ORDERED directive"_err_en_US);
+-      }
++    if (auto *doAcross{std::get_if<parser::OmpDoacross>(&dependClause.v.u)}) {
++      visitDoacross(*doAcross, itr->second->source);
+     } else {
+       context_.Say(itr->second->source,
+-          "Only DEPEND(SOURCE) or DEPEND(SINK: vec) are allowed when ORDERED "
+-          "construct is a standalone construct with no ORDERED "
+-          "region"_err_en_US);
++          "Only SINK or SOURCE dependence types are allowed when ORDERED construct is a standalone construct with no ORDERED region"_err_en_US);
+     }
+   }
+ 
+@@ -1681,20 +1682,23 @@ void OmpStructureChecker::ChecksOnOrderedAsStandalone() {
+ }
+ 
+ void OmpStructureChecker::CheckOrderedDependClause(
+-    std::optional<std::int64_t> orderedValue) {
+-  auto clauseAll{FindClauses(llvm::omp::Clause::OMPC_depend)};
+-  for (auto itr = clauseAll.first; itr != clauseAll.second; ++itr) {
+-    const auto &dependClause{
+-        std::get<parser::OmpClause::Depend>(itr->second->u)};
+-    if (const auto *sinkVectors{
+-            std::get_if<parser::OmpDependClause::Sink>(&dependClause.v.u)}) {
+-      std::int64_t numVar = sinkVectors->v.size();
++    std::optional<int64_t> orderedValue) {
++  auto visitDoacross = [&](const parser::OmpDoacross &doa,
++                           const parser::CharBlock &src) {
++    if (auto *sinkVector{std::get_if<parser::OmpDoacross::Sink>(&doa.u)}) {
++      int64_t numVar = sinkVector->v.v.size();
+       if (orderedValue != numVar) {
+-        context_.Say(itr->second->source,
+-            "The number of variables in DEPEND(SINK: vec) clause does not "
+-            "match the parameter specified in ORDERED clause"_err_en_US);
++        context_.Say(src,
++            "The number of variables in the SINK iteration vector does not match the parameter specified in ORDERED clause"_err_en_US);
+       }
+     }
++  };
++  auto clauseAll{FindClauses(llvm::omp::Clause::OMPC_depend)};
++  for (auto itr = clauseAll.first; itr != clauseAll.second; ++itr) {
++    auto &dependClause{std::get<parser::OmpClause::Depend>(itr->second->u)};
++    if (auto *doAcross{std::get_if<parser::OmpDoacross>(&dependClause.v.u)}) {
++      visitDoacross(*doAcross, itr->second->source);
++    }
+   }
+ }
+ 
+@@ -1736,17 +1740,13 @@ void OmpStructureChecker::CheckTaskDependenceType(
+     const parser::OmpTaskDependenceType::Type &x) {
+   // Common checks for task-dependence-type (DEPEND and UPDATE clauses).
+   unsigned version{context_.langOptions().OpenMPVersion};
+-  unsigned since{0}, deprecatedIn{~0u};
++  unsigned since{0};
+ 
+   switch (x) {
+   case parser::OmpTaskDependenceType::Type::In:
+   case parser::OmpTaskDependenceType::Type::Out:
+   case parser::OmpTaskDependenceType::Type::Inout:
+     break;
+-  case parser::OmpTaskDependenceType::Type::Source:
+-  case parser::OmpTaskDependenceType::Type::Sink:
+-    deprecatedIn = 52;
+-    break;
+   case parser::OmpTaskDependenceType::Type::Mutexinoutset:
+   case parser::OmpTaskDependenceType::Type::Depobj:
+     since = 50;
+@@ -1756,21 +1756,36 @@ void OmpStructureChecker::CheckTaskDependenceType(
+     break;
+   }
+ 
+-  if (version >= deprecatedIn) {
++  if (version < since) {
+     context_.Say(GetContext().clauseSource,
+-        "%s task-dependence-type is deprecated in %s"_warn_en_US,
+-        parser::ToUpperCaseLetters(
+-            parser::OmpTaskDependenceType::EnumToString(x)),
+-        ThisVersion(deprecatedIn));
+-  } else if (version < since) {
+-    context_.Say(GetContext().clauseSource,
+-        "%s task-dependence-type is not supported in %s, %s"_warn_en_US,
++        "%s task dependence type is not supported in %s, %s"_warn_en_US,
+         parser::ToUpperCaseLetters(
+             parser::OmpTaskDependenceType::EnumToString(x)),
+         ThisVersion(version), TryVersion(since));
+   }
+ }
+ 
++void OmpStructureChecker::CheckDependenceType(
++    const parser::OmpDependenceType::Type &x) {
++  // Common checks for dependence-type (DEPEND and UPDATE clauses).
++  unsigned version{context_.langOptions().OpenMPVersion};
++  unsigned deprecatedIn{~0u};
++
++  switch (x) {
++  case parser::OmpDependenceType::Type::Source:
++  case parser::OmpDependenceType::Type::Sink:
++    deprecatedIn = 52;
++    break;
++  }
++
++  if (version >= deprecatedIn) {
++    context_.Say(GetContext().clauseSource,
++        "%s dependence type is deprecated in %s"_warn_en_US,
++        parser::ToUpperCaseLetters(parser::OmpDependenceType::EnumToString(x)),
++        ThisVersion(deprecatedIn));
++  }
++}
++
+ void OmpStructureChecker::Enter(
+     const parser::OpenMPSimpleStandaloneConstruct &x) {
+   const auto &dir{std::get<parser::OmpSimpleStandaloneDirective>(x.t)};
+@@ -3434,41 +3449,50 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Device &x) {
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Depend &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_depend);
+-  llvm::omp::Directive directive{GetContext().directive};
++  llvm::omp::Directive dir{GetContext().directive};
+   unsigned version{context_.langOptions().OpenMPVersion};
+ 
+-  using DepType = parser::OmpTaskDependenceType::Type;
+-  DepType depType = x.v.GetDepType();
++  auto *doaDep{std::get_if<parser::OmpDoacross>(&x.v.u)};
++  auto *taskDep{std::get_if<parser::OmpDependClause::TaskDep>(&x.v.u)};
++  assert(((doaDep == nullptr) != (taskDep == nullptr)) &&
++      "Unexpected alternative in update clause");
+ 
+-  CheckTaskDependenceType(depType);
++  if (doaDep) {
++    CheckDependenceType(doaDep->GetDepType());
++  } else {
++    CheckTaskDependenceType(taskDep->GetTaskDepType());
++  }
+ 
+-  if (directive == llvm::omp::OMPD_depobj) {
++  if (dir == llvm::omp::OMPD_depobj) {
+     // [5.0:255:11], [5.1:288:3]
+     // A depend clause on a depobj construct must not have source, sink [or
+     // depobj](5.0) as dependence-type.
+     if (version >= 50) {
+-      bool invalidDep{depType == DepType::Source || depType == DepType::Sink};
+-      if (version == 50) {
+-        invalidDep = invalidDep || depType == DepType::Depobj;
++      bool invalidDep{false};
++      if (taskDep) {
++        if (version == 50) {
++          invalidDep = taskDep->GetTaskDepType() ==
++              parser::OmpTaskDependenceType::Type::Depobj;
++        }
++      } else {
++        invalidDep = true;
+       }
+       if (invalidDep) {
+         context_.Say(GetContext().clauseSource,
+-            "A DEPEND clause on a DEPOBJ construct must not have SOURCE%s "
+-            "as dependence-type"_err_en_US,
+-            version == 50 ? ", SINK or DEPOBJ" : " or SINK");
++            "A DEPEND clause on a DEPOBJ construct must not have %s as dependence type"_err_en_US,
++            version == 50 ? "SINK, SOURCE or DEPOBJ" : "SINK or SOURCE");
+       }
+     }
+-  } else if (directive != llvm::omp::OMPD_ordered) {
+-    if (depType == DepType::Source || depType == DepType::Sink) {
++  } else if (dir != llvm::omp::OMPD_ordered) {
++    if (doaDep) {
+       context_.Say(GetContext().clauseSource,
+-          "DEPEND(SOURCE) or DEPEND(SINK : vec) can be used only with the "
+-          "ordered directive. Used here in the %s construct."_err_en_US,
+-          parser::ToUpperCaseLetters(getDirectiveName(directive)));
++          "The SINK and SOURCE dependence types can only be used with the ORDERED directive, used here in the %s construct"_err_en_US,
++          parser::ToUpperCaseLetters(getDirectiveName(dir)));
+     }
+   }
+-  if (const auto *inOut{std::get_if<parser::OmpDependClause::InOut>(&x.v.u)}) {
+-    auto &objList{std::get<parser::OmpObjectList>(inOut->t)};
+-    if (directive == llvm::omp::OMPD_depobj) {
++  if (taskDep) {
++    auto &objList{std::get<parser::OmpObjectList>(taskDep->t)};
++    if (dir == llvm::omp::OMPD_depobj) {
+       // [5.0:255:13], [5.1:288:6], [5.2:322:26]
+       // A depend clause on a depobj construct must only specify one locator.
+       if (objList.v.size() != 1) {
+@@ -3495,14 +3519,14 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Depend &x) {
+         }
+       }
+     }
+-    if (std::get<std::optional<parser::OmpIteratorModifier>>(inOut->t)) {
++    if (std::get<std::optional<parser::OmpIteratorModifier>>(taskDep->t)) {
+       unsigned allowedInVersion{50};
+       if (version < allowedInVersion) {
+         context_.Say(GetContext().clauseSource,
+             "Iterator modifiers are not supported in %s, %s"_warn_en_US,
+             ThisVersion(version), TryVersion(allowedInVersion));
+       } else {
+-        if (directive == llvm::omp::OMPD_depobj) {
++        if (dir == llvm::omp::OMPD_depobj) {
+           context_.Say(GetContext().clauseSource,
+               "An iterator-modifier may specify multiple locators, "
+               "a DEPEND clause on a DEPOBJ construct must only specify "
+@@ -3624,29 +3648,36 @@ void OmpStructureChecker::CheckStructureElement(
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Update &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_update);
+-  llvm::omp::Directive directive{GetContext().directive};
++  llvm::omp::Directive dir{GetContext().directive};
+   unsigned version{context_.langOptions().OpenMPVersion};
+ 
+-  CheckTaskDependenceType(x.v.v.v);
++  auto *depType{std::get_if<parser::OmpDependenceType>(&x.v.u)};
++  auto *taskType{std::get_if<parser::OmpTaskDependenceType>(&x.v.u)};
++  assert(((depType == nullptr) != (taskType == nullptr)) &&
++      "Unexpected alternative in update clause");
++
++  if (depType) {
++    CheckDependenceType(depType->v);
++  } else if (taskType) {
++    CheckTaskDependenceType(taskType->v);
++  }
+ 
+   // [5.1:288:4-5]
+   // An update clause on a depobj construct must not have source, sink or depobj
+   // as dependence-type.
+   // [5.2:322:3]
+   // task-dependence-type must not be depobj.
+-  if (directive == llvm::omp::OMPD_depobj) {
++  if (dir == llvm::omp::OMPD_depobj) {
+     if (version >= 51) {
+-      // Update -> OmpUpdateClause -> OmpTaskDependenceType -> Type
+-      switch (x.v.v.v) {
+-      case parser::OmpTaskDependenceType::Type::Source:
+-      case parser::OmpTaskDependenceType::Type::Sink:
+-      case parser::OmpTaskDependenceType::Type::Depobj:
++      bool invalidDep{false};
++      if (taskType) {
++        invalidDep = taskType->v == parser::OmpTaskDependenceType::Type::Depobj;
++      } else {
++        invalidDep = true;
++      }
++      if (invalidDep) {
+         context_.Say(GetContext().clauseSource,
+-            "An UPDATE clause on a DEPOBJ construct must not have SOURCE, "
+-            "SINK or DEPOBJ as dependence-type"_err_en_US);
+-        break;
+-      default:
+-        break;
++            "An UPDATE clause on a DEPOBJ construct must not have SINK, SOURCE or DEPOBJ as dependence type"_err_en_US);
+       }
+     }
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index d9236be8bced4..9efacaa971008 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -202,6 +202,7 @@ class OmpStructureChecker
+   void CheckSIMDNest(const parser::OpenMPConstruct &x);
+   void CheckTargetNest(const parser::OpenMPConstruct &x);
+   void CheckTargetUpdate();
++  void CheckDependenceType(const parser::OmpDependenceType::Type &x);
+   void CheckTaskDependenceType(const parser::OmpTaskDependenceType::Type &x);
+   void CheckCancellationNest(
+       const parser::CharBlock &source, const parser::OmpCancelType::Type &type);
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index c2b5b9673239b..91c2871d3a677 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -553,7 +553,7 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+     return false;
+   }
+ 
+-  void Post(const parser::OmpDependSinkVec &x) {
++  void Post(const parser::OmpIteration &x) {
+     const auto &name{std::get<parser::Name>(x.t)};
+     ResolveName(&name);
+   }
+diff --git a/flang/test/Parser/OpenMP/depobj-construct.f90 b/flang/test/Parser/OpenMP/depobj-construct.f90
+index 7c474071bc1e6..3de190c95bb73 100644
+--- a/flang/test/Parser/OpenMP/depobj-construct.f90
++++ b/flang/test/Parser/OpenMP/depobj-construct.f90
+@@ -14,7 +14,7 @@ subroutine f00
+ !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct
+ !PARSE-TREE: | Verbatim
+ !PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | OmpClause -> Depend -> OmpDependClause -> InOut
++!PARSE-TREE: | OmpClause -> Depend -> OmpDependClause -> TaskDep
+ !PARSE-TREE: | | OmpTaskDependenceType -> Type = In
+ !PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'y'
+ 
+diff --git a/flang/test/Parser/OpenMP/doacross-clause.f90 b/flang/test/Parser/OpenMP/doacross-clause.f90
+new file mode 100644
+index 0000000000000..afd27d9d727e0
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/doacross-clause.f90
+@@ -0,0 +1,90 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x(10, 10)
++  !$omp do ordered(2)
++  do i = 1, 10
++    do j = 1, 10
++      !$omp ordered doacross(source)
++      x(i, j) = i + j
++    enddo
++  enddo
++  !$omp end do
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x(10_4,10_4)
++!UNPARSE: !$OMP DO  ORDERED(2_4)
++!UNPARSE:  DO i=1_4,10_4
++!UNPARSE:   DO j=1_4,10_4
++!UNPARSE: !$OMP ORDERED  DOACROSS(SOURCE)
++!UNPARSE:     x(int(i,kind=8),int(j,kind=8))=i+j
++!UNPARSE:   END DO
++!UNPARSE:  END DO
++!UNPARSE: !$OMP END DO
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE-LABEL: ProgramUnit -> SubroutineSubprogram
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: | OmpLoopDirective -> llvm::omp::Directive = do
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Ordered -> Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | LiteralConstant -> IntLiteralConstant = '2'
++![...]
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++!PARSE-TREE: | OmpSimpleStandaloneDirective -> llvm::omp::Directive = ordered
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Doacross -> OmpDoacrossClause -> OmpDoacross -> Source
++
++subroutine f01(x)
++  integer :: x(10, 10)
++  !$omp do ordered(2)
++  do i = 1, 10
++    do j = 1, 10
++      !$omp ordered doacross(sink: i+1, j-2), doacross(sink: i, j+3)
++      x(i, j) = i + j
++    enddo
++  enddo
++  !$omp end do
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x(10_4,10_4)
++!UNPARSE: !$OMP DO  ORDERED(2_4)
++!UNPARSE:  DO i=1_4,10_4
++!UNPARSE:   DO j=1_4,10_4
++!UNPARSE: !$OMP ORDERED  DOACROSS(SINK: i+1_4, j-2_4) DOACROSS(SINK: i, j+3_4)
++!UNPARSE:     x(int(i,kind=8),int(j,kind=8))=i+j
++!UNPARSE:   END DO
++!UNPARSE:  END DO
++!UNPARSE: !$OMP END DO
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE-LABEL: ProgramUnit -> SubroutineSubprogram
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: | OmpLoopDirective -> llvm::omp::Directive = do
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Ordered -> Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | LiteralConstant -> IntLiteralConstant = '2'
++![...]
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++!PARSE-TREE: | OmpSimpleStandaloneDirective -> llvm::omp::Directive = ordered
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Doacross -> OmpDoacrossClause -> OmpDoacross -> Sink -> OmpIterationVector -> OmpIteration
++!PARSE-TREE: | | Name = 'i'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | OmpIteration
++!PARSE-TREE: | | Name = 'j'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Subtract
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '2'
++!PARSE-TREE: | OmpClause -> Doacross -> OmpDoacrossClause -> OmpDoacross -> Sink -> OmpIterationVector -> OmpIteration
++!PARSE-TREE: | | Name = 'i'
++!PARSE-TREE: | OmpIteration
++!PARSE-TREE: | | Name = 'j'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '3_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '3'
++
+diff --git a/flang/test/Parser/OpenMP/ordered-depend.f90 b/flang/test/Parser/OpenMP/ordered-depend.f90
+new file mode 100644
+index 0000000000000..9e0946af0f09a
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/ordered-depend.f90
+@@ -0,0 +1,90 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=45 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=45 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x(10, 10)
++  !$omp do ordered(2)
++  do i = 1, 10
++    do j = 1, 10
++      !$omp ordered depend(source)
++      x(i, j) = i + j
++    enddo
++  enddo
++  !$omp end do
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x(10_4,10_4)
++!UNPARSE: !$OMP DO  ORDERED(2_4)
++!UNPARSE:  DO i=1_4,10_4
++!UNPARSE:   DO j=1_4,10_4
++!UNPARSE: !$OMP ORDERED  DEPEND(SOURCE)
++!UNPARSE:     x(int(i,kind=8),int(j,kind=8))=i+j
++!UNPARSE:   END DO
++!UNPARSE:  END DO
++!UNPARSE: !$OMP END DO
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE-LABEL: ProgramUnit -> SubroutineSubprogram
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: | OmpLoopDirective -> llvm::omp::Directive = do
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Ordered -> Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | LiteralConstant -> IntLiteralConstant = '2'
++![...]
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++!PARSE-TREE: | OmpSimpleStandaloneDirective -> llvm::omp::Directive = ordered
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Depend -> OmpDependClause -> OmpDoacross -> Source
++
++subroutine f01(x)
++  integer :: x(10, 10)
++  !$omp do ordered(2)
++  do i = 1, 10
++    do j = 1, 10
++      !$omp ordered depend(sink: i+1, j-2), depend(sink: i, j+3)
++      x(i, j) = i + j
++    enddo
++  enddo
++  !$omp end do
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x(10_4,10_4)
++!UNPARSE: !$OMP DO  ORDERED(2_4)
++!UNPARSE:  DO i=1_4,10_4
++!UNPARSE:   DO j=1_4,10_4
++!UNPARSE: !$OMP ORDERED  DEPEND(SINK: i+1_4, j-2_4) DEPEND(SINK: i, j+3_4)
++!UNPARSE:     x(int(i,kind=8),int(j,kind=8))=i+j
++!UNPARSE:   END DO
++!UNPARSE:  END DO
++!UNPARSE: !$OMP END DO
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE-LABEL: ProgramUnit -> SubroutineSubprogram
++!PARSE-TREE: OmpBeginLoopDirective
++!PARSE-TREE: | OmpLoopDirective -> llvm::omp::Directive = do
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Ordered -> Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | LiteralConstant -> IntLiteralConstant = '2'
++![...]
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++!PARSE-TREE: | OmpSimpleStandaloneDirective -> llvm::omp::Directive = ordered
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Depend -> OmpDependClause -> OmpDoacross -> Sink -> OmpIterationVector -> OmpIteration
++!PARSE-TREE: | | Name = 'i'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | OmpIteration
++!PARSE-TREE: | | Name = 'j'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Subtract
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '2_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '2'
++!PARSE-TREE: | OmpClause -> Depend -> OmpDependClause -> OmpDoacross -> Sink -> OmpIterationVector -> OmpIteration
++!PARSE-TREE: | | Name = 'i'
++!PARSE-TREE: | OmpIteration
++!PARSE-TREE: | | Name = 'j'
++!PARSE-TREE: | | OmpIterationOffset
++!PARSE-TREE: | | | DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | | Scalar -> Integer -> Constant -> Expr = '3_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '3'
++
+diff --git a/flang/test/Semantics/OpenMP/clause-validity01.f90 b/flang/test/Semantics/OpenMP/clause-validity01.f90
+index 124f1a02d99fb..406d30b38948e 100644
+--- a/flang/test/Semantics/OpenMP/clause-validity01.f90
++++ b/flang/test/Semantics/OpenMP/clause-validity01.f90
+@@ -495,7 +495,7 @@
+   !$omp taskyield
+   !$omp barrier
+   !$omp taskwait
+-  !ERROR: DEPEND(SOURCE) or DEPEND(SINK : vec) can be used only with the ordered directive. Used here in the TASKWAIT construct.
++  !ERROR: The SINK and SOURCE dependence types can only be used with the ORDERED directive, used here in the TASKWAIT construct
+   !$omp taskwait depend(source)
+   ! !$omp taskwait depend(sink:i-1)
+   ! !$omp target enter data map(to:arrayA) map(alloc:arrayB)
+diff --git a/flang/test/Semantics/OpenMP/depend06.f90 b/flang/test/Semantics/OpenMP/depend06.f90
+index a9668c552f967..d2e6a114676c3 100644
+--- a/flang/test/Semantics/OpenMP/depend06.f90
++++ b/flang/test/Semantics/OpenMP/depend06.f90
+@@ -2,7 +2,7 @@
+ 
+ subroutine f00(x)
+   integer :: x
+-!WARNING: INOUTSET task-dependence-type is not supported in OpenMP v4.5, try -fopenmp-version=52
++!WARNING: INOUTSET task dependence type is not supported in OpenMP v4.5, try -fopenmp-version=52
+   !$omp task depend(inoutset: x)
+   x = x + 1
+   !$omp end task
+@@ -10,7 +10,7 @@ subroutine f00(x)
+ 
+ subroutine f01(x)
+   integer :: x
+-!WARNING: MUTEXINOUTSET task-dependence-type is not supported in OpenMP v4.5, try -fopenmp-version=50
++!WARNING: MUTEXINOUTSET task dependence type is not supported in OpenMP v4.5, try -fopenmp-version=50
+   !$omp task depend(mutexinoutset: x)
+   x = x + 1
+   !$omp end task
+diff --git a/flang/test/Semantics/OpenMP/depobj-construct-v50.f90 b/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
+index e87d86ca54bee..76661785826b4 100644
+--- a/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
++++ b/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
+@@ -2,7 +2,7 @@
+ 
+ subroutine f00
+   integer :: obj
+-!ERROR: A DEPEND clause on a DEPOBJ construct must not have SOURCE, SINK or DEPOBJ as dependence-type
++!ERROR: A DEPEND clause on a DEPOBJ construct must not have SINK, SOURCE or DEPOBJ as dependence type
+   !$omp depobj(obj) depend(source)
+ end
+ 
+diff --git a/flang/test/Semantics/OpenMP/depobj-construct-v51.f90 b/flang/test/Semantics/OpenMP/depobj-construct-v51.f90
+index fa0c025a11010..fc403f0b2db22 100644
+--- a/flang/test/Semantics/OpenMP/depobj-construct-v51.f90
++++ b/flang/test/Semantics/OpenMP/depobj-construct-v51.f90
+@@ -2,12 +2,12 @@
+ 
+ subroutine f04
+   integer :: obj
+-!ERROR: An UPDATE clause on a DEPOBJ construct must not have SOURCE, SINK or DEPOBJ as dependence-type
++!ERROR: An UPDATE clause on a DEPOBJ construct must not have SINK, SOURCE or DEPOBJ as dependence type
+   !$omp depobj(obj) update(source)
+ end
+ 
+ subroutine f05
+   integer :: obj
+-!ERROR: An UPDATE clause on a DEPOBJ construct must not have SOURCE, SINK or DEPOBJ as dependence-type
++!ERROR: An UPDATE clause on a DEPOBJ construct must not have SINK, SOURCE or DEPOBJ as dependence type
+   !$omp depobj(obj) update(depobj)
+ end
+diff --git a/flang/test/Semantics/OpenMP/depobj-construct-v52.f90 b/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
+index 42a2102500ea7..644090d7f7e8b 100644
+--- a/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
++++ b/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
+@@ -2,8 +2,8 @@
+ 
+ subroutine f00
+   integer :: obj
+-!WARNING: SOURCE task-dependence-type is deprecated in OpenMP v5.2
+-!ERROR: A DEPEND clause on a DEPOBJ construct must not have SOURCE or SINK as dependence-type
++!WARNING: SOURCE dependence type is deprecated in OpenMP v5.2
++!ERROR: A DEPEND clause on a DEPOBJ construct must not have SINK or SOURCE as dependence type
+   !$omp depobj(obj) depend(source)
+ end
+ 
+diff --git a/flang/test/Semantics/OpenMP/ordered01.f90 b/flang/test/Semantics/OpenMP/ordered01.f90
+index 9433120fab10f..9f3a258d470a6 100644
+--- a/flang/test/Semantics/OpenMP/ordered01.f90
++++ b/flang/test/Semantics/OpenMP/ordered01.f90
+@@ -37,17 +37,16 @@ program main
+ 
+   !$omp do ordered(1)
+   do i = 2, N
+-    !ERROR: Only DEPEND(SOURCE) or DEPEND(SINK: vec) are allowed when ORDERED construct is a standalone construct with no ORDERED region
+-    !ERROR: At most one DEPEND(SOURCE) clause can appear on the ORDERED directive
++    !ERROR: Only SINK or SOURCE dependence types are allowed when ORDERED construct is a standalone construct with no ORDERED region
++    !ERROR: At most one SOURCE dependence type can appear on the ORDERED directive
+     !$omp ordered depend(source) depend(inout: arrayA) depend(source)
+     arrayA(i) = foo(i)
+-    !ERROR: DEPEND(SOURCE) is not allowed when DEPEND(SINK: vec) is present on ORDERED directive
+-    !ERROR: DEPEND(SOURCE) is not allowed when DEPEND(SINK: vec) is present on ORDERED directive
+-    !ERROR: At most one DEPEND(SOURCE) clause can appear on the ORDERED directive
++    !ERROR: The SINK and SOURCE dependence types are mutually exclusive
++    !ERROR: At most one SOURCE dependence type can appear on the ORDERED directive
+     !$omp ordered depend(sink: i - 1) depend(source) depend(source)
+     arrayB(i) = bar(arrayA(i), arrayB(i-1))
+-    !ERROR: Only DEPEND(SOURCE) or DEPEND(SINK: vec) are allowed when ORDERED construct is a standalone construct with no ORDERED region
+-    !ERROR: Only DEPEND(SOURCE) or DEPEND(SINK: vec) are allowed when ORDERED construct is a standalone construct with no ORDERED region
++    !ERROR: Only SINK or SOURCE dependence types are allowed when ORDERED construct is a standalone construct with no ORDERED region
++    !ERROR: Only SINK or SOURCE dependence types are allowed when ORDERED construct is a standalone construct with no ORDERED region
+     !$omp ordered depend(out: arrayC) depend(in: arrayB)
+     arrayC(i) = baz(arrayB(i-1))
+   end do
+diff --git a/flang/test/Semantics/OpenMP/ordered03.f90 b/flang/test/Semantics/OpenMP/ordered03.f90
+index 18f85fc24a9fb..e96d4557f8f18 100644
+--- a/flang/test/Semantics/OpenMP/ordered03.f90
++++ b/flang/test/Semantics/OpenMP/ordered03.f90
+@@ -99,7 +99,7 @@ subroutine sub1()
+ 
+   !$omp do ordered(1)
+   do i = 1, N
+-    !ERROR: The number of variables in DEPEND(SINK: vec) clause does not match the parameter specified in ORDERED clause
++    !ERROR: The number of variables in the SINK iteration vector does not match the parameter specified in ORDERED clause
+     !$omp ordered depend(sink: i - 1) depend(sink: i - 1, j)
+     arrayB(i) = bar(i - 1, j)
+   end do
+@@ -108,7 +108,7 @@ subroutine sub1()
+   !$omp do ordered(2)
+   do i = 1, N
+     do j = 1, N
+-      !ERROR: The number of variables in DEPEND(SINK: vec) clause does not match the parameter specified in ORDERED clause
++      !ERROR: The number of variables in the SINK iteration vector does not match the parameter specified in ORDERED clause
+       !$omp ordered depend(sink: i - 1) depend(sink: i - 1, j)
+       arrayB(i) = foo(i - 1) + bar(i - 1, j)
+     end do
+diff --git a/llvm/include/llvm/Frontend/OpenMP/ClauseT.h b/llvm/include/llvm/Frontend/OpenMP/ClauseT.h
+index 8ff15b51f1abd..f4e089db0080e 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/ClauseT.h
++++ b/llvm/include/llvm/Frontend/OpenMP/ClauseT.h
+@@ -238,8 +238,9 @@ struct MapperT {
+ // When used as arguments for other clauses, e.g. `fail`.
+ ENUM(MemoryOrder, AcqRel, Acquire, Relaxed, Release, SeqCst);
+ ENUM(MotionExpectation, Present);
++// Union of `dependence-type` and `task-depenence-type`.
+ // V5.2: [15.9.1] `task-dependence-type` modifier
+-ENUM(TaskDependenceType, Depobj, In, Inout, Inoutset, Mutexinoutset, Out, Sink,
++ENUM(DependenceType, Depobj, In, Inout, Inoutset, Mutexinoutset, Out, Sink,
+      Source);
+ 
+ template <typename I, typename E> //
+@@ -502,17 +503,17 @@ template <typename T, typename I, typename E> //
+ struct DependT {
+   using Iterator = type::IteratorT<T, I, E>;
+   using LocatorList = ObjectListT<I, E>;
+-  using TaskDependenceType = tomp::type::TaskDependenceType;
++  using DependenceType = tomp::type::DependenceType;
+ 
+-  struct DepType { // The form with task dependence type.
++  struct TaskDep { // The form with task dependence type.
+     using TupleTrait = std::true_type;
+     // Empty LocatorList means "omp_all_memory".
+-    std::tuple<TaskDependenceType, OPT(Iterator), LocatorList> t;
++    std::tuple<DependenceType, OPT(Iterator), LocatorList> t;
+   };
+ 
+   using Doacross = DoacrossT<T, I, E>;
+   using UnionTrait = std::true_type;
+-  std::variant<Doacross, DepType> u; // Doacross form is legacy
++  std::variant<Doacross, TaskDep> u; // Doacross form is legacy
+ };
+ 
+ // V5.2: [3.5] `destroy` clause
+@@ -562,7 +563,7 @@ struct DistScheduleT {
+ template <typename T, typename I, typename E> //
+ struct DoacrossT {
+   using Vector = ListT<type::LoopIterationT<I, E>>;
+-  ENUM(DependenceType, Source, Sink);
++  using DependenceType = tomp::type::DependenceType;
+   using TupleTrait = std::true_type;
+   // Empty Vector means "omp_cur_iteration"
+   std::tuple<DependenceType, Vector> t;
+@@ -1162,9 +1163,9 @@ struct UntiedT {
+ // V5.2: [15.9.3] `update` clause
+ template <typename T, typename I, typename E> //
+ struct UpdateT {
+-  using TaskDependenceType = tomp::type::TaskDependenceType;
++  using DependenceType = tomp::type::DependenceType;
+   using WrapperTrait = std::true_type;
+-  OPT(TaskDependenceType) v;
++  OPT(DependenceType) v;
+ };
+ 
+ // V5.2: [14.1.3] `use` clause
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 36834939d9b45..e81cdb681cb99 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -151,6 +151,7 @@ def OMPC_DistSchedule : Clause<"dist_schedule"> {
+ }
+ def OMPC_Doacross : Clause<"doacross"> {
+   let clangClass = "OMPDoacrossClause";
++  let flangClass = "OmpDoacrossClause";
+ }
+ def OMPC_DynamicAllocators : Clause<"dynamic_allocators"> {
+   let clangClass = "OMPDynamicAllocatorsClause";

@@ -1,0 +1,886 @@
+diff --git a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+index 28990a02af57c..dbbf86a6c6151 100644
+--- a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
++++ b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+@@ -127,18 +127,16 @@ std::string OpenMPCounterVisitor::getName(const OpenMPConstruct &c) {
+   return std::visit(
+       Fortran::common::visitors{
+           [&](const OpenMPStandaloneConstruct &c) -> std::string {
+-            return std::visit(
+-                Fortran::common::visitors{
+-                    [&](const OpenMPSimpleStandaloneConstruct &d) {
++            return common::visit(
++                common::visitors{
++                    [&](const OmpMetadirectiveDirective &d) {
++                      return normalize_construct_name(d.source.ToString());
++                    },
++                    [&](auto &&d) {
+                       const CharBlock &source{
+                           std::get<OmpDirectiveName>(d.v.t).source};
+                       return normalize_construct_name(source.ToString());
+                     },
+-                    [&](const auto &c) {
+-                      // Get source from the directive or verbatim fields
+-                      const CharBlock &source{std::get<0>(c.t).source};
+-                      return normalize_construct_name(source.ToString());
+-                    },
+                 },
+                 c.u);
+           },
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 118df6cf2a4ff..9bff2dab974ec 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -484,6 +484,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpLocatorList)
+   NODE(parser, OmpReductionSpecifier)
+   NODE(parser, OmpArgument)
++  NODE(parser, OmpArgumentList)
+   NODE(parser, OmpMetadirectiveDirective)
+   NODE(parser, OmpMatchClause)
+   NODE(parser, OmpOtherwiseClause)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index dfde4ceb787d2..029c3de354b66 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3557,6 +3557,11 @@ struct OmpArgument {
+       OmpMapperSpecifier, OmpReductionSpecifier>
+       u;
+ };
++
++struct OmpArgumentList {
++  WRAPPER_CLASS_BOILERPLATE(OmpArgumentList, std::list<OmpArgument>);
++  CharBlock source;
++};
+ } // namespace arguments
+ 
+ inline namespace traits {
+@@ -4511,10 +4516,11 @@ struct OmpDirectiveSpecification {
+   llvm::omp::Directive DirId() const { //
+     return std::get<OmpDirectiveName>(t).v;
+   }
++  const OmpArgumentList &Arguments() const;
+   const OmpClauseList &Clauses() const;
+ 
+   CharBlock source;
+-  std::tuple<OmpDirectiveName, std::optional<std::list<OmpArgument>>,
++  std::tuple<OmpDirectiveName, std::optional<OmpArgumentList>,
+       std::optional<OmpClauseList>, Flags>
+       t;
+ };
+@@ -4865,16 +4871,15 @@ struct OmpLoopDirective {
+ 
+ // 2.14.2 cancellation-point -> CANCELLATION POINT construct-type-clause
+ struct OpenMPCancellationPointConstruct {
+-  TUPLE_CLASS_BOILERPLATE(OpenMPCancellationPointConstruct);
++  WRAPPER_CLASS_BOILERPLATE(
++      OpenMPCancellationPointConstruct, OmpDirectiveSpecification);
+   CharBlock source;
+-  std::tuple<Verbatim, OmpClauseList> t;
+ };
+ 
+ // 2.14.1 cancel -> CANCEL construct-type-clause [ [,] if-clause]
+ struct OpenMPCancelConstruct {
+-  TUPLE_CLASS_BOILERPLATE(OpenMPCancelConstruct);
++  WRAPPER_CLASS_BOILERPLATE(OpenMPCancelConstruct, OmpDirectiveSpecification);
+   CharBlock source;
+-  std::tuple<Verbatim, OmpClauseList> t;
+ };
+ 
+ // Ref: [5.0:254-255], [5.1:287-288], [5.2:322-323]
+@@ -4884,9 +4889,8 @@ struct OpenMPCancelConstruct {
+ //                  destroy-clause |
+ //                  update-clause
+ struct OpenMPDepobjConstruct {
+-  TUPLE_CLASS_BOILERPLATE(OpenMPDepobjConstruct);
++  WRAPPER_CLASS_BOILERPLATE(OpenMPDepobjConstruct, OmpDirectiveSpecification);
+   CharBlock source;
+-  std::tuple<Verbatim, OmpObject, OmpClause> t;
+ };
+ 
+ // Ref: [5.2: 200-201]
+@@ -4927,11 +4931,8 @@ struct OpenMPDispatchConstruct {
+ //    ACQ_REL | RELEASE | ACQUIRE |                 // since 5.0
+ //    SEQ_CST                                       // since 5.1
+ struct OpenMPFlushConstruct {
+-  TUPLE_CLASS_BOILERPLATE(OpenMPFlushConstruct);
++  WRAPPER_CLASS_BOILERPLATE(OpenMPFlushConstruct, OmpDirectiveSpecification);
+   CharBlock source;
+-  std::tuple<Verbatim, std::optional<OmpObjectList>,
+-      std::optional<OmpClauseList>, /*TrailingClauses=*/bool>
+-      t;
+ };
+ 
+ struct OpenMPSimpleStandaloneConstruct {
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index f98cc0c83d179..5b6e099967df5 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -132,6 +132,25 @@ Object makeObject(const parser::OmpObject &object,
+   return makeObject(std::get<parser::Designator>(object.u), semaCtx);
+ }
+ 
++ObjectList makeObjects(const parser::OmpArgumentList &objects,
++                       semantics::SemanticsContext &semaCtx) {
++  return makeList(objects.v, [&](const parser::OmpArgument &arg) {
++    return common::visit(
++        common::visitors{
++            [&](const parser::OmpLocator &locator) -> Object {
++              if (auto *object = std::get_if<parser::OmpObject>(&locator.u)) {
++                return makeObject(*object, semaCtx);
++              }
++              llvm_unreachable("Expecting object");
++            },
++            [](auto &&s) -> Object { //
++              llvm_unreachable("Expecting object");
++            },
++        },
++        arg.u);
++  });
++}
++
+ std::optional<Object> getBaseObject(const Object &object,
+                                     semantics::SemanticsContext &semaCtx) {
+   // If it's just the symbol, then there is no base.
+diff --git a/flang/lib/Lower/OpenMP/Clauses.h b/flang/lib/Lower/OpenMP/Clauses.h
+index fe453eb05cde2..e0a642036a58f 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.h
++++ b/flang/lib/Lower/OpenMP/Clauses.h
+@@ -143,6 +143,9 @@ inline ObjectList makeObjects(const parser::OmpObjectList &objects,
+   return makeList(objects.v, makeObjectFn(semaCtx));
+ }
+ 
++ObjectList makeObjects(const parser::OmpArgumentList &objects,
++                       semantics::SemanticsContext &semaCtx);
++
+ template <typename FuncTy, //
+           typename ArgTy,  //
+           typename ResultTy = std::invoke_result_t<FuncTy, ArgTy>>
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index cd100bd1e0e1e..76e5a3d8bf810 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -3321,22 +3321,16 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    semantics::SemanticsContext &semaCtx,
+                    lower::pft::Evaluation &eval,
+-                   const parser::OpenMPFlushConstruct &flushConstruct) {
+-  const auto &verbatim = std::get<parser::Verbatim>(flushConstruct.t);
+-  const auto &objectList =
+-      std::get<std::optional<parser::OmpObjectList>>(flushConstruct.t);
+-  const auto &clauseList =
+-      std::get<std::optional<parser::OmpClauseList>>(flushConstruct.t);
+-  ObjectList objects =
+-      objectList ? makeObjects(*objectList, semaCtx) : ObjectList{};
++                   const parser::OpenMPFlushConstruct &construct) {
++  const auto &argumentList = construct.v.Arguments();
++  const auto &clauseList = construct.v.Clauses();
++  ObjectList objects = makeObjects(argumentList, semaCtx);
+   List<Clause> clauses =
+-      clauseList ? makeList(clauseList->v,
+-                            [&](auto &&s) { return makeClause(s, semaCtx); })
+-                 : List<Clause>{};
+-  mlir::Location currentLocation = converter.genLocation(verbatim.source);
++      makeList(clauseList.v, [&](auto &&s) { return makeClause(s, semaCtx); });
++  mlir::Location currentLocation = converter.genLocation(construct.source);
+ 
+   ConstructQueue queue{buildConstructQueue(
+-      converter.getFirOpBuilder().getModule(), semaCtx, eval, verbatim.source,
++      converter.getFirOpBuilder().getModule(), semaCtx, eval, construct.source,
+       llvm::omp::Directive::OMPD_flush, clauses)};
+   genFlushOp(converter, symTable, semaCtx, eval, currentLocation, objects,
+              queue, queue.begin());
+@@ -3363,11 +3357,12 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    const parser::OpenMPDepobjConstruct &construct) {
+   // These values will be ignored until the construct itself is implemented,
+   // but run them anyway for the sake of testing (via a Todo test).
+-  auto &ompObj = std::get<parser::OmpObject>(construct.t);
+-  const Object &depObj = makeObject(ompObj, semaCtx);
+-  Clause clause = makeClause(std::get<parser::OmpClause>(construct.t), semaCtx);
+-  (void)depObj;
+-  (void)clause;
++  ObjectList objects = makeObjects(construct.v.Arguments(), semaCtx);
++  assert(objects.size() == 1);
++  List<Clause> clauses = makeClauses(construct.v.Clauses(), semaCtx);
++  assert(clauses.size() == 1);
++  (void)objects;
++  (void)clauses;
+ 
+   TODO(converter.getCurrentLocation(), "OpenMPDepobjConstruct");
+ }
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 4509a81163c91..f76a136655478 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -236,6 +236,9 @@ TYPE_PARSER(sourced( //
+ 
+ TYPE_PARSER(construct<OmpLocatorList>(nonemptyList(Parser<OmpLocator>{})))
+ 
++TYPE_PARSER(sourced( //
++    construct<OmpArgumentList>(nonemptyList(Parser<OmpArgument>{}))))
++
+ TYPE_PARSER( //
+     construct<OmpTypeSpecifier>(Parser<DeclarationTypeSpec>{}) ||
+     construct<OmpTypeSpecifier>(Parser<TypeSpec>{}))
+@@ -1057,9 +1060,9 @@ TYPE_PARSER(sourced(construct<OmpErrorDirective>(
+ 
+ TYPE_PARSER(sourced(construct<OmpDirectiveName>(OmpDirectiveNameParser{})))
+ 
+-OmpDirectiveSpecification static makeFlushFromOldSyntax1(Verbatim &&text,
++OmpDirectiveSpecification static makeFlushFromOldSyntax(Verbatim &&text,
+     std::optional<OmpClauseList> &&clauses,
+-    std::optional<std::list<OmpArgument>> &&args,
++    std::optional<OmpArgumentList> &&args,
+     OmpDirectiveSpecification::Flags &&flags) {
+   return OmpDirectiveSpecification{OmpDirectiveName(text), std::move(args),
+       std::move(clauses), std::move(flags)};
+@@ -1073,15 +1076,15 @@ TYPE_PARSER(sourced(
+         // lists absent in the parsed result.
+         // E.g. for FLUSH(x) SEQ_CST it would find no clauses following
+         // the directive name, parse the argument list "(x)" and stop.
+-        applyFunction<OmpDirectiveSpecification>(makeFlushFromOldSyntax1,
++        applyFunction<OmpDirectiveSpecification>(makeFlushFromOldSyntax,
+             verbatim("FLUSH"_tok) / !lookAhead("("_tok),
+             maybe(Parser<OmpClauseList>{}),
+-            maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
++            maybe(parenthesized(Parser<OmpArgumentList>{})),
+             pure(OmpDirectiveSpecification::Flags::DeprecatedSyntax))) ||
+     // Parse the standard syntax: directive [(arguments)] [clauses]
+     construct<OmpDirectiveSpecification>( //
+         sourced(OmpDirectiveNameParser{}),
+-        maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
++        maybe(parenthesized(Parser<OmpArgumentList>{})),
+         maybe(Parser<OmpClauseList>{}),
+         pure(OmpDirectiveSpecification::Flags::None))))
+ 
+@@ -1157,14 +1160,6 @@ TYPE_PARSER(sourced(construct<OmpLoopDirective>(first(
+ TYPE_PARSER(sourced(construct<OmpBeginLoopDirective>(
+     sourced(Parser<OmpLoopDirective>{}), Parser<OmpClauseList>{})))
+ 
+-// 2.14.2 Cancellation Point construct
+-TYPE_PARSER(sourced(construct<OpenMPCancellationPointConstruct>(
+-    verbatim("CANCELLATION POINT"_tok), Parser<OmpClauseList>{})))
+-
+-// 2.14.1 Cancel construct
+-TYPE_PARSER(sourced(construct<OpenMPCancelConstruct>(
+-    verbatim("CANCEL"_tok), Parser<OmpClauseList>{})))
+-
+ TYPE_PARSER(sourced(construct<OmpFailClause>(
+     parenthesized(indirect(Parser<OmpMemoryOrderClause>{})))))
+ 
+@@ -1205,29 +1200,6 @@ TYPE_PARSER(sourced(construct<OmpAtomicClause>(
+ TYPE_PARSER(sourced(construct<OmpAtomicClauseList>(
+     many(maybe(","_tok) >> sourced(Parser<OmpAtomicClause>{})))))
+ 
+-TYPE_PARSER(sourced(construct<OpenMPDepobjConstruct>(verbatim("DEPOBJ"_tok),
+-    parenthesized(Parser<OmpObject>{}), sourced(Parser<OmpClause>{}))))
+-
+-static OpenMPFlushConstruct makeFlushFromOldSyntax(Verbatim &&text,
+-    std::optional<OmpClauseList> &&clauses,
+-    std::optional<OmpObjectList> &&objects) {
+-  bool oldSyntax{
+-      clauses && !clauses->v.empty() && objects && !objects->v.empty()};
+-  return OpenMPFlushConstruct{std::move(text), std::move(objects),
+-      std::move(clauses),
+-      /*TrailingClauses=*/!oldSyntax};
+-}
+-
+-TYPE_PARSER(sourced( //
+-    construct<OpenMPFlushConstruct>( //
+-        applyFunction<OpenMPFlushConstruct>(makeFlushFromOldSyntax,
+-            verbatim("FLUSH"_tok), maybe(Parser<OmpClauseList>{}),
+-            maybe(parenthesized(Parser<OmpObjectList>{})))) ||
+-
+-    construct<OpenMPFlushConstruct>( //
+-        verbatim("FLUSH"_tok), maybe(parenthesized(Parser<OmpObjectList>{})),
+-        Parser<OmpClauseList>{}, pure(/*TrailingClauses=*/true))))
+-
+ static bool IsSimpleStandalone(const OmpDirectiveName &name) {
+   switch (name.v) {
+   case llvm::omp::Directive::OMPD_barrier:
+@@ -1249,6 +1221,36 @@ TYPE_PARSER(sourced( //
+         predicated(OmpDirectiveNameParser{}, IsSimpleStandalone) >=
+         Parser<OmpDirectiveSpecification>{})))
+ 
++static inline constexpr auto IsDirective(llvm::omp::Directive dir) {
++  return [dir](const OmpDirectiveName &name) -> bool { return dir == name.v; };
++}
++
++TYPE_PARSER(sourced( //
++    construct<OpenMPFlushConstruct>(
++        predicated(OmpDirectiveNameParser{},
++            IsDirective(llvm::omp::Directive::OMPD_flush)) >=
++        Parser<OmpDirectiveSpecification>{})))
++
++// 2.14.2 Cancellation Point construct
++TYPE_PARSER(sourced( //
++    construct<OpenMPCancellationPointConstruct>(
++        predicated(OmpDirectiveNameParser{},
++            IsDirective(llvm::omp::Directive::OMPD_cancellation_point)) >=
++        Parser<OmpDirectiveSpecification>{})))
++
++// 2.14.1 Cancel construct
++TYPE_PARSER(sourced( //
++    construct<OpenMPCancelConstruct>(
++        predicated(OmpDirectiveNameParser{},
++            IsDirective(llvm::omp::Directive::OMPD_cancel)) >=
++        Parser<OmpDirectiveSpecification>{})))
++
++TYPE_PARSER(sourced( //
++    construct<OpenMPDepobjConstruct>(
++        predicated(OmpDirectiveNameParser{},
++            IsDirective(llvm::omp::Directive::OMPD_depobj)) >=
++        Parser<OmpDirectiveSpecification>{})))
++
+ // Standalone Constructs
+ TYPE_PARSER(
+     sourced( //
+diff --git a/flang/lib/Parser/parse-tree.cpp b/flang/lib/Parser/parse-tree.cpp
+index 5917f30b3c589..5839e7862b38b 100644
+--- a/flang/lib/Parser/parse-tree.cpp
++++ b/flang/lib/Parser/parse-tree.cpp
+@@ -337,6 +337,14 @@ llvm::omp::Clause OmpClause::Id() const {
+   return std::visit([](auto &&s) { return getClauseIdForClass(s); }, u);
+ }
+ 
++const OmpArgumentList &OmpDirectiveSpecification::Arguments() const {
++  static OmpArgumentList empty{decltype(OmpArgumentList::v){}};
++  if (auto &arguments = std::get<std::optional<OmpArgumentList>>(t)) {
++    return *arguments;
++  }
++  return empty;
++}
++
+ const OmpClauseList &OmpDirectiveSpecification::Clauses() const {
+   static OmpClauseList empty{decltype(OmpClauseList::v){}};
+   if (auto &clauses = std::get<std::optional<OmpClauseList>>(t)) {
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 98e02d4f02b9c..8cdbf8ed2a672 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2075,6 +2075,8 @@ class UnparseVisitor {
+   }
+ 
+   // OpenMP Clauses & Directives
++  void Unparse(const OmpArgumentList &x) { Walk(x.v, ", "); }
++
+   void Unparse(const OmpTypeNameList &x) { //
+     Walk(x.v, ",");
+   }
+@@ -2095,8 +2097,7 @@ class UnparseVisitor {
+   }
+   void Unparse(const OmpDirectiveSpecification &x) {
+     auto unparseArgs{[&]() {
+-      using ArgList = std::list<parser::OmpArgument>;
+-      if (auto &args{std::get<std::optional<ArgList>>(x.t)}) {
++      if (auto &args{std::get<std::optional<OmpArgumentList>>(x.t)}) {
+         Put("(");
+         Walk(*args);
+         Put(")");
+@@ -2823,15 +2824,15 @@ class UnparseVisitor {
+   }
+   void Unparse(const OpenMPCancellationPointConstruct &x) {
+     BeginOpenMP();
+-    Word("!$OMP CANCELLATION POINT ");
+-    Walk(std::get<OmpClauseList>(x.t));
++    Word("!$OMP ");
++    Walk(x.v);
+     Put("\n");
+     EndOpenMP();
+   }
+   void Unparse(const OpenMPCancelConstruct &x) {
+     BeginOpenMP();
+-    Word("!$OMP CANCEL ");
+-    Walk(std::get<OmpClauseList>(x.t));
++    Word("!$OMP ");
++    Walk(x.v);
+     Put("\n");
+     EndOpenMP();
+   }
+@@ -2858,23 +2859,21 @@ class UnparseVisitor {
+   }
+   void Unparse(const OpenMPDepobjConstruct &x) {
+     BeginOpenMP();
+-    Word("!$OMP DEPOBJ");
+-    Put("(");
+-    Walk(std::get<OmpObject>(x.t));
+-    Put(") ");
+-    Walk(std::get<OmpClause>(x.t));
++    Word("!$OMP ");
++    Walk(x.v);
+     Put("\n");
+     EndOpenMP();
+   }
+   void Unparse(const OpenMPFlushConstruct &x) {
+     BeginOpenMP();
+     Word("!$OMP FLUSH");
+-    if (std::get</*ClausesTrailing=*/bool>(x.t)) {
+-      Walk("(", std::get<std::optional<OmpObjectList>>(x.t), ")");
+-      Walk(" ", std::get<std::optional<OmpClauseList>>(x.t));
++    using Flags = OmpDirectiveSpecification::Flags;
++    if (std::get<Flags>(x.v.t) == Flags::DeprecatedSyntax) {
++      Walk("(", std::get<std::optional<OmpArgumentList>>(x.v.t), ")");
++      Walk(" ", std::get<std::optional<OmpClauseList>>(x.v.t));
+     } else {
+-      Walk(" ", std::get<std::optional<OmpClauseList>>(x.t));
+-      Walk(" (", std::get<std::optional<OmpObjectList>>(x.t), ")");
++      Walk(" ", std::get<std::optional<OmpClauseList>>(x.v.t));
++      Walk(" (", std::get<std::optional<OmpArgumentList>>(x.v.t), ")");
+     }
+     Put("\n");
+     EndOpenMP();
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 9c9d666b5e8d5..6bddd629d607e 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1601,23 +1601,58 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareSimdConstruct &) {
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OpenMPDepobjConstruct &x) {
+-  const auto &dir{std::get<parser::Verbatim>(x.t)};
+-  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_depobj);
++  const auto &dirName{std::get<parser::OmpDirectiveName>(x.v.t)};
++  PushContextAndClauseSets(dirName.source, llvm::omp::Directive::OMPD_depobj);
++  unsigned version{context_.langOptions().OpenMPVersion};
++
++  const parser::OmpArgumentList &arguments{x.v.Arguments()};
++  const parser::OmpClauseList &clauses{x.v.Clauses()};
++
++  // Ref: [6.0:505-506]
++
++  if (version < 60) {
++    if (arguments.v.size() != 1) {
++      parser::CharBlock source(
++          arguments.v.empty() ? dirName.source : arguments.source);
++      context_.Say(
++          source, "The DEPOBJ directive requires a single argument"_err_en_US);
++    }
++  }
++  if (clauses.v.size() != 1) {
++    context_.Say(
++        x.source, "The DEPOBJ construct requires a single clause"_err_en_US);
++    return;
++  }
++
++  auto &clause{clauses.v.front()};
++
++  if (version >= 60 && arguments.v.empty()) {
++    context_.Say(x.source,
++        "DEPOBJ syntax with no argument is not handled yet"_err_en_US);
++    return;
++  }
+ 
+   // [5.2:73:27-28]
+   // If the destroy clause appears on a depobj construct, destroy-var must
+   // refer to the same depend object as the depobj argument of the construct.
+-  auto &clause{std::get<parser::OmpClause>(x.t)};
+   if (clause.Id() == llvm::omp::Clause::OMPC_destroy) {
+-    auto getSymbol{[&](const parser::OmpObject &obj) {
++    auto getObjSymbol{[&](const parser::OmpObject &obj) {
+       return common::visit(
+           [&](auto &&s) { return GetLastName(s).symbol; }, obj.u);
+     }};
++    auto getArgSymbol{[&](const parser::OmpArgument &arg) {
++      if (auto *locator{std::get_if<parser::OmpLocator>(&arg.u)}) {
++        if (auto *object{std::get_if<parser::OmpObject>(&locator->u)}) {
++          return getObjSymbol(*object);
++        }
++      }
++      return static_cast<Symbol *>(nullptr);
++    }};
+ 
+     auto &wrapper{std::get<parser::OmpClause::Destroy>(clause.u)};
+     if (const std::optional<parser::OmpDestroyClause> &destroy{wrapper.v}) {
+-      const Symbol *constrSym{getSymbol(std::get<parser::OmpObject>(x.t))};
+-      const Symbol *clauseSym{getSymbol(destroy->v)};
++      const Symbol *constrSym{getArgSymbol(arguments.v.front())};
++      const Symbol *clauseSym{getObjSymbol(destroy->v)};
+       assert(constrSym && "Unresolved depobj construct symbol");
+       assert(clauseSym && "Unresolved destroy symbol on depobj construct");
+       if (constrSym != clauseSym) {
+@@ -2210,27 +2245,34 @@ void OmpStructureChecker::Leave(
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OpenMPFlushConstruct &x) {
+-  const auto &dir{std::get<parser::Verbatim>(x.t)};
+-  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_flush);
++  const auto &dirName{std::get<parser::OmpDirectiveName>(x.v.t)};
++  PushContextAndClauseSets(dirName.source, llvm::omp::Directive::OMPD_flush);
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OpenMPFlushConstruct &x) {
+-  auto &flushList{std::get<std::optional<parser::OmpObjectList>>(x.t)};
++  auto &flushList{std::get<std::optional<parser::OmpArgumentList>>(x.v.t)};
+ 
+-  if (FindClause(llvm::omp::Clause::OMPC_acquire) ||
+-      FindClause(llvm::omp::Clause::OMPC_release) ||
+-      FindClause(llvm::omp::Clause::OMPC_acq_rel)) {
+-    if (flushList) {
+-      context_.Say(parser::FindSourceLocation(flushList),
+-          "If memory-order-clause is RELEASE, ACQUIRE, or ACQ_REL, list items "
+-          "must not be specified on the FLUSH directive"_err_en_US);
++  if (flushList) {
++    for (const parser::OmpArgument &arg : flushList->v) {
++      if (auto *sym{GetArgumentSymbol(arg)}; sym && !IsVariableListItem(*sym)) {
++        context_.Say(arg.source,
++            "FLUSH argument must be a variable list item"_err_en_US);
++      }
++    }
++
++    if (FindClause(llvm::omp::Clause::OMPC_acquire) ||
++        FindClause(llvm::omp::Clause::OMPC_release) ||
++        FindClause(llvm::omp::Clause::OMPC_acq_rel)) {
++      context_.Say(flushList->source,
++          "If memory-order-clause is RELEASE, ACQUIRE, or ACQ_REL, list items must not be specified on the FLUSH directive"_err_en_US);
+     }
+   }
+ 
+   unsigned version{context_.langOptions().OpenMPVersion};
+   if (version >= 52) {
+-    if (!std::get</*TrailingClauses=*/bool>(x.t)) {
+-      context_.Say(parser::FindSourceLocation(flushList),
++    using Flags = parser::OmpDirectiveSpecification::Flags;
++    if (std::get<Flags>(x.v.t) == Flags::DeprecatedSyntax) {
++      context_.Say(x.source,
+           "The syntax \"FLUSH clause (object, ...)\" has been deprecated, use \"FLUSH(object, ...) clause\" instead"_warn_en_US);
+     }
+   }
+@@ -2239,13 +2281,13 @@ void OmpStructureChecker::Leave(const parser::OpenMPFlushConstruct &x) {
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OpenMPCancelConstruct &x) {
+-  const auto &dir{std::get<parser::Verbatim>(x.t)};
+-  const auto &clauses{std::get<parser::OmpClauseList>(x.t)};
+-  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_cancel);
++  auto &dirName{std::get<parser::OmpDirectiveName>(x.v.t)};
++  auto &maybeClauses{std::get<std::optional<parser::OmpClauseList>>(x.v.t)};
++  PushContextAndClauseSets(dirName.source, llvm::omp::Directive::OMPD_cancel);
+ 
+   if (auto maybeConstruct{GetCancelType(
+-          llvm::omp::Directive::OMPD_cancel, x.source, clauses)}) {
+-    CheckCancellationNest(dir.source, *maybeConstruct);
++          llvm::omp::Directive::OMPD_cancel, x.source, maybeClauses)}) {
++    CheckCancellationNest(dirName.source, *maybeConstruct);
+   }
+ }
+ 
+@@ -2318,14 +2360,15 @@ void OmpStructureChecker::Enter(
+ 
+ void OmpStructureChecker::Enter(
+     const parser::OpenMPCancellationPointConstruct &x) {
+-  const auto &dir{std::get<parser::Verbatim>(x.t)};
+-  const auto &clauses{std::get<parser::OmpClauseList>(x.t)};
++  auto &dirName{std::get<parser::OmpDirectiveName>(x.v.t)};
++  auto &maybeClauses{std::get<std::optional<parser::OmpClauseList>>(x.v.t)};
+   PushContextAndClauseSets(
+-      dir.source, llvm::omp::Directive::OMPD_cancellation_point);
++      dirName.source, llvm::omp::Directive::OMPD_cancellation_point);
+ 
+-  if (auto maybeConstruct{GetCancelType(
+-          llvm::omp::Directive::OMPD_cancellation_point, x.source, clauses)}) {
+-    CheckCancellationNest(dir.source, *maybeConstruct);
++  if (auto maybeConstruct{
++          GetCancelType(llvm::omp::Directive::OMPD_cancellation_point, x.source,
++              maybeClauses)}) {
++    CheckCancellationNest(dirName.source, *maybeConstruct);
+   }
+ }
+ 
+@@ -2336,13 +2379,16 @@ void OmpStructureChecker::Leave(
+ 
+ std::optional<llvm::omp::Directive> OmpStructureChecker::GetCancelType(
+     llvm::omp::Directive cancelDir, const parser::CharBlock &cancelSource,
+-    const parser::OmpClauseList &clauses) {
++    const std::optional<parser::OmpClauseList> &maybeClauses) {
++  if (!maybeClauses) {
++    return std::nullopt;
++  }
+   // Given clauses from CANCEL or CANCELLATION_POINT, identify the construct
+   // to which the cancellation applies.
+   std::optional<llvm::omp::Directive> cancelee;
+   llvm::StringRef cancelName{llvm::omp::getOpenMPDirectiveName(cancelDir)};
+ 
+-  for (const parser::OmpClause &clause : clauses.v) {
++  for (const parser::OmpClause &clause : maybeClauses->v) {
+     using CancellationConstructType =
+         parser::OmpClause::CancellationConstructType;
+     if (auto *cctype{std::get_if<CancellationConstructType>(&clause.u)}) {
+@@ -5254,10 +5300,23 @@ llvm::StringRef OmpStructureChecker::getDirectiveName(
+ 
+ const Symbol *OmpStructureChecker::GetObjectSymbol(
+     const parser::OmpObject &object) {
++  // Some symbols may be missing if the resolution failed, e.g. when an
++  // undeclared name is used with implicit none.
+   if (auto *name{std::get_if<parser::Name>(&object.u)}) {
+-    return &name->symbol->GetUltimate();
++    return name->symbol ? &name->symbol->GetUltimate() : nullptr;
+   } else if (auto *desg{std::get_if<parser::Designator>(&object.u)}) {
+-    return &GetLastName(*desg).symbol->GetUltimate();
++    auto &last{GetLastName(*desg)};
++    return last.symbol ? &GetLastName(*desg).symbol->GetUltimate() : nullptr;
++  }
++  return nullptr;
++}
++
++const Symbol *OmpStructureChecker::GetArgumentSymbol(
++    const parser::OmpArgument &argument) {
++  if (auto *locator{std::get_if<parser::OmpLocator>(&argument.u)}) {
++    if (auto *object{std::get_if<parser::OmpObject>(&locator->u)}) {
++      return GetObjectSymbol(*object);
++    }
+   }
+   return nullptr;
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 4d4adeeaec636..d802afeefe72f 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -225,6 +225,7 @@ class OmpStructureChecker
+   std::optional<IterTy> FindDuplicate(RangeTy &&);
+ 
+   const Symbol *GetObjectSymbol(const parser::OmpObject &object);
++  const Symbol *GetArgumentSymbol(const parser::OmpArgument &argument);
+   std::optional<parser::CharBlock> GetObjectSource(
+       const parser::OmpObject &object);
+   void CheckDependList(const parser::DataRef &);
+@@ -277,7 +278,7 @@ class OmpStructureChecker
+   void CheckTaskDependenceType(const parser::OmpTaskDependenceType::Value &x);
+   std::optional<llvm::omp::Directive> GetCancelType(
+       llvm::omp::Directive cancelDir, const parser::CharBlock &cancelSource,
+-      const parser::OmpClauseList &clauses);
++      const std::optional<parser::OmpClauseList> &maybeClauses);
+   void CheckCancellationNest(
+       const parser::CharBlock &source, llvm::omp::Directive type);
+   std::int64_t GetOrdCollapseLevel(const parser::OpenMPLoopConstruct &x);
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 9fa0bb0c79a5e..bbb990a8970a1 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -398,8 +398,13 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+ 
+   bool Pre(const parser::OpenMPDepobjConstruct &x) {
+     PushContext(x.source, llvm::omp::Directive::OMPD_depobj);
+-    auto &object{std::get<parser::OmpObject>(x.t)};
+-    ResolveOmpObject(object, Symbol::Flag::OmpDependObject);
++    for (auto &arg : x.v.Arguments().v) {
++      if (auto *locator{std::get_if<parser::OmpLocator>(&arg.u)}) {
++        if (auto *object{std::get_if<parser::OmpObject>(&locator->u)}) {
++          ResolveOmpObject(*object, Symbol::Flag::OmpDependObject);
++        }
++      }
++    }
+     return true;
+   }
+   void Post(const parser::OpenMPDepobjConstruct &) { PopContext(); }
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 8af7e1462a143..8ba476ec547fc 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1814,13 +1814,13 @@ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+   // METADIRECTIVE, some semantic checks may not be applicable.
+   // Disable the semantic analysis for it in such cases to allow the compiler
+   // to parse METADIRECTIVE without flagging errors.
+-  auto &maybeArgs{std::get<std::optional<std::list<parser::OmpArgument>>>(x.t)};
++  auto &maybeArgs{std::get<std::optional<parser::OmpArgumentList>>(x.t)};
+   auto &maybeClauses{std::get<std::optional<parser::OmpClauseList>>(x.t)};
+ 
+   switch (x.DirId()) {
+   case llvm::omp::Directive::OMPD_declare_mapper:
+     if (maybeArgs && maybeClauses) {
+-      const parser::OmpArgument &first{maybeArgs->front()};
++      const parser::OmpArgument &first{maybeArgs->v.front()};
+       if (auto *spec{std::get_if<parser::OmpMapperSpecifier>(&first.u)}) {
+         ProcessMapperSpecifier(*spec, *maybeClauses);
+       }
+@@ -1828,7 +1828,7 @@ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+     break;
+   case llvm::omp::Directive::OMPD_declare_reduction:
+     if (maybeArgs && maybeClauses) {
+-      const parser::OmpArgument &first{maybeArgs->front()};
++      const parser::OmpArgument &first{maybeArgs->v.front()};
+       if (auto *spec{std::get_if<parser::OmpReductionSpecifier>(&first.u)}) {
+         ProcessReductionSpecifier(*spec, maybeClauses);
+       }
+diff --git a/flang/test/Parser/OpenMP/depobj-construct.f90 b/flang/test/Parser/OpenMP/depobj-construct.f90
+index f186c82a2ccc3..55807195c5fbb 100644
+--- a/flang/test/Parser/OpenMP/depobj-construct.f90
++++ b/flang/test/Parser/OpenMP/depobj-construct.f90
+@@ -11,10 +11,10 @@ subroutine f00
+ !UNPARSE: !$OMP DEPOBJ(x) DEPEND(IN: y)
+ !UNPARSE: END SUBROUTINE
+ 
+-!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct
+-!PARSE-TREE: | Verbatim
+-!PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | OmpClause -> Depend -> OmpDependClause -> TaskDep
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct -> OmpDirectiveSpecification
++!PARSE-TREE: | OmpDirectiveName -> llvm::omp::Directive = depobj
++!PARSE-TREE: | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Depend -> OmpDependClause -> TaskDep
+ !PARSE-TREE: | | Modifier -> OmpTaskDependenceType -> Value = In
+ !PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'y'
+ 
+@@ -28,10 +28,10 @@ subroutine f01
+ !UNPARSE: !$OMP DEPOBJ(x) UPDATE(OUT)
+ !UNPARSE: END SUBROUTINE
+ 
+-!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct
+-!PARSE-TREE: | Verbatim
+-!PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | OmpClause -> Update -> OmpUpdateClause -> OmpTaskDependenceType -> Value = Out
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct -> OmpDirectiveSpecification
++!PARSE-TREE: | OmpDirectiveName -> llvm::omp::Directive = depobj
++!PARSE-TREE: | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Update -> OmpUpdateClause -> OmpTaskDependenceType -> Value = Out
+ 
+ subroutine f02
+   integer :: x
+@@ -43,10 +43,10 @@ subroutine f02
+ !UNPARSE: !$OMP DEPOBJ(x) DESTROY(x)
+ !UNPARSE: END SUBROUTINE
+ 
+-!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct
+-!PARSE-TREE: | Verbatim
+-!PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | OmpClause -> Destroy -> OmpDestroyClause -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct -> OmpDirectiveSpecification
++!PARSE-TREE: | OmpDirectiveName -> llvm::omp::Directive = depobj
++!PARSE-TREE: | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Destroy -> OmpDestroyClause -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ 
+ subroutine f03
+   integer :: x
+@@ -58,7 +58,7 @@ subroutine f03
+ !UNPARSE: !$OMP DEPOBJ(x) DESTROY
+ !UNPARSE: END SUBROUTINE
+ 
+-!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct
+-!PARSE-TREE: | Verbatim
+-!PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | OmpClause -> Destroy ->
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPDepobjConstruct -> OmpDirectiveSpecification
++!PARSE-TREE: | OmpDirectiveName -> llvm::omp::Directive = depobj
++!PARSE-TREE: | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Destroy ->
+diff --git a/flang/test/Parser/OpenMP/metadirective-dirspec.f90 b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+index 61bc5346753b2..b6c9c58948fec 100644
+--- a/flang/test/Parser/OpenMP/metadirective-dirspec.f90
++++ b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+@@ -26,7 +26,7 @@ subroutine f00(x)
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = allocate
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f01(x)
+@@ -52,7 +52,7 @@ subroutine f01(x)
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = critical
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f02
+@@ -77,7 +77,7 @@ subroutine f02
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare mapper
+-!PARSE-TREE: | | | OmpArgument -> OmpMapperSpecifier
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpMapperSpecifier
+ !PARSE-TREE: | | | | Name = 'mymapper'
+ !PARSE-TREE: | | | | TypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
+ !PARSE-TREE: | | | | Name = 'v'
+@@ -121,7 +121,7 @@ subroutine f03
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare reduction
+-!PARSE-TREE: | | | OmpArgument -> OmpReductionSpecifier
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpReductionSpecifier
+ !PARSE-TREE: | | | | OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
+ !PARSE-TREE: | | | | OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
+ !PARSE-TREE: | | | | | Name = 'tt1'
+@@ -164,7 +164,7 @@ subroutine f04
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare simd
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f04'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f04'
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: ImplicitPart ->
+ 
+@@ -189,7 +189,7 @@ subroutine f05
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare target
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f05'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f05'
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: ImplicitPart ->
+ 
+@@ -216,8 +216,8 @@ subroutine f06(x, y)
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'y'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'y'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f07
+@@ -243,5 +243,5 @@ subroutine f07
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = threadprivate
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 't'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 't'
+ !PARSE-TREE: | | | OmpClauseList ->
+diff --git a/flang/test/Parser/OpenMP/metadirective-flush.f90 b/flang/test/Parser/OpenMP/metadirective-flush.f90
+index 8403663200f93..083791097c67d 100644
+--- a/flang/test/Parser/OpenMP/metadirective-flush.f90
++++ b/flang/test/Parser/OpenMP/metadirective-flush.f90
+@@ -23,7 +23,7 @@ subroutine f00()
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList -> OmpClause -> SeqCst
+ !PARSE-TREE: | | | Flags = DeprecatedSyntax
+ 
+@@ -49,6 +49,6 @@ subroutine f01()
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
+-!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList -> OmpClause -> SeqCst
+ !PARSE-TREE: | | | Flags = None
+diff --git a/flang/test/Semantics/OpenMP/depobj-construct-v50.f90 b/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
+index 76661785826b4..ce030a1082bde 100644
+--- a/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
++++ b/flang/test/Semantics/OpenMP/depobj-construct-v50.f90
+@@ -26,3 +26,20 @@ subroutine f03
+ !WARNING: The object parameter in DESTROY clause on DEPOPJ construct is not allowed in OpenMP v5.0, try -fopenmp-version=52
+   !$omp depobj(obj) destroy(jbo)
+ end
++
++subroutine f04
++  integer :: obj1, obj2
++!ERROR: The DEPOBJ directive requires a single argument
++  !$omp depobj(ob1, obj2) destroy
++end
++
++subroutine f05
++!ERROR: The DEPOBJ directive requires a single argument
++  !$omp depobj update(in)
++end
++
++subroutine f06
++  integer :: obj
++!ERROR: The DEPOBJ construct requires a single clause
++  !$omp depobj(obj) update(in) destroy
++end

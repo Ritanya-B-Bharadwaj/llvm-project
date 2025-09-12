@@ -1,0 +1,154 @@
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index e5e03f644f1b0..3ab93d93b9f54 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -720,6 +720,7 @@ class ScopeHandler : public ImplicitRulesVisitor {
+ 
+   bool inSpecificationPart_{false};
+   bool deferImplicitTyping_{false};
++  bool skipImplicitTyping_{false};
+   bool inEquivalenceStmt_{false};
+ 
+   // Some information is collected from a specification part for deferred
+@@ -758,6 +759,10 @@ class ScopeHandler : public ImplicitRulesVisitor {
+     }
+   }
+ 
++  void SkipImplicitTyping(bool skip) {
++    deferImplicitTyping_ = skipImplicitTyping_ = skip;
++  }
++
+ private:
+   Scope *currScope_{nullptr};
+   FuncResultStack funcResultStack_{*this};
+@@ -1506,6 +1511,25 @@ class OmpVisitor : public virtual DeclarationVisitor {
+   void Post(const parser::OmpEndCriticalDirective &) {
+     messageHandler().set_currStmtSource(std::nullopt);
+   }
++  bool Pre(const parser::OpenMPThreadprivate &) {
++    SkipImplicitTyping(true);
++    return true;
++  }
++  void Post(const parser::OpenMPThreadprivate &) { SkipImplicitTyping(false); }
++  bool Pre(const parser::OpenMPDeclareTargetConstruct &) {
++    SkipImplicitTyping(true);
++    return true;
++  }
++  void Post(const parser::OpenMPDeclareTargetConstruct &) {
++    SkipImplicitTyping(false);
++  }
++  bool Pre(const parser::OpenMPDeclarativeAllocate &) {
++    SkipImplicitTyping(true);
++    return true;
++  }
++  void Post(const parser::OpenMPDeclarativeAllocate &) {
++    SkipImplicitTyping(false);
++  }
+ };
+ 
+ bool OmpVisitor::NeedsScope(const parser::OpenMPBlockConstruct &x) {
+@@ -2556,8 +2580,10 @@ void ScopeHandler::ApplyImplicitRules(
+     return;
+   }
+   if (const DeclTypeSpec * type{GetImplicitType(symbol)}) {
+-    symbol.set(Symbol::Flag::Implicit);
+-    symbol.SetType(*type);
++    if (!skipImplicitTyping_) {
++      symbol.set(Symbol::Flag::Implicit);
++      symbol.SetType(*type);
++    }
+     return;
+   }
+   if (symbol.has<ProcEntityDetails>() && !symbol.attrs().test(Attr::EXTERNAL)) {
+diff --git a/flang/test/Semantics/OpenMP/declarative-directive.f90 b/flang/test/Semantics/OpenMP/declarative-directive01.f90
+similarity index 100%
+rename from flang/test/Semantics/OpenMP/declarative-directive.f90
+rename to flang/test/Semantics/OpenMP/declarative-directive01.f90
+diff --git a/flang/test/Semantics/OpenMP/declarative-directive02.f90 b/flang/test/Semantics/OpenMP/declarative-directive02.f90
+new file mode 100644
+index 0000000000000..dcde963689eb0
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/declarative-directive02.f90
+@@ -0,0 +1,56 @@
++! RUN: %flang -fsyntax-only -fopenmp %s 2>&1
++
++! Check that OpenMP declarative directives can be used with objects that have
++! an incomplete type.
++
++subroutine test_decl
++  ! OMPv5.2 5.2 threadprivate
++  ! OMPv5.2 6.5 allocate
++  implicit none
++  save :: x1, y1
++  !$omp threadprivate(x1)
++  !$omp allocate(y1)
++  integer :: x1, y1
++
++  ! OMPv5.2 7.7 declare-simd
++  external :: simd_func
++  !$omp declare simd(simd_func)
++  logical :: simd_func
++
++  ! OMPv5.2 7.8.1 declare-target
++  allocatable :: j
++  !$omp declare target(j)
++  save :: j
++  real(kind=8) :: j(:)
++
++  ! OMPv5.2 5.5.11 declare-reduction - crashes
++  !external :: my_add_red
++  !!$omp declare reduction(my_add_red : integer : my_add_red(omp_out, omp_in)) &
++  !!$omp&  initializer(omp_priv=0)
++  !integer :: my_add_red
++end subroutine
++
++subroutine test_decl2
++  save x1, y1
++  !$omp threadprivate(x1)
++  !$omp allocate(y1)
++  integer :: x1, y1
++
++  ! implicit decl
++  !$omp threadprivate(x2)
++  !$omp allocate(y2)
++  save x2, y2
++end subroutine
++
++module m1
++  ! implicit decl
++  !$omp threadprivate(x, y, z)
++  integer :: y
++  real :: z
++
++contains
++  subroutine sub
++    !$omp parallel copyin(x, y, z)
++    !$omp end parallel
++  end subroutine
++end module
+diff --git a/flang/test/Semantics/OpenMP/declare-target06.f90 b/flang/test/Semantics/OpenMP/declare-target06.f90
+index 9abcfcecb681a..7df0a73123094 100644
+--- a/flang/test/Semantics/OpenMP/declare-target06.f90
++++ b/flang/test/Semantics/OpenMP/declare-target06.f90
+@@ -6,21 +6,16 @@
+ 
+ module test_0
+     implicit none
+-!ERROR: The given DECLARE TARGET directive clause has an invalid argument
+ !ERROR: No explicit type declared for 'no_implicit_materialization_1'
+ !$omp declare target(no_implicit_materialization_1)
+ 
+-!ERROR: The given DECLARE TARGET directive clause has an invalid argument
+ !ERROR: No explicit type declared for 'no_implicit_materialization_2'
+ !$omp declare target link(no_implicit_materialization_2)
+ 
+-!ERROR: The given DECLARE TARGET directive clause has an invalid argument
+ !WARNING: The usage of TO clause on DECLARE TARGET directive has been deprecated. Use ENTER clause instead.
+ !ERROR: No explicit type declared for 'no_implicit_materialization_3'
+ !$omp declare target to(no_implicit_materialization_3)
+ 
+-!ERROR: The given DECLARE TARGET directive clause has an invalid argument
+-!ERROR: No explicit type declared for 'no_implicit_materialization_3'
+ !$omp declare target enter(no_implicit_materialization_3)
+ 
+ INTEGER :: data_int = 10

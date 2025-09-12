@@ -1,0 +1,722 @@
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index c409409602e75..a53fd6b2964cb 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -2613,9 +2613,8 @@ StmtResult Parser::ParseOpenMPDeclarativeOrExecutableDirective(
+     Diag(Tok, diag::err_omp_unknown_directive);
+     return StmtError();
+   }
+-  if (DKind == OMPD_workshare) {
+-    // "workshare" is an executable, Fortran-only directive. Treat it
+-    // as unknown.
++  if (!(getDirectiveLanguages(DKind) & SourceLanguage::C)) {
++    // Treat directives that are not allowed in C/C++ as unknown.
+     DKind = OMPD_unknown;
+   }
+ 
+diff --git a/clang/test/OpenMP/openmp_non_c_directives.c b/clang/test/OpenMP/openmp_non_c_directives.c
+new file mode 100644
+index 0000000000000..844d7dad551bc
+--- /dev/null
++++ b/clang/test/OpenMP/openmp_non_c_directives.c
+@@ -0,0 +1,12 @@
++// RUN: %clang_cc1 -verify -fopenmp -ferror-limit 100 -o - %s
++
++// Test the reaction to some Fortran-only directives.
++
++void foo() {
++#pragma omp allocators // expected-error {{expected an OpenMP directive}}
++#pragma omp do // expected-error {{expected an OpenMP directive}}
++#pragma omp end workshare // expected-error {{expected an OpenMP directive}}
++#pragma omp parallel workshare // expected-warning {{extra tokens at the end of '#pragma omp parallel' are ignored}}
++#pragma omp workshare // expected-error {{expected an OpenMP directive}}
++}
++
+diff --git a/clang/test/OpenMP/openmp_workshare.c b/clang/test/OpenMP/openmp_workshare.c
+deleted file mode 100644
+index 0302eb19f9ef4..0000000000000
+--- a/clang/test/OpenMP/openmp_workshare.c
++++ /dev/null
+@@ -1,8 +0,0 @@
+-// RUN: %clang_cc1 -verify -fopenmp -ferror-limit 100 -o - %s
+-
+-// Workshare is a Fortran-only directive.
+-
+-void foo() {
+-#pragma omp workshare // expected-error {{expected an OpenMP directive}}
+-}
+-
+diff --git a/llvm/include/llvm/ADT/BitmaskEnum.h b/llvm/include/llvm/ADT/BitmaskEnum.h
+index dcb13bd8ba51a..7214f25b0aa10 100644
+--- a/llvm/include/llvm/ADT/BitmaskEnum.h
++++ b/llvm/include/llvm/ADT/BitmaskEnum.h
+@@ -92,6 +92,7 @@
+   using ::llvm::BitmaskEnumDetail::operator^=;                                 \
+   using ::llvm::BitmaskEnumDetail::operator<<=;                                \
+   using ::llvm::BitmaskEnumDetail::operator>>=;                                \
++  using ::llvm::BitmaskEnumDetail::operator!;                                  \
+   /* Force a semicolon at the end of this macro. */                            \
+   using ::llvm::BitmaskEnumDetail::any
+ 
+@@ -141,6 +142,11 @@ constexpr unsigned bitWidth(uint64_t Value) {
+   return Value ? 1 + bitWidth(Value >> 1) : 0;
+ }
+ 
++template <typename E, typename = std::enable_if_t<is_bitmask_enum<E>::value>>
++constexpr bool operator!(E Val) {
++  return Val == static_cast<E>(0);
++}
++
+ template <typename E, typename = std::enable_if_t<is_bitmask_enum<E>::value>>
+ constexpr bool any(E Val) {
+   return Val != static_cast<E>(0);
+diff --git a/llvm/include/llvm/Frontend/Directive/DirectiveBase.td b/llvm/include/llvm/Frontend/Directive/DirectiveBase.td
+index 4faea18324cb7..3e2744dea8d14 100644
+--- a/llvm/include/llvm/Frontend/Directive/DirectiveBase.td
++++ b/llvm/include/llvm/Frontend/Directive/DirectiveBase.td
+@@ -172,6 +172,15 @@ def CA_Meta: Category<"Meta"> {}
+ def CA_Subsidiary: Category<"Subsidiary"> {}
+ def CA_Utility: Category<"Utility"> {}
+ 
++class SourceLanguage<string n> {
++  string name = n;  // Name of the enum value in enum class Association.
++}
++
++// The C languages also implies C++ until there is a reason to add C++
++// separately.
++def L_C : SourceLanguage<"C"> {}
++def L_Fortran : SourceLanguage<"Fortran"> {}
++
+ // Information about a specific directive.
+ class Directive<string d> {
+   // Name of the directive. Can be composite directive sepearted by whitespace.
+@@ -205,4 +214,7 @@ class Directive<string d> {
+ 
+   // The category of the directive.
+   Category category = ?;
++
++  // The languages that allow this directive. Default: all languages.
++  list<SourceLanguage> languages = [L_C, L_Fortran];
+ }
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 194b1e657c493..0af4b436649a3 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -573,6 +573,7 @@ def OMP_Allocators : Directive<"allocators"> {
+   ];
+   let association = AS_Block;
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_Assumes : Directive<"assumes"> {
+   let association = AS_None;
+@@ -586,10 +587,6 @@ def OMP_Assumes : Directive<"assumes"> {
+     VersionedClause<OMPC_NoParallelism, 51>,
+   ];
+ }
+-def OMP_EndAssumes : Directive<"end assumes"> {
+-  let association = AS_Delimited;
+-  let category = OMP_Assumes.category;
+-}
+ def OMP_Assume : Directive<"assume"> {
+   let association = AS_Block;
+   let category = CA_Informational;
+@@ -637,6 +634,12 @@ def OMP_BeginAssumes : Directive<"begin assumes"> {
+     VersionedClause<OMPC_NoOpenMPRoutines, 51>,
+     VersionedClause<OMPC_NoParallelism, 51>,
+   ];
++  let languages = [L_C];
++}
++def OMP_EndAssumes : Directive<"end assumes"> {
++  let association = AS_Delimited;
++  let category = OMP_BeginAssumes.category;
++  let languages = OMP_BeginAssumes.languages;
+ }
+ def OMP_BeginDeclareTarget : Directive<"begin declare target"> {
+   let allowedClauses = [
+@@ -647,10 +650,22 @@ def OMP_BeginDeclareTarget : Directive<"begin declare target"> {
+   ];
+   let association = AS_Delimited;
+   let category = CA_Declarative;
++  let languages = [L_C];
++}
++def OMP_EndDeclareTarget : Directive<"end declare target"> {
++  let association = AS_Delimited;
++  let category = OMP_BeginDeclareTarget.category;
++  let languages = OMP_BeginDeclareTarget.languages;
+ }
+ def OMP_BeginDeclareVariant : Directive<"begin declare variant"> {
+   let association = AS_Delimited;
+   let category = CA_Declarative;
++  let languages = [L_C];
++}
++def OMP_EndDeclareVariant : Directive<"end declare variant"> {
++  let association = AS_Delimited;
++  let category = OMP_BeginDeclareVariant.category;
++  let languages = OMP_BeginDeclareVariant.languages;
+ }
+ def OMP_Cancel : Directive<"cancel"> {
+   let allowedOnceClauses = [
+@@ -717,10 +732,6 @@ def OMP_DeclareTarget : Directive<"declare target"> {
+   let association = AS_None;
+   let category = CA_Declarative;
+ }
+-def OMP_EndDeclareTarget : Directive<"end declare target"> {
+-  let association = AS_Delimited;
+-  let category = OMP_DeclareTarget.category;
+-}
+ def OMP_DeclareVariant : Directive<"declare variant"> {
+   let allowedClauses = [
+     VersionedClause<OMPC_AdjustArgs, 51>,
+@@ -731,10 +742,7 @@ def OMP_DeclareVariant : Directive<"declare variant"> {
+   ];
+   let association = AS_Declaration;
+   let category = CA_Declarative;
+-}
+-def OMP_EndDeclareVariant : Directive<"end declare variant"> {
+-  let association = AS_Delimited;
+-  let category = OMP_DeclareVariant.category;
++  let languages = [L_C];
+ }
+ def OMP_Depobj : Directive<"depobj"> {
+   let allowedClauses = [
+@@ -793,15 +801,16 @@ def OMP_Do : Directive<"do"> {
+   ];
+   let association = AS_Loop;
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_EndDo : Directive<"end do"> {
+   let allowedOnceClauses = [
+     VersionedClause<OMPC_NoWait>,
+   ];
+-  // Needed for association computation, since OMP_Do has it "from leafConstructs".
+   let leafConstructs = OMP_Do.leafConstructs;
+   let association = OMP_Do.association;
+   let category = OMP_Do.category;
++  let languages = OMP_Do.languages;
+ }
+ def OMP_Error : Directive<"error"> {
+   let allowedClauses = [
+@@ -841,6 +850,7 @@ def OMP_For : Directive<"for"> {
+   ];
+   let association = AS_Loop;
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_Interchange : Directive<"interchange"> {
+   let allowedOnceClauses = [
+@@ -984,6 +994,7 @@ def OMP_EndScope : Directive<"end scope"> {
+   let leafConstructs = OMP_Scope.leafConstructs;
+   let association = OMP_Scope.association;
+   let category = OMP_Scope.category;
++  let languages = [L_Fortran];
+ }
+ def OMP_Section : Directive<"section"> {
+   let association = AS_Separating;
+@@ -1008,6 +1019,7 @@ def OMP_EndSections : Directive<"end sections"> {
+   let leafConstructs = OMP_Sections.leafConstructs;
+   let association = OMP_Sections.association;
+   let category = OMP_Sections.category;
++  let languages = [L_Fortran];
+ }
+ def OMP_Simd : Directive<"simd"> {
+   let allowedClauses = [
+@@ -1052,6 +1064,7 @@ def OMP_EndSingle : Directive<"end single"> {
+   let leafConstructs = OMP_Single.leafConstructs;
+   let association = OMP_Single.association;
+   let category = OMP_Single.category;
++  let languages = [L_Fortran];
+ }
+ def OMP_Target : Directive<"target"> {
+   let allowedClauses = [
+@@ -1259,6 +1272,7 @@ def OMP_Workshare : Directive<"workshare"> {
+   ];
+   let association = AS_Block;
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_EndWorkshare : Directive<"end workshare"> {
+   let allowedOnceClauses = [
+@@ -1267,6 +1281,7 @@ def OMP_EndWorkshare : Directive<"end workshare"> {
+   let leafConstructs = OMP_Workshare.leafConstructs;
+   let association = OMP_Workshare.association;
+   let category = OMP_Workshare.category;
++  let languages = [L_Fortran];
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1298,6 +1313,7 @@ def OMP_DistributeParallelDo : Directive<"distribute parallel do"> {
+   ];
+   let leafConstructs = [OMP_Distribute, OMP_Parallel, OMP_Do];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_DistributeParallelDoSimd : Directive<"distribute parallel do simd"> {
+   let allowedClauses = [
+@@ -1324,6 +1340,7 @@ def OMP_DistributeParallelDoSimd : Directive<"distribute parallel do simd"> {
+   ];
+   let leafConstructs = [OMP_Distribute, OMP_Parallel, OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_DistributeParallelFor : Directive<"distribute parallel for"> {
+   let allowedClauses = [
+@@ -1346,6 +1363,7 @@ def OMP_DistributeParallelFor : Directive<"distribute parallel for"> {
+   ];
+   let leafConstructs = [OMP_Distribute, OMP_Parallel, OMP_For];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_DistributeParallelForSimd : Directive<"distribute parallel for simd"> {
+   let allowedClauses = [
+@@ -1373,6 +1391,7 @@ def OMP_DistributeParallelForSimd : Directive<"distribute parallel for simd"> {
+   ];
+   let leafConstructs = [OMP_Distribute, OMP_Parallel, OMP_For, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_DistributeSimd : Directive<"distribute simd"> {
+   let allowedClauses = [
+@@ -1422,6 +1441,7 @@ def OMP_DoSimd : Directive<"do simd"> {
+   ];
+   let leafConstructs = [OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_EndDoSimd : Directive<"end do simd"> {
+   let allowedOnceClauses = [
+@@ -1430,6 +1450,7 @@ def OMP_EndDoSimd : Directive<"end do simd"> {
+   let leafConstructs = OMP_DoSimd.leafConstructs;
+   let association = OMP_DoSimd.association;
+   let category = OMP_DoSimd.category;
++  let languages = [L_Fortran];
+ }
+ def OMP_ForSimd : Directive<"for simd"> {
+   let allowedClauses = [
+@@ -1611,6 +1632,7 @@ def OMP_ParallelDo : Directive<"parallel do"> {
+   ];
+   let leafConstructs = [OMP_Parallel, OMP_Do];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_ParallelDoSimd : Directive<"parallel do simd"> {
+   let allowedClauses = [
+@@ -1639,6 +1661,7 @@ def OMP_ParallelDoSimd : Directive<"parallel do simd"> {
+   ];
+   let leafConstructs = [OMP_Parallel, OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_ParallelFor : Directive<"parallel for"> {
+   let allowedClauses = [
+@@ -1662,6 +1685,7 @@ def OMP_ParallelFor : Directive<"parallel for"> {
+   ];
+   let leafConstructs = [OMP_Parallel, OMP_For];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_ParallelForSimd : Directive<"parallel for simd"> {
+   let allowedClauses = [
+@@ -1689,6 +1713,7 @@ def OMP_ParallelForSimd : Directive<"parallel for simd"> {
+   ];
+   let leafConstructs = [OMP_Parallel, OMP_For, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_parallel_loop : Directive<"parallel loop"> {
+   let allowedClauses = [
+@@ -1907,6 +1932,7 @@ def OMP_ParallelWorkshare : Directive<"parallel workshare"> {
+   ];
+   let leafConstructs = [OMP_Parallel, OMP_Workshare];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TargetParallel : Directive<"target parallel"> {
+   let allowedClauses = [
+@@ -1966,6 +1992,7 @@ def OMP_TargetParallelDo : Directive<"target parallel do"> {
+   ];
+   let leafConstructs = [OMP_Target, OMP_Parallel, OMP_Do];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TargetParallelDoSimd : Directive<"target parallel do simd"> {
+   let allowedClauses = [
+@@ -1999,6 +2026,7 @@ def OMP_TargetParallelDoSimd : Directive<"target parallel do simd"> {
+   ];
+   let leafConstructs = [OMP_Target, OMP_Parallel, OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TargetParallelFor : Directive<"target parallel for"> {
+   let allowedClauses = [
+@@ -2033,6 +2061,7 @@ def OMP_TargetParallelFor : Directive<"target parallel for"> {
+   ];
+   let leafConstructs = [OMP_Target, OMP_Parallel, OMP_For];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_TargetParallelForSimd : Directive<"target parallel for simd"> {
+   let allowedClauses = [
+@@ -2071,6 +2100,7 @@ def OMP_TargetParallelForSimd : Directive<"target parallel for simd"> {
+   ];
+   let leafConstructs = [OMP_Target, OMP_Parallel, OMP_For, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_target_parallel_loop : Directive<"target parallel loop"> {
+   let allowedClauses = [
+@@ -2230,8 +2260,10 @@ def OMP_TargetTeamsDistributeParallelDo :
+     VersionedClause<OMPC_Schedule>,
+     VersionedClause<OMPC_ThreadLimit>,
+   ];
+-  let leafConstructs = [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do];
++  let leafConstructs =
++      [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TargetTeamsDistributeParallelDoSimd :
+     Directive<"target teams distribute parallel do simd"> {
+@@ -2268,8 +2300,10 @@ def OMP_TargetTeamsDistributeParallelDoSimd :
+     VersionedClause<OMPC_SimdLen>,
+     VersionedClause<OMPC_ThreadLimit>,
+   ];
+-  let leafConstructs = [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do, OMP_Simd];
++  let leafConstructs =
++      [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TargetTeamsDistributeParallelFor :
+     Directive<"target teams distribute parallel for"> {
+@@ -2303,8 +2337,10 @@ def OMP_TargetTeamsDistributeParallelFor :
+   let allowedOnceClauses = [
+     VersionedClause<OMPC_OMPX_DynCGroupMem>,
+   ];
+-  let leafConstructs = [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For];
++  let leafConstructs =
++      [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_TargetTeamsDistributeParallelForSimd :
+     Directive<"target teams distribute parallel for simd"> {
+@@ -2343,8 +2379,10 @@ def OMP_TargetTeamsDistributeParallelForSimd :
+   let allowedOnceClauses = [
+     VersionedClause<OMPC_OMPX_DynCGroupMem>,
+   ];
+-  let leafConstructs = [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For, OMP_Simd];
++  let leafConstructs =
++      [OMP_Target, OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_TargetTeamsDistributeSimd :
+     Directive<"target teams distribute simd"> {
+@@ -2494,6 +2532,7 @@ def OMP_TeamsDistributeParallelDo :
+   ];
+   let leafConstructs = [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TeamsDistributeParallelDoSimd :
+     Directive<"teams distribute parallel do simd"> {
+@@ -2522,8 +2561,10 @@ def OMP_TeamsDistributeParallelDoSimd :
+     VersionedClause<OMPC_SimdLen>,
+     VersionedClause<OMPC_ThreadLimit>,
+   ];
+-  let leafConstructs = [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do, OMP_Simd];
++  let leafConstructs =
++      [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_Do, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_Fortran];
+ }
+ def OMP_TeamsDistributeParallelFor :
+     Directive<"teams distribute parallel for"> {
+@@ -2549,6 +2590,7 @@ def OMP_TeamsDistributeParallelFor :
+   ];
+   let leafConstructs = [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_TeamsDistributeParallelForSimd :
+     Directive<"teams distribute parallel for simd"> {
+@@ -2576,8 +2618,10 @@ def OMP_TeamsDistributeParallelForSimd :
+     VersionedClause<OMPC_SimdLen>,
+     VersionedClause<OMPC_ThreadLimit>,
+   ];
+-  let leafConstructs = [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For, OMP_Simd];
++  let leafConstructs =
++      [OMP_Teams, OMP_Distribute, OMP_Parallel, OMP_For, OMP_Simd];
+   let category = CA_Executable;
++  let languages = [L_C];
+ }
+ def OMP_TeamsDistributeSimd : Directive<"teams distribute simd"> {
+   let allowedClauses = [
+diff --git a/llvm/include/llvm/TableGen/DirectiveEmitter.h b/llvm/include/llvm/TableGen/DirectiveEmitter.h
+index e7f712451d482..234979eebc881 100644
+--- a/llvm/include/llvm/TableGen/DirectiveEmitter.h
++++ b/llvm/include/llvm/TableGen/DirectiveEmitter.h
+@@ -71,6 +71,10 @@ class DirectiveLanguage {
+     return Records.getAllDerivedDefinitions("Category");
+   }
+ 
++  ArrayRef<const Record *> getSourceLanguages() const {
++    return Records.getAllDerivedDefinitions("SourceLanguage");
++  }
++
+   ArrayRef<const Record *> getDirectives() const {
+     return Records.getAllDerivedDefinitions("Directive");
+   }
+@@ -109,13 +113,15 @@ class BaseRecord {
+ 
+   // Returns the name of the directive formatted for output. Whitespace are
+   // replaced with underscores.
+-  std::string getFormattedName() const {
+-    StringRef Name = Def->getValueAsString("name");
++  static std::string getFormattedName(const Record *R) {
++    StringRef Name = R->getValueAsString("name");
+     std::string N = Name.str();
+     llvm::replace(N, ' ', '_');
+     return N;
+   }
+ 
++  std::string getFormattedName() const { return getFormattedName(Def); }
++
+   bool isDefault() const { return Def->getValueAsBit("isDefault"); }
+ 
+   // Returns the record name.
+@@ -157,6 +163,10 @@ class Directive : public BaseRecord {
+ 
+   const Record *getCategory() const { return Def->getValueAsDef("category"); }
+ 
++  std::vector<const Record *> getSourceLanguages() const {
++    return Def->getValueAsListOfDefs("languages");
++  }
++
+   // Clang uses a different format for names of its directives enum.
+   std::string getClangAccSpelling() const {
+     std::string Name = Def->getValueAsString("name").str();
+diff --git a/llvm/test/TableGen/directive1.td b/llvm/test/TableGen/directive1.td
+index 2f877029c8396..8270de5eb2132 100644
+--- a/llvm/test/TableGen/directive1.td
++++ b/llvm/test/TableGen/directive1.td
+@@ -84,6 +84,14 @@ def TDL_DirA : Directive<"dira"> {
+ // CHECK-EMPTY:
+ // CHECK-NEXT:  static constexpr std::size_t Category_enumSize = 6;
+ // CHECK-EMPTY:
++// CHECK-NEXT:  enum class SourceLanguage : uint32_t {
++// CHECK-NEXT:    C = 1U,
++// CHECK-NEXT:    Fortran = 2U,
++// CHECK-NEXT:    LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/Fortran)
++// CHECK-NEXT:  };
++// CHECK-EMPTY:
++// CHECK-NEXT:  static constexpr std::size_t SourceLanguage_enumSize = 2;
++// CHECK-EMPTY:
+ // CHECK-NEXT:  enum class Directive {
+ // CHECK-NEXT:    TDLD_dira,
+ // CHECK-NEXT:  };
+@@ -129,6 +137,7 @@ def TDL_DirA : Directive<"dira"> {
+ // CHECK-NEXT:  constexpr std::size_t getMaxLeafCount() { return 0; }
+ // CHECK-NEXT:  LLVM_ABI Association getDirectiveAssociation(Directive D);
+ // CHECK-NEXT:  LLVM_ABI Category getDirectiveCategory(Directive D);
++// CHECK-NEXT:  LLVM_ABI SourceLanguage getDirectiveLanguages(Directive D);
+ // CHECK-NEXT:  LLVM_ABI AKind getAKind(StringRef);
+ // CHECK-NEXT:  LLVM_ABI llvm::StringRef getTdlAKindName(AKind);
+ // CHECK-EMPTY:
+@@ -390,6 +399,14 @@ def TDL_DirA : Directive<"dira"> {
+ // IMPL-NEXT:    llvm_unreachable("Unexpected directive");
+ // IMPL-NEXT:  }
+ // IMPL-EMPTY:
++// IMPL-NEXT:  llvm::tdl::SourceLanguage llvm::tdl::getDirectiveLanguages(llvm::tdl::Directive D) {
++// IMPL-NEXT:    switch (D) {
++// IMPL-NEXT:    case llvm::tdl::TDLD_dira:
++// IMPL-NEXT:      return llvm::tdl::SourceLanguage::C | llvm::tdl::SourceLanguage::Fortran;
++// IMPL-NEXT:    } // switch(D)
++// IMPL-NEXT:    llvm_unreachable("Unexpected directive");
++// IMPL-NEXT:  }
++// IMPL-EMPTY:
+ // IMPL-NEXT:  static_assert(sizeof(llvm::tdl::Directive) == sizeof(int));
+ // IMPL-NEXT:  {{.*}} static const llvm::tdl::Directive LeafConstructTable[][2] = {
+ // IMPL-NEXT:    {llvm::tdl::TDLD_dira, static_cast<llvm::tdl::Directive>(0),},
+diff --git a/llvm/test/TableGen/directive2.td b/llvm/test/TableGen/directive2.td
+index 3f1a44cfdd4f9..58740cb8e1d96 100644
+--- a/llvm/test/TableGen/directive2.td
++++ b/llvm/test/TableGen/directive2.td
+@@ -75,6 +75,14 @@ def TDL_DirA : Directive<"dira"> {
+ // CHECK-EMPTY:
+ // CHECK-NEXT:  static constexpr std::size_t Category_enumSize = 6;
+ // CHECK-EMPTY:
++// CHECK-NEXT:  enum class SourceLanguage : uint32_t {
++// CHECK-NEXT:    C = 1U,
++// CHECK-NEXT:    Fortran = 2U,
++// CHECK-NEXT:    LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/Fortran)
++// CHECK-NEXT:  };
++// CHECK-EMPTY:
++// CHECK-NEXT:  static constexpr std::size_t SourceLanguage_enumSize = 2;
++// CHECK-EMPTY:
+ // CHECK-NEXT:  enum class Directive {
+ // CHECK-NEXT:    TDLD_dira,
+ // CHECK-NEXT:  };
+@@ -105,6 +113,7 @@ def TDL_DirA : Directive<"dira"> {
+ // CHECK-NEXT:  constexpr std::size_t getMaxLeafCount() { return 0; }
+ // CHECK-NEXT:  LLVM_ABI Association getDirectiveAssociation(Directive D);
+ // CHECK-NEXT:  LLVM_ABI Category getDirectiveCategory(Directive D);
++// CHECK-NEXT:  LLVM_ABI SourceLanguage getDirectiveLanguages(Directive D);
+ // CHECK-NEXT:  } // namespace tdl
+ // CHECK-NEXT:  } // namespace llvm
+ // CHECK-NEXT:  #endif // LLVM_Tdl_INC
+@@ -321,6 +330,14 @@ def TDL_DirA : Directive<"dira"> {
+ // IMPL-NEXT:    llvm_unreachable("Unexpected directive");
+ // IMPL-NEXT:  }
+ // IMPL-EMPTY:
++// IMPL-NEXT:  llvm::tdl::SourceLanguage llvm::tdl::getDirectiveLanguages(llvm::tdl::Directive D) {
++// IMPL-NEXT:    switch (D) {
++// IMPL-NEXT:    case llvm::tdl::TDLD_dira:
++// IMPL-NEXT:      return llvm::tdl::SourceLanguage::C | llvm::tdl::SourceLanguage::Fortran;
++// IMPL-NEXT:    } // switch(D)
++// IMPL-NEXT:    llvm_unreachable("Unexpected directive");
++// IMPL-NEXT:  }
++// IMPL-EMPTY:
+ // IMPL-NEXT:  static_assert(sizeof(llvm::tdl::Directive) == sizeof(int));
+ // IMPL-NEXT:  {{.*}} static const llvm::tdl::Directive LeafConstructTable[][2] = {
+ // IMPL-NEXT:    {llvm::tdl::TDLD_dira, static_cast<llvm::tdl::Directive>(0),},
+diff --git a/llvm/unittests/ADT/BitmaskEnumTest.cpp b/llvm/unittests/ADT/BitmaskEnumTest.cpp
+index 2c0a80342a54c..b1ef8482416a9 100644
+--- a/llvm/unittests/ADT/BitmaskEnumTest.cpp
++++ b/llvm/unittests/ADT/BitmaskEnumTest.cpp
+@@ -176,6 +176,17 @@ TEST(BitmaskEnumTest, BitwiseNot) {
+   EXPECT_EQ(15, ~V0);
+ }
+ 
++TEST(BitmaskEnumTest, BooleanNot) {
++  bool b0 = !F0;
++  EXPECT_TRUE(b0);
++
++  bool b1 = !(F1 & F2);
++  EXPECT_TRUE(b1);
++
++  bool b2 = !(F2 | F4);
++  EXPECT_FALSE(b2);
++}
++
+ enum class FlagsClass {
+   F0 = 0,
+   F1 = 1,
+diff --git a/llvm/utils/TableGen/Basic/DirectiveEmitter.cpp b/llvm/utils/TableGen/Basic/DirectiveEmitter.cpp
+index 339b8d6acd622..df37d7005215e 100644
+--- a/llvm/utils/TableGen/Basic/DirectiveEmitter.cpp
++++ b/llvm/utils/TableGen/Basic/DirectiveEmitter.cpp
+@@ -77,6 +77,48 @@ static void generateEnumClass(ArrayRef<const Record *> Records, raw_ostream &OS,
+   }
+ }
+ 
++// Generate enum class with values corresponding to different bit positions.
++// Entries are emitted in the order in which they appear in the `Records`
++// vector.
++static void generateEnumBitmask(ArrayRef<const Record *> Records,
++                                raw_ostream &OS, StringRef Enum,
++                                StringRef Prefix,
++                                const DirectiveLanguage &DirLang,
++                                bool ExportEnums) {
++  assert(Records.size() <= 64 && "Too many values for a bitmask");
++  llvm::StringRef Type = Records.size() <= 32 ? "uint32_t" : "uint64_t";
++  llvm::StringRef TypeSuffix = Records.size() <= 32 ? "U" : "ULL";
++
++  OS << "\n";
++  OS << "enum class " << Enum << " : " << Type << " {\n";
++  std::string LastName;
++  for (auto [I, R] : llvm::enumerate(Records)) {
++    BaseRecord Rec(R);
++    LastName = Prefix.str() + Rec.getFormattedName();
++    OS << "  " << LastName << " = " << (1ull << I) << TypeSuffix << ",\n";
++  }
++  OS << "  LLVM_MARK_AS_BITMASK_ENUM(/*LargestValue=*/" << LastName << ")\n";
++  OS << "};\n";
++  OS << "\n";
++  OS << "static constexpr std::size_t " << Enum
++     << "_enumSize = " << Records.size() << ";\n";
++
++  // Make the enum values available in the defined namespace. This allows us to
++  // write something like Enum_X if we have a `using namespace <CppNamespace>`.
++  // At the same time we do not loose the strong type guarantees of the enum
++  // class, that is we cannot pass an unsigned as Directive without an explicit
++  // cast.
++  if (ExportEnums) {
++    OS << "\n";
++    for (const auto &R : Records) {
++      BaseRecord Rec(R);
++      OS << "constexpr auto " << Prefix << Rec.getFormattedName() << " = "
++         << "llvm::" << DirLang.getCppNamespace() << "::" << Enum
++         << "::" << Prefix << Rec.getFormattedName() << ";\n";
++    }
++  }
++}
++
+ // Generate enums for values that clauses can take.
+ // Also generate function declarations for get<Enum>Name(StringRef Str).
+ static void generateEnumClauseVal(ArrayRef<const Record *> Records,
+@@ -224,6 +266,9 @@ static void emitDirectivesDecl(const RecordKeeper &Records, raw_ostream &OS) {
+   generateEnumClass(DirLang.getCategories(), OS, "Category", /*Prefix=*/"",
+                     DirLang, /*ExportEnums=*/false);
+ 
++  generateEnumBitmask(DirLang.getSourceLanguages(), OS, "SourceLanguage",
++                      /*Prefix=*/"", DirLang, /*ExportEnums=*/false);
++
+   // Emit Directive enumeration
+   generateEnumClass(DirLang.getDirectives(), OS, "Directive",
+                     DirLang.getDirectivePrefix(), DirLang,
+@@ -267,6 +312,7 @@ static void emitDirectivesDecl(const RecordKeeper &Records, raw_ostream &OS) {
+      << getMaxLeafCount(DirLang) << "; }\n";
+   OS << "LLVM_ABI Association getDirectiveAssociation(Directive D);\n";
+   OS << "LLVM_ABI Category getDirectiveCategory(Directive D);\n";
++  OS << "LLVM_ABI SourceLanguage getDirectiveLanguages(Directive D);\n";
+   if (EnumHelperFuncs.length() > 0) {
+     OS << EnumHelperFuncs;
+     OS << "\n";
+@@ -764,6 +810,34 @@ static void generateGetDirectiveCategory(const DirectiveLanguage &DirLang,
+   OS << "}\n";
+ }
+ 
++static void generateGetDirectiveLanguages(const DirectiveLanguage &DirLang,
++                                          raw_ostream &OS) {
++  std::string LangNamespace = "llvm::" + DirLang.getCppNamespace().str();
++  std::string LanguageTypeName = LangNamespace + "::SourceLanguage";
++  std::string LanguageNamespace = LanguageTypeName + "::";
++
++  OS << '\n';
++  OS << LanguageTypeName << ' ' << LangNamespace << "::getDirectiveLanguages("
++     << getDirectiveType(DirLang) << " D) {\n";
++  OS << "  switch (D) {\n";
++
++  for (const Record *R : DirLang.getDirectives()) {
++    Directive D(R);
++    OS << "  case " << getDirectiveName(DirLang, R) << ":\n";
++    OS << "    return ";
++    llvm::interleave(
++        D.getSourceLanguages(), OS,
++        [&](const Record *L) {
++          OS << LanguageNamespace << BaseRecord::getFormattedName(L);
++        },
++        " | ");
++    OS << ";\n";
++  }
++  OS << "  } // switch(D)\n";
++  OS << "  llvm_unreachable(\"Unexpected directive\");\n";
++  OS << "}\n";
++}
++
+ namespace {
+ enum class DirectiveClauseFE { Flang, Clang };
+ 
+@@ -1264,6 +1338,9 @@ void emitDirectivesBasicImpl(const DirectiveLanguage &DirLang,
+   // getDirectiveCategory(Directive D)
+   generateGetDirectiveCategory(DirLang, OS);
+ 
++  // getDirectiveLanguages(Directive D)
++  generateGetDirectiveLanguages(DirLang, OS);
++
+   // Leaf table for getLeafConstructs, etc.
+   emitLeafTable(DirLang, OS, "LeafConstructTable");
+ }

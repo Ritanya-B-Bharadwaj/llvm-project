@@ -1,0 +1,568 @@
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index 715811885c219..3ea9c31461e24 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -754,12 +754,12 @@ class Symbol {
+       // OpenMP data-copying attribute
+       OmpCopyIn, OmpCopyPrivate,
+       // OpenMP miscellaneous flags
+-      OmpCommonBlock, OmpReduction, OmpAligned, OmpNontemporal, OmpAllocate,
+-      OmpDeclarativeAllocateDirective, OmpExecutableAllocateDirective,
+-      OmpDeclareSimd, OmpDeclareTarget, OmpThreadprivate, OmpDeclareReduction,
+-      OmpFlushed, OmpCriticalLock, OmpIfSpecified, OmpNone, OmpPreDetermined,
+-      OmpImplicit, OmpDependObject, OmpInclusiveScan, OmpExclusiveScan,
+-      OmpInScanReduction);
++      OmpCommonBlock, OmpReduction, OmpInReduction, OmpAligned, OmpNontemporal,
++      OmpAllocate, OmpDeclarativeAllocateDirective,
++      OmpExecutableAllocateDirective, OmpDeclareSimd, OmpDeclareTarget,
++      OmpThreadprivate, OmpDeclareReduction, OmpFlushed, OmpCriticalLock,
++      OmpIfSpecified, OmpNone, OmpPreDetermined, OmpImplicit, OmpDependObject,
++      OmpInclusiveScan, OmpExclusiveScan, OmpInScanReduction);
+   using Flags = common::EnumSet<Flag, Flag_enumSize>;
+ 
+   const Scope &owner() const { return *owner_; }
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 44796994b244c..afe9f90b270ab 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -976,6 +976,29 @@ bool ClauseProcessor::processIf(
+   });
+   return found;
+ }
++bool ClauseProcessor::processInReduction(
++    mlir::Location currentLocation, mlir::omp::InReductionClauseOps &result,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &outReductionSyms) const {
++  return findRepeatableClause<omp::clause::InReduction>(
++      [&](const omp::clause::InReduction &clause, const parser::CharBlock &) {
++        llvm::SmallVector<mlir::Value> inReductionVars;
++        llvm::SmallVector<bool> inReduceVarByRef;
++        llvm::SmallVector<mlir::Attribute> inReductionDeclSymbols;
++        llvm::SmallVector<const semantics::Symbol *> inReductionSyms;
++        ReductionProcessor rp;
++        rp.processReductionArguments<omp::clause::InReduction>(
++            currentLocation, converter, clause, inReductionVars,
++            inReduceVarByRef, inReductionDeclSymbols, inReductionSyms);
++
++        // Copy local lists into the output.
++        llvm::copy(inReductionVars, std::back_inserter(result.inReductionVars));
++        llvm::copy(inReduceVarByRef,
++                   std::back_inserter(result.inReductionByref));
++        llvm::copy(inReductionDeclSymbols,
++                   std::back_inserter(result.inReductionSyms));
++        llvm::copy(inReductionSyms, std::back_inserter(outReductionSyms));
++      });
++}
+ 
+ bool ClauseProcessor::processIsDevicePtr(
+     mlir::omp::IsDevicePtrClauseOps &result,
+@@ -1250,9 +1273,9 @@ bool ClauseProcessor::processReduction(
+         llvm::SmallVector<mlir::Attribute> reductionDeclSymbols;
+         llvm::SmallVector<const semantics::Symbol *> reductionSyms;
+         ReductionProcessor rp;
+-        rp.processReductionArguments(
++        rp.processReductionArguments<omp::clause::Reduction>(
+             currentLocation, converter, clause, reductionVars, reduceVarByRef,
+-            reductionDeclSymbols, reductionSyms, result.reductionMod);
++            reductionDeclSymbols, reductionSyms, &result.reductionMod);
+         // Copy local lists into the output.
+         llvm::copy(reductionVars, std::back_inserter(result.reductionVars));
+         llvm::copy(reduceVarByRef, std::back_inserter(result.reductionByref));
+@@ -1262,6 +1285,30 @@ bool ClauseProcessor::processReduction(
+       });
+ }
+ 
++bool ClauseProcessor::processTaskReduction(
++    mlir::Location currentLocation, mlir::omp::TaskReductionClauseOps &result,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &outReductionSyms) const {
++  return findRepeatableClause<omp::clause::TaskReduction>(
++      [&](const omp::clause::TaskReduction &clause, const parser::CharBlock &) {
++        llvm::SmallVector<mlir::Value> taskReductionVars;
++        llvm::SmallVector<bool> TaskReduceVarByRef;
++        llvm::SmallVector<mlir::Attribute> TaskReductionDeclSymbols;
++        llvm::SmallVector<const semantics::Symbol *> TaskReductionSyms;
++        ReductionProcessor rp;
++        rp.processReductionArguments<omp::clause::TaskReduction>(
++            currentLocation, converter, clause, taskReductionVars,
++            TaskReduceVarByRef, TaskReductionDeclSymbols, TaskReductionSyms);
++        // Copy local lists into the output.
++        llvm::copy(taskReductionVars,
++                   std::back_inserter(result.taskReductionVars));
++        llvm::copy(TaskReduceVarByRef,
++                   std::back_inserter(result.taskReductionByref));
++        llvm::copy(TaskReductionDeclSymbols,
++                   std::back_inserter(result.taskReductionSyms));
++        llvm::copy(TaskReductionSyms, std::back_inserter(outReductionSyms));
++      });
++}
++
+ bool ClauseProcessor::processTo(
+     llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const {
+   return findRepeatableClause<omp::clause::To>(
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index bdddeb145b496..3d3f26f06da26 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -112,6 +112,9 @@ class ClauseProcessor {
+   processEnter(llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const;
+   bool processIf(omp::clause::If::DirectiveNameModifier directiveName,
+                  mlir::omp::IfClauseOps &result) const;
++  bool processInReduction(
++      mlir::Location currentLocation, mlir::omp::InReductionClauseOps &result,
++      llvm::SmallVectorImpl<const semantics::Symbol *> &outReductionSyms) const;
+   bool processIsDevicePtr(
+       mlir::omp::IsDevicePtrClauseOps &result,
+       llvm::SmallVectorImpl<const semantics::Symbol *> &isDeviceSyms) const;
+@@ -133,6 +136,9 @@ class ClauseProcessor {
+   bool processReduction(
+       mlir::Location currentLocation, mlir::omp::ReductionClauseOps &result,
+       llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSyms) const;
++  bool processTaskReduction(
++      mlir::Location currentLocation, mlir::omp::TaskReductionClauseOps &result,
++      llvm::SmallVectorImpl<const semantics::Symbol *> &outReductionSyms) const;
+   bool processTo(llvm::SmallVectorImpl<DeclareTargetCapturePair> &result) const;
+   bool processUseDeviceAddr(
+       lower::StatementContext &stmtCtx,
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 312557d5da07e..2bf03c61abe56 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1773,34 +1773,34 @@ static void genTargetEnterExitUpdateDataClauses(
+   cp.processNowait(clauseOps);
+ }
+ 
+-static void genTaskClauses(lower::AbstractConverter &converter,
+-                           semantics::SemanticsContext &semaCtx,
+-                           lower::SymMap &symTable,
+-                           lower::StatementContext &stmtCtx,
+-                           const List<Clause> &clauses, mlir::Location loc,
+-                           mlir::omp::TaskOperands &clauseOps) {
++static void genTaskClauses(
++    lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
++    lower::SymMap &symTable, lower::StatementContext &stmtCtx,
++    const List<Clause> &clauses, mlir::Location loc,
++    mlir::omp::TaskOperands &clauseOps,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &inReductionSyms) {
+   ClauseProcessor cp(converter, semaCtx, clauses);
+   cp.processAllocate(clauseOps);
+   cp.processDepend(symTable, stmtCtx, clauseOps);
+   cp.processFinal(stmtCtx, clauseOps);
+   cp.processIf(llvm::omp::Directive::OMPD_task, clauseOps);
++  cp.processInReduction(loc, clauseOps, inReductionSyms);
+   cp.processMergeable(clauseOps);
+   cp.processPriority(stmtCtx, clauseOps);
+   cp.processUntied(clauseOps);
+   cp.processDetach(clauseOps);
+ 
+-  cp.processTODO<clause::Affinity, clause::InReduction>(
+-      loc, llvm::omp::Directive::OMPD_task);
++  cp.processTODO<clause::Affinity>(loc, llvm::omp::Directive::OMPD_task);
+ }
+ 
+-static void genTaskgroupClauses(lower::AbstractConverter &converter,
+-                                semantics::SemanticsContext &semaCtx,
+-                                const List<Clause> &clauses, mlir::Location loc,
+-                                mlir::omp::TaskgroupOperands &clauseOps) {
++static void genTaskgroupClauses(
++    lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
++    const List<Clause> &clauses, mlir::Location loc,
++    mlir::omp::TaskgroupOperands &clauseOps,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &taskReductionSyms) {
+   ClauseProcessor cp(converter, semaCtx, clauses);
+   cp.processAllocate(clauseOps);
+-  cp.processTODO<clause::TaskReduction>(loc,
+-                                        llvm::omp::Directive::OMPD_taskgroup);
++  cp.processTaskReduction(loc, clauseOps, taskReductionSyms);
+ }
+ 
+ static void genTaskwaitClauses(lower::AbstractConverter &converter,
+@@ -2480,8 +2480,9 @@ genTaskOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+           mlir::Location loc, const ConstructQueue &queue,
+           ConstructQueue::const_iterator item) {
+   mlir::omp::TaskOperands clauseOps;
++  llvm::SmallVector<const semantics::Symbol *> inReductionSyms;
+   genTaskClauses(converter, semaCtx, symTable, stmtCtx, item->clauses, loc,
+-                 clauseOps);
++                 clauseOps, inReductionSyms);
+ 
+   if (!enableDelayedPrivatization)
+     return genOpWithBody<mlir::omp::TaskOp>(
+@@ -2498,6 +2499,8 @@ genTaskOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   EntryBlockArgs taskArgs;
+   taskArgs.priv.syms = dsp.getDelayedPrivSymbols();
+   taskArgs.priv.vars = clauseOps.privateVars;
++  taskArgs.inReduction.syms = inReductionSyms;
++  taskArgs.inReduction.vars = clauseOps.inReductionVars;
+ 
+   return genOpWithBody<mlir::omp::TaskOp>(
+       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, eval,
+@@ -2515,12 +2518,19 @@ genTaskgroupOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                const ConstructQueue &queue,
+                ConstructQueue::const_iterator item) {
+   mlir::omp::TaskgroupOperands clauseOps;
+-  genTaskgroupClauses(converter, semaCtx, item->clauses, loc, clauseOps);
++  llvm::SmallVector<const semantics::Symbol *> taskReductionSyms;
++  genTaskgroupClauses(converter, semaCtx, item->clauses, loc, clauseOps,
++                      taskReductionSyms);
++
++  EntryBlockArgs taskgroupArgs;
++  taskgroupArgs.taskReduction.syms = taskReductionSyms;
++  taskgroupArgs.taskReduction.vars = clauseOps.taskReductionVars;
+ 
+   return genOpWithBody<mlir::omp::TaskgroupOp>(
+       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, eval,
+                         llvm::omp::Directive::OMPD_taskgroup)
+-          .setClauses(&item->clauses),
++          .setClauses(&item->clauses)
++          .setEntryBlockArgs(&taskgroupArgs),
+       queue, item, clauseOps);
+ }
+ 
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index 729bd3689ad4f..b8aa0deb42dd6 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -25,6 +25,7 @@
+ #include "flang/Parser/tools.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+ #include "llvm/Support/CommandLine.h"
++#include <type_traits>
+ 
+ static llvm::cl::opt<bool> forceByrefReduction(
+     "force-byref-reduction",
+@@ -38,6 +39,37 @@ namespace Fortran {
+ namespace lower {
+ namespace omp {
+ 
++// explicit template declarations
++template void
++ReductionProcessor::processReductionArguments<omp::clause::Reduction>(
++    mlir::Location currentLocation, lower::AbstractConverter &converter,
++    const omp::clause::Reduction &reduction,
++    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++    llvm::SmallVectorImpl<bool> &reduceVarByRef,
++    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
++    mlir::omp::ReductionModifierAttr *reductionMod);
++
++template void
++ReductionProcessor::processReductionArguments<omp::clause::TaskReduction>(
++    mlir::Location currentLocation, lower::AbstractConverter &converter,
++    const omp::clause::TaskReduction &reduction,
++    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++    llvm::SmallVectorImpl<bool> &reduceVarByRef,
++    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
++    mlir::omp::ReductionModifierAttr *reductionMod);
++
++template void
++ReductionProcessor::processReductionArguments<omp::clause::InReduction>(
++    mlir::Location currentLocation, lower::AbstractConverter &converter,
++    const omp::clause::InReduction &reduction,
++    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++    llvm::SmallVectorImpl<bool> &reduceVarByRef,
++    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
++    mlir::omp::ReductionModifierAttr *reductionMod);
++
+ ReductionProcessor::ReductionIdentifier ReductionProcessor::getReductionType(
+     const omp::clause::ProcedureDesignator &pd) {
+   auto redType = llvm::StringSwitch<std::optional<ReductionIdentifier>>(
+@@ -538,28 +570,30 @@ mlir::omp::ReductionModifier translateReductionModifier(ReductionModifier mod) {
+   return mlir::omp::ReductionModifier::defaultmod;
+ }
+ 
++template <class T>
+ void ReductionProcessor::processReductionArguments(
+     mlir::Location currentLocation, lower::AbstractConverter &converter,
+-    const omp::clause::Reduction &reduction,
+-    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++    const T &reduction, llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+     llvm::SmallVectorImpl<bool> &reduceVarByRef,
+     llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+     llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+-    mlir::omp::ReductionModifierAttr &reductionMod) {
++    mlir::omp::ReductionModifierAttr *reductionMod) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+ 
+-  auto mod = std::get<std::optional<ReductionModifier>>(reduction.t);
+-  if (mod.has_value()) {
+-    if (mod.value() == ReductionModifier::Task)
+-      TODO(currentLocation, "Reduction modifier `task` is not supported");
+-    else
+-      reductionMod = mlir::omp::ReductionModifierAttr::get(
+-          firOpBuilder.getContext(), translateReductionModifier(mod.value()));
++  if constexpr (std::is_same_v<T, omp::clause::Reduction>) {
++    auto mod = std::get<std::optional<ReductionModifier>>(reduction.t);
++    if (mod.has_value()) {
++      if (mod.value() == ReductionModifier::Task)
++        TODO(currentLocation, "Reduction modifier `task` is not supported");
++      else
++        *reductionMod = mlir::omp::ReductionModifierAttr::get(
++            firOpBuilder.getContext(), translateReductionModifier(mod.value()));
++    }
+   }
+ 
+   mlir::omp::DeclareReductionOp decl;
+   const auto &redOperatorList{
+-      std::get<omp::clause::Reduction::ReductionIdentifiers>(reduction.t)};
++      std::get<typename T::ReductionIdentifiers>(reduction.t)};
+   assert(redOperatorList.size() == 1 && "Expecting single operator");
+   const auto &redOperator = redOperatorList.front();
+   const auto &objectList{std::get<omp::ObjectList>(reduction.t)};
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.h b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+index 11baa839c74b4..a7198b48f6b4e 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.h
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.h
+@@ -121,14 +121,14 @@ class ReductionProcessor {
+ 
+   /// Creates a reduction declaration and associates it with an OpenMP block
+   /// directive.
++  template <class T>
+   static void processReductionArguments(
+       mlir::Location currentLocation, lower::AbstractConverter &converter,
+-      const omp::clause::Reduction &reduction,
+-      llvm::SmallVectorImpl<mlir::Value> &reductionVars,
++      const T &reduction, llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+       llvm::SmallVectorImpl<bool> &reduceVarByRef,
+       llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+       llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+-      mlir::omp::ReductionModifierAttr &reductionMod);
++      mlir::omp::ReductionModifierAttr *reductionMod = nullptr);
+ };
+ 
+ template <typename FloatOp, typename IntegerOp>
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index d75b4ea13d35f..7f16dd631c88f 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -530,6 +530,12 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+     return false;
+   }
+ 
++  bool Pre(const parser::OmpInReductionClause &x) {
++    auto &objects{std::get<parser::OmpObjectList>(x.t)};
++    ResolveOmpObjectList(objects, Symbol::Flag::OmpInReduction);
++    return false;
++  }
++
+   bool Pre(const parser::OmpClause::Reduction &x) {
+     const auto &objList{std::get<parser::OmpObjectList>(x.v.t)};
+     ResolveOmpObjectList(objList, Symbol::Flag::OmpReduction);
+diff --git a/flang/test/Lower/OpenMP/Todo/task-inreduction.f90 b/flang/test/Lower/OpenMP/Todo/task-inreduction.f90
+deleted file mode 100644
+index aeed680a6dba7..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/task-inreduction.f90
++++ /dev/null
+@@ -1,15 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!===============================================================================
+-! `mergeable` clause
+-!===============================================================================
+-
+-! CHECK: not yet implemented: Unhandled clause IN_REDUCTION in TASK construct
+-subroutine omp_task_in_reduction()
+-  integer i
+-  i = 0
+-  !$omp task in_reduction(+:i)
+-  i = i + 1
+-  !$omp end task
+-end subroutine omp_task_in_reduction
+diff --git a/flang/test/Lower/OpenMP/Todo/taskgroup-task-reduction.f90 b/flang/test/Lower/OpenMP/Todo/taskgroup-task-reduction.f90
+deleted file mode 100644
+index 1cb471d784d76..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/taskgroup-task-reduction.f90
++++ /dev/null
+@@ -1,10 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s -fopenmp-version=50 2>&1 | FileCheck %s
+-
+-! CHECK: not yet implemented: Unhandled clause TASK_REDUCTION in TASKGROUP construct
+-subroutine omp_taskgroup_task_reduction
+-  integer :: res
+-  !$omp taskgroup task_reduction(+:res)
+-  res = res + 1
+-  !$omp end taskgroup
+-end subroutine omp_taskgroup_task_reduction
+diff --git a/flang/test/Lower/OpenMP/task-inreduction.f90 b/flang/test/Lower/OpenMP/task-inreduction.f90
+new file mode 100644
+index 0000000000000..41657d320f7d2
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/task-inreduction.f90
+@@ -0,0 +1,35 @@
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++!CHECK-LABEL: omp.declare_reduction
++!CHECK-SAME:  @[[RED_I32_NAME:.*]] : i32 init {
++!CHECK:       ^bb0(%{{.*}}: i32):
++!CHECK:         %[[C0_1:.*]] = arith.constant 0 : i32
++!CHECK:         omp.yield(%[[C0_1]] : i32)
++!CHECK:       } combiner {
++!CHECK:       ^bb0(%[[ARG0:.*]]: i32, %[[ARG1:.*]]: i32):
++!CHECK:          %[[RES:.*]] = arith.addi %[[ARG0]], %[[ARG1]] : i32
++!CHECK:          omp.yield(%[[RES]] : i32)
++!CHECK:         }
++
++!CHECK-LABEL:  func.func @_QPomp_task_in_reduction() {
++!                [...]
++!CHECK:          omp.task in_reduction(@[[RED_I32_NAME]] %[[VAL_1:.*]]#0  -> %[[ARG0]] : !fir.ref<i32>) {
++!CHECK:            %[[VAL_4:.*]]:2 = hlfir.declare %[[ARG0]]
++!CHECK-SAME:       {uniq_name = "_QFomp_task_in_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:            %[[VAL_5:.*]] = fir.load %[[VAL_4]]#0 : !fir.ref<i32>
++!CHECK:            %[[VAL_6:.*]] = arith.constant 1 : i32
++!CHECK:            %[[VAL_7:.*]] = arith.addi %[[VAL_5]], %[[VAL_6]] : i32
++!CHECK:            hlfir.assign %[[VAL_7]] to %[[VAL_4]]#0 : i32, !fir.ref<i32>
++!CHECK:            omp.terminator
++!CHECK:           }
++!CHECK:           return
++!CHECK:          }
++
++subroutine omp_task_in_reduction()
++   integer i
++   i = 0
++   !$omp task in_reduction(+:i)
++   i = i + 1
++   !$omp end task
++end subroutine omp_task_in_reduction
+diff --git a/flang/test/Lower/OpenMP/taskgroup-task-array-reduction.f90 b/flang/test/Lower/OpenMP/taskgroup-task-array-reduction.f90
+new file mode 100644
+index 0000000000000..18d45217272fc
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/taskgroup-task-array-reduction.f90
+@@ -0,0 +1,49 @@
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++! CHECK-LABEL:  omp.declare_reduction @add_reduction_byref_box_Uxf32 : !fir.ref<!fir.box<!fir.array<?xf32>>> alloc {
++!                 [...]
++! CHECK:          omp.yield
++! CHECK-LABEL:  } init {
++!                 [...]
++! CHECK:          omp.yield
++! CHECK-LABEL:  } combiner {
++!                 [...]
++! CHECK:          omp.yield
++! CHECK-LABEL:  }  cleanup {
++!                  [...]
++! CHECK:           omp.yield
++! CHECK:  }
++
++! CHECK-LABEL:  func.func @_QPtask_reduction
++! CHECK-SAME:  (%[[VAL_0:.*]]: !fir.box<!fir.array<?xf32>> {fir.bindc_name = "x"}) {
++! CHECK:          %[[VAL_1:.*]] = fir.dummy_scope : !fir.dscope
++! CHECK:          %[[VAL_2:.*]]:2 = hlfir.declare %[[VAL_0]] dummy_scope %[[VAL_1]]
++! CHECK-SAME:      {uniq_name = "_QFtask_reductionEx"} : (!fir.box<!fir.array<?xf32>>, !fir.dscope) -> (!fir.box<!fir.array<?xf32>>, !fir.box<!fir.array<?xf32>>)
++! CHECK:          omp.parallel {
++! CHECK:            %[[VAL_3:.*]] = fir.alloca !fir.box<!fir.array<?xf32>>
++! CHECK:            fir.store %[[VAL_2]]#1 to %[[VAL_3]] : !fir.ref<!fir.box<!fir.array<?xf32>>>
++! CHECK:            omp.taskgroup task_reduction(byref @add_reduction_byref_box_Uxf32 %[[VAL_3]] -> %[[VAL_4:.*]]: !fir.ref<!fir.box<!fir.array<?xf32>>>) {
++! CHECK:              %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_4]] 
++! CHECK-SAME:         {uniq_name = "_QFtask_reductionEx"} : (!fir.ref<!fir.box<!fir.array<?xf32>>>) -> (!fir.ref<!fir.box<!fir.array<?xf32>>>, !fir.ref<!fir.box<!fir.array<?xf32>>>)
++! CHECK:              omp.task in_reduction(byref @add_reduction_byref_box_Uxf32 %[[VAL_5]]#0 -> %[[VAL_6:.*]] : !fir.ref<!fir.box<!fir.array<?xf32>>>) {
++!                       [...]
++! CHECK:                omp.terminator
++! CHECK:               }
++! CHECK:               omp.terminator
++! CHECK:              }
++! CHECK:              omp.terminator
++! CHECK:             }
++! CHECK:             return
++! CHECK:           }
++
++subroutine task_reduction(x)
++   real, dimension(:) :: x
++   !$omp parallel
++   !$omp taskgroup task_reduction(+:x)
++   !$omp task in_reduction(+:x)
++   x = x + 1
++   !$omp end task
++   !$omp end taskgroup
++   !$omp end parallel
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/taskgroup-task_reduction01.f90 b/flang/test/Lower/OpenMP/taskgroup-task_reduction01.f90
+new file mode 100644
+index 0000000000000..be4d3193e99f7
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/taskgroup-task_reduction01.f90
+@@ -0,0 +1,36 @@
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++!CHECK-LABEL: omp.declare_reduction
++!CHECK-SAME:  @[[RED_I32_NAME:.*]] : i32 init {
++!CHECK:       ^bb0(%{{.*}}: i32):
++!CHECK:         %[[C0_1:.*]] = arith.constant 0 : i32
++!CHECK:         omp.yield(%[[C0_1]] : i32)
++!CHECK:       } combiner {
++!CHECK:      ^bb0(%[[ARG0:.*]]: i32, %[[ARG1:.*]]: i32):
++!CHECK:        %[[RES:.*]] = arith.addi %[[ARG0]], %[[ARG1]] : i32
++!CHECK:        omp.yield(%[[RES]] : i32)
++!CHECK:       }
++
++!CHECK-LABEL: func.func @_QPomp_taskgroup_task_reduction() {
++!CHECK:         %[[VAL_0:.*]] = fir.alloca i32 {bindc_name = "res", uniq_name = "_QFomp_taskgroup_task_reductionEres"}
++!CHECK:         %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFomp_taskgroup_task_reductionEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:         omp.taskgroup task_reduction(@[[RED_I32_NAME]]  %[[VAL_1]]#0 -> %[[VAL_2:.*]] : !fir.ref<i32>) {
++!CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_2]] 
++!CHECK-SAME:      {uniq_name = "_QFomp_taskgroup_task_reductionEres"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:           %[[VAL_4:.*]] = fir.load %[[VAL_3]]#0 : !fir.ref<i32>
++!CHECK:           %[[VAL_5:.*]] = arith.constant 1 : i32
++!CHECK:           %[[VAL_6:.*]] = arith.addi %[[VAL_4]], %[[VAL_5]] : i32
++!CHECK:           hlfir.assign %[[VAL_6]] to %[[VAL_3]]#0 : i32, !fir.ref<i32>
++!CHECK:           omp.terminator
++!CHECK:          }
++!CHECK:        return
++!CHECK:       }
++
++
++subroutine omp_taskgroup_task_reduction()
++   integer :: res
++   !$omp taskgroup task_reduction(+:res)
++   res = res + 1
++   !$omp end taskgroup
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/taskgroup-task_reduction02.f90 b/flang/test/Lower/OpenMP/taskgroup-task_reduction02.f90
+new file mode 100644
+index 0000000000000..ed91e582d2bf5
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/taskgroup-task_reduction02.f90
+@@ -0,0 +1,37 @@
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 -o - %s 2>&1 | FileCheck %s
++
++!CHECK-LABEL: omp.declare_reduction
++!CHECK-SAME:  @[[RED_I32_NAME:.*]] : i32 init {
++!CHECK:       ^bb0(%{{.*}}: i32):
++!CHECK:         %[[C0_1:.*]] = arith.constant 0 : i32
++!CHECK:         omp.yield(%[[C0_1]] : i32)
++!CHECK:       } combiner {
++!CHECK:       ^bb0(%[[ARG0:.*]]: i32, %[[ARG1:.*]]: i32):
++!CHECK:         %[[RES:.*]] = arith.addi %[[ARG0]], %[[ARG1]] : i32
++!CHECK:         omp.yield(%[[RES]] : i32)
++!CHECK:        }
++
++!CHECK-LABEL:  func.func @_QPin_reduction() {
++!                [...]
++!CHECK:          omp.taskgroup task_reduction(@[[RED_I32_NAME]] %[[VAL_1:.*]]#0 -> %[[VAL_3:.*]] : !fir.ref<i32>) {
++!CHECK:             %[[VAL_4:.*]]:2 = hlfir.declare %[[VAL_3]] {uniq_name = "_QFin_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:             omp.task in_reduction(@[[RED_I32_NAME]] %[[VAL_4]]#0 -> %[[VAL_5:.*]] : !fir.ref<i32>) {
++!CHECK:               %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFin_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!                     [...]
++!CHECK:               omp.terminator
++!CHECK:             }
++!CHECK:             omp.terminator
++!CHECK:          }
++!CHECK:          return
++!CHECK:         }
++
++subroutine in_reduction()
++   integer :: x
++   x = 0
++   !$omp taskgroup task_reduction(+:x)
++   !$omp task in_reduction(+:x)
++   x = x + 1
++   !$omp end task
++   !$omp end taskgroup
++end subroutine

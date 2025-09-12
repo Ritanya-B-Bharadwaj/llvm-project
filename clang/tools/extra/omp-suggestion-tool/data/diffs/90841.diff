@@ -1,0 +1,255 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 4d2d352f7520b..9f0c07ef0da91 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1500,19 +1500,6 @@ IRBuilder<>::InsertPoint OpenMPIRBuilder::createParallel(
+     };
+   }
+ 
+-  // Adjust the finalization stack, verify the adjustment, and call the
+-  // finalize function a last time to finalize values between the pre-fini
+-  // block and the exit block if we left the parallel "the normal way".
+-  auto FiniInfo = FinalizationStack.pop_back_val();
+-  (void)FiniInfo;
+-  assert(FiniInfo.DK == OMPD_parallel &&
+-         "Unexpected finalization stack state!");
+-
+-  Instruction *PRegPreFiniTI = PRegPreFiniBB->getTerminator();
+-
+-  InsertPointTy PreFiniIP(PRegPreFiniBB, PRegPreFiniTI->getIterator());
+-  FiniCB(PreFiniIP);
+-
+   OI.OuterAllocaBB = OuterAllocaBlock;
+   OI.EntryBB = PRegEntryBB;
+   OI.ExitBB = PRegExitBB;
+@@ -1637,6 +1624,19 @@ IRBuilder<>::InsertPoint OpenMPIRBuilder::createParallel(
+       dbgs() << " PBR: " << BB->getName() << "\n";
+   });
+ 
++  // Adjust the finalization stack, verify the adjustment, and call the
++  // finalize function a last time to finalize values between the pre-fini
++  // block and the exit block if we left the parallel "the normal way".
++  auto FiniInfo = FinalizationStack.pop_back_val();
++  (void)FiniInfo;
++  assert(FiniInfo.DK == OMPD_parallel &&
++         "Unexpected finalization stack state!");
++
++  Instruction *PRegPreFiniTI = PRegPreFiniBB->getTerminator();
++
++  InsertPointTy PreFiniIP(PRegPreFiniBB, PRegPreFiniTI->getIterator());
++  FiniCB(PreFiniIP);
++
+   // Register the outlined info.
+   addOutlineInfo(std::move(OI));
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 9f87f89d8c636..bfd7d65912bdb 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -33,6 +33,7 @@
+ #include "llvm/Transforms/Utils/ModuleUtils.h"
+ 
+ #include <any>
++#include <iterator>
+ #include <optional>
+ #include <utility>
+ 
+@@ -878,36 +879,40 @@ static void collectReductionInfo(
+ }
+ 
+ /// handling of DeclareReductionOp's cleanup region
+-static LogicalResult inlineReductionCleanup(
+-    llvm::SmallVectorImpl<omp::DeclareReductionOp> &reductionDecls,
+-    llvm::ArrayRef<llvm::Value *> privateReductionVariables,
+-    LLVM::ModuleTranslation &moduleTranslation, llvm::IRBuilderBase &builder) {
+-  for (auto [i, reductionDecl] : llvm::enumerate(reductionDecls)) {
+-    Region &cleanupRegion = reductionDecl.getCleanupRegion();
+-    if (cleanupRegion.empty())
++static LogicalResult
++inlineOmpRegionCleanup(llvm::SmallVectorImpl<Region *> &cleanupRegions,
++                       llvm::ArrayRef<llvm::Value *> privateVariables,
++                       LLVM::ModuleTranslation &moduleTranslation,
++                       llvm::IRBuilderBase &builder, StringRef regionName,
++                       bool shouldLoadCleanupRegionArg = true) {
++  for (auto [i, cleanupRegion] : llvm::enumerate(cleanupRegions)) {
++    if (cleanupRegion->empty())
+       continue;
+ 
+     // map the argument to the cleanup region
+-    Block &entry = cleanupRegion.front();
++    Block &entry = cleanupRegion->front();
+ 
+     llvm::Instruction *potentialTerminator =
+         builder.GetInsertBlock()->empty() ? nullptr
+                                           : &builder.GetInsertBlock()->back();
+     if (potentialTerminator && potentialTerminator->isTerminator())
+       builder.SetInsertPoint(potentialTerminator);
+-    llvm::Value *reductionVar = builder.CreateLoad(
+-        moduleTranslation.convertType(entry.getArgument(0).getType()),
+-        privateReductionVariables[i]);
++    llvm::Value *prviateVarValue =
++        shouldLoadCleanupRegionArg
++            ? builder.CreateLoad(
++                  moduleTranslation.convertType(entry.getArgument(0).getType()),
++                  privateVariables[i])
++            : privateVariables[i];
+ 
+-    moduleTranslation.mapValue(entry.getArgument(0), reductionVar);
++    moduleTranslation.mapValue(entry.getArgument(0), prviateVarValue);
+ 
+-    if (failed(inlineConvertOmpRegions(cleanupRegion, "omp.reduction.cleanup",
+-                                       builder, moduleTranslation)))
++    if (failed(inlineConvertOmpRegions(*cleanupRegion, regionName, builder,
++                                       moduleTranslation)))
+       return failure();
+ 
+     // clear block argument mapping in case it needs to be re-created with a
+     // different source for another use of the same reduction decl
+-    moduleTranslation.forgetMapping(cleanupRegion);
++    moduleTranslation.forgetMapping(*cleanupRegion);
+   }
+   return success();
+ }
+@@ -1110,8 +1115,14 @@ convertOmpWsloop(Operation &opInst, llvm::IRBuilderBase &builder,
+   builder.restoreIP(nextInsertionPoint);
+ 
+   // after the workshare loop, deallocate private reduction variables
+-  return inlineReductionCleanup(reductionDecls, privateReductionVariables,
+-                                moduleTranslation, builder);
++  SmallVector<Region *> reductionRegions;
++  llvm::transform(reductionDecls, std::back_inserter(reductionRegions),
++                  [](omp::DeclareReductionOp reductionDecl) {
++                    return &reductionDecl.getCleanupRegion();
++                  });
++  return inlineOmpRegionCleanup(reductionRegions, privateReductionVariables,
++                                moduleTranslation, builder,
++                                "omp.reduction.cleanup");
+ }
+ 
+ /// A RAII class that on construction replaces the region arguments of the
+@@ -1267,6 +1278,9 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+     }
+   };
+ 
++  SmallVector<omp::PrivateClauseOp> privatizerClones;
++  SmallVector<llvm::Value *> privateVariables;
++
+   // TODO: Perform appropriate actions according to the data-sharing
+   // attribute (shared, private, firstprivate, ...) of variables.
+   // Currently shared and private are supported.
+@@ -1356,12 +1370,17 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+         opInst.emitError("failed to inline `alloc` region of an `omp.private` "
+                          "op in the parallel region");
+         bodyGenStatus = failure();
++        privatizerClone.erase();
+       } else {
+         assert(yieldedValues.size() == 1);
+         replacementValue = yieldedValues.front();
++
++        // Keep the LLVM replacement value and the op clone in case we need to
++        // emit cleanup (i.e. deallocation) logic.
++        privateVariables.push_back(replacementValue);
++        privatizerClones.push_back(privatizerClone);
+       }
+ 
+-      privatizerClone.erase();
+       builder.restoreIP(oldIP);
+     }
+ 
+@@ -1376,8 +1395,25 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+ 
+     // if the reduction has a cleanup region, inline it here to finalize the
+     // reduction variables
+-    if (failed(inlineReductionCleanup(reductionDecls, privateReductionVariables,
+-                                      moduleTranslation, builder)))
++    SmallVector<Region *> reductionCleanupRegions;
++    llvm::transform(reductionDecls, std::back_inserter(reductionCleanupRegions),
++                    [](omp::DeclareReductionOp reductionDecl) {
++                      return &reductionDecl.getCleanupRegion();
++                    });
++    if (failed(inlineOmpRegionCleanup(
++            reductionCleanupRegions, privateReductionVariables,
++            moduleTranslation, builder, "omp.reduction.cleanup")))
++      bodyGenStatus = failure();
++
++    SmallVector<Region *> privateCleanupRegions;
++    llvm::transform(privatizerClones, std::back_inserter(privateCleanupRegions),
++                    [](omp::PrivateClauseOp privatizer) {
++                      return &privatizer.getDeallocRegion();
++                    });
++
++    if (failed(inlineOmpRegionCleanup(
++            privateCleanupRegions, privateVariables, moduleTranslation, builder,
++            "omp.private.dealloc", /*shouldLoadCleanupRegionArg=*/false)))
+       bodyGenStatus = failure();
+ 
+     builder.restoreIP(oldIP);
+@@ -1403,6 +1439,9 @@ convertOmpParallel(omp::ParallelOp opInst, llvm::IRBuilderBase &builder,
+       ompBuilder->createParallel(ompLoc, allocaIP, bodyGenCB, privCB, finiCB,
+                                  ifCond, numThreads, pbKind, isCancellable));
+ 
++  for (mlir::omp::PrivateClauseOp privatizerClone : privatizerClones)
++    privatizerClone.erase();
++
+   return bodyGenStatus;
+ }
+ 
+diff --git a/mlir/test/Target/LLVMIR/openmp-omp.private-dealloc.mlir b/mlir/test/Target/LLVMIR/openmp-omp.private-dealloc.mlir
+new file mode 100644
+index 0000000000000..835caccb262c4
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-omp.private-dealloc.mlir
+@@ -0,0 +1,53 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s | FileCheck %s
++
++llvm.func @free(!llvm.ptr)
++
++llvm.func @parallel_op_dealloc(%arg0: !llvm.ptr) {
++  omp.parallel private(@x.privatizer %arg0 -> %arg2 : !llvm.ptr) {
++    %0 = llvm.load %arg2 : !llvm.ptr -> f32
++    omp.terminator
++  }
++  llvm.return
++}
++
++omp.private {type = firstprivate} @x.privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %c1 = llvm.mlir.constant(1 : i32) : i32
++  %0 = llvm.alloca %c1 x f32 : (i32) -> !llvm.ptr
++  omp.yield(%0 : !llvm.ptr)
++} copy {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %0 = llvm.load %arg0 : !llvm.ptr -> f32
++  llvm.store %0, %arg1 : f32, !llvm.ptr
++  omp.yield(%arg1 : !llvm.ptr)
++} dealloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.ptrtoint %arg0 : !llvm.ptr to i64
++  %c0 = llvm.mlir.constant(0 : i64) : i64
++  %1 = llvm.icmp "ne" %0, %c0 : i64
++  llvm.cond_br %1, ^bb1, ^bb2
++
++^bb1:
++  llvm.call @free(%arg0) : (!llvm.ptr) -> ()
++  llvm.br ^bb2
++
++^bb2:
++  omp.yield
++}
++
++// CHECK-LABEL: define internal void @parallel_op_dealloc..omp_par
++// CHECK:         %[[LOCAL_ALLOC:.*]] = alloca float, align 4
++
++// CHECK:      omp.par.pre_finalize:
++// CHECK:        br label %[[DEALLOC_REG_START:.*]]
++
++// CHECK:      [[DEALLOC_REG_START]]:
++// CHECK:        %[[LOCAL_ALLOC_CONV:.*]] = ptrtoint ptr %[[LOCAL_ALLOC]] to i64
++// CHECK:        %[[COND:.*]] = icmp ne i64 %[[LOCAL_ALLOC_CONV]], 0
++// CHECK:        br i1 %[[COND]], label %[[DEALLOC_REG_BB1:.*]], label %[[DEALLOC_REG_BB2:.*]]
++
++// CHECK:      [[DEALLOC_REG_BB2]]:
++
++// CHECK:      [[DEALLOC_REG_BB1]]:
++// CHECK-NEXT:   call void @free(ptr %[[LOCAL_ALLOC]])
++// CHECK-NEXT:   br label %[[DEALLOC_REG_BB2]]

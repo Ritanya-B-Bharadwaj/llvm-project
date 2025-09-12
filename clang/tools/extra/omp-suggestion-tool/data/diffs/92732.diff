@@ -1,0 +1,365 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 122abbe7cc975..dc9ac2b9de22f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -152,13 +152,9 @@ def ParallelOp : OpenMP_Op<"parallel", [
+     variable should be passed into the reduction region by value or by reference
+     in `reduction_vars_byref`. Each reduction is identified by the accumulator
+     it uses and accumulators must not be repeated in the same reduction. The
+-    `omp.reduction` operation accepts the accumulator and a partial value which
+-    is considered to be produced by the thread for the given reduction. If
+-    multiple values are produced for the same accumulator, i.e. there are
+-    multiple `omp.reduction`s, the last value is taken. The reduction
+-    declaration specifies how to combine the values from each thread into the
+-    final value, which is available in the accumulator after all the threads
+-    complete.
++    reduction declaration specifies how to combine the values from each thread
++    into the final value, which is available in the accumulator after all the
++    threads complete.
+ 
+     The optional $proc_bind_val attribute controls the thread affinity for the execution
+     of the parallel region.
+@@ -307,13 +303,9 @@ def SectionsOp : OpenMP_Op<"sections", [AttrSizedOperandSegments,
+     accumulator variables in `reduction_vars` and symbols referring to reduction
+     declarations in the `reductions` attribute. Each reduction is identified
+     by the accumulator it uses and accumulators must not be repeated in the same
+-    reduction. The `omp.reduction` operation accepts the accumulator and a
+-    partial value which is considered to be produced by the section for the
+-    given reduction. If multiple values are produced for the same accumulator,
+-    i.e. there are multiple `omp.reduction`s, the last value is taken. The
+-    reduction declaration specifies how to combine the values from each section
+-    into the final value, which is available in the accumulator after all the
+-    sections complete.
++    reduction. The reduction declaration specifies how to combine the values
++    from each section into the final value, which is available in the
++    accumulator after all the sections complete.
+ 
+     The $allocators_vars and $allocate_vars parameters are a variadic list of values
+     that specify the memory allocator to be used to obtain storage for private values.
+@@ -912,11 +904,7 @@ def TaskloopOp : OpenMP_Op<"taskloop", [AttrSizedOperandSegments,
+     variables in `reduction_vars` or `in_reduction_vars` and symbols referring
+     to reduction declarations in the `reductions` or `in_reductions` attribute.
+     Each reduction is identified by the accumulator it uses and accumulators
+-    must not be repeated in the same reduction. The `omp.reduction` operation
+-    accepts the accumulator and a partial value which is considered to be
+-    produced by the current loop iteration for the given reduction. If multiple
+-    values are produced for the same accumulator, i.e. there are multiple
+-    `omp.reduction`s, the last value is taken. The reduction declaration
++    must not be repeated in the same reduction. The reduction declaration
+     specifies how to combine the values from each iteration into the final
+     value, which is available in the accumulator after the loop completes.
+ 
+@@ -2159,24 +2147,4 @@ def DeclareReductionOp : OpenMP_Op<"declare_reduction", [Symbol,
+   let hasRegionVerifier = 1;
+ }
+ 
+-//===----------------------------------------------------------------------===//
+-// 2.19.5.4 reduction clause
+-//===----------------------------------------------------------------------===//
+-
+-def ReductionOp : OpenMP_Op<"reduction"> {
+-  let summary = "reduction construct";
+-  let description = [{
+-    Indicates the value that is produced by the current reduction-participating
+-    entity for a reduction requested in some ancestor. The reduction is
+-    identified by the accumulator, but the value of the accumulator may not be
+-    updated immediately.
+-  }];
+-
+-  let arguments= (ins AnyType:$operand, OpenMP_PointerLikeType:$accumulator);
+-  let assemblyFormat = [{
+-    $operand `,` $accumulator attr-dict `:` type($operand) `,` type($accumulator)
+-  }];
+-  let hasVerifier = 1;
+-}
+-
+ #endif // OPENMP_OPS
+diff --git a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+index a206c7b228d21..f6a6d1d7228a0 100644
+--- a/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
++++ b/mlir/lib/Conversion/OpenMPToLLVM/OpenMPToLLVM.cpp
+@@ -185,21 +185,6 @@ struct MapInfoOpConversion : public ConvertOpToLLVMPattern<omp::MapInfoOp> {
+   }
+ };
+ 
+-struct ReductionOpConversion : public ConvertOpToLLVMPattern<omp::ReductionOp> {
+-  using ConvertOpToLLVMPattern<omp::ReductionOp>::ConvertOpToLLVMPattern;
+-  LogicalResult
+-  matchAndRewrite(omp::ReductionOp curOp, OpAdaptor adaptor,
+-                  ConversionPatternRewriter &rewriter) const override {
+-    if (isa<MemRefType>(curOp.getAccumulator().getType())) {
+-      // TODO: Support memref type in variable operands
+-      return rewriter.notifyMatchFailure(curOp, "memref is not supported yet");
+-    }
+-    rewriter.replaceOpWithNewOp<omp::ReductionOp>(
+-        curOp, TypeRange(), adaptor.getOperands(), curOp->getAttrs());
+-    return success();
+-  }
+-};
+-
+ template <typename OpType>
+ struct MultiRegionOpConversion : public ConvertOpToLLVMPattern<OpType> {
+   using ConvertOpToLLVMPattern<OpType>::ConvertOpToLLVMPattern;
+@@ -246,9 +231,6 @@ void mlir::configureOpenMPToLLVMConversionLegality(
+         return typeConverter.isLegal(op->getOperandTypes()) &&
+                typeConverter.isLegal(op->getResultTypes());
+       });
+-  target.addDynamicallyLegalOp<mlir::omp::ReductionOp>([&](Operation *op) {
+-    return typeConverter.isLegal(op->getOperandTypes());
+-  });
+   target.addDynamicallyLegalOp<
+       mlir::omp::AtomicUpdateOp, mlir::omp::CriticalOp, mlir::omp::TargetOp,
+       mlir::omp::TargetDataOp, mlir::omp::LoopNestOp,
+@@ -275,11 +257,11 @@ void mlir::populateOpenMPToLLVMConversionPatterns(LLVMTypeConverter &converter,
+       [&](omp::MapBoundsType type) -> Type { return type; });
+ 
+   patterns.add<
+-      AtomicReadOpConversion, MapInfoOpConversion, ReductionOpConversion,
++      AtomicReadOpConversion, MapInfoOpConversion,
+       MultiRegionOpConversion<omp::DeclareReductionOp>,
+       MultiRegionOpConversion<omp::PrivateClauseOp>,
+       RegionOpConversion<omp::CriticalOp>, RegionOpConversion<omp::LoopNestOp>,
+-      RegionOpConversion<omp::MasterOp>, ReductionOpConversion,
++      RegionOpConversion<omp::MasterOp>,
+       RegionOpConversion<omp::OrderedRegionOp>,
+       RegionOpConversion<omp::ParallelOp>, RegionOpConversion<omp::WsloopOp>,
+       RegionOpConversion<omp::SectionsOp>, RegionOpConversion<omp::SectionOp>,
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 24a6d5b5d6849..110873011fe35 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1789,7 +1789,7 @@ LogicalResult DistributeOp::verify() {
+ }
+ 
+ //===----------------------------------------------------------------------===//
+-// ReductionOp
++// DeclareReductionOp
+ //===----------------------------------------------------------------------===//
+ 
+ static ParseResult parseAtomicReductionRegion(OpAsmParser &parser,
+@@ -1881,21 +1881,6 @@ LogicalResult DeclareReductionOp::verifyRegions() {
+   return success();
+ }
+ 
+-LogicalResult ReductionOp::verify() {
+-  auto *op = (*this)->getParentWithTrait<ReductionClauseInterface::Trait>();
+-  if (!op)
+-    return emitOpError() << "must be used within an operation supporting "
+-                            "reduction clause interface";
+-  while (op) {
+-    for (const auto &var :
+-         cast<ReductionClauseInterface>(op).getAllReductionVars())
+-      if (var == getAccumulator())
+-        return success();
+-    op = op->getParentWithTrait<ReductionClauseInterface::Trait>();
+-  }
+-  return emitOpError() << "the accumulator is not used by the parent";
+-}
+-
+ //===----------------------------------------------------------------------===//
+ // TaskOp
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 9d125b7f11809..6ec4c120c11ea 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -334,54 +334,6 @@ convertOmpCritical(Operation &opInst, llvm::IRBuilderBase &builder,
+   return success();
+ }
+ 
+-/// Returns a reduction declaration that corresponds to the given reduction
+-/// operation in the given container. Currently only supports reductions inside
+-/// WsloopOp and ParallelOp but can be easily extended as long as the given
+-/// construct implements getNumReductionVars.
+-template <typename T>
+-static std::optional<omp::DeclareReductionOp>
+-findReductionDeclInContainer(T container, omp::ReductionOp reduction) {
+-  for (unsigned i = 0, e = container.getNumReductionVars(); i < e; ++i) {
+-    if (container.getReductionVars()[i] != reduction.getAccumulator())
+-      continue;
+-
+-    SymbolRefAttr reductionSymbol =
+-        cast<SymbolRefAttr>((*container.getReductions())[i]);
+-    auto declareOp =
+-        SymbolTable::lookupNearestSymbolFrom<omp::DeclareReductionOp>(
+-            container, reductionSymbol);
+-    return declareOp;
+-  }
+-  return std::nullopt;
+-}
+-
+-/// Searches for a reduction in a provided region and the regions
+-/// it is nested in
+-static omp::DeclareReductionOp findReductionDecl(Operation &containerOp,
+-                                                 omp::ReductionOp reduction) {
+-  std::optional<omp::DeclareReductionOp> declareOp = std::nullopt;
+-  Operation *container = &containerOp;
+-
+-  while (!declareOp.has_value() && container) {
+-    // Check if current container is supported for reductions searches
+-    if (auto par = dyn_cast<omp::ParallelOp>(*container)) {
+-      declareOp = findReductionDeclInContainer(par, reduction);
+-    } else if (auto loop = dyn_cast<omp::WsloopOp>(*container)) {
+-      declareOp = findReductionDeclInContainer(loop, reduction);
+-    } else {
+-      break;
+-    }
+-
+-    // See if we can search parent for reductions as well
+-    container = containerOp.getParentOp();
+-  }
+-
+-  assert(declareOp.has_value() &&
+-         "reduction operation must be associated with a declaration");
+-
+-  return *declareOp;
+-}
+-
+ /// Populates `reductions` with reduction declarations used in the given loop.
+ template <typename T>
+ static void
+@@ -1786,62 +1738,6 @@ convertOmpAtomicCapture(omp::AtomicCaptureOp atomicCaptureOp,
+   return updateGenStatus;
+ }
+ 
+-/// Converts an OpenMP reduction operation using OpenMPIRBuilder. Expects the
+-/// mapping between reduction variables and their private equivalents to have
+-/// been stored on the ModuleTranslation stack. Currently only supports
+-/// reduction within WsloopOp and ParallelOp, but can be easily extended.
+-static LogicalResult
+-convertOmpReductionOp(omp::ReductionOp reductionOp,
+-                      llvm::IRBuilderBase &builder,
+-                      LLVM::ModuleTranslation &moduleTranslation) {
+-  // Find the declaration that corresponds to the reduction op.
+-  omp::DeclareReductionOp declaration;
+-  Operation *reductionParent = reductionOp->getParentOp();
+-  if (dyn_cast<omp::ParallelOp>(reductionParent) ||
+-      dyn_cast<omp::WsloopOp>(reductionParent)) {
+-    declaration = findReductionDecl(*reductionParent, reductionOp);
+-  } else {
+-    llvm_unreachable("Unhandled reduction container");
+-  }
+-  assert(declaration && "could not find reduction declaration");
+-
+-  // Retrieve the mapping between reduction variables and their private
+-  // equivalents.
+-  const DenseMap<Value, llvm::Value *> *reductionVariableMap = nullptr;
+-  moduleTranslation.stackWalk<OpenMPVarMappingStackFrame>(
+-      [&](const OpenMPVarMappingStackFrame &frame) {
+-        if (frame.mapping.contains(reductionOp.getAccumulator())) {
+-          reductionVariableMap = &frame.mapping;
+-          return WalkResult::interrupt();
+-        }
+-        return WalkResult::advance();
+-      });
+-  assert(reductionVariableMap && "couldn't find private reduction variables");
+-  // Translate the reduction operation by emitting the body of the corresponding
+-  // reduction declaration.
+-  Region &reductionRegion = declaration.getReductionRegion();
+-  llvm::Value *privateReductionVar =
+-      reductionVariableMap->lookup(reductionOp.getAccumulator());
+-  llvm::Value *reductionVal = builder.CreateLoad(
+-      moduleTranslation.convertType(reductionOp.getOperand().getType()),
+-      privateReductionVar);
+-
+-  moduleTranslation.mapValue(reductionRegion.front().getArgument(0),
+-                             reductionVal);
+-  moduleTranslation.mapValue(
+-      reductionRegion.front().getArgument(1),
+-      moduleTranslation.lookupValue(reductionOp.getOperand()));
+-
+-  SmallVector<llvm::Value *> phis;
+-  if (failed(inlineConvertOmpRegions(reductionRegion, "omp.reduction.body",
+-                                     builder, moduleTranslation, &phis)))
+-    return failure();
+-  assert(phis.size() == 1 && "expected one value to be yielded from "
+-                             "the reduction body declaration region");
+-  builder.CreateStore(phis[0], privateReductionVar);
+-  return success();
+-}
+-
+ /// Converts an OpenMP Threadprivate operation into LLVM IR using
+ /// OpenMPIRBuilder.
+ static LogicalResult
+@@ -3350,9 +3246,6 @@ convertHostOrTargetOperation(Operation *op, llvm::IRBuilderBase &builder,
+       .Case([&](omp::ParallelOp op) {
+         return convertOmpParallel(op, builder, moduleTranslation);
+       })
+-      .Case([&](omp::ReductionOp reductionOp) {
+-        return convertOmpReductionOp(reductionOp, builder, moduleTranslation);
+-      })
+       .Case([&](omp::MasterOp) {
+         return convertOmpMaster(*op, builder, moduleTranslation);
+       })
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index db016fe8e7ba8..115d164b6cc7e 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -648,7 +648,6 @@ func.func @foo(%lb : index, %ub : index, %step : index) {
+   omp.wsloop reduction(@foo %0 -> %prv : !llvm.ptr) {
+     omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+       %2 = arith.constant 2.0 : f32
+-      omp.reduction %2, %1 : f32, !llvm.ptr
+       omp.yield
+     }
+     omp.terminator
+@@ -678,7 +677,6 @@ func.func @foo(%lb : index, %ub : index, %step : index) {
+   omp.wsloop reduction(@add_f32 %0 -> %prv : !llvm.ptr, @add_f32 %0 -> %prv1 : !llvm.ptr) {
+     omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+       %2 = arith.constant 2.0 : f32
+-      omp.reduction %2, %0 : f32, !llvm.ptr
+       omp.yield
+     }
+     omp.terminator
+@@ -713,7 +711,6 @@ func.func @foo(%lb : index, %ub : index, %step : index, %mem : memref<1xf32>) {
+   omp.wsloop reduction(@add_f32 %mem -> %prv : memref<1xf32>) {
+     omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+       %2 = arith.constant 2.0 : f32
+-      omp.reduction %2, %mem : f32, memref<1xf32>
+       omp.yield
+     }
+     omp.terminator
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 0d5fd9383a92f..caf25a3cb59f0 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -1003,8 +1003,6 @@ func.func @omp_teams(%lb : i32, %ub : i32, %if_cond : i1, %num_threads : i32,
+   // CHECK: omp.teams reduction(@add_f32 -> %{{.+}} : !llvm.ptr) {
+   omp.teams reduction(@add_f32 -> %0 : !llvm.ptr) {
+     %1 = arith.constant 2.0 : f32
+-    // CHECK: omp.reduction %{{.+}}, %{{.+}}
+-    omp.reduction %1, %0 : f32, !llvm.ptr
+     // CHECK: omp.terminator
+     omp.terminator
+   }
+@@ -1028,15 +1026,11 @@ func.func @sections_reduction() {
+     // CHECK: omp.section
+     omp.section {
+       %1 = arith.constant 2.0 : f32
+-      // CHECK: omp.reduction %{{.+}}, %{{.+}}
+-      omp.reduction %1, %0 : f32, !llvm.ptr
+       omp.terminator
+     }
+     // CHECK: omp.section
+     omp.section {
+       %1 = arith.constant 3.0 : f32
+-      // CHECK: omp.reduction %{{.+}}, %{{.+}}
+-      omp.reduction %1, %0 : f32, !llvm.ptr
+       omp.terminator
+     }
+     omp.terminator
+@@ -1130,14 +1124,10 @@ func.func @sections_reduction2() {
+   omp.sections reduction(@add2_f32 -> %0 : memref<1xf32>) {
+     omp.section {
+       %1 = arith.constant 2.0 : f32
+-      // CHECK: omp.reduction
+-      omp.reduction %1, %0 : f32, memref<1xf32>
+       omp.terminator
+     }
+     omp.section {
+       %1 = arith.constant 2.0 : f32
+-      // CHECK: omp.reduction
+-      omp.reduction %1, %0 : f32, memref<1xf32>
+       omp.terminator
+     }
+     omp.terminator

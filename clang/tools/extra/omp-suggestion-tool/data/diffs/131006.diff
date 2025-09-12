@@ -1,0 +1,149 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index dda2ac76df3b2..c66fd46767b86 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -929,18 +929,35 @@ void ClauseProcessor::processMapObjects(
+     llvm::StringRef mapperIdNameRef) const {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+ 
++  auto getDefaultMapperID = [&](const omp::Object &object,
++                                std::string &mapperIdName) {
++    if (!mlir::isa<mlir::omp::DeclareMapperOp>(
++            firOpBuilder.getRegion().getParentOp())) {
++      const semantics::DerivedTypeSpec *typeSpec = nullptr;
++
++      if (object.sym()->owner().IsDerivedType())
++        typeSpec = object.sym()->owner().derivedTypeSpec();
++      else if (object.sym()->GetType() &&
++               object.sym()->GetType()->category() ==
++                   semantics::DeclTypeSpec::TypeDerived)
++        typeSpec = &object.sym()->GetType()->derivedTypeSpec();
++
++      if (typeSpec) {
++        mapperIdName = typeSpec->name().ToString() + ".default";
++        mapperIdName =
++            converter.mangleName(mapperIdName, *typeSpec->GetScope());
++      }
++    }
++  };
++
+   // Create the mapper symbol from its name, if specified.
+   mlir::FlatSymbolRefAttr mapperId;
+-  if (!mapperIdNameRef.empty() && !objects.empty()) {
++  if (!mapperIdNameRef.empty() && !objects.empty() &&
++      mapperIdNameRef != "__implicit_mapper") {
+     std::string mapperIdName = mapperIdNameRef.str();
+-    if (mapperIdName == "default") {
+-      const omp::Object &object = objects.front();
+-      auto &typeSpec = object.sym()->owner().IsDerivedType()
+-                           ? *object.sym()->owner().derivedTypeSpec()
+-                           : object.sym()->GetType()->derivedTypeSpec();
+-      mapperIdName = typeSpec.name().ToString() + ".default";
+-      mapperIdName = converter.mangleName(mapperIdName, *typeSpec.GetScope());
+-    }
++    const omp::Object &object = objects.front();
++    if (mapperIdNameRef == "default")
++      getDefaultMapperID(object, mapperIdName);
+     assert(converter.getModuleOp().lookupSymbol(mapperIdName) &&
+            "mapper not found");
+     mapperId =
+@@ -978,6 +995,15 @@ void ClauseProcessor::processMapObjects(
+       }
+     }
+ 
++    if (mapperIdNameRef == "__implicit_mapper") {
++      std::string mapperIdName;
++      getDefaultMapperID(object, mapperIdName);
++      mapperId = converter.getModuleOp().lookupSymbol(mapperIdName)
++                     ? mlir::FlatSymbolRefAttr::get(&converter.getMLIRContext(),
++                                                    mapperIdName)
++                     : mlir::FlatSymbolRefAttr();
++    }
++
+     // Explicit map captures are captured ByRef by default,
+     // optimisation passes may alter this to ByCopy or other capture
+     // types to optimise
+@@ -1023,7 +1049,7 @@ bool ClauseProcessor::processMap(
+     const auto &[mapType, typeMods, mappers, iterator, objects] = clause.t;
+     llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+         llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE;
+-    std::string mapperIdName;
++    std::string mapperIdName = "__implicit_mapper";
+     // If the map type is specified, then process it else Tofrom is the
+     // default.
+     Map::MapType type = mapType.value_or(Map::MapType::Tofrom);
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 77786742b3e13..7ad9433de2769 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2234,6 +2234,16 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       fir::ExtendedValue dataExv = converter.getSymbolExtendedValue(sym);
+       name << sym.name().ToString();
+ 
++      mlir::FlatSymbolRefAttr mapperId;
++      if (sym.GetType()->category() == semantics::DeclTypeSpec::TypeDerived) {
++        auto &typeSpec = sym.GetType()->derivedTypeSpec();
++        std::string mapperIdName = typeSpec.name().ToString() + ".default";
++        mapperIdName = converter.mangleName(mapperIdName, *typeSpec.GetScope());
++        if (converter.getModuleOp().lookupSymbol(mapperIdName))
++          mapperId = mlir::FlatSymbolRefAttr::get(&converter.getMLIRContext(),
++                                                  mapperIdName);
++      }
++
+       fir::factory::AddrAndBoundsInfo info =
+           Fortran::lower::getDataOperandBaseAddr(
+               converter, firOpBuilder, sym, converter.getCurrentLocation());
+@@ -2285,7 +2295,7 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+           static_cast<
+               std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+               mapFlag),
+-          captureKind, baseOp.getType());
++          captureKind, baseOp.getType(), /*partialMap=*/false, mapperId);
+ 
+       clauseOps.mapVars.push_back(mapOp);
+       mapSyms.push_back(&sym);
+diff --git a/flang/test/Lower/OpenMP/declare-mapper.f90 b/flang/test/Lower/OpenMP/declare-mapper.f90
+index e12becbc5d9a9..ce38d511959b7 100644
+--- a/flang/test/Lower/OpenMP/declare-mapper.f90
++++ b/flang/test/Lower/OpenMP/declare-mapper.f90
+@@ -4,6 +4,7 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-1.f90 -o - | FileCheck %t/omp-declare-mapper-1.f90
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-2.f90 -o - | FileCheck %t/omp-declare-mapper-2.f90
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-3.f90 -o - | FileCheck %t/omp-declare-mapper-3.f90
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-4.f90 -o - | FileCheck %t/omp-declare-mapper-4.f90
+ 
+ !--- omp-declare-mapper-1.f90
+ subroutine declare_mapper_1
+@@ -141,3 +142,32 @@ subroutine declare_mapper_3
+    !$omp declare mapper (my_mapper : my_type :: var) map (var, var%values (1:var%num_vals))
+    !$omp declare mapper (my_mapper2 : my_type2 :: v) map (mapper(my_mapper) : v%my_type_var) map (tofrom : v%arr)
+ end subroutine declare_mapper_3
++
++!--- omp-declare-mapper-4.f90
++subroutine declare_mapper_4
++   type my_type
++      integer              :: num
++   end type
++
++   !CHECK: omp.declare_mapper @[[MY_TYPE_MAPPER:_QQFdeclare_mapper_4my_type.default]] : [[MY_TYPE:!fir\.type<_QFdeclare_mapper_4Tmy_type\{num:i32\}>]]
++   !$omp declare mapper (my_type :: var) map (var%num)
++
++   type(my_type) :: a
++   integer :: b
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) mapper(@[[MY_TYPE_MAPPER]]) map_clauses(tofrom) capture(ByRef) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "b"}
++   !$omp target map(a, b)
++   a%num = 10
++   b = 20
++   !$omp end target
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}} : !fir.ref<i32>, i32) mapper(@[[MY_TYPE_MAPPER]]) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "a%{{.*}}"}
++   !$omp target map(a%num)
++   a%num = 30
++   !$omp end target
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) mapper(@[[MY_TYPE_MAPPER]]) map_clauses(implicit, tofrom) capture(ByRef) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !$omp target
++   a%num = 40
++   !$omp end target
++end subroutine declare_mapper_4

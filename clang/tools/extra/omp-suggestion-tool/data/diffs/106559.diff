@@ -1,0 +1,1011 @@
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index c48daba8cf7fa..fe72f1722983f 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -856,7 +856,7 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+ 
+     copyVarHLFIR(loc, Fortran::lower::SymbolBox::Intrinsic{dst},
+                  Fortran::lower::SymbolBox::Intrinsic{src}, isAllocatable,
+-                 isPointer);
++                 isPointer, Fortran::semantics::Symbol::Flags());
+   }
+ 
+   void copyHostAssociateVar(
+@@ -893,7 +893,7 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+       rhs_sb = &hsb;
+     }
+ 
+-    copyVar(sym, *lhs_sb, *rhs_sb);
++    copyVar(sym, *lhs_sb, *rhs_sb, sym.flags());
+ 
+     if (copyAssignIP && copyAssignIP->isSet() &&
+         sym.test(Fortran::semantics::Symbol::Flag::OmpLastPrivate)) {
+@@ -1209,16 +1209,18 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+ 
+   void copyVar(const Fortran::semantics::Symbol &sym,
+                const Fortran::lower::SymbolBox &lhs_sb,
+-               const Fortran::lower::SymbolBox &rhs_sb) {
++               const Fortran::lower::SymbolBox &rhs_sb,
++               Fortran::semantics::Symbol::Flags flags) {
+     mlir::Location loc = genLocation(sym.name());
+     if (lowerToHighLevelFIR())
+-      copyVarHLFIR(loc, lhs_sb, rhs_sb);
++      copyVarHLFIR(loc, lhs_sb, rhs_sb, flags);
+     else
+       copyVarFIR(loc, sym, lhs_sb, rhs_sb);
+   }
+ 
+   void copyVarHLFIR(mlir::Location loc, Fortran::lower::SymbolBox dst,
+-                    Fortran::lower::SymbolBox src) {
++                    Fortran::lower::SymbolBox src,
++                    Fortran::semantics::Symbol::Flags flags) {
+     assert(lowerToHighLevelFIR());
+ 
+     bool isBoxAllocatable = dst.match(
+@@ -1235,51 +1237,39 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+         },
+         [](const auto &box) { return false; });
+ 
+-    copyVarHLFIR(loc, dst, src, isBoxAllocatable, isBoxPointer);
++    copyVarHLFIR(loc, dst, src, isBoxAllocatable, isBoxPointer, flags);
+   }
+ 
+   void copyVarHLFIR(mlir::Location loc, Fortran::lower::SymbolBox dst,
+                     Fortran::lower::SymbolBox src, bool isAllocatable,
+-                    bool isPointer) {
++                    bool isPointer, Fortran::semantics::Symbol::Flags flags) {
+     assert(lowerToHighLevelFIR());
+     hlfir::Entity lhs{dst.getAddr()};
+     hlfir::Entity rhs{src.getAddr()};
+-    // Temporary_lhs is set to true in hlfir.assign below to avoid user
+-    // assignment to be used and finalization to be called on the LHS.
+-    // This may or may not be correct but mimics the current behaviour
+-    // without HLFIR.
++
+     auto copyData = [&](hlfir::Entity l, hlfir::Entity r) {
+       // Dereference RHS and load it if trivial scalar.
+       r = hlfir::loadTrivialScalar(loc, *builder, r);
+-      builder->create<hlfir::AssignOp>(
+-          loc, r, l,
+-          /*isWholeAllocatableAssignment=*/false,
+-          /*keepLhsLengthInAllocatableAssignment=*/false,
+-          /*temporary_lhs=*/true);
++      builder->create<hlfir::AssignOp>(loc, r, l, isAllocatable);
+     };
+ 
+-    if (isAllocatable) {
+-      // Deep copy allocatable if it is allocated.
+-      // Note that when allocated, the RHS is already allocated with the LHS
+-      // shape for copy on entry in createHostAssociateVarClone.
+-      // For lastprivate, this assumes that the RHS was not reallocated in
+-      // the OpenMP region.
+-      lhs = hlfir::derefPointersAndAllocatables(loc, *builder, lhs);
+-      mlir::Value addr = hlfir::genVariableRawAddress(loc, *builder, lhs);
+-      mlir::Value isAllocated = builder->genIsNotNullAddr(loc, addr);
+-      builder->genIfThen(loc, isAllocated)
+-          .genThen([&]() {
+-            // Copy the DATA, not the descriptors.
+-            copyData(lhs, rhs);
+-          })
+-          .end();
+-    } else if (isPointer) {
++    if (isPointer) {
+       // Set LHS target to the target of RHS (do not copy the RHS
+       // target data into the LHS target storage).
+       auto loadVal = builder->create<fir::LoadOp>(loc, rhs);
+       builder->create<fir::StoreOp>(loc, loadVal, lhs);
++    } else if (isAllocatable &&
++               flags.test(Fortran::semantics::Symbol::Flag::OmpFirstPrivate)) {
++      // For firstprivate allocatable variables, RHS must be copied only when
++      // LHS is allocated.
++      hlfir::Entity temp =
++          hlfir::derefPointersAndAllocatables(loc, *builder, lhs);
++      mlir::Value addr = hlfir::genVariableRawAddress(loc, *builder, temp);
++      mlir::Value isAllocated = builder->genIsNotNullAddr(loc, addr);
++      builder->genIfThen(loc, isAllocated)
++          .genThen([&]() { copyData(lhs, rhs); })
++          .end();
+     } else {
+-      // Non ALLOCATABLE/POINTER variable. Simple DATA copy.
+       copyData(lhs, rhs);
+     }
+   }
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 1b2f926e21bed..c447e8f8dcddb 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -132,54 +132,9 @@ void DataSharingProcessor::copyFirstPrivateSymbol(
+ }
+ 
+ void DataSharingProcessor::copyLastPrivateSymbol(
+-    const semantics::Symbol *sym,
+-    [[maybe_unused]] mlir::OpBuilder::InsertPoint *lastPrivIP) {
+-  if (sym->test(semantics::Symbol::Flag::OmpLastPrivate)) {
+-    bool allocatable = semantics::IsAllocatable(sym->GetUltimate());
+-    if (!allocatable) {
+-      converter.copyHostAssociateVar(*sym, lastPrivIP);
+-      return;
+-    }
+-
+-    // copyHostAssociateVar doesn't work properly if the privatised copy was
+-    // reallocated (e.g. by assignment): it will only copy if the ultimate
+-    // symbol was already allocated, and it only copies data so any reallocated
+-    // lengths etc are lost
+-
+-    // 1) Fetch the original copy of the variable.
+-    assert(sym->has<Fortran::semantics::HostAssocDetails>() &&
+-           "No host-association found");
+-    const Fortran::semantics::Symbol &hsym = sym->GetUltimate();
+-    Fortran::lower::SymbolBox hsb = symTable->lookupOneLevelUpSymbol(hsym);
+-    assert(hsb && "Host symbol box not found");
+-
+-    // 2) Fetch the copied one that will mask the original.
+-    Fortran::lower::SymbolBox sb = symTable->shallowLookupSymbol(sym);
+-    assert(sb && "Host-associated symbol box not found");
+-    assert(hsb.getAddr() != sb.getAddr() &&
+-           "Host and associated symbol boxes are the same");
+-
+-    // 3) Perform the assignment.
+-    fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+-    mlir::Location loc = converter.genLocation(sym->name());
+-    mlir::OpBuilder::InsertPoint insPt = builder.saveInsertionPoint();
+-    if (lastPrivIP && lastPrivIP->isSet())
+-      builder.restoreInsertionPoint(*lastPrivIP);
+-    else
+-      builder.setInsertionPointAfter(sb.getAddr().getDefiningOp());
+-
+-    hlfir::Entity dst{hsb.getAddr()};
+-    hlfir::Entity src{sb.getAddr()};
+-    builder.create<hlfir::AssignOp>(
+-        loc, src, dst, /*isWholeAllocatableAssignment=*/allocatable,
+-        /*keepLhsLengthInAllocatableAssignment=*/false,
+-        /*temporary_lhs=*/false);
+-
+-    if (lastPrivIP && lastPrivIP->isSet() &&
+-        sym->test(Fortran::semantics::Symbol::Flag::OmpLastPrivate)) {
+-      builder.restoreInsertionPoint(insPt);
+-    }
+-  }
++    const semantics::Symbol *sym, mlir::OpBuilder::InsertPoint *lastPrivIP) {
++  if (sym->test(semantics::Symbol::Flag::OmpLastPrivate))
++    converter.copyHostAssociateVar(*sym, lastPrivIP);
+ }
+ 
+ void DataSharingProcessor::collectOmpObjectListSymbol(
+diff --git a/flang/runtime/assign.cpp b/flang/runtime/assign.cpp
+index c3c9b0ba10ab3..d558ada51cd21 100644
+--- a/flang/runtime/assign.cpp
++++ b/flang/runtime/assign.cpp
+@@ -591,7 +591,7 @@ void RTDEF(AssignTemporary)(Descriptor &to, const Descriptor &from,
+     }
+   }
+ 
+-  Assign(to, from, terminator, PolymorphicLHS);
++  Assign(to, from, terminator, MaybeReallocate | PolymorphicLHS);
+ }
+ 
+ void RTDEF(CopyInAssign)(Descriptor &temp, const Descriptor &var,
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/equivalence.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/equivalence.f90
+index 1cbbcdcd0e4fd..2307c09513795 100644
+--- a/flang/test/Lower/OpenMP/DelayedPrivatization/equivalence.f90
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/equivalence.f90
+@@ -22,7 +22,7 @@ subroutine private_common
+ ! CHECK:  } copy {
+ ! CHECK:  ^bb0(%[[ORIG_PTR:.*]]: ![[X_TYPE]], %[[PRIV_REF:.*]]: ![[X_TYPE]]):
+ ! CHECK:    %[[ORIG_VAL:.*]] = fir.load %[[ORIG_PTR]] : !fir.ptr<f32>
+-! CHECK:    hlfir.assign %[[ORIG_VAL]] to %[[PRIV_REF]] temporary_lhs : f32, ![[X_TYPE]]
++! CHECK:    hlfir.assign %[[ORIG_VAL]] to %[[PRIV_REF]] : f32, ![[X_TYPE]]
+ ! CHECK:    omp.yield(%[[PRIV_REF]] : ![[X_TYPE]])
+ ! CHECK:  }
+ 
+diff --git a/flang/test/Lower/OpenMP/copyin-order.f90 b/flang/test/Lower/OpenMP/copyin-order.f90
+index 8999c247eebdc..ffbbad00e7cbd 100644
+--- a/flang/test/Lower/OpenMP/copyin-order.f90
++++ b/flang/test/Lower/OpenMP/copyin-order.f90
+@@ -6,11 +6,11 @@
+ !CHECK:   %[[THP1:[0-9]+]] = omp.threadprivate %{{[0-9]+}}#1
+ !CHECK:   %[[DCL1:[0-9]+]]:2 = hlfir.declare %[[THP1]] {uniq_name = "_QFcopyin_scalar_arrayEx1"}
+ !CHECK:   %[[LD1:[0-9]+]] = fir.load %{{[0-9]+}}#0
+-!CHECK:   hlfir.assign %[[LD1]] to %[[DCL1]]#0 temporary_lhs
++!CHECK:   hlfir.assign %[[LD1]] to %[[DCL1]]#0
+ !CHECK:   %[[THP2:[0-9]+]] = omp.threadprivate %{{[0-9]+}}#1
+ !CHECK:   %[[SHP2:[0-9]+]] = fir.shape %c{{[0-9]+}}
+ !CHECK:   %[[DCL2:[0-9]+]]:2 = hlfir.declare %[[THP2]](%[[SHP2]]) {uniq_name = "_QFcopyin_scalar_arrayEx2"}
+-!CHECK:   hlfir.assign %{{[0-9]+}}#0 to %[[DCL2]]#0 temporary_lhs
++!CHECK:   hlfir.assign %{{[0-9]+}}#0 to %[[DCL2]]#0
+ !CHECK:   omp.barrier
+ !CHECK:   fir.call @_QPsub1(%[[DCL1]]#1, %[[DCL2]]#1)
+ !CHECK:   omp.terminator
+diff --git a/flang/test/Lower/OpenMP/copyin.f90 b/flang/test/Lower/OpenMP/copyin.f90
+index 34c83fca46417..4023987a841b8 100644
+--- a/flang/test/Lower/OpenMP/copyin.f90
++++ b/flang/test/Lower/OpenMP/copyin.f90
+@@ -21,11 +21,11 @@
+ ! CHECK:             %[[VAL_11:.*]] = omp.threadprivate %[[VAL_1]]#1 : !fir.ref<i32> -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_11]] {uniq_name = "_QFcopyin_scalar_arrayEx1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[VAL_13:.*]] = fir.load %[[VAL_3]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_13]] to %[[VAL_12]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_13]] to %[[VAL_12]]#0 : i32, !fir.ref<i32>
+ ! CHECK:             %[[VAL_14:.*]] = omp.threadprivate %[[VAL_7]]#1 : !fir.ref<!fir.array<10xi64>> -> !fir.ref<!fir.array<10xi64>>
+ ! CHECK:             %[[VAL_15:.*]] = fir.shape %[[VAL_5]] : (index) -> !fir.shape<1>
+ ! CHECK:             %[[VAL_16:.*]]:2 = hlfir.declare %[[VAL_14]](%[[VAL_15]]) {uniq_name = "_QFcopyin_scalar_arrayEx2"} : (!fir.ref<!fir.array<10xi64>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi64>>, !fir.ref<!fir.array<10xi64>>)
+-! CHECK:             hlfir.assign %[[VAL_10]]#0 to %[[VAL_16]]#0 temporary_lhs : !fir.ref<!fir.array<10xi64>>, !fir.ref<!fir.array<10xi64>>
++! CHECK:             hlfir.assign %[[VAL_10]]#0 to %[[VAL_16]]#0 : !fir.ref<!fir.array<10xi64>>, !fir.ref<!fir.array<10xi64>>
+ ! CHECK:             omp.barrier
+ ! CHECK:             fir.call @_QPsub1(%[[VAL_12]]#1, %[[VAL_16]]#1) fastmath<contract> : (!fir.ref<i32>, !fir.ref<!fir.array<10xi64>>) -> ()
+ ! CHECK:             omp.terminator
+@@ -61,11 +61,11 @@ subroutine copyin_scalar_array()
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_13:.*]] = omp.threadprivate %[[VAL_2]]#1 : !fir.ref<!fir.char<1,5>> -> !fir.ref<!fir.char<1,5>>
+ ! CHECK:             %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_13]] typeparams %[[VAL_1]] {uniq_name = "_QFcopyin_char_chararrayEx3"} : (!fir.ref<!fir.char<1,5>>, index) -> (!fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>)
+-! CHECK:             hlfir.assign %[[VAL_4]]#0 to %[[VAL_14]]#0 temporary_lhs : !fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>
++! CHECK:             hlfir.assign %[[VAL_4]]#0 to %[[VAL_14]]#0 : !fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>
+ ! CHECK:             %[[VAL_15:.*]] = omp.threadprivate %[[VAL_9]]#1 : !fir.ref<!fir.array<10x!fir.char<1,5>>> -> !fir.ref<!fir.array<10x!fir.char<1,5>>>
+ ! CHECK:             %[[VAL_16:.*]] = fir.shape %[[VAL_7]] : (index) -> !fir.shape<1>
+ ! CHECK:             %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]](%[[VAL_16]]) typeparams %[[VAL_6]] {uniq_name = "_QFcopyin_char_chararrayEx4"} : (!fir.ref<!fir.array<10x!fir.char<1,5>>>, !fir.shape<1>, index) -> (!fir.ref<!fir.array<10x!fir.char<1,5>>>, !fir.ref<!fir.array<10x!fir.char<1,5>>>)
+-! CHECK:             hlfir.assign %[[VAL_12]]#0 to %[[VAL_17]]#0 temporary_lhs : !fir.ref<!fir.array<10x!fir.char<1,5>>>, !fir.ref<!fir.array<10x!fir.char<1,5>>>
++! CHECK:             hlfir.assign %[[VAL_12]]#0 to %[[VAL_17]]#0 : !fir.ref<!fir.array<10x!fir.char<1,5>>>, !fir.ref<!fir.array<10x!fir.char<1,5>>>
+ ! CHECK:             omp.barrier
+ ! CHECK:             %[[VAL_18:.*]] = fir.emboxchar %[[VAL_14]]#1, %[[VAL_1]] : (!fir.ref<!fir.char<1,5>>, index) -> !fir.boxchar<1>
+ ! CHECK:             %[[VAL_19:.*]] = fir.convert %[[VAL_17]]#1 : (!fir.ref<!fir.array<10x!fir.char<1,5>>>) -> !fir.ref<!fir.char<1,5>>
+@@ -116,7 +116,7 @@ subroutine copyin_char_chararray()
+ ! CHECK:           omp.parallel {
+ ! CHECK:             %[[VAL_27:.*]] = omp.threadprivate %[[VAL_17]]#1 : !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>> -> !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>
+ ! CHECK:             %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_27]] {uniq_name = "_QFcopyin_derived_typeEx5"} : (!fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>) -> (!fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>, !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>)
+-! CHECK:             hlfir.assign %[[VAL_19]]#0 to %[[VAL_28]]#0 temporary_lhs : !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>, !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>
++! CHECK:             hlfir.assign %[[VAL_19]]#0 to %[[VAL_28]]#0 : !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>, !fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>
+ ! CHECK:             omp.barrier
+ ! CHECK:             fir.call @_QPsub3(%[[VAL_28]]#1) fastmath<contract> : (!fir.ref<!fir.type<_QFcopyin_derived_typeTmy_type{t_i:i32,t_arr:!fir.array<5xi32>}>>) -> ()
+ ! CHECK:             omp.terminator
+@@ -150,7 +150,7 @@ subroutine copyin_derived_type()
+ ! CHECK:             %[[VAL_8:.*]] = omp.threadprivate %[[VAL_3]]#1 : !fir.ref<i32> -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFcombined_parallel_worksharing_loopEx6"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[VAL_10:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_10]] to %[[VAL_9]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_10]] to %[[VAL_9]]#0 : i32, !fir.ref<i32>
+ 
+ ! CHECK:             omp.barrier
+ 
+@@ -194,7 +194,7 @@ subroutine combined_parallel_worksharing_loop()
+ ! CHECK:             %[[VAL_4:.*]] = omp.threadprivate %[[VAL_1]]#1 : !fir.ref<i32> -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_4]] {uniq_name = "_QFcombined_parallel_sectionsEx7"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[VAL_6:.*]] = fir.load %[[VAL_3]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_6]] to %[[VAL_5]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_6]] to %[[VAL_5]]#0 : i32, !fir.ref<i32>
+ ! CHECK:             omp.barrier
+ ! CHECK:             omp.sections {
+ ! CHECK:               omp.section {
+@@ -247,7 +247,7 @@ subroutine combined_parallel_sections()
+ ! CHECK:             %[[VAL_18:.*]] = fir.convert %[[VAL_17]] : (!fir.ref<i8>) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_19:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFcommon_1Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[VAL_20:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_20]] to %[[VAL_19]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_20]] to %[[VAL_19]]#0 : i32, !fir.ref<i32>
+ ! CHECK:             omp.barrier
+ ! CHECK:             omp.sections {
+ ! CHECK:               omp.section {
+@@ -318,9 +318,9 @@ subroutine common_1()
+ ! CHECK:             %[[VAL_30:.*]] = fir.convert %[[VAL_29]] : (!fir.ref<i8>) -> !fir.ref<i32>
+ ! CHECK:             %[[VAL_31:.*]]:2 = hlfir.declare %[[VAL_30]] {uniq_name = "_QFcommon_2Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[VAL_32:.*]] = fir.load %[[VAL_13]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_32]] to %[[VAL_26]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_32]] to %[[VAL_26]]#0 : i32, !fir.ref<i32>
+ ! CHECK:             %[[VAL_33:.*]] = fir.load %[[VAL_18]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[VAL_33]] to %[[VAL_31]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_33]] to %[[VAL_31]]#0 : i32, !fir.ref<i32>
+ ! CHECK:             omp.barrier
+ 
+ ! CHECK:             %[[VAL_19:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+diff --git a/flang/test/Lower/OpenMP/copyprivate.f90 b/flang/test/Lower/OpenMP/copyprivate.f90
+index 4b3d8a6b596ef..bb86aa5356b1e 100644
+--- a/flang/test/Lower/OpenMP/copyprivate.f90
++++ b/flang/test/Lower/OpenMP/copyprivate.f90
+@@ -35,7 +35,7 @@
+ !CHECK-NEXT:    %[[DST:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_copy_i32_dst"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[SRC:.*]]:2 = hlfir.declare %[[ARG1]] {uniq_name = "_copy_i32_src"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[SRC_VAL:.*]] = fir.load %[[SRC]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:    hlfir.assign %[[SRC_VAL]] to %[[DST]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[SRC_VAL]] to %[[DST]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:    return
+ !CHECK-NEXT:  }
+ 
+diff --git a/flang/test/Lower/OpenMP/copyprivate2.f90 b/flang/test/Lower/OpenMP/copyprivate2.f90
+index 38235e8ec79c3..848ebe39e45f4 100644
+--- a/flang/test/Lower/OpenMP/copyprivate2.f90
++++ b/flang/test/Lower/OpenMP/copyprivate2.f90
+@@ -24,12 +24,9 @@
+ !CHECK-NEXT:    %[[SRC:.*]]:2 = hlfir.declare %[[ARG1]] {fortran_attrs = #fir.var_attrs<allocatable>,
+ !CHECK-SAME:      uniq_name = "_copy_box_heap_Uxi32_src"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
+ !CHECK-SAME:      (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+-!CHECK-NEXT:    %[[DST_BOX:.*]] = fir.load %[[DST]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-!CHECK:         fir.if %{{.*}} {
+-!CHECK-NEXT:      %[[SRC_BOX:.*]] = fir.load %[[SRC]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-!CHECK-NEXT:      hlfir.assign %[[SRC_BOX]] to %[[DST_BOX]] temporary_lhs : !fir.box<!fir.heap<!fir.array<?xi32>>>,
+-!CHECK-SAME:        !fir.box<!fir.heap<!fir.array<?xi32>>>
+-!CHECK-NEXT:    }
++!CHECK-NEXT:    %[[SRC_BOX:.*]] = fir.load %[[SRC]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!CHECK-NEXT:    hlfir.assign %[[SRC_BOX]] to %[[DST]]#0 realloc : !fir.box<!fir.heap<!fir.array<?xi32>>>,
++!CHECK-SAME:      !fir.box<!fir.heap<!fir.array<?xi32>>>
+ !CHECK-NEXT:    return
+ !CHECK-NEXT:  }
+ 
+diff --git a/flang/test/Lower/OpenMP/default-clause-byref.f90 b/flang/test/Lower/OpenMP/default-clause-byref.f90
+index 626ba3335a8c1..7e9011f9c1bd5 100644
+--- a/flang/test/Lower/OpenMP/default-clause-byref.f90
++++ b/flang/test/Lower/OpenMP/default-clause-byref.f90
+@@ -15,7 +15,7 @@
+ !CHECK:  } copy {
+ !CHECK:  ^bb0(%[[ORIG_W:.*]]: !fir.ref<i32>, %[[PRIV_W:.*]]: !fir.ref<i32>):
+ !CHECK:    %[[ORIG_W_VAL:.*]] = fir.load %[[ORIG_W]]
+-!CHECK:    hlfir.assign %[[ORIG_W_VAL]] to %[[PRIV_W]] temporary_lhs
++!CHECK:    hlfir.assign %[[ORIG_W_VAL]] to %[[PRIV_W]]
+ !CHECK:    omp.yield(%[[PRIV_W]] : !fir.ref<i32>)
+ !CHECK:  }
+ 
+@@ -27,7 +27,7 @@
+ !CHECK:  } copy {
+ !CHECK:  ^bb0(%[[ORIG_Y:.*]]: !fir.ref<i32>, %[[PRIV_Y:.*]]: !fir.ref<i32>):
+ !CHECK:    %[[ORIG_Y_VAL:.*]] = fir.load %[[ORIG_Y]]
+-!CHECK:    hlfir.assign %[[ORIG_Y_VAL]] to %[[PRIV_Y]] temporary_lhs
++!CHECK:    hlfir.assign %[[ORIG_Y_VAL]] to %[[PRIV_Y]]
+ !CHECK:    omp.yield(%[[PRIV_Y]] : !fir.ref<i32>)
+ !CHECK:  }
+ 
+@@ -60,7 +60,7 @@
+ !CHECK:  } copy {
+ !CHECK:  ^bb0(%[[ORIG_X:.*]]: !fir.ref<i32>, %[[PRIV_X:.*]]: !fir.ref<i32>):
+ !CHECK:    %[[ORIG_X_VAL:.*]] = fir.load %[[ORIG_X]]
+-!CHECK:    hlfir.assign %[[ORIG_X_VAL]] to %[[PRIV_X]] temporary_lhs
++!CHECK:    hlfir.assign %[[ORIG_X_VAL]] to %[[PRIV_X]]
+ !CHECK:    omp.yield(%[[PRIV_X]] : !fir.ref<i32>)
+ !CHECK:  }
+ 
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90 b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90
+index 47e163014fe86..759d80cf45b2a 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-array.f90
+@@ -61,7 +61,7 @@ subroutine delayed_privatization_private(var1, l1)
+ 
+ ! CHECK-NEXT:  fir.if %[[COPY_COND]] {
+ ! CHECK-NEXT:    %[[PRIV_ORIG_ARG_VAL:.*]] = fir.load %[[PRIV_ORIG_ARG]]
+-! CHECK-NEXT:    hlfir.assign %[[PRIV_ORIG_ARG_VAL]] to %[[PRIV_BASE_VAL]] temporary_lhs
++! CHECK-NEXT:    hlfir.assign %[[PRIV_ORIG_ARG_VAL]] to %[[PRIV_PRIV_ARG]] realloc
+ ! CHECK-NEXT:   }
+ ! CHECK-NEXT:   omp.yield
+ ! CHECK-NEXT: }
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90 b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+index 5f09371bbaba2..9c97c689dad70 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+@@ -35,7 +35,7 @@ subroutine delayed_privatization_allocatable
+ ! CHECK-NEXT:    %[[ORIG_BASE_VAL:.*]] = fir.load %[[PRIV_ORIG_ARG]]
+ ! CHECK-NEXT:    %[[ORIG_BASE_ADDR:.*]] = fir.box_addr %[[ORIG_BASE_VAL]]
+ ! CHECK-NEXT:    %[[ORIG_BASE_LD:.*]] = fir.load %[[ORIG_BASE_ADDR]]
+-! CHECK-NEXT:    hlfir.assign %[[ORIG_BASE_LD]] to %[[PRIV_BASE_BOX]] temporary_lhs
++! CHECK-NEXT:    hlfir.assign %[[ORIG_BASE_LD]] to %[[PRIV_PRIV_ARG]] realloc
+ ! CHECK-NEXT:  }
+ 
+ ! RUN: %flang -c -emit-llvm -fopenmp -mmlir --openmp-enable-delayed-privatization \
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-array.f90 b/flang/test/Lower/OpenMP/delayed-privatization-array.f90
+index 1d291b2ac0feb..3d641a0d69689 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-array.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-array.f90
+@@ -42,7 +42,7 @@ subroutine delayed_privatization_private_1d(var1, l1, u1)
+ 
+ ! ONE_DIM-NEXT: } copy {
+ ! ONE_DIM-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
+-! ONE_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]] temporary_lhs
++! ONE_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]]
+ ! ONE_DIM-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]] : [[TYPE]])
+ ! ONE_DIM-NEXT: }
+ 
+@@ -75,7 +75,7 @@ subroutine delayed_privatization_private_2d(var1, l1, u1, l2, u2)
+ 
+ ! TWO_DIM-NEXT: } copy {
+ ! TWO_DIM-NEXT: ^bb0(%[[PRIV_ORIG_ARG:.*]]: [[TYPE]], %[[PRIV_PRIV_ARG:.*]]: [[TYPE]]):
+-! TWO_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]] temporary_lhs
++! TWO_DIM-NEXT:  hlfir.assign %[[PRIV_ORIG_ARG]] to %[[PRIV_PRIV_ARG]]
+ ! TWO_DIM-NEXT:   omp.yield(%[[PRIV_PRIV_ARG]] : [[TYPE]])
+ ! TWO_DIM-NEXT: }
+ 
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-firstprivate.f90 b/flang/test/Lower/OpenMP/delayed-privatization-firstprivate.f90
+index 0fb81d68016a4..119f77ea26626 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-firstprivate.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-firstprivate.f90
+@@ -23,7 +23,7 @@ subroutine delayed_privatization_firstprivate
+ ! CHECK: } copy {
+ ! CHECK: ^bb0(%[[PRIV_ORIG_ARG:.*]]: !fir.ref<i32>, %[[PRIV_PRIV_ARG:.*]]: !fir.ref<i32>):
+ ! CHECK:    %[[ORIG_VAL:.*]] = fir.load %[[PRIV_ORIG_ARG]] : !fir.ref<i32>
+-! CHECK:    hlfir.assign %[[ORIG_VAL]] to %[[PRIV_PRIV_ARG]] temporary_lhs : i32, !fir.ref<i32>
++! CHECK:    hlfir.assign %[[ORIG_VAL]] to %[[PRIV_PRIV_ARG]] : i32, !fir.ref<i32>
+ ! CHECK:    omp.yield(%[[PRIV_PRIV_ARG]] : !fir.ref<i32>)
+ ! CHECK: }
+ 
+diff --git a/flang/test/Lower/OpenMP/implicit-dsa.f90 b/flang/test/Lower/OpenMP/implicit-dsa.f90
+index fd38ca6b2f6f2..925677469847e 100644
+--- a/flang/test/Lower/OpenMP/implicit-dsa.f90
++++ b/flang/test/Lower/OpenMP/implicit-dsa.f90
+@@ -17,7 +17,7 @@
+ !CHECK-NEXT:    %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test1Ex"}
+ !CHECK-NEXT:    %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test1Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NOT:     fir.alloca
+ !CHECK:       }
+ !CHECK:       omp.task {
+@@ -44,7 +44,7 @@ subroutine implicit_dsa_test1
+ !CHECK:     %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test2Ex"}
+ !CHECK:     %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:     %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:   }
+ !CHECK: }
+ subroutine implicit_dsa_test2
+@@ -76,7 +76,7 @@ subroutine implicit_dsa_test2
+ !CHECK:     %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test3Ex"}
+ !CHECK:     %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test3Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:     %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
+ !CHECK:     hlfir.assign %[[ONE]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
+@@ -115,11 +115,11 @@ subroutine implicit_dsa_test3
+ !CHECK-NEXT:      %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test4Ex"}
+ !CHECK-NEXT:      %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:      %[[PRIV2_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test4Ez"}
+ !CHECK-NEXT:      %[[PRIV2_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV2_Z]] {uniq_name = "_QFimplicit_dsa_test4Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[PRIV_Z_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Z_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Z_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:           %[[ZERO:.*]] = arith.constant 0 : i32
+ !CHECK-NEXT:      hlfir.assign %[[ZERO]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:           %[[ONE:.*]] = arith.constant 1 : i32
+@@ -129,11 +129,11 @@ subroutine implicit_dsa_test3
+ !CHECK-NEXT:      %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test4Ex"}
+ !CHECK-NEXT:      %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:      %[[PRIV2_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test4Ey"}
+ !CHECK-NEXT:      %[[PRIV2_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV2_Y]] {uniq_name = "_QFimplicit_dsa_test4Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[PRIV_Y_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Y_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:           %[[ONE:.*]] = arith.constant 1 : i32
+ !CHECK-NEXT:      hlfir.assign %[[ONE]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:           %[[ZERO:.*]] = arith.constant 0 : i32
+@@ -166,7 +166,7 @@ subroutine implicit_dsa_test4
+ !CHECK:     %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test5Ex"}
+ !CHECK:     %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test5Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:     omp.parallel {
+ !CHECK:       %[[ONE:.*]] = arith.constant 1 : i32
+ !CHECK:       hlfir.assign %[[ONE]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
+@@ -197,15 +197,15 @@ subroutine implicit_dsa_test5
+ !CHECK-NEXT:    %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test6Ex"}
+ !CHECK-NEXT:    %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:    %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test6Ey"}
+ !CHECK-NEXT:    %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test6Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[TEMP2:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:    hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:    %[[PRIV_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test6Ez"}
+ !CHECK-NEXT:    %[[PRIV_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV_Z]] {uniq_name = "_QFimplicit_dsa_test6Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:    %[[TEMP3:.*]] = fir.load %[[Z_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:    hlfir.assign %[[TEMP3]] to %[[PRIV_Z_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP3]] to %[[PRIV_Z_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:         omp.parallel private({{.*}} %{{.*}}#0 -> %[[PRIV2_X:.*]] : {{.*}}, {{.*}} %{{.*}}#0 -> %[[PRIV2_Y:.*]] : {{.*}}) {
+ !CHECK:           %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NOT:       hlfir.assign
+@@ -244,11 +244,11 @@ subroutine implicit_dsa_test6
+ !CHECK-NEXT:      %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test7Ex"}
+ !CHECK-NEXT:      %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test7Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT:      %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test7Ey"}
+ !CHECK-NEXT:      %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test7Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:         }
+ !CHECK:       }
+ subroutine implicit_dsa_test7
+diff --git a/flang/test/Lower/OpenMP/lastprivate-allocatable.f90 b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+index 41bbb182aade2..0dce4d514bd10 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+@@ -1,18 +1,6 @@
+ ! RUN: %flang_fc1 -emit-hlfir -o - -fopenmp %s | FileCheck %s
+ ! RUN: bbc -emit-hlfir -o - -fopenmp %s | FileCheck %s
+ 
+-program lastprivate_allocatable
+-  integer, allocatable :: a
+-  integer :: i
+-  ! a is unallocated here
+-  !$omp parallel do lastprivate(a)
+-  do i=1,1
+-    a = 42
+-  enddo
+-  !$omp end parallel do
+-  ! a should be allocated here
+-end program
+-
+ ! CHECK-LABEL:   func.func @_QQmain()
+ ! CHECK:           %[[VAL_0:.*]] = fir.alloca !fir.box<!fir.heap<i32>> {bindc_name = "a", uniq_name = "_QFEa"}
+ ! CHECK:           %[[VAL_1:.*]] = fir.zero_bits !fir.heap<i32>
+@@ -32,7 +20,50 @@ program lastprivate_allocatable
+ !                          store loop IV
+ ! CHECK:                   fir.store %{{.*}} to %[[VAL_18]]#1 : !fir.ref<i32>
+ !                          assign private variable to original copy: realloc
+-! CHECK:                   hlfir.assign %[[VAL_16]]#0 to %[[VAL_3]]#0 realloc : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK:                   %[[VAL_23:.*]] = fir.load %[[VAL_16]]#0 : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK:                   %[[VAL_24:.*]] = fir.box_addr %[[VAL_23]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
++! CHECK:                   %[[VAL_25:.*]] = fir.load %[[VAL_24]] : !fir.heap<i32>
++! CHECK:                   hlfir.assign %[[VAL_25]] to %[[VAL_3]]#0 realloc : i32, !fir.ref<!fir.box<!fir.heap<i32>>>
+ ! CHECK-NEXT:            }
+ ! CHECK-NEXT:            omp.yield
+ ! CHECK-NEXT:          }
++program lastprivate_allocatable
++  integer, allocatable :: a
++  integer :: i
++  ! a is unallocated here
++  !$omp parallel do lastprivate(a)
++  do i=1,1
++    a = 42
++  enddo
++  !$omp end parallel do
++  ! a should be allocated here
++end program
++
++! CHECK-LABEL:  func @_QPlastprivate_realloc()
++! CHECK:          %[[A:.*]]:2 = hlfir.declare %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFlastprivate_reallocEa"} :
++! CHECK-SAME:       (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>) ->
++! CHECK-SAME:       (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>)
++! CHECK:          omp.parallel {
++! CHECK:            %[[A_PRIV:.*]]:2 = hlfir.declare %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFlastprivate_reallocEa"} :
++! CHECK-SAME:         (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>) ->
++! CHECK-SAME:         (!fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>)
++! CHECK:            omp.sections {
++! CHECK:              omp.section {
++! CHECK:                %[[TEMP:.*]] = fir.load %[[A_PRIV:.*]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>
++! CHECK:                hlfir.assign %[[TEMP]] to %[[A]]#0 realloc : !fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>,
++! CHECK-SAME:             !fir.ref<!fir.box<!fir.heap<!fir.array<?x!fir.complex<4>>>>>
++! CHECK:              }
++! CHECK:            }
++! CHECK:          }
++subroutine lastprivate_realloc()
++  complex, allocatable :: a(:)
++
++  allocate(a(2))
++  !$omp parallel
++    !$omp sections lastprivate(a)
++      !$omp section
++        deallocate(a)
++        allocate(a(3))
++    !$omp end sections
++  !$omp end parallel
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/lastprivate-commonblock.f90 b/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
+index f823bf6c56ae3..dcba34b2da8ef 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
+@@ -26,9 +26,9 @@
+ !CHECK:          fir.if %[[LAST_ITER]] {
+ !CHECK:            fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ !CHECK:            %[[PRIVATE_X_VAL:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<f32>
+-!CHECK:            hlfir.assign %[[PRIVATE_X_VAL]] to %[[X_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
++!CHECK:            hlfir.assign %[[PRIVATE_X_VAL]] to %[[X_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK:            %[[PRIVATE_Y_VAL:.*]] = fir.load %[[PRIVATE_Y_DECL]]#0 : !fir.ref<f32>
+-!CHECK:            hlfir.assign %[[PRIVATE_Y_VAL]] to %[[Y_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
++!CHECK:            hlfir.assign %[[PRIVATE_Y_VAL]] to %[[Y_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK:          }
+ !CHECK:          omp.yield
+ !CHECK:        }
+diff --git a/flang/test/Lower/OpenMP/lastprivate-iv.f90 b/flang/test/Lower/OpenMP/lastprivate-iv.f90
+index 21a701441cb56..609192471eae1 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-iv.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-iv.f90
+@@ -24,7 +24,7 @@
+ !CHECK:          fir.if %[[CMP]] {
+ !CHECK:            fir.store %[[V]] to %[[I]]#1 : !fir.ref<i32>
+ !CHECK:            %[[I_VAL:.*]] = fir.load %[[I]]#0 : !fir.ref<i32>
+-!CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 : i32, !fir.ref<i32>
+ !CHECK:          }
+ !CHECK:          omp.yield
+ !CHECK:        }
+@@ -62,7 +62,7 @@ subroutine lastprivate_iv_inc()
+ !CHECK:          fir.if %[[CMP]] {
+ !CHECK:            fir.store %[[V]] to %[[I]]#1 : !fir.ref<i32>
+ !CHECK:            %[[I_VAL:.*]] = fir.load %[[I]]#0 : !fir.ref<i32>
+-!CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 : i32, !fir.ref<i32>
+ !CHECK:          }
+ !CHECK:          omp.yield
+ !CHECK:        }
+@@ -88,7 +88,7 @@ subroutine lastprivate_iv_i1
+ !CHECK:          %[[I8_VAL:.*]] = fir.convert %{{.*}} : (i32) -> i8
+ !CHECK:          fir.store %[[I8_VAL]] to %[[IV:.*]]#1 : !fir.ref<i8>
+ !CHECK:          %[[IV_VAL:.*]] = fir.load %[[IV]]#0 : !fir.ref<i8>
+-!CHECK:          hlfir.assign %[[IV_VAL]] to %{{.*}}#0 temporary_lhs : i8, !fir.ref<i8>
++!CHECK:          hlfir.assign %[[IV_VAL]] to %{{.*}}#0 : i8, !fir.ref<i8>
+ !CHECK:        }
+   !$omp do lastprivate(i1)
+   do i1=1,8
+diff --git a/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90 b/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
+index be0cc4195c280..62bc247a1456a 100644
+--- a/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
++++ b/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
+@@ -37,8 +37,8 @@
+ !CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ 
+ ! Testing lastprivate val update
+-!CHECK: hlfir.assign %[[ARG1_PVT_DECL]]#0 to %[[ARG1_DECL]]#0 temporary_lhs : !fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>
+-!CHECK: } 
++!CHECK: hlfir.assign %[[ARG1_PVT_DECL]]#0 to %[[ARG1_DECL]]#0 : !fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>
++!CHECK: }
+ !CHECK: omp.yield
+ !CHECK: }
+ !CHECK: omp.terminator
+@@ -76,7 +76,7 @@ subroutine lastprivate_character(arg1)
+ 
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE_DECL]]#0 : !fir.ref<i32>
+-!CHECK:      hlfir.assign %[[CLONE_LD]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:      hlfir.assign %[[CLONE_LD]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: }
+ !CHECK: omp.yield
+ !CHECK: }
+@@ -118,9 +118,9 @@ subroutine lastprivate_int(arg1)
+ !CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-DAG: %[[CLONE_LD1:.*]] = fir.load %[[CLONE1_DECL]]#0 : !fir.ref<i32>
+-!CHECK-DAG: hlfir.assign %[[CLONE_LD1]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-DAG: hlfir.assign %[[CLONE_LD1]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-DAG: %[[CLONE_LD2:.*]] = fir.load %[[CLONE2_DECL]]#0 : !fir.ref<i32>
+-!CHECK-DAG: hlfir.assign %[[CLONE_LD2]] to %[[ARG2_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-DAG: hlfir.assign %[[CLONE_LD2]] to %[[ARG2_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: }
+ !CHECK: omp.yield
+ !CHECK: }
+@@ -163,9 +163,9 @@ subroutine mult_lastprivate_int(arg1, arg2)
+ !CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ !Testing lastprivate val update
+ !CHECK-DAG: %[[CLONE_LD2:.*]] = fir.load %[[CLONE2_DECL]]#0 : !fir.ref<i32>
+-!CHECK-DAG: hlfir.assign %[[CLONE_LD2]] to %[[ARG2_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-DAG: hlfir.assign %[[CLONE_LD2]] to %[[ARG2_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-DAG: %[[CLONE_LD1:.*]] = fir.load %[[CLONE1_DECL]]#0 : !fir.ref<i32>
+-!CHECK-DAG: hlfir.assign %[[CLONE_LD1]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-DAG: hlfir.assign %[[CLONE_LD1]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: }
+ !CHECK: omp.yield
+ !CHECK: }
+@@ -194,7 +194,7 @@ subroutine mult_lastprivate_int2(arg1, arg2)
+ !CHECK: %[[CLONE1:.*]] = fir.alloca i32 {bindc_name = "arg1", pinned, {{.*}}}
+ !CHECK: %[[CLONE1_DECL:.*]]:2 = hlfir.declare %[[CLONE1]] {uniq_name = "_QFfirstpriv_lastpriv_intEarg1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[FPV_LD:.*]] = fir.load %[[ARG1_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[FPV_LD]] to %[[CLONE1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[FPV_LD]] to %[[CLONE1_DECL]]#0 : i32, !fir.ref<i32>
+ ! Lastprivate Allocation
+ !CHECK: %[[CLONE2:.*]] = fir.alloca i32 {bindc_name = "arg2", pinned, {{.*}}}
+ !CHECK: %[[CLONE2_DECL:.*]]:2 = hlfir.declare %[[CLONE2]] {uniq_name = "_QFfirstpriv_lastpriv_intEarg2"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -213,7 +213,7 @@ subroutine mult_lastprivate_int2(arg1, arg2)
+ !CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE2_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG2_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG2_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT: }
+ !CHECK-NEXT: omp.yield
+ !CHECK-NEXT: }
+@@ -242,7 +242,7 @@ subroutine firstpriv_lastpriv_int(arg1, arg2)
+ !CHECK: %[[CLONE1:.*]] = fir.alloca i32 {bindc_name = "arg1", pinned, {{.*}}}
+ !CHECK: %[[CLONE1_DECL:.*]]:2 = hlfir.declare %[[CLONE1]] {uniq_name = "_QFfirstpriv_lastpriv_int2Earg1"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK-NEXT: %[[FPV_LD:.*]] = fir.load %[[ARG1_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT: hlfir.assign %[[FPV_LD]] to %[[CLONE1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT: hlfir.assign %[[FPV_LD]] to %[[CLONE1_DECL]]#0 : i32, !fir.ref<i32>
+ 
+ !CHECK-NEXT: %[[IV:.*]] = fir.alloca i32 {bindc_name = "n", pinned, {{.*}}}
+ !CHECK-NEXT: hlfir.declare %[[IV]]
+@@ -261,7 +261,7 @@ subroutine firstpriv_lastpriv_int(arg1, arg2)
+ !CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE1_DECL]]#0 : !fir.ref<i32>
+-!CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK-NEXT: }
+ !CHECK-NEXT: omp.yield
+ !CHECK-NEXT: }
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
+index 33dab125b3b2d..de3f42be10482 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
+@@ -15,7 +15,7 @@ subroutine omp_do_firstprivate(a)
+   ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, uniq_name = "_QFomp_do_firstprivateEa"}
+   ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_firstprivateEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK-NEXT: %[[LD:.*]] = fir.load %[[ARG0_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK-NEXT: hlfir.assign %[[LD]] to %[[A_PVT_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[LD]] to %[[A_PVT_DECL]]#0 : i32, !fir.ref<i32>
+ 
+   ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+   ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_firstprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -52,12 +52,12 @@ subroutine omp_do_firstprivate2(a, n)
+   ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, {{.*}}}
+   ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2Ea"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[LD:.*]] = fir.load %[[ARG0_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK: hlfir.assign %[[LD]] to %[[A_PVT_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK: hlfir.assign %[[LD]] to %[[A_PVT_DECL]]#0 : i32, !fir.ref<i32>
+ 
+   ! CHECK: %[[N_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "n", pinned, uniq_name = "_QFomp_do_firstprivate2En"}
+   ! CHECK: %[[N_PVT_DECL:.*]]:2 = hlfir.declare %[[N_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2En"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[LD1:.*]] = fir.load %[[ARG1_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK: hlfir.assign %[[LD1]] to %[[N_PVT_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK: hlfir.assign %[[LD1]] to %[[N_PVT_DECL]]#0 : i32, !fir.ref<i32>
+ 
+   ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+   ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+index 9b90ac28f693c..254aeff21d06e 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+@@ -34,7 +34,7 @@ subroutine omp_do_lastprivate(a)
+   ! CHECK:      fir.if %[[SEL]] {
+   ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+ 
+   ! CHECK-NEXT: omp.yield
+@@ -84,9 +84,9 @@ subroutine omp_do_lastprivate2(a, n)
+   ! CHECK: fir.if %[[SEL]] {
+   ! CHECK:   fir.store %[[NEXT_ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:   %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:   hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:   hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:   %[[N_PVT_LOAD:.*]] = fir.load %[[N_PVT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:   hlfir.assign %[[N_PVT_LOAD]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:   hlfir.assign %[[N_PVT_LOAD]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK: }
+ 
+   ! CHECK: omp.yield
+@@ -143,7 +143,7 @@ subroutine omp_do_lastprivate_collapse2(a)
+   ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+ 
+   ! CHECK-NEXT: omp.yield
+@@ -219,7 +219,7 @@ subroutine omp_do_lastprivate_collapse3(a)
+   ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:        fir.store %[[NEXT_ARG3]] to %[[K_PVT_DECL]]#1 : !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+ 
+   ! CHECK-NEXT: omp.yield
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop.f90 b/flang/test/Lower/OpenMP/parallel-wsloop.f90
+index 5853d07c46c7d..de1b8f4bc7d04 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop.f90
+@@ -100,7 +100,7 @@ subroutine parallel_do_with_privatisation_clauses(cond,nt)
+   ! CHECK:      %[[PRIVATE_NT_REF:.*]] = fir.alloca i32 {bindc_name = "nt", pinned, uniq_name = "_QFparallel_do_with_privatisation_clausesEnt"}
+   ! CHECK:      %[[PRIVATE_NT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_NT_REF]] {uniq_name = "_QFparallel_do_with_privatisation_clausesEnt"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK:      %[[NT_VAL:.*]] = fir.load %[[NT_DECL]]#0 : !fir.ref<i32>
+-  ! CHECK:      hlfir.assign %[[NT_VAL]] to %[[PRIVATE_NT_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:      hlfir.assign %[[NT_VAL]] to %[[PRIVATE_NT_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      %[[WS_LB:.*]] = arith.constant 1 : i32
+   ! CHECK:      %[[WS_UB:.*]] = arith.constant 9 : i32
+   ! CHECK:      %[[WS_STEP:.*]] = arith.constant 1 : i32
+@@ -250,7 +250,7 @@ end subroutine parallel_do_private
+ ! CHECK:             %[[NT_PRIV_ADDR:.*]] = fir.alloca i32 {bindc_name = "nt", pinned, uniq_name = "_QFparallel_do_privateEnt"}
+ ! CHECK:             %[[NT_PRIV_DECL:.*]]:2 = hlfir.declare %[[NT_PRIV_ADDR]] {uniq_name = "_QFparallel_do_privateEnt"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[NT_VAL:.*]] = fir.load %[[NT_DECL]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[NT_VAL]] to %[[NT_PRIV_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[NT_VAL]] to %[[NT_PRIV_DECL]]#0 : i32, !fir.ref<i32>
+ 
+ ! CHECK:             %[[I_PRIV_ADDR:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ADDR]] {uniq_name = "_QFparallel_do_privateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+@@ -298,12 +298,12 @@ end subroutine omp_parallel_do_multiple_firstprivate
+ ! CHECK:             %[[A_PRIV_ADDR:.*]] = fir.alloca i32 {bindc_name = "a", pinned, uniq_name = "_QFomp_parallel_do_multiple_firstprivateEa"}
+ ! CHECK:             %[[A_PRIV_DECL:.*]]:2 = hlfir.declare %[[A_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_do_multiple_firstprivateEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[A:.*]] = fir.load %[[A_DECL]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[A]] to %[[A_PRIV_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[A]] to %[[A_PRIV_DECL]]#0 : i32, !fir.ref<i32>
+ 
+ ! CHECK:             %[[B_PRIV_ADDR:.*]] = fir.alloca i32 {bindc_name = "b", pinned, uniq_name = "_QFomp_parallel_do_multiple_firstprivateEb"}
+ ! CHECK:             %[[B_PRIV_DECL:.*]]:2 = hlfir.declare %[[B_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_do_multiple_firstprivateEb"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:             %[[B:.*]] = fir.load %[[B_DECL]]#0 : !fir.ref<i32>
+-! CHECK:             hlfir.assign %[[B]] to %[[B_PRIV_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++! CHECK:             hlfir.assign %[[B]] to %[[B_PRIV_DECL]]#0 : i32, !fir.ref<i32>
+ 
+ ! CHECK:             %[[I_PRIV_ADDR:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
+ ! CHECK:             %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_do_multiple_firstprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+diff --git a/flang/test/Lower/OpenMP/sections.f90 b/flang/test/Lower/OpenMP/sections.f90
+index c79d6b020f3f5..2287918528635 100644
+--- a/flang/test/Lower/OpenMP/sections.f90
++++ b/flang/test/Lower/OpenMP/sections.f90
+@@ -83,7 +83,7 @@ end program sample
+ !CHECK:   %[[PRIVATE_ALPHA:.*]] = fir.alloca f32 {bindc_name = "alpha", pinned, uniq_name = "_QFfirstprivateEalpha"}
+ !CHECK:   %[[PRIVATE_ALPHA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ALPHA]] {uniq_name = "_QFfirstprivateEalpha"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK:   %[[TEMP:.*]] = fir.load %[[ARG_DECL]]#0 : !fir.ref<f32>
+-!CHECK:   hlfir.assign %[[TEMP]] to %[[PRIVATE_ALPHA_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
++!CHECK:   hlfir.assign %[[TEMP]] to %[[PRIVATE_ALPHA_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK:   omp.sections {
+ !CHECK:     omp.section  {
+ !CHECK:       omp.terminator
+@@ -138,7 +138,7 @@ subroutine lastprivate()
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: %[[TEMP1:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP1]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP1]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+@@ -150,7 +150,7 @@ subroutine lastprivate()
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.barrier
+ !CHECK: omp.sections {
+     !$omp sections firstprivate(x) lastprivate(x)
+@@ -169,7 +169,7 @@ subroutine lastprivate()
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+@@ -181,7 +181,7 @@ subroutine lastprivate()
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.barrier
+ !CHECK: omp.sections nowait {
+     !$omp sections firstprivate(x) lastprivate(x)
+@@ -200,7 +200,7 @@ subroutine lastprivate()
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+@@ -221,7 +221,7 @@ subroutine lastprivate()
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[INNER_PRIVATE_X]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: %[[LOADED_VALUE:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[LOADED_VALUE]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[LOADED_VALUE]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+ !CHECK: }
+ !CHECK: omp.terminator
+@@ -247,9 +247,9 @@ subroutine lastprivate()
+ !CHECK: omp.sections {
+ !CHECK:   omp.section {
+ !CHECK:     %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK:     hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:     %[[TEMP2:.*]] = fir.load %[[PRIVATE_Y_DECL]]#0 : !fir.ref<i32>
+-!CHECK:     hlfir.assign %[[TEMP2]] to %[[Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP2]] to %[[Y_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:     omp.terminator
+ !CHECK:   }
+ !CHECK:   omp.terminator
+@@ -289,7 +289,7 @@ subroutine unstructured_sections_privatization()
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca f32 {bindc_name = "x", pinned, uniq_name = "_QFunstructured_sections_privatizationEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFunstructured_sections_privatizationEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<f32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
++!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK: omp.sections {
+ !CHECK: omp.section {
+ !CHECK: cf.br ^bb1
+diff --git a/flang/test/Lower/OpenMP/single.f90 b/flang/test/Lower/OpenMP/single.f90
+index 2e5d05dd7b472..9fd34344eb43b 100644
+--- a/flang/test/Lower/OpenMP/single.f90
++++ b/flang/test/Lower/OpenMP/single.f90
+@@ -84,7 +84,7 @@ end subroutine single_allocate
+ ! CHECK:             %[[Y_PVT:.*]] = fir.alloca f64 {bindc_name = "y", pinned, uniq_name = "_QFsingle_privatizationEy"}
+ ! CHECK:             %[[Y_PVT_DECL:.*]]:2 = hlfir.declare %[[Y_PVT]] {uniq_name = "_QFsingle_privatizationEy"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+ ! CHECK:             %[[Y_LOAD:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<f64>
+-! CHECK:             hlfir.assign %[[Y_LOAD]] to %[[Y_PVT_DECL]]#0 temporary_lhs : f64, !fir.ref<f64>
++! CHECK:             hlfir.assign %[[Y_LOAD]] to %[[Y_PVT_DECL]]#0 : f64, !fir.ref<f64>
+ ! CHECK:             fir.call @_QPbar(%[[X_PVT_DECL]]#1, %[[Y_PVT_DECL]]#1) fastmath<contract> : (!fir.ref<f32>, !fir.ref<f64>) -> ()
+ ! CHECK:           omp.terminator
+ ! CHECK:         }
+@@ -112,7 +112,7 @@ subroutine single_privatization(x, y)
+ ! CHECK:             %[[Y_PVT:.*]] = fir.alloca f64 {bindc_name = "y", pinned, uniq_name = "_QFsingle_privatization2Ey"}
+ ! CHECK:             %[[Y_PVT_DECL:.*]]:2 = hlfir.declare %[[Y_PVT]] {uniq_name = "_QFsingle_privatization2Ey"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+ ! CHECK:             %[[Y_LOAD:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<f64>
+-! CHECK:             hlfir.assign %[[Y_LOAD]] to %[[Y_PVT_DECL]]#0 temporary_lhs : f64, !fir.ref<f64>
++! CHECK:             hlfir.assign %[[Y_LOAD]] to %[[Y_PVT_DECL]]#0 : f64, !fir.ref<f64>
+ ! CHECK:             fir.call @_QPbar(%[[X_PVT_DECL]]#1, %[[Y_PVT_DECL]]#1) fastmath<contract> : (!fir.ref<f32>, !fir.ref<f64>) -> ()
+ ! CHECK:             omp.terminator
+ ! CHECK:           }
+diff --git a/flang/test/Lower/OpenMP/statement-function.f90 b/flang/test/Lower/OpenMP/statement-function.f90
+index 6cdbcb6e141c7..fd6f5986bb072 100644
+--- a/flang/test/Lower/OpenMP/statement-function.f90
++++ b/flang/test/Lower/OpenMP/statement-function.f90
+@@ -26,10 +26,10 @@ subroutine test_implicit_use()
+ !CHECK:         omp.task
+ !CHECK:           %[[PRIV_IEXP:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFtest_implicit_use2Eiexp"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:           %[[TEMP0:.*]] = fir.load %[[IEXP]]#0 : !fir.ref<i32>
+-!CHECK:           hlfir.assign %[[TEMP0]] to %[[PRIV_IEXP]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:           hlfir.assign %[[TEMP0]] to %[[PRIV_IEXP]]#0 : i32, !fir.ref<i32>
+ !CHECK:           %[[PRIV_IIMP:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFtest_implicit_use2Eiimp"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:           %[[TEMP1:.*]] = fir.load %[[IIMP]]#0 : !fir.ref<i32>
+-!CHECK:           hlfir.assign %[[TEMP1]] to %[[PRIV_IIMP]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:           hlfir.assign %[[TEMP1]] to %[[PRIV_IIMP]]#0 : i32, !fir.ref<i32>
+ subroutine test_implicit_use2()
+   implicit none
+   integer :: iexp, iimp
+diff --git a/flang/test/Lower/OpenMP/task.f90 b/flang/test/Lower/OpenMP/task.f90
+index afbe2cbfa746e..28e438d342d35 100644
+--- a/flang/test/Lower/OpenMP/task.f90
++++ b/flang/test/Lower/OpenMP/task.f90
+@@ -201,10 +201,10 @@ subroutine task_firstprivate
+ !CHECK: %[[INT_FIRSTPRIVATE_ALLOCA:.+]] = fir.alloca i32 {bindc_name = "int_var", pinned, uniq_name = "_QFtask_firstprivateEint_var"}
+ !CHECK: %[[INT_VAR_FIRSTPRIVATE:.+]]:2 = hlfir.declare %[[INT_FIRSTPRIVATE_ALLOCA]] {uniq_name = "_QFtask_firstprivateEint_var"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[INT_VAR_LOAD:.+]] = fir.load %[[INT_VAR]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[INT_VAR_LOAD]] to %[[INT_VAR_FIRSTPRIVATE]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[INT_VAR_LOAD]] to %[[INT_VAR_FIRSTPRIVATE]]#0 : i32, !fir.ref<i32>
+ !CHECK: %[[MYTYPE_FIRSTPRIVATE_ALLOCA:.+]] = fir.alloca !fir.type<_QFtask_firstprivateTmytype{x:i32}> {bindc_name = "mytype_var", pinned, uniq_name = "_QFtask_firstprivateEmytype_var"}
+ !CHECK: %[[MYTYPE_VAR_FIRSTPRIVATE:.+]]:2 = hlfir.declare %[[MYTYPE_FIRSTPRIVATE_ALLOCA]] {uniq_name = "_QFtask_firstprivateEmytype_var"} : (!fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>) -> (!fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>, !fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>)
+-!CHECK: hlfir.assign %[[MYTYPE_VAR]]#0 to %[[MYTYPE_VAR_FIRSTPRIVATE]]#0 temporary_lhs : !fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>, !fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>
++!CHECK: hlfir.assign %[[MYTYPE_VAR]]#0 to %[[MYTYPE_VAR_FIRSTPRIVATE]]#0 : !fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>, !fir.ref<!fir.type<_QFtask_firstprivateTmytype{x:i32}>>
+   call baz(int_var, mytype_var)
+   !CHECK: omp.terminator
+   !$omp end task
+@@ -235,7 +235,7 @@ subroutine task_multiple_clauses()
+ !CHECK: %[[Y_PRIV_ALLOCA:.+]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFtask_multiple_clausesEy"}
+ !CHECK: %[[Y_PRIV:.+]]:2 = hlfir.declare %[[Y_PRIV_ALLOCA]] {uniq_name = "_QFtask_multiple_clausesEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[Y_LOAD:.+]] = fir.load %[[Y]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[Y_LOAD]] to %[[Y_PRIV]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK: hlfir.assign %[[Y_LOAD]] to %[[Y_PRIV]]#0 : i32, !fir.ref<i32>
+ 
+   !CHECK: arith.addi
+   x = x + 12
+diff --git a/flang/test/Lower/OpenMP/task2.f90 b/flang/test/Lower/OpenMP/task2.f90
+index ce491d95e9397..cff9ebdd375b3 100644
+--- a/flang/test/Lower/OpenMP/task2.f90
++++ b/flang/test/Lower/OpenMP/task2.f90
+@@ -18,12 +18,9 @@ subroutine omp_task_nested_allocatable_firstprivate
+ !CHECK-SAME:        uniq_name = "_QFomp_task_nested_allocatable_firstprivateEa"} :
+ !CHECK-SAME:        (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) ->
+ !CHECK-SAME:        (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+-!CHECK:           %[[PRIV_A_BOX:.*]] = fir.load %[[PRIV_A]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-!CHECK:           fir.if %{{.*}} {
+-!CHECK:             %[[TEMP:.*]] = fir.load %[[A]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+-!CHECK:             hlfir.assign %[[TEMP]] to %[[PRIV_A_BOX]] temporary_lhs :
+-!CHECK-SAME:          !fir.box<!fir.heap<!fir.array<?xi32>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>
+-!CHECK:           }
++!CHECK:           %[[TEMP:.*]] = fir.load %[[A]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++!CHECK:           hlfir.assign %[[TEMP]] to %[[PRIV_A]]#0 realloc :
++!CHECK-SAME:        !fir.box<!fir.heap<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+     !$omp task default(firstprivate)
+       a = 2
+ !CHECK:         }

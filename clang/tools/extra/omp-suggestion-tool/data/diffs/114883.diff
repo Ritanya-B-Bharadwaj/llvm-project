@@ -1,0 +1,890 @@
+diff --git a/clang/docs/ReleaseNotes.rst b/clang/docs/ReleaseNotes.rst
+index dc45202f6b2e8..f07bc5044c925 100644
+--- a/clang/docs/ReleaseNotes.rst
++++ b/clang/docs/ReleaseNotes.rst
+@@ -888,6 +888,7 @@ OpenMP Support
+ --------------
+ - Added support for 'omp assume' directive.
+ - Added support for 'omp scope' directive.
++- Added support for allocator-modifier in 'allocate' clause.
+ 
+ Improvements
+ ^^^^^^^^^^^^
+diff --git a/clang/include/clang/AST/OpenMPClause.h b/clang/include/clang/AST/OpenMPClause.h
+index 9cf46f73f6e46..00c87e71bde31 100644
+--- a/clang/include/clang/AST/OpenMPClause.h
++++ b/clang/include/clang/AST/OpenMPClause.h
+@@ -486,7 +486,8 @@ class OMPAlignClause final
+ /// #pragma omp parallel private(a) allocate(omp_default_mem_alloc :a)
+ /// \endcode
+ /// In this example directive '#pragma omp parallel' has clause 'private'
+-/// and clause 'allocate' for the variable 'a'.
++/// and clause 'allocate' for the variable 'a', which specifies an explicit
++/// memory allocator.
+ class OMPAllocateClause final
+     : public OMPVarListClause<OMPAllocateClause>,
+       private llvm::TrailingObjects<OMPAllocateClause, Expr *> {
+@@ -499,6 +500,10 @@ class OMPAllocateClause final
+   Expr *Allocator = nullptr;
+   /// Position of the ':' delimiter in the clause;
+   SourceLocation ColonLoc;
++  /// Modifier of 'allocate' clause.
++  OpenMPAllocateClauseModifier AllocatorModifier = OMPC_ALLOCATE_unknown;
++  /// Location of allocator modifier if any.
++  SourceLocation AllocatorModifierLoc;
+ 
+   /// Build clause with number of variables \a N.
+   ///
+@@ -510,10 +515,14 @@ class OMPAllocateClause final
+   /// \param N Number of the variables in the clause.
+   OMPAllocateClause(SourceLocation StartLoc, SourceLocation LParenLoc,
+                     Expr *Allocator, SourceLocation ColonLoc,
+-                    SourceLocation EndLoc, unsigned N)
++                    OpenMPAllocateClauseModifier AllocatorModifier,
++                    SourceLocation AllocatorModifierLoc, SourceLocation EndLoc,
++                    unsigned N)
+       : OMPVarListClause<OMPAllocateClause>(llvm::omp::OMPC_allocate, StartLoc,
+                                             LParenLoc, EndLoc, N),
+-        Allocator(Allocator), ColonLoc(ColonLoc) {}
++        Allocator(Allocator), ColonLoc(ColonLoc),
++        AllocatorModifier(AllocatorModifier),
++        AllocatorModifierLoc(AllocatorModifierLoc) {}
+ 
+   /// Build an empty clause.
+   ///
+@@ -527,6 +536,9 @@ class OMPAllocateClause final
+   void setColonLoc(SourceLocation CL) { ColonLoc = CL; }
+ 
+   void setAllocator(Expr *A) { Allocator = A; }
++  void setAllocatorModifier(OpenMPAllocateClauseModifier AM) {
++    AllocatorModifier = AM;
++  }
+ 
+ public:
+   /// Creates clause with a list of variables \a VL.
+@@ -536,18 +548,31 @@ class OMPAllocateClause final
+   /// \param LParenLoc Location of '('.
+   /// \param Allocator Allocator expression.
+   /// \param ColonLoc Location of ':' delimiter.
++  /// \param AllocatorModifier Allocator modifier.
++  /// \param SourceLocation Allocator modifier location.
+   /// \param EndLoc Ending location of the clause.
+   /// \param VL List of references to the variables.
+-  static OMPAllocateClause *Create(const ASTContext &C, SourceLocation StartLoc,
+-                                   SourceLocation LParenLoc, Expr *Allocator,
+-                                   SourceLocation ColonLoc,
+-                                   SourceLocation EndLoc, ArrayRef<Expr *> VL);
++  static OMPAllocateClause *
++  Create(const ASTContext &C, SourceLocation StartLoc, SourceLocation LParenLoc,
++         Expr *Allocator, SourceLocation ColonLoc,
++         OpenMPAllocateClauseModifier AllocatorModifier,
++         SourceLocation AllocatorModifierLoc, SourceLocation EndLoc,
++         ArrayRef<Expr *> VL);
+ 
+   /// Returns the allocator expression or nullptr, if no allocator is specified.
+   Expr *getAllocator() const { return Allocator; }
+ 
++  /// Return 'allocate' modifier.
++  OpenMPAllocateClauseModifier getAllocatorModifier() const {
++    return AllocatorModifier;
++  }
++
+   /// Returns the location of the ':' delimiter.
+   SourceLocation getColonLoc() const { return ColonLoc; }
++  /// Return the location of the modifier.
++  SourceLocation getAllocatorModifierLoc() const {
++    return AllocatorModifierLoc;
++  }
+ 
+   /// Creates an empty clause with the place for \a N variables.
+   ///
+diff --git a/clang/include/clang/Basic/OpenMPKinds.def b/clang/include/clang/Basic/OpenMPKinds.def
+index 51084913bf102..3f25e7aafe23b 100644
+--- a/clang/include/clang/Basic/OpenMPKinds.def
++++ b/clang/include/clang/Basic/OpenMPKinds.def
+@@ -86,6 +86,9 @@
+ #ifndef OPENMP_DOACROSS_MODIFIER
+ #define OPENMP_DOACROSS_MODIFIER(Name)
+ #endif
++#ifndef OPENMP_ALLOCATE_MODIFIER
++#define OPENMP_ALLOCATE_MODIFIER(Name)
++#endif
+ 
+ // Static attributes for 'schedule' clause.
+ OPENMP_SCHEDULE_KIND(static)
+@@ -214,6 +217,9 @@ OPENMP_GRAINSIZE_MODIFIER(strict)
+ // Modifiers for the 'num_tasks' clause.
+ OPENMP_NUMTASKS_MODIFIER(strict)
+ 
++// Modifiers for 'allocate' clause.
++OPENMP_ALLOCATE_MODIFIER(allocator)
++
+ // Modifiers for the 'doacross' clause.
+ OPENMP_DOACROSS_MODIFIER(source)
+ OPENMP_DOACROSS_MODIFIER(sink)
+@@ -245,4 +251,5 @@ OPENMP_DOACROSS_MODIFIER(source_omp_cur_iteration)
+ #undef OPENMP_DEFAULTMAP_KIND
+ #undef OPENMP_DEFAULTMAP_MODIFIER
+ #undef OPENMP_DOACROSS_MODIFIER
++#undef OPENMP_ALLOCATE_MODIFIER
+ 
+diff --git a/clang/include/clang/Basic/OpenMPKinds.h b/clang/include/clang/Basic/OpenMPKinds.h
+index 1acdafa857221..900ad6ca6d66f 100644
+--- a/clang/include/clang/Basic/OpenMPKinds.h
++++ b/clang/include/clang/Basic/OpenMPKinds.h
+@@ -223,6 +223,13 @@ enum OpenMPDoacrossClauseModifier {
+   OMPC_DOACROSS_unknown
+ };
+ 
++/// OpenMP modifiers for 'allocate' clause.
++enum OpenMPAllocateClauseModifier {
++#define OPENMP_ALLOCATE_MODIFIER(Name) OMPC_ALLOCATE_##Name,
++#include "clang/Basic/OpenMPKinds.def"
++  OMPC_ALLOCATE_unknown
++};
++
+ /// Contains 'interop' data for 'append_args' and 'init' clauses.
+ class Expr;
+ struct OMPInteropInfo final {
+diff --git a/clang/include/clang/Sema/SemaOpenMP.h b/clang/include/clang/Sema/SemaOpenMP.h
+index 1bf71b13cbb0f..3d1cc4fab1c10 100644
+--- a/clang/include/clang/Sema/SemaOpenMP.h
++++ b/clang/include/clang/Sema/SemaOpenMP.h
+@@ -1148,6 +1148,7 @@ class SemaOpenMP : public SemaBase {
+     SourceLocation OmpAllMemoryLoc;
+     SourceLocation
+         StepModifierLoc; /// 'step' modifier location for linear clause
++    OpenMPAllocateClauseModifier AllocClauseModifier = OMPC_ALLOCATE_unknown;
+   };
+ 
+   OMPClause *ActOnOpenMPVarListClause(OpenMPClauseKind Kind,
+@@ -1165,10 +1166,10 @@ class SemaOpenMP : public SemaBase {
+                                         SourceLocation LParenLoc,
+                                         SourceLocation EndLoc);
+   /// Called on well-formed 'allocate' clause.
+-  OMPClause *
+-  ActOnOpenMPAllocateClause(Expr *Allocator, ArrayRef<Expr *> VarList,
+-                            SourceLocation StartLoc, SourceLocation ColonLoc,
+-                            SourceLocation LParenLoc, SourceLocation EndLoc);
++  OMPClause *ActOnOpenMPAllocateClause(
++      Expr *Allocator, OpenMPAllocateClauseModifier ACModifier,
++      ArrayRef<Expr *> VarList, SourceLocation StartLoc,
++      SourceLocation ColonLoc, SourceLocation LParenLoc, SourceLocation EndLoc);
+   /// Called on well-formed 'private' clause.
+   OMPClause *ActOnOpenMPPrivateClause(ArrayRef<Expr *> VarList,
+                                       SourceLocation StartLoc,
+diff --git a/clang/lib/AST/OpenMPClause.cpp b/clang/lib/AST/OpenMPClause.cpp
+index 985c844362d95..ddff7db976798 100644
+--- a/clang/lib/AST/OpenMPClause.cpp
++++ b/clang/lib/AST/OpenMPClause.cpp
+@@ -1023,12 +1023,17 @@ OMPPartialClause *OMPPartialClause::CreateEmpty(const ASTContext &C) {
+ OMPAllocateClause *
+ OMPAllocateClause::Create(const ASTContext &C, SourceLocation StartLoc,
+                           SourceLocation LParenLoc, Expr *Allocator,
+-                          SourceLocation ColonLoc, SourceLocation EndLoc,
+-                          ArrayRef<Expr *> VL) {
++                          SourceLocation ColonLoc,
++                          OpenMPAllocateClauseModifier AllocatorModifier,
++                          SourceLocation AllocatorModifierLoc,
++                          SourceLocation EndLoc, ArrayRef<Expr *> VL) {
++
+   // Allocate space for private variables and initializer expressions.
+   void *Mem = C.Allocate(totalSizeToAlloc<Expr *>(VL.size()));
+-  auto *Clause = new (Mem) OMPAllocateClause(StartLoc, LParenLoc, Allocator,
+-                                             ColonLoc, EndLoc, VL.size());
++  auto *Clause = new (Mem) OMPAllocateClause(
++      StartLoc, LParenLoc, Allocator, ColonLoc, AllocatorModifier,
++      AllocatorModifierLoc, EndLoc, VL.size());
++
+   Clause->setVarRefs(VL);
+   return Clause;
+ }
+@@ -2242,9 +2247,17 @@ void OMPClausePrinter::VisitOMPAllocateClause(OMPAllocateClause *Node) {
+   if (Node->varlist_empty())
+     return;
+   OS << "allocate";
++  OpenMPAllocateClauseModifier Modifier = Node->getAllocatorModifier();
+   if (Expr *Allocator = Node->getAllocator()) {
+     OS << "(";
+-    Allocator->printPretty(OS, nullptr, Policy, 0);
++    if (Modifier == OMPC_ALLOCATE_allocator) {
++      OS << getOpenMPSimpleClauseTypeName(Node->getClauseKind(), Modifier);
++      OS << "(";
++      Allocator->printPretty(OS, nullptr, Policy, 0);
++      OS << ")";
++    } else {
++      Allocator->printPretty(OS, nullptr, Policy, 0);
++    }
+     OS << ":";
+     VisitOMPClauseList(Node, ' ');
+   } else {
+diff --git a/clang/lib/Basic/OpenMPKinds.cpp b/clang/lib/Basic/OpenMPKinds.cpp
+index 8d2460bc74fa3..62a13f01481b2 100644
+--- a/clang/lib/Basic/OpenMPKinds.cpp
++++ b/clang/lib/Basic/OpenMPKinds.cpp
+@@ -180,6 +180,11 @@ unsigned clang::getOpenMPSimpleClauseType(OpenMPClauseKind Kind, StringRef Str,
+       return OMPC_NUMTASKS_unknown;
+     return Type;
+   }
++  case OMPC_allocate:
++    return llvm::StringSwitch<OpenMPAllocateClauseModifier>(Str)
++#define OPENMP_ALLOCATE_MODIFIER(Name) .Case(#Name, OMPC_ALLOCATE_##Name)
++#include "clang/Basic/OpenMPKinds.def"
++        .Default(OMPC_ALLOCATE_unknown);
+   case OMPC_unknown:
+   case OMPC_threadprivate:
+   case OMPC_if:
+@@ -190,7 +195,6 @@ unsigned clang::getOpenMPSimpleClauseType(OpenMPClauseKind Kind, StringRef Str,
+   case OMPC_sizes:
+   case OMPC_permutation:
+   case OMPC_allocator:
+-  case OMPC_allocate:
+   case OMPC_collapse:
+   case OMPC_private:
+   case OMPC_firstprivate:
+@@ -505,6 +509,16 @@ const char *clang::getOpenMPSimpleClauseTypeName(OpenMPClauseKind Kind,
+ #include "clang/Basic/OpenMPKinds.def"
+     }
+     llvm_unreachable("Invalid OpenMP 'num_tasks' clause modifier");
++  case OMPC_allocate:
++    switch (Type) {
++    case OMPC_ALLOCATE_unknown:
++      return "unknown";
++#define OPENMP_ALLOCATE_MODIFIER(Name)                                         \
++  case OMPC_ALLOCATE_##Name:                                                   \
++    return #Name;
++#include "clang/Basic/OpenMPKinds.def"
++    }
++    llvm_unreachable("Invalid OpenMP 'allocate' clause modifier");
+   case OMPC_unknown:
+   case OMPC_threadprivate:
+   case OMPC_if:
+@@ -515,7 +529,6 @@ const char *clang::getOpenMPSimpleClauseTypeName(OpenMPClauseKind Kind,
+   case OMPC_sizes:
+   case OMPC_permutation:
+   case OMPC_allocator:
+-  case OMPC_allocate:
+   case OMPC_collapse:
+   case OMPC_private:
+   case OMPC_firstprivate:
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 16f731174fd0e..59a33eafa6be4 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -4800,7 +4800,23 @@ bool Parser::ParseOpenMPVarList(OpenMPDirectiveKind DKind,
+     // iterator(iterators-definition)
+     ExprResult Tail;
+     if (Kind == OMPC_allocate) {
+-      Tail = ParseAssignmentExpression();
++      auto Modifier = static_cast<OpenMPAllocateClauseModifier>(
++          getOpenMPSimpleClauseType(Kind, PP.getSpelling(Tok), getLangOpts()));
++      if (Modifier == OMPC_ALLOCATE_allocator) {
++        Data.AllocClauseModifier = Modifier;
++        ConsumeToken();
++        BalancedDelimiterTracker AllocateT(*this, tok::l_paren,
++                                           tok::annot_pragma_openmp_end);
++        if (Tok.is(tok::l_paren)) {
++          AllocateT.consumeOpen();
++          Tail = ParseAssignmentExpression();
++          AllocateT.consumeClose();
++        } else {
++          Diag(Tok, diag::err_expected) << tok::l_paren;
++        }
++      } else {
++        Tail = ParseAssignmentExpression();
++      }
+     } else {
+       HasIterator = true;
+       EnterScope(Scope::OpenMPDirectiveScope | Scope::DeclScope);
+@@ -4817,6 +4833,12 @@ bool Parser::ParseOpenMPVarList(OpenMPDirectiveKind DKind,
+       } else {
+         // Colon not found, parse only list of variables.
+         TPA.Revert();
++        if (Kind == OMPC_allocate &&
++            Data.AllocClauseModifier == OMPC_ALLOCATE_allocator) {
++          SkipUntil(tok::r_paren, tok::annot_pragma_openmp_end,
++                    StopBeforeMatch);
++          Diag(Tok, diag::err_modifier_expected_colon) << "allocator";
++        }
+       }
+     } else {
+       // Parsing was unsuccessfull, revert and skip to the end of clause or
+@@ -4886,7 +4908,6 @@ bool Parser::ParseOpenMPVarList(OpenMPDirectiveKind DKind,
+   // Parse ')' for linear clause with modifier.
+   if (NeedRParenForLinear)
+     LinearT.consumeClose();
+-
+   // Parse ':' linear modifiers (val, uval, ref or step(step-size))
+   // or parse ':' alignment.
+   const bool MustHaveTail = MayHaveTail && Tok.is(tok::colon);
+@@ -5018,6 +5039,9 @@ bool Parser::ParseOpenMPVarList(OpenMPDirectiveKind DKind,
+ ///       'has_device_addr' '(' list ')'
+ ///    allocate-clause:
+ ///       'allocate' '(' [ allocator ':' ] list ')'
++///       As of OpenMP 5.1 there's also
++///         'allocate' '(' allocate-modifier: list ')'
++///         where allocate-modifier is: 'allocator' '(' allocator ')'
+ ///    nontemporal-clause:
+ ///       'nontemporal' '(' list ')'
+ ///    inclusive-clause:
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index 79e1536288e60..fe8bb99d2db04 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -17156,7 +17156,8 @@ OMPClause *SemaOpenMP::ActOnOpenMPVarListClause(OpenMPClauseKind Kind,
+     Res = ActOnOpenMPHasDeviceAddrClause(VarList, Locs);
+     break;
+   case OMPC_allocate:
+-    Res = ActOnOpenMPAllocateClause(Data.DepModOrTailExpr, VarList, StartLoc,
++    Res = ActOnOpenMPAllocateClause(Data.DepModOrTailExpr,
++                                    Data.AllocClauseModifier, VarList, StartLoc,
+                                     LParenLoc, ColonLoc, EndLoc);
+     break;
+   case OMPC_nontemporal:
+@@ -23162,9 +23163,17 @@ SemaOpenMP::ActOnOpenMPHasDeviceAddrClause(ArrayRef<Expr *> VarList,
+ }
+ 
+ OMPClause *SemaOpenMP::ActOnOpenMPAllocateClause(
+-    Expr *Allocator, ArrayRef<Expr *> VarList, SourceLocation StartLoc,
+-    SourceLocation LParenLoc, SourceLocation ColonLoc, SourceLocation EndLoc) {
++    Expr *Allocator, OpenMPAllocateClauseModifier AllocClauseModifier,
++    ArrayRef<Expr *> VarList, SourceLocation StartLoc, SourceLocation LParenLoc,
++    SourceLocation ColonLoc, SourceLocation EndLoc) {
++
+   if (Allocator) {
++    // Allocator expression is dependent - skip it for now and build the
++    // allocator when instantiated.
++    if (Allocator->isTypeDependent() || Allocator->isValueDependent() ||
++        Allocator->isInstantiationDependent() ||
++        Allocator->containsUnexpandedParameterPack())
++      return nullptr;
+     // OpenMP [2.11.4 allocate Clause, Description]
+     // allocator is an expression of omp_allocator_handle_t type.
+     if (!findOMPAllocatorHandleT(SemaRef, Allocator->getExprLoc(), DSAStack))
+@@ -23220,8 +23229,12 @@ OMPClause *SemaOpenMP::ActOnOpenMPAllocateClause(
+ 
+   if (Allocator)
+     DSAStack->addInnerAllocatorExpr(Allocator);
++
++  OpenMPAllocateClauseModifier AllocatorModifier = AllocClauseModifier;
++  SourceLocation AllocatorModifierLoc;
+   return OMPAllocateClause::Create(getASTContext(), StartLoc, LParenLoc,
+-                                   Allocator, ColonLoc, EndLoc, Vars);
++                                   Allocator, ColonLoc, AllocatorModifier,
++                                   AllocatorModifierLoc, EndLoc, Vars);
+ }
+ 
+ OMPClause *SemaOpenMP::ActOnOpenMPNontemporalClause(ArrayRef<Expr *> VarList,
+diff --git a/clang/lib/Sema/TreeTransform.h b/clang/lib/Sema/TreeTransform.h
+index 15ba022b096ac..68f6e4fed066b 100644
+--- a/clang/lib/Sema/TreeTransform.h
++++ b/clang/lib/Sema/TreeTransform.h
+@@ -2075,13 +2075,15 @@ class TreeTransform {
+   ///
+   /// By default, performs semantic analysis to build the new OpenMP clause.
+   /// Subclasses may override this routine to provide different behavior.
+-  OMPClause *RebuildOMPAllocateClause(Expr *Allocate, ArrayRef<Expr *> VarList,
++  OMPClause *RebuildOMPAllocateClause(Expr *Allocate,
++                                      OpenMPAllocateClauseModifier ACModifier,
++                                      ArrayRef<Expr *> VarList,
+                                       SourceLocation StartLoc,
+                                       SourceLocation LParenLoc,
+                                       SourceLocation ColonLoc,
+                                       SourceLocation EndLoc) {
+     return getSema().OpenMP().ActOnOpenMPAllocateClause(
+-        Allocate, VarList, StartLoc, LParenLoc, ColonLoc, EndLoc);
++        Allocate, ACModifier, VarList, StartLoc, LParenLoc, ColonLoc, EndLoc);
+   }
+ 
+   /// Build a new OpenMP 'num_teams' clause.
+@@ -11128,8 +11130,8 @@ TreeTransform<Derived>::TransformOMPAllocateClause(OMPAllocateClause *C) {
+     Vars.push_back(EVar.get());
+   }
+   return getDerived().RebuildOMPAllocateClause(
+-      Allocator, Vars, C->getBeginLoc(), C->getLParenLoc(), C->getColonLoc(),
+-      C->getEndLoc());
++      Allocator, C->getAllocatorModifier(), Vars, C->getBeginLoc(),
++      C->getLParenLoc(), C->getColonLoc(), C->getEndLoc());
+ }
+ 
+ template <typename Derived>
+diff --git a/clang/lib/Serialization/ASTReader.cpp b/clang/lib/Serialization/ASTReader.cpp
+index 004a584ff77b4..99e492ee4f7e1 100644
+--- a/clang/lib/Serialization/ASTReader.cpp
++++ b/clang/lib/Serialization/ASTReader.cpp
+@@ -11598,6 +11598,7 @@ void OMPClauseReader::VisitOMPMapClause(OMPMapClause *C) {
+ }
+ 
+ void OMPClauseReader::VisitOMPAllocateClause(OMPAllocateClause *C) {
++  C->setAllocatorModifier(Record.readEnum<OpenMPAllocateClauseModifier>());
+   C->setLParenLoc(Record.readSourceLocation());
+   C->setColonLoc(Record.readSourceLocation());
+   C->setAllocator(Record.readSubExpr());
+diff --git a/clang/lib/Serialization/ASTWriter.cpp b/clang/lib/Serialization/ASTWriter.cpp
+index 732c7ef01c0db..3b174cb539ebd 100644
+--- a/clang/lib/Serialization/ASTWriter.cpp
++++ b/clang/lib/Serialization/ASTWriter.cpp
+@@ -7619,6 +7619,7 @@ void OMPClauseWriter::VisitOMPMapClause(OMPMapClause *C) {
+ 
+ void OMPClauseWriter::VisitOMPAllocateClause(OMPAllocateClause *C) {
+   Record.push_back(C->varlist_size());
++  Record.writeEnum(C->getAllocatorModifier());
+   Record.AddSourceLocation(C->getLParenLoc());
+   Record.AddSourceLocation(C->getColonLoc());
+   Record.AddStmt(C->getAllocator());
+diff --git a/clang/test/OpenMP/allocate_allocator_modifier_ast_print.cpp b/clang/test/OpenMP/allocate_allocator_modifier_ast_print.cpp
+new file mode 100644
+index 0000000000000..15f3f1dd9bbb9
+--- /dev/null
++++ b/clang/test/OpenMP/allocate_allocator_modifier_ast_print.cpp
+@@ -0,0 +1,86 @@
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -std=c++14 \
++// RUN:   -ast-print %s | FileCheck %s --check-prefix=PRINT
++
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -std=c++14 \
++// RUN:   -ast-dump %s | FileCheck %s --check-prefix=DUMP
++
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -std=c++14 -emit-pch -o %t %s
++
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -std=c++14 -include-pch \
++// RUN:   %t -ast-print %s | FileCheck %s --check-prefix=PRINT
++
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -std=c++14 -include-pch \
++// RUN:   %t -ast-dump-all %s | FileCheck %s --check-prefix=DUMP
++// expected-no-diagnostics
++
++#ifndef HEADER
++#define HEADER
++
++typedef enum omp_allocator_handle_t {
++      omp_null_allocator = 0,
++      omp_default_mem_alloc = 1,
++      omp_large_cap_mem_alloc = 2,
++      omp_const_mem_alloc = 3,
++      omp_high_bw_mem_alloc = 4,
++      omp_low_lat_mem_alloc = 5,
++      omp_cgroup_mem_alloc = 6,
++      omp_pteam_mem_alloc = 7,
++      omp_thread_mem_alloc = 8,
++} omp_allocator_handle_t;
++
++omp_allocator_handle_t myAlloc() {
++  return omp_large_cap_mem_alloc;
++}
++
++int main() {
++  int a, b, c, d;
++  #pragma omp scope private(a) allocate(omp_const_mem_alloc:a)
++  a++;
++  #pragma omp scope private(a,b) allocate(allocator(omp_const_mem_alloc):a,b)
++  b++;
++  #pragma omp scope private(c,a,b) allocate(allocator(myAlloc()):a,b,c)
++  c++;
++  #pragma omp scope private(c,a,b,d) allocate(myAlloc():a,b,c,d)
++// DUMP: FunctionDecl {{.*}}
++// DUMP: DeclRefExpr {{.*}}'omp_allocator_handle_t' EnumConstant {{.*}}'omp_large_cap_mem_alloc' 'omp_allocator_handle_t'
++// DUMP: FunctionDecl {{.*}}
++// DUMP: OMPScopeDirective {{.*}}
++// DUMP: OMPPrivateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: OMPAllocateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: OMPScopeDirective {{.*}}
++// DUMP: OMPPrivateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: OMPAllocateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: OMPScopeDirective {{.*}}
++// DUMP: OMPPrivateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'c' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: OMPAllocateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'c' 'int'
++// DUMP: OMPScopeDirective {{.*}}
++// DUMP: OMPPrivateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'c' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'d' 'int'
++// DUMP: OMPAllocateClause {{.*}}
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'a' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'b' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'c' 'int'
++// DUMP: DeclRefExpr {{.*}}'int' lvalue Var {{.*}}'d' 'int'
++// PRINT: #pragma omp scope private(a) allocate(omp_const_mem_alloc: a)
++// PRINT: #pragma omp scope private(a,b) allocate(allocator(omp_const_mem_alloc): a,b)
++// PRINT: #pragma omp scope private(c,a,b) allocate(allocator(myAlloc()): a,b,c)
++// PRINT: #pragma omp scope private(c,a,b,d) allocate(myAlloc(): a,b,c,d)
++  d++;
++  return a+b+c+d;
++}
++#endif
+diff --git a/clang/test/OpenMP/allocate_allocator_modifier_codegen.cpp b/clang/test/OpenMP/allocate_allocator_modifier_codegen.cpp
+new file mode 100644
+index 0000000000000..1bf927ebb2eb7
+--- /dev/null
++++ b/clang/test/OpenMP/allocate_allocator_modifier_codegen.cpp
+@@ -0,0 +1,255 @@
++// NOTE: Assertions have been autogenerated by utils/update_cc_test_checks.py UTC_ARGS: --include-generated-funcs --replace-value-regex "__omp_offloading_[0-9a-z]+_[0-9a-z]+" "reduction_size[.].+[.]" "pl_cond[.].+[.|,]" --prefix-filecheck-ir-name _ --version 5
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -fnoopenmp-use-tls -triple x86_64-unknown-linux-gnu -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-version=52 -fnoopenmp-use-tls -triple x86_64-unknown-linux-gnu -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck --check-prefix CHECK-TLS %s
++
++// RUN: %clang_cc1 -verify -fopenmp-simd -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck --check-prefix SIMD-ONLY0 %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck --check-prefix SIMD-ONLY0 %s
++// RUN: %clang_cc1 -verify -fopenmp-simd -fopenmp-version=52 -triple x86_64-unknown-linux-gnu -emit-llvm -o - %s | FileCheck --check-prefix SIMD-ONLY0 %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=52 -fnoopenmp-use-tls -triple x86_64-unknown-linux-gnu -x c++ -std=c++11 -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp-simd -fopenmp-version=52 -fnoopenmp-use-tls -triple x86_64-unknown-linux-gnu -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck --check-prefix SIMD-ONLY0 %s
++// expected-no-diagnostics
++
++#ifndef HEADER
++#define HEADER
++
++enum omp_allocator_handle_t {
++  omp_null_allocator = 0,
++  omp_default_mem_alloc = 1,
++  omp_large_cap_mem_alloc = 2,
++  omp_const_mem_alloc = 3,
++  omp_high_bw_mem_alloc = 4,
++  omp_low_lat_mem_alloc = 5,
++  omp_cgroup_mem_alloc = 6,
++  omp_pteam_mem_alloc = 7,
++  omp_thread_mem_alloc = 8,
++  KMP_ALLOCATOR_MAX_HANDLE = __UINTPTR_MAX__
++};
++
++template <class T>
++struct ST {
++  static T m;
++};
++
++template <class T, omp_allocator_handle_t TY> T foo() {
++  T v;
++ #pragma omp scope private(v) allocate(allocator(TY):v)
++  v = ST<T>::m;
++  return v;
++}
++
++namespace ns {
++int a;
++}
++
++int main() {
++  static int a;
++  static int temp;
++  #pragma omp scope private(ns::a) allocate(allocator(omp_pteam_mem_alloc):ns::a)
++  ns::a++;
++
++ #pragma omp scope private(a) allocate(allocator(omp_thread_mem_alloc):a)
++  a = 2;
++  double b = 3;
++  #pragma omp scope private(temp) allocate(temp)
++  temp += foo<int, omp_cgroup_mem_alloc>();
++  return temp+ns::a;
++}
++
++extern template int ST<int>::m;
++
++int b;
++
++void bar(int a, float &z) {
++  #pragma omp scope private(a,z) allocate(allocator(omp_default_mem_alloc):a,z)
++  a += b;
++}
++#endif
++// CHECK-LABEL: define dso_local noundef i32 @main(
++// CHECK-SAME: ) #[[ATTR0:[0-9]+]] {
++// CHECK-NEXT:  [[ENTRY:.*:]]
++// CHECK-NEXT:    [[RETVAL:%.*]] = alloca i32, align 4
++// CHECK-NEXT:    [[B:%.*]] = alloca double, align 8
++// CHECK-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1:[0-9]+]])
++// CHECK-NEXT:    store i32 0, ptr [[RETVAL]], align 4
++// CHECK-NEXT:    [[DOTA__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 7 to ptr))
++// CHECK-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP1]], 1
++// CHECK-NEXT:    store i32 [[INC]], ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR]], ptr inttoptr (i64 7 to ptr))
++// CHECK-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2:[0-9]+]], i32 [[TMP0]])
++// CHECK-NEXT:    [[DOTA__VOID_ADDR1:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 8 to ptr))
++// CHECK-NEXT:    store i32 2, ptr [[DOTA__VOID_ADDR1]], align 4
++// CHECK-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR1]], ptr inttoptr (i64 8 to ptr))
++// CHECK-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-NEXT:    store double 3.000000e+00, ptr [[B]], align 8
++// CHECK-NEXT:    [[DOTTEMP__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr null)
++// CHECK-NEXT:    [[CALL:%.*]] = call noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v()
++// CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTEMP__VOID_ADDR]], align 4
++// CHECK-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP2]], [[CALL]]
++// CHECK-NEXT:    store i32 [[ADD]], ptr [[DOTTEMP__VOID_ADDR]], align 4
++// CHECK-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTTEMP__VOID_ADDR]], ptr null)
++// CHECK-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-NEXT:    [[TMP3:%.*]] = load i32, ptr @_ZZ4mainE4temp, align 4
++// CHECK-NEXT:    [[TMP4:%.*]] = load i32, ptr @_ZN2ns1aE, align 4
++// CHECK-NEXT:    [[ADD2:%.*]] = add nsw i32 [[TMP3]], [[TMP4]]
++// CHECK-NEXT:    ret i32 [[ADD2]]
++//
++//
++// CHECK-LABEL: define linkonce_odr noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v(
++// CHECK-SAME: ) #[[ATTR3:[0-9]+]] comdat {
++// CHECK-NEXT:  [[ENTRY:.*:]]
++// CHECK-NEXT:    [[V:%.*]] = alloca i32, align 4
++// CHECK-NEXT:    [[V1:%.*]] = alloca i32, align 4
++// CHECK-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1]])
++// CHECK-NEXT:    [[TMP1:%.*]] = load i32, ptr @_ZN2STIiE1mE, align 4
++// CHECK-NEXT:    store i32 [[TMP1]], ptr [[V1]], align 4
++// CHECK-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[V]], align 4
++// CHECK-NEXT:    ret i32 [[TMP2]]
++//
++//
++// CHECK-LABEL: define dso_local void @_Z3bariRf(
++// CHECK-SAME: i32 noundef [[A:%.*]], ptr noundef nonnull align 4 dereferenceable(4) [[Z:%.*]]) #[[ATTR3]] {
++// CHECK-NEXT:  [[ENTRY:.*:]]
++// CHECK-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
++// CHECK-NEXT:    [[Z_ADDR:%.*]] = alloca ptr, align 8
++// CHECK-NEXT:    [[TMP:%.*]] = alloca ptr, align 8
++// CHECK-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1]])
++// CHECK-NEXT:    store i32 [[A]], ptr [[A_ADDR]], align 4
++// CHECK-NEXT:    store ptr [[Z]], ptr [[Z_ADDR]], align 8
++// CHECK-NEXT:    [[DOTA__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 1 to ptr))
++// CHECK-NEXT:    [[DOTZ__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 1 to ptr))
++// CHECK-NEXT:    store ptr [[DOTZ__VOID_ADDR]], ptr [[TMP]], align 8
++// CHECK-NEXT:    [[TMP1:%.*]] = load i32, ptr @b, align 4
++// CHECK-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP2]], [[TMP1]]
++// CHECK-NEXT:    store i32 [[ADD]], ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTZ__VOID_ADDR]], ptr inttoptr (i64 1 to ptr))
++// CHECK-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR]], ptr inttoptr (i64 1 to ptr))
++// CHECK-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-NEXT:    ret void
++//
++//
++// CHECK-TLS-LABEL: define dso_local noundef i32 @main(
++// CHECK-TLS-SAME: ) #[[ATTR0:[0-9]+]] {
++// CHECK-TLS-NEXT:  [[ENTRY:.*:]]
++// CHECK-TLS-NEXT:    [[RETVAL:%.*]] = alloca i32, align 4
++// CHECK-TLS-NEXT:    [[B:%.*]] = alloca double, align 8
++// CHECK-TLS-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1:[0-9]+]])
++// CHECK-TLS-NEXT:    store i32 0, ptr [[RETVAL]], align 4
++// CHECK-TLS-NEXT:    [[DOTA__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 7 to ptr))
++// CHECK-TLS-NEXT:    [[TMP1:%.*]] = load i32, ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP1]], 1
++// CHECK-TLS-NEXT:    store i32 [[INC]], ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR]], ptr inttoptr (i64 7 to ptr))
++// CHECK-TLS-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2:[0-9]+]], i32 [[TMP0]])
++// CHECK-TLS-NEXT:    [[DOTA__VOID_ADDR1:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 8 to ptr))
++// CHECK-TLS-NEXT:    store i32 2, ptr [[DOTA__VOID_ADDR1]], align 4
++// CHECK-TLS-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR1]], ptr inttoptr (i64 8 to ptr))
++// CHECK-TLS-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-TLS-NEXT:    store double 3.000000e+00, ptr [[B]], align 8
++// CHECK-TLS-NEXT:    [[DOTTEMP__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr null)
++// CHECK-TLS-NEXT:    [[CALL:%.*]] = call noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v()
++// CHECK-TLS-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTTEMP__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP2]], [[CALL]]
++// CHECK-TLS-NEXT:    store i32 [[ADD]], ptr [[DOTTEMP__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTTEMP__VOID_ADDR]], ptr null)
++// CHECK-TLS-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-TLS-NEXT:    [[TMP3:%.*]] = load i32, ptr @_ZZ4mainE4temp, align 4
++// CHECK-TLS-NEXT:    [[TMP4:%.*]] = load i32, ptr @_ZN2ns1aE, align 4
++// CHECK-TLS-NEXT:    [[ADD2:%.*]] = add nsw i32 [[TMP3]], [[TMP4]]
++// CHECK-TLS-NEXT:    ret i32 [[ADD2]]
++//
++//
++// CHECK-TLS-LABEL: define linkonce_odr noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v(
++// CHECK-TLS-SAME: ) #[[ATTR3:[0-9]+]] comdat {
++// CHECK-TLS-NEXT:  [[ENTRY:.*:]]
++// CHECK-TLS-NEXT:    [[V:%.*]] = alloca i32, align 4
++// CHECK-TLS-NEXT:    [[V1:%.*]] = alloca i32, align 4
++// CHECK-TLS-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1]])
++// CHECK-TLS-NEXT:    [[TMP1:%.*]] = load i32, ptr @_ZN2STIiE1mE, align 4
++// CHECK-TLS-NEXT:    store i32 [[TMP1]], ptr [[V1]], align 4
++// CHECK-TLS-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-TLS-NEXT:    [[TMP2:%.*]] = load i32, ptr [[V]], align 4
++// CHECK-TLS-NEXT:    ret i32 [[TMP2]]
++//
++//
++// CHECK-TLS-LABEL: define dso_local void @_Z3bariRf(
++// CHECK-TLS-SAME: i32 noundef [[A:%.*]], ptr noundef nonnull align 4 dereferenceable(4) [[Z:%.*]]) #[[ATTR3]] {
++// CHECK-TLS-NEXT:  [[ENTRY:.*:]]
++// CHECK-TLS-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
++// CHECK-TLS-NEXT:    [[Z_ADDR:%.*]] = alloca ptr, align 8
++// CHECK-TLS-NEXT:    [[TMP:%.*]] = alloca ptr, align 8
++// CHECK-TLS-NEXT:    [[TMP0:%.*]] = call i32 @__kmpc_global_thread_num(ptr @[[GLOB1]])
++// CHECK-TLS-NEXT:    store i32 [[A]], ptr [[A_ADDR]], align 4
++// CHECK-TLS-NEXT:    store ptr [[Z]], ptr [[Z_ADDR]], align 8
++// CHECK-TLS-NEXT:    [[DOTA__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 1 to ptr))
++// CHECK-TLS-NEXT:    [[DOTZ__VOID_ADDR:%.*]] = call ptr @__kmpc_alloc(i32 [[TMP0]], i64 4, ptr inttoptr (i64 1 to ptr))
++// CHECK-TLS-NEXT:    store ptr [[DOTZ__VOID_ADDR]], ptr [[TMP]], align 8
++// CHECK-TLS-NEXT:    [[TMP1:%.*]] = load i32, ptr @b, align 4
++// CHECK-TLS-NEXT:    [[TMP2:%.*]] = load i32, ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP2]], [[TMP1]]
++// CHECK-TLS-NEXT:    store i32 [[ADD]], ptr [[DOTA__VOID_ADDR]], align 4
++// CHECK-TLS-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTZ__VOID_ADDR]], ptr inttoptr (i64 1 to ptr))
++// CHECK-TLS-NEXT:    call void @__kmpc_free(i32 [[TMP0]], ptr [[DOTA__VOID_ADDR]], ptr inttoptr (i64 1 to ptr))
++// CHECK-TLS-NEXT:    call void @__kmpc_barrier(ptr @[[GLOB2]], i32 [[TMP0]])
++// CHECK-TLS-NEXT:    ret void
++//
++//
++// SIMD-ONLY0-LABEL: define dso_local noundef i32 @main(
++// SIMD-ONLY0-SAME: ) #[[ATTR0:[0-9]+]] {
++// SIMD-ONLY0-NEXT:  [[ENTRY:.*:]]
++// SIMD-ONLY0-NEXT:    [[RETVAL:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[A:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[A1:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[B:%.*]] = alloca double, align 8
++// SIMD-ONLY0-NEXT:    [[TEMP:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    store i32 0, ptr [[RETVAL]], align 4
++// SIMD-ONLY0-NEXT:    [[TMP0:%.*]] = load i32, ptr [[A]], align 4
++// SIMD-ONLY0-NEXT:    [[INC:%.*]] = add nsw i32 [[TMP0]], 1
++// SIMD-ONLY0-NEXT:    store i32 [[INC]], ptr [[A]], align 4
++// SIMD-ONLY0-NEXT:    store i32 2, ptr [[A1]], align 4
++// SIMD-ONLY0-NEXT:    store double 3.000000e+00, ptr [[B]], align 8
++// SIMD-ONLY0-NEXT:    [[CALL:%.*]] = call noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v()
++// SIMD-ONLY0-NEXT:    [[TMP1:%.*]] = load i32, ptr [[TEMP]], align 4
++// SIMD-ONLY0-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP1]], [[CALL]]
++// SIMD-ONLY0-NEXT:    store i32 [[ADD]], ptr [[TEMP]], align 4
++// SIMD-ONLY0-NEXT:    [[TMP2:%.*]] = load i32, ptr @_ZZ4mainE4temp, align 4
++// SIMD-ONLY0-NEXT:    [[TMP3:%.*]] = load i32, ptr @_ZN2ns1aE, align 4
++// SIMD-ONLY0-NEXT:    [[ADD2:%.*]] = add nsw i32 [[TMP2]], [[TMP3]]
++// SIMD-ONLY0-NEXT:    ret i32 [[ADD2]]
++//
++//
++// SIMD-ONLY0-LABEL: define linkonce_odr noundef i32 @_Z3fooIiL22omp_allocator_handle_t6EET_v(
++// SIMD-ONLY0-SAME: ) #[[ATTR1:[0-9]+]] comdat {
++// SIMD-ONLY0-NEXT:  [[ENTRY:.*:]]
++// SIMD-ONLY0-NEXT:    [[V:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[V1:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[TMP0:%.*]] = load i32, ptr @_ZN2STIiE1mE, align 4
++// SIMD-ONLY0-NEXT:    store i32 [[TMP0]], ptr [[V1]], align 4
++// SIMD-ONLY0-NEXT:    [[TMP1:%.*]] = load i32, ptr [[V]], align 4
++// SIMD-ONLY0-NEXT:    ret i32 [[TMP1]]
++//
++//
++// SIMD-ONLY0-LABEL: define dso_local void @_Z3bariRf(
++// SIMD-ONLY0-SAME: i32 noundef [[A:%.*]], ptr noundef nonnull align 4 dereferenceable(4) [[Z:%.*]]) #[[ATTR1]] {
++// SIMD-ONLY0-NEXT:  [[ENTRY:.*:]]
++// SIMD-ONLY0-NEXT:    [[A_ADDR:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[Z_ADDR:%.*]] = alloca ptr, align 8
++// SIMD-ONLY0-NEXT:    [[A1:%.*]] = alloca i32, align 4
++// SIMD-ONLY0-NEXT:    [[Z2:%.*]] = alloca float, align 4
++// SIMD-ONLY0-NEXT:    [[TMP:%.*]] = alloca ptr, align 8
++// SIMD-ONLY0-NEXT:    store i32 [[A]], ptr [[A_ADDR]], align 4
++// SIMD-ONLY0-NEXT:    store ptr [[Z]], ptr [[Z_ADDR]], align 8
++// SIMD-ONLY0-NEXT:    store ptr [[Z2]], ptr [[TMP]], align 8
++// SIMD-ONLY0-NEXT:    [[TMP0:%.*]] = load i32, ptr @b, align 4
++// SIMD-ONLY0-NEXT:    [[TMP1:%.*]] = load i32, ptr [[A1]], align 4
++// SIMD-ONLY0-NEXT:    [[ADD:%.*]] = add nsw i32 [[TMP1]], [[TMP0]]
++// SIMD-ONLY0-NEXT:    store i32 [[ADD]], ptr [[A1]], align 4
++// SIMD-ONLY0-NEXT:    ret void
++//
+diff --git a/clang/test/OpenMP/allocate_allocator_modifier_messages.cpp b/clang/test/OpenMP/allocate_allocator_modifier_messages.cpp
+new file mode 100644
+index 0000000000000..160c4996c1219
+--- /dev/null
++++ b/clang/test/OpenMP/allocate_allocator_modifier_messages.cpp
+@@ -0,0 +1,97 @@
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-version=52 %s
++
++typedef enum omp_allocator_handle_t {
++      omp_null_allocator = 0,
++      omp_default_mem_alloc = 1,
++      omp_large_cap_mem_alloc = 2,
++      omp_const_mem_alloc = 3,
++      omp_high_bw_mem_alloc = 4,
++      omp_low_lat_mem_alloc = 5,
++      omp_cgroup_mem_alloc = 6,
++      omp_pteam_mem_alloc = 7,
++      omp_thread_mem_alloc = 8,
++} omp_allocator_handle_t;
++
++int myAlloc() {
++  return 100;
++}
++
++int main() {
++  int a, b, c;
++  // expected-error@+4 {{expected '('}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator
++  // expected-error@+6 {{expected expression}}
++  // expected-error@+5 {{expected ')'}}
++  // expected-note@+4 {{to match this '('}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator(
++  // expected-error@+4 {{expected expression}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator()
++  // expected-error@+2 {{expected expression}}
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator())
++  // expected-error@+6 {{expected ')'}}
++  // expected-note@+5 {{to match this '('}}
++  // expected-error@+4 {{missing ':' after allocator modifier}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator(omp_default_mem_alloc
++  // expected-error@+6 {{missing ':' after allocator modifier}}
++  // expected-error@+5 {{expected expression}}
++  // expected-error@+4 {{expected ')'}}
++  // expected-note@+3 {{to match this '('}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator(omp_large_cap_mem_alloc:
++  // expected-error@+4 {{missing ':' after allocator modifier}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator(omp_const_mem_alloc)
++  // expected-error@+2 {{missing ':' after allocator modifier}}
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator(omp_high_bw_mem_alloc))
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator(omp_low_lat_mem_alloc):)
++  // expected-error@+6 {{expected ')'}}
++  // expected-note@+5 {{to match this '('}}
++  // expected-error@+4 {{missing ':' after allocator modifier}}
++  // expected-error@+3 {{expected expression}}
++  // expected-error@+2 {{expected ')'}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(c) allocate(allocator(omp_cgroup_mem_alloc:)
++  // expected-error@+4 {{expected ')'}}
++  // expected-note@+3 {{to match this '('}}
++  // expected-error@+2 {{missing ':' after allocator modifier}}
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator(omp_pteam_mem_alloc:))
++  // expected-error@+4 {{expected ')'}}
++  // expected-note@+3 {{to match this '('}}
++  // expected-error@+2 {{missing ':' after allocator modifier}}
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator(omp_thread_mem_alloc:c))
++  // expected-error@+1 {{expected variable name}}
++  #pragma omp scope private(c) allocate(allocator(omp_const_mem_alloc):1)
++  // expected-error@+1 {{expected variable name}}
++  #pragma omp scope private(c) allocate(allocator(omp_const_mem_alloc):-10)
++  // expected-error@+4 {{expected ',' or ')' in 'allocate' clause}}
++  // expected-error@+3 {{expected ')'}}
++  // expected-warning@+2 {{extra tokens at the end of '#pragma omp scope' are ignored}}
++  // expected-note@+1 {{to match this '('}}
++  #pragma omp scope private(a,b,c) allocate(allocator(omp_const_mem_alloc):c:b;a)
++  // expected-error@+1 {{initializing 'const omp_allocator_handle_t' with an expression of incompatible type 'int'}}
++  #pragma omp scope private(c,a,b) allocate(allocator(myAlloc()):a,b,c)
++  // expected-error@+2 {{missing ':' after allocator modifier}}
++  // expected-error@+1 {{expected expression}}
++  #pragma omp scope private(c) allocate(allocator(omp_default_mem_alloc);c)
++  ++a;
++}

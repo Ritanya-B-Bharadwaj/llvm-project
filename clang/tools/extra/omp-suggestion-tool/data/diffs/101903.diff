@@ -1,0 +1,117 @@
+diff --git a/clang/lib/CodeGen/CGOpenMPRuntime.cpp b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+index d869aa3322cce..de04b7997ca37 100644
+--- a/clang/lib/CodeGen/CGOpenMPRuntime.cpp
++++ b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+@@ -7125,6 +7125,9 @@ class MappableExprsHandler {
+     bool IsNonContiguous = CombinedInfo.NonContigInfo.IsNonContiguous;
+     bool IsPrevMemberReference = false;
+ 
++    bool IsPartialMapped =
++        !PartialStruct.PreliminaryMapData.BasePointers.empty();
++
+     // We need to check if we will be encountering any MEs. If we do not
+     // encounter any ME expression it means we will be mapping the whole struct.
+     // In that case we need to skip adding an entry for the struct to the
+@@ -7370,7 +7373,9 @@ class MappableExprsHandler {
+         // whole struct is currently being mapped. The struct needs to be added
+         // in the first position before any data internal to the struct is being
+         // mapped.
+-        if (!IsMemberPointerOrAddr ||
++        // Skip adding an entry in the CurInfo of this combined entry if the
++        // PartialStruct.PreliminaryMapData.BasePointers has been mapped.
++        if ((!IsMemberPointerOrAddr && !IsPartialMapped) ||
+             (Next == CE && MapType != OMPC_MAP_unknown)) {
+           if (!IsMappingWholeStruct) {
+             CombinedInfo.Exprs.emplace_back(MapDecl, MapExpr);
+@@ -7486,8 +7491,8 @@ class MappableExprsHandler {
+         // The pointer becomes the base for the next element.
+         if (Next != CE)
+           BP = IsMemberReference ? LowestElem : LB;
+-
+-        IsExpressionFirstInfo = false;
++        if (!IsPartialMapped)
++          IsExpressionFirstInfo = false;
+         IsCaptureFirstInfo = false;
+         FirstPointerInComplexData = false;
+         IsPrevMemberReference = IsMemberReference;
+@@ -8295,7 +8300,9 @@ class MappableExprsHandler {
+     // Map type is always TARGET_PARAM, if generate info for captures.
+     CombinedInfo.Types.push_back(
+         NotTargetParams ? OpenMPOffloadMappingFlags::OMP_MAP_NONE
+-                        : OpenMPOffloadMappingFlags::OMP_MAP_TARGET_PARAM);
++        : !PartialStruct.PreliminaryMapData.BasePointers.empty()
++            ? OpenMPOffloadMappingFlags::OMP_MAP_PTR_AND_OBJ
++            : OpenMPOffloadMappingFlags::OMP_MAP_TARGET_PARAM);
+     // If any element has the present modifier, then make sure the runtime
+     // doesn't attempt to allocate the struct.
+     if (CurTypes.end() !=
+@@ -9525,10 +9532,9 @@ static void genMapInfoForCaptures(
+     // individual members mapped. Emit an extra combined entry.
+     if (PartialStruct.Base.isValid()) {
+       CombinedInfo.append(PartialStruct.PreliminaryMapData);
+-      MEHandler.emitCombinedEntry(
+-          CombinedInfo, CurInfo.Types, PartialStruct, CI->capturesThis(),
+-          OMPBuilder, nullptr,
+-          !PartialStruct.PreliminaryMapData.BasePointers.empty());
++      MEHandler.emitCombinedEntry(CombinedInfo, CurInfo.Types, PartialStruct,
++                                  CI->capturesThis(), OMPBuilder, nullptr,
++                                  /*NotTargetParams*/ false);
+     }
+ 
+     // We need to append the results of this capture to what we already have.
+diff --git a/clang/test/OpenMP/target_map_pointer_defalut_mapper_codegen.cpp b/clang/test/OpenMP/target_map_pointer_defalut_mapper_codegen.cpp
+new file mode 100644
+index 0000000000000..6ab10c45beb25
+--- /dev/null
++++ b/clang/test/OpenMP/target_map_pointer_defalut_mapper_codegen.cpp
+@@ -0,0 +1,50 @@
++// RUN: %clang_cc1 -verify -fopenmp -fopenmp-targets=powerpc64le-ibm-linux-gnu -x c++ -triple powerpc64le-unknown-unknown -emit-llvm %s -o - | FileCheck %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-targets=powerpc64le-ibm-linux-gnu -x c++ -std=c++11 -triple powerpc64le-unknown-unknown -emit-pch -o %t %s
++// RUN: %clang_cc1 -fopenmp -fopenmp-targets=powerpc64le-ibm-linux-gnu -x c++ -triple powerpc64le-unknown-unknown -std=c++11 -include-pch %t -verify %s -emit-llvm -o - | FileCheck %s
++
++// expected-no-diagnostics
++#ifndef HEADER
++#define HEADER
++
++typedef struct {
++  int a;
++} C;
++#pragma omp declare mapper(C s) map(to : s.a)
++
++typedef struct {
++  int e;
++  C f;
++  int h;
++} D;
++
++D s;
++
++void foo() {
++  s.e = 111;
++  s.h = 10;
++  D *sp = &s;
++  D **spp = &sp;
++  D ***sppp = &spp;
++#pragma omp target map(tofrom : spp[0][0])
++  {
++    spp[0][0].e = 333;
++  }
++#pragma omp target map(tofrom : sp[0])
++  {
++    sp[0].e = 444;
++  }
++#pragma omp target map(tofrom : sppp[0][0][0])
++  {
++    sppp[0][0][0].e = 555;
++  }
++}
++#endif
++
++// CHECK: @.offload_sizes = private unnamed_addr constant [5 x i64] [i64 8, i64 0, i64 0, i64 0, i64 4]
++// CHECK-NOT: @.offload_sizes = private unnamed_addr constant [6 x i64] [i64 8, i64 0, i64 0, i64 0, i64 8, i64 4]
++// CHECK: @.offload_maptypes = private unnamed_addr constant [5 x i64] [i64 35, i64 16, i64 562949953421315, i64 562949953421315, i64 562949953421827]
++// CHECK-NOT: .offload_maptypes = private unnamed_addr constant  [6 x i64] [i64 35, i64 0, i64 562949953421315, i64 562949953421315, i64 562949953421827, i64 562949953421843]
++// CHECK: @.offload_sizes.1 = private unnamed_addr constant [4 x i64] [i64 0, i64 0, i64 0, i64 4]
++// CHECK: @.offload_maptypes.2 = private unnamed_addr constant [4 x i64] [i64 32, i64 281474976710659, i64 281474976710659, i64 281474976711171]
++// CHECK: @.offload_sizes.3 = private unnamed_addr constant [6 x i64] [i64 8, i64 8, i64 0, i64 0, i64 0, i64 4]
++// CHECK: @.offload_maptypes.4 = private unnamed_addr constant [6 x i64] [i64 35, i64 16, i64 16, i64 844424930131971, i64 844424930131971, i64 844424930132483]

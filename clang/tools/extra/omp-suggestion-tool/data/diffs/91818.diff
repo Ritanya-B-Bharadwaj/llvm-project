@@ -1,0 +1,158 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 24742826280ce..e150495d189c4 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -84,9 +84,9 @@ class OmpWorkshareBlockChecker {
+   parser::CharBlock source_;
+ };
+ 
+-class OmpCycleAndExitChecker {
++class AssociatedLoopChecker {
+ public:
+-  OmpCycleAndExitChecker(SemanticsContext &context, std::int64_t level)
++  AssociatedLoopChecker(SemanticsContext &context, std::int64_t level)
+       : context_{context}, level_{level} {}
+ 
+   template <typename T> bool Pre(const T &) { return true; }
+@@ -94,11 +94,24 @@ class OmpCycleAndExitChecker {
+ 
+   bool Pre(const parser::DoConstruct &dc) {
+     level_--;
+-    const auto &constructName{std::get<0>(std::get<0>(dc.t).statement.t)};
++    const auto &doStmt{
++        std::get<parser::Statement<parser::NonLabelDoStmt>>(dc.t)};
++    const auto &constructName{
++        std::get<std::optional<parser::Name>>(doStmt.statement.t)};
+     if (constructName) {
+       constructNamesAndLevels_.emplace(
+           constructName.value().ToString(), level_);
+     }
++    if (level_ >= 0) {
++      if (dc.IsDoWhile()) {
++        context_.Say(doStmt.source,
++            "The associated loop of a loop-associated directive cannot be a DO WHILE."_err_en_US);
++      }
++      if (!dc.GetLoopControl()) {
++        context_.Say(doStmt.source,
++            "The associated loop of a loop-associated directive cannot be a DO without control."_err_en_US);
++      }
++    }
+     return true;
+   }
+ 
+@@ -450,9 +463,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
+     const auto &doBlock{std::get<parser::Block>(doConstruct->t)};
+     CheckNoBranching(doBlock, beginDir.v, beginDir.source);
+   }
+-  CheckDoWhile(x);
+   CheckLoopItrVariableIsInt(x);
+-  CheckCycleConstraints(x);
++  CheckAssociatedLoopConstraints(x);
+   HasInvalidDistributeNesting(x);
+   if (CurrentDirectiveIsNested() &&
+       llvm::omp::topTeamsSet.test(GetContextParent().directive)) {
+@@ -478,21 +490,6 @@ void OmpStructureChecker::SetLoopInfo(const parser::OpenMPLoopConstruct &x) {
+     }
+   }
+ }
+-void OmpStructureChecker::CheckDoWhile(const parser::OpenMPLoopConstruct &x) {
+-  const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
+-  const auto &beginDir{std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
+-  if (beginDir.v == llvm::omp::Directive::OMPD_do) {
+-    if (const auto &doConstruct{
+-            std::get<std::optional<parser::DoConstruct>>(x.t)}) {
+-      if (doConstruct.value().IsDoWhile()) {
+-        const auto &doStmt{std::get<parser::Statement<parser::NonLabelDoStmt>>(
+-            doConstruct.value().t)};
+-        context_.Say(doStmt.source,
+-            "The DO loop cannot be a DO WHILE with DO directive."_err_en_US);
+-      }
+-    }
+-  }
+-}
+ 
+ void OmpStructureChecker::CheckLoopItrVariableIsInt(
+     const parser::OpenMPLoopConstruct &x) {
+@@ -647,8 +644,8 @@ std::int64_t OmpStructureChecker::GetOrdCollapseLevel(
+   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
+   const auto &clauseList{std::get<parser::OmpClauseList>(beginLoopDir.t)};
+   std::int64_t orderedCollapseLevel{1};
+-  std::int64_t orderedLevel{0};
+-  std::int64_t collapseLevel{0};
++  std::int64_t orderedLevel{1};
++  std::int64_t collapseLevel{1};
+ 
+   for (const auto &clause : clauseList.v) {
+     if (const auto *collapseClause{
+@@ -672,10 +669,10 @@ std::int64_t OmpStructureChecker::GetOrdCollapseLevel(
+   return orderedCollapseLevel;
+ }
+ 
+-void OmpStructureChecker::CheckCycleConstraints(
++void OmpStructureChecker::CheckAssociatedLoopConstraints(
+     const parser::OpenMPLoopConstruct &x) {
+   std::int64_t ordCollapseLevel{GetOrdCollapseLevel(x)};
+-  OmpCycleAndExitChecker checker{context_, ordCollapseLevel};
++  AssociatedLoopChecker checker{context_, ordCollapseLevel};
+   parser::Walk(x, checker);
+ }
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 47705771e8e28..2cc1a78068f54 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -186,7 +186,7 @@ class OmpStructureChecker
+ 
+   void CheckLoopItrVariableIsInt(const parser::OpenMPLoopConstruct &x);
+   void CheckDoWhile(const parser::OpenMPLoopConstruct &x);
+-  void CheckCycleConstraints(const parser::OpenMPLoopConstruct &x);
++  void CheckAssociatedLoopConstraints(const parser::OpenMPLoopConstruct &x);
+   template <typename T, typename D> bool IsOperatorValid(const T &, const D &);
+   void CheckAtomicMemoryOrderClause(
+       const parser::OmpAtomicClauseList *, const parser::OmpAtomicClauseList *);
+diff --git a/flang/test/Semantics/OpenMP/clause-validity01.f90 b/flang/test/Semantics/OpenMP/clause-validity01.f90
+index 22ac57065ffec..745895248ddf4 100644
+--- a/flang/test/Semantics/OpenMP/clause-validity01.f90
++++ b/flang/test/Semantics/OpenMP/clause-validity01.f90
+@@ -173,6 +173,7 @@
+   outer: do i=0, 10
+     inner: do j=1, 10
+       exit
++      !ERROR: EXIT statement terminates associated loop of an OpenMP DO construct
+       exit outer
+       !ERROR: EXIT to construct 'outofparallel' outside of PARALLEL construct is not allowed
+       !ERROR: EXIT to construct 'outofparallel' outside of DO construct is not allowed
+diff --git a/flang/test/Semantics/OpenMP/do-collapse.f90 b/flang/test/Semantics/OpenMP/do-collapse.f90
+index 145b7b75d28df..4f2512937ace4 100644
+--- a/flang/test/Semantics/OpenMP/do-collapse.f90
++++ b/flang/test/Semantics/OpenMP/do-collapse.f90
+@@ -26,6 +26,7 @@ program omp_doCollapse
+   !$omp parallel do collapse(2)
+     do i = 1, 3
+       !ERROR: Loop control is not present in the DO LOOP
++      !ERROR: The associated loop of a loop-associated directive cannot be a DO without control.
+       do
+       end do
+     end do
+diff --git a/flang/test/Semantics/OpenMP/do09.f90 b/flang/test/Semantics/OpenMP/do09.f90
+index af9f2e294ace9..624a11555f105 100644
+--- a/flang/test/Semantics/OpenMP/do09.f90
++++ b/flang/test/Semantics/OpenMP/do09.f90
+@@ -6,7 +6,7 @@
+ program omp_do
+   integer ::  i = 0,k
+   !$omp do
+-  !ERROR: The DO loop cannot be a DO WHILE with DO directive.
++  !ERROR: The associated loop of a loop-associated directive cannot be a DO WHILE.
+   do while (i <= 10)
+     print *, "it",i
+     i = i+1
+@@ -14,7 +14,7 @@ program omp_do
+   !$omp end do
+ 
+   !$omp do
+-  !ERROR: The DO loop cannot be a DO WHILE with DO directive.
++  !ERROR: The associated loop of a loop-associated directive cannot be a DO WHILE.
+   do while (i <= 10)
+     do while (j <= 10)
+       print *, "it",k

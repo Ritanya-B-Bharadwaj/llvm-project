@@ -1,0 +1,54 @@
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 4d2d352f7520b..dae3aa1216617 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1870,6 +1870,9 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+     //    call @__kmpc_omp_task(...)
+     //    br label %exit
+     //  else:
++    //    ;; Wait for resolution of dependencies, if any, before
++    //    ;; beginning the task
++    //    call @__kmpc_omp_wait_deps(...)
+     //    call @__kmpc_omp_task_begin_if0(...)
+     //    call @outlined_fn(...)
+     //    call @__kmpc_omp_task_complete_if0(...)
+@@ -1887,6 +1890,16 @@ OpenMPIRBuilder::createTask(const LocationDescription &Loc,
+       SplitBlockAndInsertIfThenElse(IfCondition, IfTerminator, &ThenTI,
+                                     &ElseTI);
+       Builder.SetInsertPoint(ElseTI);
++
++      if (Dependencies.size()) {
++        Function *TaskWaitFn =
++            getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_wait_deps);
++        Builder.CreateCall(
++            TaskWaitFn,
++            {Ident, ThreadID, Builder.getInt32(Dependencies.size()), DepArray,
++             ConstantInt::get(Builder.getInt32Ty(), 0),
++             ConstantPointerNull::get(PointerType::getUnqual(M.getContext()))});
++      }
+       Function *TaskBeginFn =
+           getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_task_begin_if0);
+       Function *TaskCompleteFn =
+diff --git a/mlir/test/Target/LLVMIR/omptask_if_false.mlir b/mlir/test/Target/LLVMIR/omptask_if_false.mlir
+new file mode 100644
+index 0000000000000..c6014a76add6d
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptask_if_false.mlir
+@@ -0,0 +1,17 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++llvm.func @foo_(%arg0: !llvm.ptr {fir.bindc_name = "n"}, %arg1: !llvm.ptr {fir.bindc_name = "r"}) attributes {fir.internal_name = "_QPfoo"} {
++  %0 = llvm.mlir.constant(false) : i1
++  omp.task if(%0) depend(taskdependin -> %arg0 : !llvm.ptr) {
++    %1 = llvm.load %arg0 : !llvm.ptr -> i32
++    llvm.store %1, %arg1 : i32, !llvm.ptr
++    omp.terminator
++  }
++  llvm.return
++}
++
++// CHECK: call void @__kmpc_omp_wait_deps
++// CHECK-NEXT: call void @__kmpc_omp_task_begin_if0
++// CHECK-NEXT: call void @foo_..omp_par
++// CHECK-NEXT: call void @__kmpc_omp_task_complete_if0
++

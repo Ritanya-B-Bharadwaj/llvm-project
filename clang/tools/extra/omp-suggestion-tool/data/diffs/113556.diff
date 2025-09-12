@@ -1,0 +1,525 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index a0da3db124d1f..a4cd81ac226b8 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -939,7 +939,7 @@ def MapInfoOp : OpenMP_Op<"map.info", [AttrSizedOperandSegments]> {
+                        TypeAttr:$var_type,
+                        Optional<OpenMP_PointerLikeType>:$var_ptr_ptr,
+                        Variadic<OpenMP_PointerLikeType>:$members,
+-                       OptionalAttr<AnyIntElementsAttr>:$members_index,
++                       OptionalAttr<IndexListArrayAttr>:$members_index,
+                        Variadic<OpenMP_MapBoundsType>:$bounds, /* rank-0 to rank-{n-1} */
+                        OptionalAttr<UI64Attr>:$map_type,
+                        OptionalAttr<VariableCaptureKindAttr>:$map_capture_type,
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index a1de0831653e6..8561fbc20fa32 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1395,16 +1395,15 @@ static void printMapClause(OpAsmPrinter &p, Operation *op,
+ }
+ 
+ static ParseResult parseMembersIndex(OpAsmParser &parser,
+-                                     DenseIntElementsAttr &membersIdx) {
+-  SmallVector<APInt> values;
+-  int64_t value;
+-  int64_t shape[2] = {0, 0};
+-  unsigned shapeTmp = 0;
++                                     ArrayAttr &membersIdx) {
++  SmallVector<Attribute> values, memberIdxs;
++
+   auto parseIndices = [&]() -> ParseResult {
++    int64_t value;
+     if (parser.parseInteger(value))
+       return failure();
+-    shapeTmp++;
+-    values.push_back(APInt(32, value, /*isSigned=*/true));
++    values.push_back(IntegerAttr::get(parser.getBuilder().getIntegerType(64),
++                                      APInt(64, value, /*isSigned=*/false)));
+     return success();
+   };
+ 
+@@ -1418,52 +1417,29 @@ static ParseResult parseMembersIndex(OpAsmParser &parser,
+     if (failed(parser.parseRSquare()))
+       return failure();
+ 
+-    // Only set once, if any indices are not the same size
+-    // we error out in the next check as that's unsupported
+-    if (shape[1] == 0)
+-      shape[1] = shapeTmp;
+-
+-    // Verify that the recently parsed list is equal to the
+-    // first one we parsed, they must be equal lengths to
+-    // keep the rectangular shape DenseIntElementsAttr
+-    // requires
+-    if (shapeTmp != shape[1])
+-      return failure();
+-
+-    shapeTmp = 0;
+-    shape[0]++;
++    memberIdxs.push_back(ArrayAttr::get(parser.getContext(), values));
++    values.clear();
+   } while (succeeded(parser.parseOptionalComma()));
+ 
+-  if (!values.empty()) {
+-    ShapedType valueType =
+-        VectorType::get(shape, IntegerType::get(parser.getContext(), 32));
+-    membersIdx = DenseIntElementsAttr::get(valueType, values);
+-  }
++  if (!memberIdxs.empty())
++    membersIdx = ArrayAttr::get(parser.getContext(), memberIdxs);
+ 
+   return success();
+ }
+ 
+ static void printMembersIndex(OpAsmPrinter &p, MapInfoOp op,
+-                              DenseIntElementsAttr membersIdx) {
+-  llvm::ArrayRef<int64_t> shape = membersIdx.getShapedType().getShape();
+-  assert(shape.size() <= 2);
+-
++                              ArrayAttr membersIdx) {
+   if (!membersIdx)
+     return;
+ 
+-  for (int i = 0; i < shape[0]; ++i) {
++  llvm::interleaveComma(membersIdx, p, [&p](Attribute v) {
+     p << "[";
+-    int rowOffset = i * shape[1];
+-    for (int j = 0; j < shape[1]; ++j) {
+-      p << membersIdx.getValues<int32_t>()[rowOffset + j];
+-      if ((j + 1) < shape[1])
+-        p << ",";
+-    }
++    auto memberIdx = cast<ArrayAttr>(v);
++    llvm::interleaveComma(memberIdx.getValue(), p, [&p](Attribute v2) {
++      p << cast<IntegerAttr>(v2).getInt();
++    });
+     p << "]";
+-
+-    if ((i + 1) < shape[0])
+-      p << ", ";
+-  }
++  });
+ }
+ 
+ static void printCaptureType(OpAsmPrinter &p, Operation *op,
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 5bf99535295c4..a39b27aa9e12d 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -2878,46 +2878,36 @@ static int getMapDataMemberIdx(MapInfoData &mapData, omp::MapInfoOp memberOp) {
+ 
+ static omp::MapInfoOp getFirstOrLastMappedMemberPtr(omp::MapInfoOp mapInfo,
+                                                     bool first) {
+-  DenseIntElementsAttr indexAttr = mapInfo.getMembersIndexAttr();
+-
++  ArrayAttr indexAttr = mapInfo.getMembersIndexAttr();
+   // Only 1 member has been mapped, we can return it.
+   if (indexAttr.size() == 1)
+-    if (auto mapOp =
+-            dyn_cast<omp::MapInfoOp>(mapInfo.getMembers()[0].getDefiningOp()))
+-      return mapOp;
++    return cast<omp::MapInfoOp>(mapInfo.getMembers()[0].getDefiningOp());
+ 
+-  llvm::ArrayRef<int64_t> shape = indexAttr.getShapedType().getShape();
+-  llvm::SmallVector<size_t> indices(shape[0]);
++  llvm::SmallVector<size_t> indices(indexAttr.size());
+   std::iota(indices.begin(), indices.end(), 0);
+ 
+   llvm::sort(indices.begin(), indices.end(),
+              [&](const size_t a, const size_t b) {
+-               auto indexValues = indexAttr.getValues<int32_t>();
+-               for (int i = 0; i < shape[1]; ++i) {
+-                 int aIndex = indexValues[a * shape[1] + i];
+-                 int bIndex = indexValues[b * shape[1] + i];
++               auto memberIndicesA = cast<ArrayAttr>(indexAttr[a]);
++               auto memberIndicesB = cast<ArrayAttr>(indexAttr[b]);
++               for (const auto it : llvm::zip(memberIndicesA, memberIndicesB)) {
++                 int64_t aIndex = cast<IntegerAttr>(std::get<0>(it)).getInt();
++                 int64_t bIndex = cast<IntegerAttr>(std::get<1>(it)).getInt();
+ 
+                  if (aIndex == bIndex)
+                    continue;
+ 
+-                 if (aIndex != -1 && bIndex == -1)
+-                   return false;
+-
+-                 if (aIndex == -1 && bIndex != -1)
+-                   return true;
+-
+-                 // A is earlier in the record type layout than B
+                  if (aIndex < bIndex)
+                    return first;
+ 
+-                 if (bIndex < aIndex)
++                 if (aIndex > bIndex)
+                    return !first;
+                }
+ 
+-               // Iterated the entire list and couldn't make a decision, all
+-               // elements were likely the same. Return false, since the sort
+-               // comparator should return false for equal elements.
+-               return false;
++               // Iterated the up until the end of the smallest member and
++               // they were found to be equal up to that point, so select
++               // the member with the lowest index count, so the "parent"
++               return memberIndicesA.size() < memberIndicesB.size();
+              });
+ 
+   return llvm::cast<omp::MapInfoOp>(
+@@ -3088,17 +3078,8 @@ static llvm::omp::OpenMPOffloadMappingFlags mapParentWithMembers(
+       /*isSigned=*/false);
+   combinedInfo.Sizes.push_back(size);
+ 
+-  // TODO: This will need to be expanded to include the whole host of logic for
+-  // the map flags that Clang currently supports (e.g. it should take the map
+-  // flag of the parent map flag, remove the OMP_MAP_TARGET_PARAM and do some
+-  // further case specific flag modifications). For the moment, it handles what
+-  // we support as expected.
+-  llvm::omp::OpenMPOffloadMappingFlags mapFlag =
+-      llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
+-
+   llvm::omp::OpenMPOffloadMappingFlags memberOfFlag =
+       ompBuilder.getMemberOfFlag(combinedInfo.BasePointers.size() - 1);
+-  ompBuilder.setCorrectMemberOfFlag(mapFlag, memberOfFlag);
+ 
+   // This creates the initial MEMBER_OF mapping that consists of
+   // the parent/top level container (same as above effectively, except
+@@ -3107,6 +3088,12 @@ static llvm::omp::OpenMPOffloadMappingFlags mapParentWithMembers(
+   // only relevant if the structure in its totality is being mapped,
+   // otherwise the above suffices.
+   if (!parentClause.getPartialMap()) {
++    // TODO: This will need to be expanded to include the whole host of logic
++    // for the map flags that Clang currently supports (e.g. it should do some
++    // further case specific flag modifications). For the moment, it handles
++    // what we support as expected.
++    llvm::omp::OpenMPOffloadMappingFlags mapFlag = mapData.Types[mapDataIndex];
++    ompBuilder.setCorrectMemberOfFlag(mapFlag, memberOfFlag);
+     combinedInfo.Types.emplace_back(mapFlag);
+     combinedInfo.DevicePointers.emplace_back(
+         llvm::OpenMPIRBuilder::DeviceInfoTy::None);
+@@ -3157,6 +3144,31 @@ static void processMapMembersWithParent(
+ 
+     assert(memberDataIdx >= 0 && "could not find mapped member of structure");
+ 
++    // If we're currently mapping a pointer to a block of data, we must
++    // initially map the pointer, and then attatch/bind the data with a
++    // subsequent map to the pointer. This segment of code generates the
++    // pointer mapping, which can in certain cases be optimised out as Clang
++    // currently does in its lowering. However, for the moment we do not do so,
++    // in part as we currently have substantially less information on the data
++    // being mapped at this stage.
++    if (checkIfPointerMap(memberClause)) {
++      auto mapFlag = llvm::omp::OpenMPOffloadMappingFlags(
++          memberClause.getMapType().value());
++      mapFlag &= ~llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TARGET_PARAM;
++      mapFlag |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_MEMBER_OF;
++      ompBuilder.setCorrectMemberOfFlag(mapFlag, memberOfFlag);
++      combinedInfo.Types.emplace_back(mapFlag);
++      combinedInfo.DevicePointers.emplace_back(
++          llvm::OpenMPIRBuilder::DeviceInfoTy::None);
++      combinedInfo.Names.emplace_back(
++          LLVM::createMappingInformation(memberClause.getLoc(), ompBuilder));
++      combinedInfo.BasePointers.emplace_back(
++          mapData.BasePointers[mapDataIndex]);
++      combinedInfo.Pointers.emplace_back(mapData.BasePointers[memberDataIdx]);
++      combinedInfo.Sizes.emplace_back(builder.getInt64(
++          moduleTranslation.getLLVMModule()->getDataLayout().getPointerSize()));
++    }
++
+     // Same MemberOfFlag to indicate its link with parent and other members
+     // of.
+     auto mapFlag =
+@@ -3172,7 +3184,10 @@ static void processMapMembersWithParent(
+         mapData.DevicePointers[memberDataIdx]);
+     combinedInfo.Names.emplace_back(
+         LLVM::createMappingInformation(memberClause.getLoc(), ompBuilder));
+-    combinedInfo.BasePointers.emplace_back(mapData.BasePointers[mapDataIndex]);
++    uint64_t basePointerIndex =
++        checkIfPointerMap(memberClause) ? memberDataIdx : mapDataIndex;
++    combinedInfo.BasePointers.emplace_back(
++        mapData.BasePointers[basePointerIndex]);
+     combinedInfo.Pointers.emplace_back(mapData.Pointers[memberDataIdx]);
+     combinedInfo.Sizes.emplace_back(mapData.Sizes[memberDataIdx]);
+   }
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 4f5cc696cada8..69c53d1f77e84 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -2633,8 +2633,8 @@ func.func @omp_map_with_members(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm
+   // CHECK: %[[MAP4:.*]] = omp.map.info var_ptr(%[[ARG4]] : !llvm.ptr, f32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+   %mapv5 = omp.map.info var_ptr(%arg4 : !llvm.ptr, f32) map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+ 
+-  // CHECK: %[[MAP5:.*]] = omp.map.info var_ptr(%[[ARG5]] : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%[[MAP3]], %[[MAP4]] : [1,0], [1,1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
+-  %mapv6 = omp.map.info var_ptr(%arg5 : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%mapv4, %mapv5 : [1,0], [1,1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
++  // CHECK: %[[MAP5:.*]] = omp.map.info var_ptr(%[[ARG5]] : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%[[MAP3]], %[[MAP4]] : [1, 0], [1, 1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
++  %mapv6 = omp.map.info var_ptr(%arg5 : !llvm.ptr, !llvm.struct<(i32, struct<(i32, f32)>)>) map_clauses(from) capture(ByRef) members(%mapv4, %mapv5 : [1, 0], [1, 1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "", partial_map = true}
+ 
+   // CHECK: omp.target_exit_data map_entries(%[[MAP3]], %[[MAP4]], %[[MAP5]] : !llvm.ptr, !llvm.ptr, !llvm.ptr)
+   omp.target_exit_data map_entries(%mapv4, %mapv5, %mapv6 : !llvm.ptr, !llvm.ptr, !llvm.ptr){}
+diff --git a/mlir/test/Target/LLVMIR/omptarget-nested-ptr-record-type-mapping-host.mlir b/mlir/test/Target/LLVMIR/omptarget-nested-ptr-record-type-mapping-host.mlir
+new file mode 100644
+index 0000000000000..5d772a13fe578
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-nested-ptr-record-type-mapping-host.mlir
+@@ -0,0 +1,66 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// This test checks the offload sizes, map types and base pointers and pointers
++// provided to the OpenMP kernel argument structure are correct when lowering
++// to LLVM-IR from MLIR when performing explicit member mapping of a record type
++// that includes records with pointer members in various locations of the record
++// types hierarchy.
++
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
++  llvm.func @omp_nested_derived_type_alloca_map(%arg0: !llvm.ptr) {
++    %0 = llvm.mlir.constant(4 : index) : i64
++    %1 = llvm.mlir.constant(1 : index) : i64
++    %2 = llvm.mlir.constant(2 : index) : i64
++    %3 = llvm.mlir.constant(0 : index) : i64
++    %4 = llvm.mlir.constant(6 : index) : i64
++    %5 = omp.map.bounds lower_bound(%3 : i64) upper_bound(%0 : i64) extent(%0 : i64) stride(%1 : i64) start_idx(%3 : i64) {stride_in_bytes = true}
++    %6 = llvm.getelementptr %arg0[0, 6] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(f32, struct<(ptr, i64, i32, i8, i8, i8, i8)>, array<10 x i32>, f32, struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>, i32, struct<(f32, array<10 x i32>, struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>, i32)>)>
++    %7 = llvm.getelementptr %6[0, 2] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(f32, array<10 x i32>, struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>, i32)>
++    %8 = llvm.getelementptr %7[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++    %9 = omp.map.info var_ptr(%7 : !llvm.ptr, i32) var_ptr_ptr(%8 : !llvm.ptr) map_clauses(tofrom) capture(ByRef) bounds(%5) -> !llvm.ptr {name = ""}
++    %10 = omp.map.info var_ptr(%7 : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "one_l%nest%array_k"}
++    %11 = omp.map.info var_ptr(%arg0 : !llvm.ptr, !llvm.struct<(f32, struct<(ptr, i64, i32, i8, i8, i8, i8)>, array<10 x i32>, f32, struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>, i32, struct<(f32, array<10 x i32>, struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>, i32)>)>) map_clauses(tofrom) capture(ByRef) members(%10, %9 : [6,2], [6,2,0] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "one_l", partial_map = true}
++    omp.target map_entries(%10 -> %arg1, %9 -> %arg2, %11 -> %arg3 : !llvm.ptr, !llvm.ptr, !llvm.ptr) {
++      omp.terminator
++    }
++    llvm.return
++  }
++}
++
++// CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [4 x i64] [i64 0, i64 48, i64 8, i64 20]
++// CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [4 x i64] [i64 32, i64 281474976710659, i64 281474976710659, i64 281474976710675]
++
++// CHECK: define void @omp_nested_derived_type_alloca_map(ptr %[[ARG:.*]]) {
++
++// CHECK: %[[NESTED_DTYPE_MEMBER_GEP:.*]] = getelementptr { float, { ptr, i64, i32, i8, i8, i8, i8 }, [10 x i32], float, { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i32, { float, [10 x i32], { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i32 } }, ptr %[[ARG]], i32 0, i32 6
++// CHECK: %[[NESTED_STRUCT_PTR_MEMBER_GEP:.*]] = getelementptr { float, [10 x i32], { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, i32 }, ptr %[[NESTED_DTYPE_MEMBER_GEP]], i32 0, i32 2
++// CHECK: %[[NESTED_STRUCT_PTR_MEMBER_BADDR_GEP:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[NESTED_STRUCT_PTR_MEMBER_GEP]], i32 0, i32 0
++// CHECK: %[[NESTED_STRUCT_PTR_MEMBER_BADDR_LOAD:.*]] = load ptr, ptr %[[NESTED_STRUCT_PTR_MEMBER_BADDR_GEP]], align 8
++// CHECK: %[[ARR_OFFSET:.*]] = getelementptr inbounds i32, ptr %[[NESTED_STRUCT_PTR_MEMBER_BADDR_LOAD]], i64 0
++// CHECK: %[[DTYPE_SIZE_SEGMENT_CALC_1:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr %[[NESTED_STRUCT_PTR_MEMBER_GEP]], i64 1
++// CHECK: %[[DTYPE_SIZE_SEGMENT_CALC_2:.*]] = ptrtoint ptr %[[DTYPE_SIZE_SEGMENT_CALC_1]] to i64
++// CHECK: %[[DTYPE_SIZE_SEGMENT_CALC_3:.*]] = ptrtoint ptr %[[NESTED_STRUCT_PTR_MEMBER_GEP]] to i64
++// CHECK: %[[DTYPE_SIZE_SEGMENT_CALC_4:.*]] = sub i64 %[[DTYPE_SIZE_SEGMENT_CALC_2]], %[[DTYPE_SIZE_SEGMENT_CALC_3]]
++// CHECK: %[[DTYPE_SIZE_SEGMENT_CALC_5:.*]] = sdiv exact i64 %[[DTYPE_SIZE_SEGMENT_CALC_4]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
++
++// CHECK:  %[[BASE_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++// CHECK:  store ptr %[[ARG]], ptr %[[BASE_PTRS]], align 8
++// CHECK:  %[[OFFLOAD_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++// CHECK:  store ptr %[[NESTED_STRUCT_PTR_MEMBER_GEP]], ptr %[[OFFLOAD_PTRS]], align 8
++// CHECK:  %[[OFFLOAD_SIZES:.*]] = getelementptr inbounds [4 x i64], ptr %.offload_sizes, i32 0, i32 0
++// CHECK:  store i64 %[[DTYPE_SIZE_SEGMENT_CALC_5]], ptr %[[OFFLOAD_SIZES]], align 8
++
++// CHECK:  %[[BASE_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++// CHECK:  store ptr %[[ARG]], ptr %[[BASE_PTRS]], align 8
++// CHECK:  %[[OFFLOAD_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++// CHECK:  store ptr %[[NESTED_STRUCT_PTR_MEMBER_GEP]], ptr %[[OFFLOAD_PTRS]], align 8
++
++// CHECK:  %[[BASE_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_baseptrs, i32 0, i32 2
++// CHECK:  store ptr %[[ARG]], ptr %[[BASE_PTRS]], align 8
++// CHECK:  %[[OFFLOAD_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_ptrs, i32 0, i32 2
++// CHECK:  store ptr %[[NESTED_STRUCT_PTR_MEMBER_BADDR_GEP]], ptr %[[OFFLOAD_PTRS]], align 8
++
++// CHECK:  %[[BASE_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_baseptrs, i32 0, i32 3
++// CHECK:  store ptr %[[NESTED_STRUCT_PTR_MEMBER_BADDR_GEP]], ptr %[[BASE_PTRS]], align 8
++// CHECK:  %[[OFFLOAD_PTRS:.*]] = getelementptr inbounds [4 x ptr], ptr %.offload_ptrs, i32 0, i32 3
++// CHECK:  store ptr %[[ARR_OFFSET]], ptr %[[OFFLOAD_PTRS]], align 8
+diff --git a/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir b/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
+index 8c1182c839a25..8837b42f70a44 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
+@@ -21,7 +21,7 @@ llvm.func @_QQmain() {
+     %9 = llvm.getelementptr %4[0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(f32, array<10 x i32>, struct<(f32, i32)>, i32)>
+     %10 = omp.map.bounds lower_bound(%2 : i64) upper_bound(%1 : i64) extent(%0 : i64) stride(%2 : i64) start_idx(%2 : i64)
+     %11 = omp.map.info var_ptr(%9 : !llvm.ptr, !llvm.array<10 x i32>) map_clauses(tofrom) capture(ByRef) bounds(%10) -> !llvm.ptr
+-    %12 = omp.map.info var_ptr(%4 : !llvm.ptr, !llvm.struct<(f32, array<10 x i32>, struct<(f32, i32)>, i32)>) map_clauses(tofrom) capture(ByRef) members(%6, %8, %11 : [3, -1], [2, 1], [1, -1] : !llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr {partial_map = true}
++    %12 = omp.map.info var_ptr(%4 : !llvm.ptr, !llvm.struct<(f32, array<10 x i32>, struct<(f32, i32)>, i32)>) map_clauses(tofrom) capture(ByRef) members(%6, %8, %11 : [3], [2, 1], [1] : !llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.ptr {partial_map = true}
+     omp.target map_entries(%6 -> %arg0, %8 -> %arg1, %11 -> %arg2, %12 -> %arg3 : !llvm.ptr, !llvm.ptr, !llvm.ptr, !llvm.ptr) {
+       omp.terminator
+     }
+diff --git a/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir b/mlir/test/Target/LLVMIR/omptarget-record-type-with-ptr-member-host.mlir
+similarity index 58%
+rename from mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir
+rename to mlir/test/Target/LLVMIR/omptarget-record-type-with-ptr-member-host.mlir
+index 6fe77bd228ef2..d5ca33fb38f38 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-record-type-with-ptr-member-host.mlir
+@@ -1,20 +1,20 @@
+ // RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
+ 
+ // This test checks the offload sizes, map types and base pointers and pointers
+-// provided to the OpenMP kernel argument structure are correct when lowering 
+-// to LLVM-IR from MLIR when a fortran allocatable descriptor type is provided 
+-// alongside the omp.map.info, the test utilises mapping of array sections, 
++// provided to the OpenMP kernel argument structure are correct when lowering
++// to LLVM-IR from MLIR when a structure with a pointer member type is provided
++// alongside the omp.map.info, the test utilises mapping of array sections,
+ // full arrays and individual allocated scalars.
+ 
+ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+-  llvm.func @_QQmain() {
++  llvm.func @main() {
+     %0 = llvm.mlir.constant(5 : index) : i64
+     %1 = llvm.mlir.constant(2 : index) : i64
+     %2 = llvm.mlir.constant(1 : index) : i64
+-    %3 = llvm.mlir.addressof @_QFEfull_arr : !llvm.ptr
++    %3 = llvm.mlir.addressof @full_arr : !llvm.ptr
+     %4 = llvm.mlir.constant(1 : i64) : i64
+-    %5 = llvm.alloca %4 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> {bindc_name = "scalar"} : (i64) -> !llvm.ptr
+-    %6 = llvm.mlir.addressof @_QFEsect_arr : !llvm.ptr
++    %5 = llvm.alloca %4 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)> : (i64) -> !llvm.ptr
++    %6 = llvm.mlir.addressof @sect_arr : !llvm.ptr
+     %7 = llvm.mlir.constant(0 : i64) : i64
+     %8 = llvm.getelementptr %3[0, 7, %7, 0] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
+     %9 = llvm.load %8 : !llvm.ptr -> i64
+@@ -47,11 +47,11 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
+     }
+     llvm.return
+   }
+-  llvm.mlir.global internal @_QFEfull_arr() {addr_space = 0 : i32} : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {
++  llvm.mlir.global internal @full_arr() {addr_space = 0 : i32} : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {
+     %0 = llvm.mlir.undef : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
+     llvm.return %0 : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
+   }
+-  llvm.mlir.global internal @_QFEsect_arr() {addr_space = 0 : i32} : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {
++  llvm.mlir.global internal @sect_arr() {addr_space = 0 : i32} : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {
+     %0 = llvm.mlir.undef : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
+     llvm.return %0 : !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
+   }
+@@ -59,11 +59,11 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
+ 
+ // CHECK: @[[FULL_ARR_GLOB:.*]] = internal global { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] } undef
+ // CHECK: @[[ARR_SECT_GLOB:.*]] = internal global { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] } undef
+-// CHECK: @.offload_sizes = private unnamed_addr constant [9 x i64] [i64 0, i64 48, i64 0, i64 0, i64 48, i64 0, i64 0, i64 24, i64 4]
+-// CHECK: @.offload_maptypes = private unnamed_addr constant [9 x i64] [i64 32, i64 281474976710657, i64 281474976710675, i64 32, i64 1125899906842625, i64 1125899906842643, i64 32, i64 1970324836974593, i64 1970324836974611]
+-// CHECK: @.offload_mapnames = private constant [9 x ptr] [ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}]
++// CHECK: @.offload_sizes = private unnamed_addr constant [12 x i64] [i64 0, i64 48, i64 8, i64 0, i64 0, i64 48, i64 8, i64 0, i64 0, i64 24, i64 8, i64 4]
++// CHECK: @.offload_maptypes = private unnamed_addr constant [12 x i64] [i64 32, i64 281474976710659, i64 281474976710659, i64 281474976710675, i64 32, i64 1407374883553283, i64 1407374883553283, i64 1407374883553299, i64 32, i64 2533274790395907, i64 2533274790395907, i64 2533274790395923]
++// CHECK: @.offload_mapnames = private constant [12 x ptr] [ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}]
+ 
+-// CHECK: define void @_QQmain()
++// CHECK: define void @main()
+ // CHECK: %[[SCALAR_ALLOCA:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1, align 8
+ // CHECK: %[[FULL_ARR_SIZE5:.*]] = load i64, ptr getelementptr ({ ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @[[FULL_ARR_GLOB]], i32 0, i32 7, i64 0, i32 1), align 4
+ // CHECK: %[[FULL_ARR_SIZE4:.*]] = sub i64 %[[FULL_ARR_SIZE5]], 1
+@@ -79,67 +79,77 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
+ // CHECK: %[[ARR_SECT_SIZE2:.*]] = add i64 %[[ARR_SECT_SIZE3]], 1
+ // CHECK: %[[ARR_SECT_SIZE1:.*]] = mul i64 1, %[[ARR_SECT_SIZE2]]
+ // CHECK: %[[ARR_SECT_SIZE:.*]] = mul i64 %[[ARR_SECT_SIZE1]], 4
+-// CHECK: %[[LFULL_ARR:.*]] = load ptr, ptr @_QFEfull_arr, align 8
++// CHECK: %[[LFULL_ARR:.*]] = load ptr, ptr @full_arr, align 8
+ // CHECK: %[[FULL_ARR_PTR:.*]] = getelementptr inbounds float, ptr %[[LFULL_ARR]], i64 0
+ // CHECK: %[[ARR_SECT_OFFSET1:.*]] = mul i64 %[[ARR_SECT_OFFSET2]], 1
+-// CHECK: %[[LARR_SECT:.*]] = load ptr, ptr @_QFEsect_arr, align 8
++// CHECK: %[[LARR_SECT:.*]] = load ptr, ptr @sect_arr, align 8
+ // CHECK: %[[ARR_SECT_PTR:.*]] = getelementptr inbounds i32, ptr %[[LARR_SECT]], i64 %[[ARR_SECT_OFFSET1]]
+ // CHECK: %[[SCALAR_PTR_LOAD:.*]] = load ptr, ptr %[[SCALAR_BASE]], align 8
+-// CHECK: %[[FULL_ARR_DESC_SIZE:.*]] = sdiv exact i64 sub (i64 ptrtoint (ptr getelementptr ({ ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @_QFEfull_arr, i32 1) to i64), i64 ptrtoint (ptr @_QFEfull_arr to i64)), ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
+-// CHECK: %[[ARR_SECT_DESC_SIZE:.*]] = sdiv exact i64 sub (i64 ptrtoint (ptr getelementptr ({ ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @_QFEsect_arr, i32 1) to i64), i64 ptrtoint (ptr @_QFEsect_arr to i64)), ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
++// CHECK: %[[FULL_ARR_DESC_SIZE:.*]] = sdiv exact i64 sub (i64 ptrtoint (ptr getelementptr ({ ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @full_arr, i32 1) to i64), i64 ptrtoint (ptr @full_arr to i64)), ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
++// CHECK: %[[ARR_SECT_DESC_SIZE:.*]] = sdiv exact i64 sub (i64 ptrtoint (ptr getelementptr ({ ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @sect_arr, i32 1) to i64), i64 ptrtoint (ptr @sect_arr to i64)), ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
+ // CHECK: %[[SCALAR_DESC_SZ4:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8 }, ptr %[[SCALAR_ALLOCA]], i32 1
+ // CHECK: %[[SCALAR_DESC_SZ3:.*]] = ptrtoint ptr %[[SCALAR_DESC_SZ4]] to i64
+ // CHECK: %[[SCALAR_DESC_SZ2:.*]] = ptrtoint ptr %[[SCALAR_ALLOCA]] to i64
+ // CHECK: %[[SCALAR_DESC_SZ1:.*]] = sub i64 %[[SCALAR_DESC_SZ3]], %[[SCALAR_DESC_SZ2]]
+ // CHECK: %[[SCALAR_DESC_SZ:.*]] = sdiv exact i64 %[[SCALAR_DESC_SZ1]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
+ 
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
+-// CHECK: store ptr @_QFEfull_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 0
+-// CHECK: store ptr @_QFEfull_arr, ptr %[[OFFLOADPTRS]], align 8
+-
+-// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [9 x i64], ptr %.offload_sizes, i32 0, i32 0
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [12 x i64], ptr %.offload_sizes, i32 0, i32 0
+ // CHECK: store i64 %[[FULL_ARR_DESC_SIZE]], ptr %[[OFFLOADSIZES]], align 8
+-
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
+-// CHECK: store ptr @_QFEfull_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 1
+-// CHECK: store ptr @_QFEfull_arr, ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 2
+-// CHECK: store ptr @_QFEfull_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 2
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 2
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 2
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 3
++// CHECK: store ptr @full_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 3
+ // CHECK: store ptr %[[FULL_ARR_PTR]], ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [9 x i64], ptr %.offload_sizes, i32 0, i32 2
++// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [12 x i64], ptr %.offload_sizes, i32 0, i32 3
+ // CHECK: store i64 %[[FULL_ARR_SIZE]], ptr %[[OFFLOADSIZES]], align 8
+ 
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 3
+-// CHECK: store ptr @_QFEsect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 3
+-// CHECK: store ptr @_QFEsect_arr, ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [9 x i64], ptr %.offload_sizes, i32 0, i32 3
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 4
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 4
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [12 x i64], ptr %.offload_sizes, i32 0, i32 4
+ // CHECK: store i64 %[[ARR_SECT_DESC_SIZE]], ptr %[[OFFLOADSIZES]], align 8
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 4
+-// CHECK: store ptr @_QFEsect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 4
+-// CHECK: store ptr @_QFEsect_arr, ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 5
+-// CHECK: store ptr @_QFEsect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 5
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 5
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 5
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 6
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 6
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 7
++// CHECK: store ptr @sect_arr, ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 7
+ // CHECK: store ptr %[[ARR_SECT_PTR]], ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [9 x i64], ptr %.offload_sizes, i32 0, i32 5
++// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [12 x i64], ptr %.offload_sizes, i32 0, i32 7
+ // CHECK: store i64 %[[ARR_SECT_SIZE]], ptr %[[OFFLOADSIZES]], align 8
+ 
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 6
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 8
+ // CHECK: store ptr %[[SCALAR_ALLOCA]], ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 6
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 8
+ // CHECK: store ptr %[[SCALAR_ALLOCA]], ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [9 x i64], ptr %.offload_sizes, i32 0, i32 6
++// CHECK: %[[OFFLOADSIZES:.*]] = getelementptr inbounds [12 x i64], ptr %.offload_sizes, i32 0, i32 8
+ // CHECK: store i64 %[[SCALAR_DESC_SZ]], ptr %[[OFFLOADSIZES]], align 8
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 7
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 9
+ // CHECK: store ptr %[[SCALAR_ALLOCA]], ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 7
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 9
+ // CHECK: store ptr %[[SCALAR_ALLOCA]], ptr %[[OFFLOADPTRS]], align 8
+-// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_baseptrs, i32 0, i32 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 10
+ // CHECK: store ptr %[[SCALAR_ALLOCA]], ptr %[[OFFLOADBASEPTRS]], align 8
+-// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [9 x ptr], ptr %.offload_ptrs, i32 0, i32 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 10
++// CHECK: store ptr %[[SCALAR_BASE]], ptr %[[OFFLOADPTRS]], align 8
++// CHECK: %[[OFFLOADBASEPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_baseptrs, i32 0, i32 11
++// CHECK: store ptr %[[SCALAR_BASE]], ptr %[[OFFLOADBASEPTRS]], align 8
++// CHECK: %[[OFFLOADPTRS:.*]] = getelementptr inbounds [12 x ptr], ptr %.offload_ptrs, i32 0, i32 11
+ // CHECK: store ptr %[[SCALAR_PTR_LOAD]], ptr %[[OFFLOADPTRS]], align 8

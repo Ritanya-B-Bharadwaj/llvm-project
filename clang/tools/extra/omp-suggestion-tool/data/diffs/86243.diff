@@ -1,0 +1,568 @@
+diff --git a/openmp/runtime/src/kmp_collapse.cpp b/openmp/runtime/src/kmp_collapse.cpp
+index 569d2c1508319..e63a98081db9b 100644
+--- a/openmp/runtime/src/kmp_collapse.cpp
++++ b/openmp/runtime/src/kmp_collapse.cpp
+@@ -1517,16 +1517,11 @@ void kmp_handle_upper_triangle_matrix(
+   kmp_uint64 iter_with_current = iter_before_current + iter_current;
+   // calculate the outer loop lower bound (lbo) which is the max outer iv value
+   // that gives the number of iterations that is equal or just below the total
+-  // number of iterations executed by the previous threads, for less_than
+-  // (1-based) inner loops (inner_ub0 == -1) it will be i.e.
+-  // lbo*(lbo-1)/2<=iter_before_current => lbo^2-lbo-2*iter_before_current<=0
+-  // for less_than_equal (0-based) inner loops (inner_ub == 0) it will be:
+-  // i.e. lbo*(lbo+1)/2<=iter_before_current =>
+-  // lbo^2+lbo-2*iter_before_current<=0 both cases can be handled similarily
+-  // using a parameter to control the equatio sign
++  // number of iterations executed by the previous threads:
++  // lbo*(lbo+1)/2<=iter_before_current =>
++  // lbo^2+lbo-2*iter_before_current<=0
+   kmp_uint64 lower_bound_outer =
+       (kmp_uint64)(sqrt_newton_approx(1 + 8 * iter_before_current) + 1) / 2 - 1;
+-  ;
+   // calculate the inner loop lower bound which is the remaining number of
+   // iterations required to hit the total number of iterations executed by the
+   // previous threads giving the starting point of this thread
+diff --git a/openmp/runtime/test/worksharing/for/collapse_test.inc b/openmp/runtime/test/worksharing/for/collapse_test.inc
+new file mode 100644
+index 0000000000000..de0e7e4e57f30
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/collapse_test.inc
+@@ -0,0 +1,201 @@
++#include <omp.h>
++#include <malloc.h>
++#include <stdio.h>
++#include <memory.h>
++
++#define LOOP_IV_TYPE0 LOOP_TYPES
++#define LOOP_TYPE0 LOOP_TYPES
++#define LOOP_STYPE0 LOOP_TYPES
++
++#define LOOP_IV_TYPE1 LOOP_TYPES
++#define LOOP_TYPE1 LOOP_TYPES
++#define LOOP_STYPE1 LOOP_TYPES
++
++#define LOOP_IV_TYPE2 LOOP_TYPES
++#define LOOP_TYPE2 LOOP_TYPES
++#define LOOP_STYPE2 LOOP_TYPES
++
++#define MAX_THREADS 256
++
++#if defined VERBOSE
++#define PRINTF printf
++#else
++#define PRINTF
++#endif
++
++LOOP_TYPE0 iLB, iUB;
++LOOP_TYPE1 jA0, jB0;
++LOOP_TYPE2 kA0, kB0;
++
++LOOP_STYPE0 iStep;
++LOOP_STYPE1 jA1, jB1, jStep;
++LOOP_STYPE2 kA1, kB1, kStep;
++
++// We can check <=, <, >=, > (!= has different pattern)
++// Additional definition of LOOP_LEi, LOOP_LTi, etc. is helpful to build calls
++// of the test from main
++
++#if defined LOOP_LE0
++#define COMPARE0 <=
++#elif defined LOOP_LT0
++#define COMPARE0 <
++#elif defined LOOP_GE0
++#define COMPARE0 >=
++#elif defined LOOP_GT0
++#define COMPARE0 >
++#endif
++
++#if defined LOOP_LE1
++#define COMPARE1 <=
++#elif defined LOOP_LT1
++#define COMPARE1 <
++#elif defined LOOP_GE1
++#define COMPARE1 >=
++#elif defined LOOP_GT1
++#define COMPARE1 >
++#endif
++
++#if defined LOOP_LE2
++#define COMPARE2 <=
++#elif defined LOOP_LT2
++#define COMPARE2 <
++#elif defined LOOP_GE2
++#define COMPARE2 >=
++#elif defined LOOP_GT2
++#define COMPARE2 >
++#endif
++
++typedef struct {
++  LOOP_IV_TYPE0 i;
++  LOOP_IV_TYPE1 j;
++  LOOP_IV_TYPE2 k;
++} spaceType;
++
++spaceType *AllocSpace(unsigned size) {
++
++  spaceType *p = (spaceType *)malloc(size * sizeof(spaceType));
++  memset(p, 0, size * sizeof(spaceType));
++  return p;
++}
++
++void FreeSpace(spaceType *space) { free(space); }
++
++// record an iteration
++void Set(spaceType *space, unsigned count, unsigned trueCount, LOOP_IV_TYPE0 i,
++         LOOP_IV_TYPE1 j, LOOP_IV_TYPE0 k) {
++  if (count > trueCount) {
++    // number of iterations exceeded
++    // will be reported with checks
++    return;
++  }
++  space[count - 1].i = i;
++  space[count - 1].j = j;
++  space[count - 1].k = k;
++}
++int test() {
++  int pass = 1;
++  LOOP_IV_TYPE0 i;
++  LOOP_IV_TYPE1 j;
++  LOOP_IV_TYPE2 k;
++
++  spaceType *openmpSpace;
++  spaceType *scalarSpace;
++
++  unsigned trueCount = 0;
++  unsigned openmpCount = 0;
++  unsigned scalarCount = 0;
++  unsigned uselessThreadsOpenMP = 0;
++  unsigned usefulThreadsOpenMP = 0;
++  unsigned chunkSizesOpenmp[MAX_THREADS] = {0};
++
++  unsigned num_threads = omp_get_max_threads();
++  if (num_threads > MAX_THREADS)
++    num_threads = MAX_THREADS;
++  omp_set_num_threads(num_threads);
++
++  // count iterations and allocate space
++  LOOP { ++trueCount; }
++
++  openmpSpace = AllocSpace(trueCount);
++  scalarSpace = AllocSpace(trueCount);
++
++  // fill the scalar (compare) space
++  LOOP {
++    ++scalarCount;
++    Set(scalarSpace, scalarCount, trueCount, i, j, k);
++  }
++
++  // test run body:
++  // perform and record OpenMP iterations and thread use
++#pragma omp parallel num_threads(num_threads)
++  {
++#pragma omp for collapse(3) private(i, j, k)
++    LOOP {
++      unsigned count;
++      unsigned gtid = omp_get_thread_num();
++#pragma omp atomic update
++      ++chunkSizesOpenmp[gtid];
++#pragma omp atomic capture
++      count = ++openmpCount;
++      Set(openmpSpace, count, trueCount, i, j, k);
++    }
++  }
++
++  // check for the right number of iterations processed
++  // (only need to check for less, greater is checked when recording)
++  if (openmpCount < trueCount) {
++    PRINTF("OpenMP FAILURE: Openmp processed fewer iterations: %d vs %d\n",
++           openmpCount, trueCount);
++    pass = 0;
++  } else if (openmpCount > trueCount) {
++    PRINTF("OpenMP FAILURE: Openmp processed more iterations: %d vs %d\n",
++           openmpCount, trueCount);
++    pass = 0;
++  }
++
++  // check openMP for iteration correctnes against scalar
++  for (unsigned i = 0; i < trueCount; i++) {
++    unsigned j;
++    for (j = 0; j < openmpCount; j++) {
++      if ((scalarSpace[i].i == openmpSpace[j].i) &&
++          (scalarSpace[i].j == openmpSpace[j].j) &&
++          (scalarSpace[i].k == openmpSpace[j].k)) {
++        break;
++      }
++    }
++    if (j == openmpCount) {
++      PRINTF("OpenMP FAILURE: (%d %d %d) not processed\n", scalarSpace[i].i,
++             scalarSpace[i].j, scalarSpace[i].k);
++      pass = 0;
++    }
++  }
++
++  // check for efficient thread use
++  for (unsigned i = 0; i < num_threads; ++i) {
++    if (chunkSizesOpenmp[i] == 0) {
++      ++uselessThreadsOpenMP;
++    }
++  }
++
++  // a check to see if at least more than one thread was used (weakish)
++  if ((uselessThreadsOpenMP == num_threads - 1) && (trueCount > 1)) {
++    PRINTF("OpenMP FAILURE: threads are not used\n");
++    pass = 0;
++  }
++
++#if 0
++    // a check to see if the load was spread more or less evenly so that
++    // when there was more work than threads each one got at least something 
++    // (stronger, but may currently fail for a general collapse case)
++    if ((trueCount >= num_threads) && (uselessThreadsOpenMP > 0)) {
++       PRINTF("OpenMP FAILURE: %d threads not used with %d iterations\n", 
++           uselessThreadsOpenMP, openmpCount);
++       pass = 0;
++    }
++#endif
++
++  // clean up space
++  FreeSpace(openmpSpace);
++  FreeSpace(scalarSpace);
++  return pass;
++}
+diff --git a/openmp/runtime/test/worksharing/for/omp_collapse_many_GELTGT_int.c b/openmp/runtime/test/worksharing/for/omp_collapse_many_GELTGT_int.c
+new file mode 100644
+index 0000000000000..77b2d6918d872
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/omp_collapse_many_GELTGT_int.c
+@@ -0,0 +1,65 @@
++// RUN: %libomp-compile-and-run
++
++// Non-rectangular loop collapsing.
++//
++// Nested loops conform to OpenMP 5.2 standard,
++// inner loops bounds may depend on outer loops induction variables.
++
++#define LOOP_TYPES int
++#define COMPARE0 >=
++#define COMPARE1 <
++#define COMPARE2 >
++#define LOOP                                                                   \
++  for (i = iLB; i COMPARE0 iUB; i += iStep)                                    \
++    for (j = jA0; j COMPARE1 jB0; j += jStep)                                  \
++      for (k = kA0; k COMPARE2 kB0; k += kStep)
++#include "collapse_test.inc"
++
++int main() {
++  int fail;
++
++  iLB = 3;
++  iUB = -2;
++  jA0 = -3;
++  jA1 = 0;
++  jB0 = -6;
++  jB1 = 0;
++  kA0 = -2;
++  kA1 = 0;
++  kB0 = -4;
++  kB1 = 0;
++  iStep = -1;
++  jStep = -1;
++  kStep = -4;
++  PRINTF("\nOne off iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; jB1=%d; kA0=%d; "
++         "kA1=%d; kB0=%d; kB1=%d; iStep=%d; jStep=%d; kStep=%d;\n",
++         iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1, iStep, jStep, kStep);
++  fail = (test() == 0);
++
++  if (!fail) {
++    for (iStep = -3; iStep >= -6; iStep -= 2) {
++      for (jA0 = -6; jA0 <= 6; jA0 += 3) {
++        for (jB0 = -3; jB0 <= 10; jB0 += 3) {
++          for (jStep = 1; jStep <= 10; jStep += 2) {
++            for (kA0 = -2; kA0 <= 4; ++kA0) {
++              for (kB0 = -4; kB0 <= 2; ++kB0) {
++                for (kStep = -2; kStep >= -10; kStep -= 4) {
++                  {
++                    PRINTF("\nTrying iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; "
++                           "jB1=%d; kA0=%d; kA1=%d; kB0=%d; kB1=%d; iStep=%d; "
++                           "jStep=%d; kStep=%d;\n",
++                           iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1,
++                           iStep, jStep, kStep);
++                    fail = fail || (test() == 0);
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return fail;
++}
+diff --git a/openmp/runtime/test/worksharing/for/omp_collapse_many_GTGEGT_int.c b/openmp/runtime/test/worksharing/for/omp_collapse_many_GTGEGT_int.c
+new file mode 100644
+index 0000000000000..985211172e628
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/omp_collapse_many_GTGEGT_int.c
+@@ -0,0 +1,71 @@
++// RUN: %libomp-compile-and-run
++
++// Non-rectangular loop collapsing.
++//
++// Nested loops conform to OpenMP 5.2 standard,
++// inner loops bounds may depend on outer loops induction variables.
++
++#define LOOP_TYPES int
++#define COMPARE0 >
++#define COMPARE1 >=
++#define COMPARE2 >
++
++#define DLOOP_GT0
++#define DLOOP_GE1
++#define DLOOP_GT2
++
++#define LOOP                                                                   \
++  for (i = iLB; i COMPARE0 iUB; i += iStep)                                    \
++    for (j = jA0; j COMPARE1 jB0; j += jStep)                                  \
++      for (k = kA0; k COMPARE2 kB0; k += kStep)
++#include "collapse_test.inc"
++
++int main() {
++  int fail;
++
++  iLB = 3;
++  iUB = -2;
++  jA0 = -3;
++  jA1 = 0;
++  jB0 = -6;
++  jB1 = 0;
++  kA0 = -2;
++  kA1 = 0;
++  kB0 = -4;
++  kB1 = 0;
++  iStep = -1;
++  jStep = -1;
++  kStep = -4;
++  PRINTF("\nOne off iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; jB1=%d; kA0=%d; "
++         "kA1=%d; kB0=%d; kB1=%d; iStep=%d; jStep=%d; kStep=%d;\n",
++         iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1, iStep, jStep, kStep);
++  fail = (test() == 0);
++
++  if (!fail) {
++
++    for (iStep = -3; iStep >= -6; iStep -= 2) {
++      for (jA0 = -3; jA0 <= 10; jA0 += 3) {
++        for (jB0 = -6; jB0 <= 6; jB0 += 3) {
++          for (jStep = -1; jStep >= -10; jStep -= 2) {
++            for (kA0 = -2; kA0 <= 4; ++kA0) {
++              for (kB0 = -4; kB0 <= 2; ++kB0) {
++                for (kStep = -2; kStep >= -10; kStep -= 4) {
++                  {
++                    PRINTF("\nTrying iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; "
++                           "jB1=%d; kA0=%d; kA1=%d; kB0=%d; kB1=%d; iStep=%d; "
++                           "jStep=%d; kStep=%d;\n",
++                           iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1,
++                           iStep, jStep, kStep);
++                    fail = fail || (test() == 0);
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return fail;
++}
+diff --git a/openmp/runtime/test/worksharing/for/omp_collapse_many_LTLEGE_int.c b/openmp/runtime/test/worksharing/for/omp_collapse_many_LTLEGE_int.c
+new file mode 100644
+index 0000000000000..47e3b42226c83
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/omp_collapse_many_LTLEGE_int.c
+@@ -0,0 +1,66 @@
++// RUN: %libomp-compile-and-run
++
++// Non-rectangular loop collapsing.
++//
++// Nested loops conform to OpenMP 5.2 standard,
++// inner loops bounds may depend on outer loops induction variables.
++
++#define LOOP_TYPES int
++#define COMPARE0 <
++#define COMPARE1 <=
++#define COMPARE2 >=
++#define LOOP                                                                   \
++  for (i = iLB; i COMPARE0 iUB; i += iStep)                                    \
++    for (j = jA0; j COMPARE1 jB0; j += jStep)                                  \
++      for (k = kA0; k COMPARE2 kB0; k += kStep)
++#include "collapse_test.inc"
++
++int main() {
++  int fail;
++
++  iLB = -2;
++  iUB = 3;
++  jA0 = -3;
++  jA1 = 0;
++  jB0 = -6;
++  jB1 = 0;
++  kA0 = -2;
++  kA1 = 0;
++  kB0 = -4;
++  kB1 = 0;
++  iStep = -1;
++  jStep = -1;
++  kStep = -4;
++  PRINTF("\nOne off iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; jB1=%d; kA0=%d; "
++         "kA1=%d; kB0=%d; kB1=%d; iStep=%d; jStep=%d; kStep=%d;\n",
++         iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1, iStep, jStep, kStep);
++  fail = (test() == 0);
++
++  if (!fail) {
++
++    for (iStep = 2; iStep <= 6; iStep += 2) {
++      for (jA0 = -6; jA0 <= 6; jA0 += 3) {
++        for (jB0 = -3; jB0 <= 10; jB0 += 3) {
++          for (jStep = 1; jStep <= 10; jStep += 2) {
++            for (kA0 = -2; kA0 <= 4; ++kA0) {
++              for (kB0 = -4; kB0 <= 2; ++kB0) {
++                for (kStep = -2; kStep >= -10; kStep -= 4) {
++                  {
++                    PRINTF("\nTrying iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; "
++                           "jB1=%d; kA0=%d; kA1=%d; kB0=%d; kB1=%d; iStep=%d; "
++                           "jStep=%d; kStep=%d;\n",
++                           iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1,
++                           iStep, jStep, kStep);
++                    fail = fail || (test() == 0);
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return fail;
++}
+diff --git a/openmp/runtime/test/worksharing/for/omp_collapse_many_int.c b/openmp/runtime/test/worksharing/for/omp_collapse_many_int.c
+new file mode 100644
+index 0000000000000..4455602df8a23
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/omp_collapse_many_int.c
+@@ -0,0 +1,73 @@
++// RUN: %libomp-compile-and-run
++// XFAIL: true
++
++// Non-rectangular loop collapsing.
++//
++// Nested loops conform to OpenMP 5.2 standard,
++// inner loops bounds may depend on outer loops induction variables.
++
++#define LOOP_TYPES int
++#define LOOP                                                                   \
++  for (i = iLB; i <= iUB; i += iStep)                                          \
++    for (j = i * jA1 + jA0; j <= i * jB1 + jB0; j += jStep)                    \
++      for (k = j * kA1 + kA0; k <= j * kB1 + kB0; k += kStep)
++#include "collapse_test.inc"
++
++int main() {
++  int fail = 0;
++
++  iLB = -2;
++  iUB = 3;
++  jA0 = -7;
++  jA1 = -1;
++  jB0 = 13;
++  jB1 = 3;
++  kA0 = -20;
++  kA1 = -2;
++  kB0 = 111;
++  kB1 = -1;
++  iStep = 5;
++  jStep = 9;
++  kStep = 10;
++  PRINTF("\nOne off iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; jB1=%d; kA0=%d; "
++         "kA1=%d; kB0=%d; kB1=%d; iStep=%d; jStep=%d; kStep=%d;\n",
++         iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1, iStep, jStep, kStep);
++  fail = fail || (test() == 0);
++
++  if (!fail) {
++
++    // NOTE: if a loop on some level won't execute  for all iterations of an
++    // outer loop, it still should work. Runtime doesn't require lower bounds to
++    // be <= upper bounds for all possible i, j, k.
++
++    iLB = -2;
++    iUB = 3;
++    jA0 = -7;
++    jB0 = 5;
++    kA0 = -13;
++    kB0 = 37;
++
++    for (kA1 = -2; kA1 <= 2; ++kA1) { // <=
++      for (kB1 = -2; kB1 <= 2; ++kB1) {
++        for (jA1 = -3; jA1 <= 3; ++jA1) {
++          for (jB1 = -3; jB1 <= 3; ++jB1) {
++            for (iStep = 1; iStep <= 3; ++iStep) {
++              for (jStep = 2; jStep <= 6; jStep += 2) {
++                for (kStep = 2; kStep <= 8; kStep += 3) {
++                  PRINTF("\nTrying iLB=%d; iUB=%d; jA0=%d; jA1=%d; jB0=%d; "
++                         "jB1=%d; kA0=%d; kA1=%d; kB0=%d; kB1=%d; iStep=%d; "
++                         "jStep=%d; kStep=%d;\n",
++                         iLB, iUB, jA0, jA1, jB0, jB1, kA0, kA1, kB0, kB1,
++                         iStep, jStep, kStep);
++                  fail = fail || (test() == 0);
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++
++  return fail;
++}
+diff --git a/openmp/runtime/test/worksharing/for/omp_collapse_one_int.c b/openmp/runtime/test/worksharing/for/omp_collapse_one_int.c
+new file mode 100644
+index 0000000000000..437d4bff31eb3
+--- /dev/null
++++ b/openmp/runtime/test/worksharing/for/omp_collapse_one_int.c
+@@ -0,0 +1,32 @@
++// RUN: %libomp-compile-and-run
++
++// Non-rectangular loop collapsing.
++//
++// Nested loops conform to OpenMP 5.2 standard,
++// inner loops bounds may depend on outer loops induction variables.
++
++#define LOOP_TYPES int
++#define LOOP                                                                   \
++  for (i = iLB; i <= iUB; i += iStep)                                          \
++    for (j = i + jA0; j <= i + jB0; j += jStep)                                \
++      for (k = j + kA0; k <= j + kB0; k += kStep)
++
++#include "collapse_test.inc"
++
++int main() {
++  int fail;
++  iLB = -2;
++  iUB = 3;
++  jA0 = -7;
++  jB0 = 13;
++  kA0 = -20;
++  kB0 = 111;
++  iStep = 5;
++  jStep = 9;
++  kStep = 10;
++  PRINTF("\nOne off iLB=%d; iUB=%d; jA0=%d; jB0=%d; kA0=%d; kB0=%d; iStep=%d; "
++         "jStep=%d; kStep=%d;\n",
++         iLB, iUB, jA0, jB0, kA0, kB0, iStep, jStep, kStep);
++  fail = (test() == 0);
++  return fail;
++}

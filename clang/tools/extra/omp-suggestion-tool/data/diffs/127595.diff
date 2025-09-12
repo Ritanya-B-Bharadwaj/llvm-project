@@ -1,0 +1,367 @@
+diff --git a/flang/docs/DoConcurrentConversionToOpenMP.md b/flang/docs/DoConcurrentConversionToOpenMP.md
+index 62bc3172f8e3b..7b49af742f242 100644
+--- a/flang/docs/DoConcurrentConversionToOpenMP.md
++++ b/flang/docs/DoConcurrentConversionToOpenMP.md
+@@ -53,6 +53,79 @@ that:
+ * It has been tested in a very limited way so far.
+ * It has been tested mostly on simple synthetic inputs.
+ 
++### Loop nest detection
++
++On the `FIR` dialect level, the following loop:
++```fortran
++  do concurrent(i=1:n, j=1:m, k=1:o)
++    a(i,j,k) = i + j + k
++  end do
++```
++is modelled as a nest of `fir.do_loop` ops such that an outer loop's region
++contains **only** the following:
++  1. The operations needed to assign/update the outer loop's induction variable.
++  1. The inner loop itself.
++
++So the MLIR structure for the above example looks similar to the following:
++```
++  fir.do_loop %i_idx = %34 to %36 step %c1 unordered {
++    %i_idx_2 = fir.convert %i_idx : (index) -> i32
++    fir.store %i_idx_2 to %i_iv#1 : !fir.ref<i32>
++
++    fir.do_loop %j_idx = %37 to %39 step %c1_3 unordered {
++      %j_idx_2 = fir.convert %j_idx : (index) -> i32
++      fir.store %j_idx_2 to %j_iv#1 : !fir.ref<i32>
++
++      fir.do_loop %k_idx = %40 to %42 step %c1_5 unordered {
++        %k_idx_2 = fir.convert %k_idx : (index) -> i32
++        fir.store %k_idx_2 to %k_iv#1 : !fir.ref<i32>
++
++        ... loop nest body goes here ...
++      }
++    }
++  }
++```
++This applies to multi-range loops in general; they are represented in the IR as
++a nest of `fir.do_loop` ops with the above nesting structure.
++
++Therefore, the pass detects such "perfectly" nested loop ops to identify multi-range
++loops and map them as "collapsed" loops in OpenMP.
++
++#### Further info regarding loop nest detection
++
++Loop nest detection is currently limited to the scenario described in the previous
++section. However, this is quite limited and can be extended in the future to cover
++more cases. At the moment, for the following loop nest, even though both loops are
++perfectly nested, only the outer loop is parallelized:
++```fortran
++do concurrent(i=1:n)
++  do concurrent(j=1:m)
++    a(i,j) = i * j
++  end do
++end do
++```
++
++Similarly, for the following loop nest, even though the intervening statement `x = 41`
++does not have any memory effects that would affect parallelization, this nest is
++not parallelized either (only the outer loop is).
++
++```fortran
++do concurrent(i=1:n)
++  x = 41
++  do concurrent(j=1:m)
++    a(i,j) = i * j
++  end do
++end do
++```
++
++The above also has the consequence that the `j` variable will **not** be
++privatized in the OpenMP parallel/target region. In other words, it will be
++treated as if it was a `shared` variable. For more details about privatization,
++see the "Data environment" section below.
++
++See `flang/test/Transforms/DoConcurrent/loop_nest_test.f90` for more examples
++of what is and is not detected as a perfect loop nest.
++
+ <!--
+ More details about current status will be added along with relevant parts of the
+ implementation in later upstreaming patches.
+@@ -63,6 +136,17 @@ implementation in later upstreaming patches.
+ This section describes some of the open questions/issues that are not tackled yet
+ even in the downstream implementation.
+ 
++### Separate MLIR op for `do concurrent`
++
++At the moment, both increment and concurrent loops are represented by one MLIR
++op: `fir.do_loop`; where we differentiate concurrent loops with the `unordered`
++attribute. This is not ideal since the `fir.do_loop` op support only single
++iteration ranges. Consequently, to model multi-range `do concurrent` loops, flang
++emits a nest of `fir.do_loop` ops which we have to detect in the OpenMP conversion
++pass to handle multi-range loops. Instead, it would better to model multi-range
++concurrent loops using a separate op which the IR more representative of the input
++Fortran code and also easier to detect and transform.
++
+ ### Delayed privatization
+ 
+ So far, we emit the privatization logic for IVs inline in the parallel/target
+@@ -150,6 +234,7 @@ targeting OpenMP.
+ - [x] Command line options for `flang` and `bbc`.
+ - [x] Conversion pass skeleton (no transormations happen yet).
+ - [x] Status description and tracking document (this document).
++- [x] Loop nest detection to identify multi-range loops.
+ - [ ] Basic host/CPU mapping support.
+ - [ ] Basic device/GPU mapping support.
+ - [ ] More advanced host and device support (expaned to multiple items as needed).
+diff --git a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+index cebf6cd8ed0df..ad88b42ac6d7a 100644
+--- a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
++++ b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+@@ -9,8 +9,10 @@
+ #include "flang/Optimizer/Dialect/FIROps.h"
+ #include "flang/Optimizer/OpenMP/Passes.h"
+ #include "flang/Optimizer/OpenMP/Utils.h"
++#include "mlir/Analysis/SliceAnalysis.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+ #include "mlir/Transforms/DialectConversion.h"
++#include "mlir/Transforms/RegionUtils.h"
+ 
+ namespace flangomp {
+ #define GEN_PASS_DEF_DOCONCURRENTCONVERSIONPASS
+@@ -21,6 +23,131 @@ namespace flangomp {
+ #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE << "]: ")
+ 
+ namespace {
++namespace looputils {
++using LoopNest = llvm::SetVector<fir::DoLoopOp>;
++
++/// Loop \p innerLoop is considered perfectly-nested inside \p outerLoop iff
++/// there are no operations in \p outerloop's body other than:
++///
++/// 1. the operations needed to assign/update \p outerLoop's induction variable.
++/// 2. \p innerLoop itself.
++///
++/// \p return true if \p innerLoop is perfectly nested inside \p outerLoop
++/// according to the above definition.
++bool isPerfectlyNested(fir::DoLoopOp outerLoop, fir::DoLoopOp innerLoop) {
++  mlir::ForwardSliceOptions forwardSliceOptions;
++  forwardSliceOptions.inclusive = true;
++  // The following will be used as an example to clarify the internals of this
++  // function:
++  // ```
++  // 1. fir.do_loop %i_idx = %34 to %36 step %c1 unordered {
++  // 2.   %i_idx_2 = fir.convert %i_idx : (index) -> i32
++  // 3.   fir.store %i_idx_2 to %i_iv#1 : !fir.ref<i32>
++  //
++  // 4.   fir.do_loop %j_idx = %37 to %39 step %c1_3 unordered {
++  // 5.     %j_idx_2 = fir.convert %j_idx : (index) -> i32
++  // 6.     fir.store %j_idx_2 to %j_iv#1 : !fir.ref<i32>
++  //        ... loop nest body, possible uses %i_idx ...
++  //      }
++  //    }
++  // ```
++  // In this example, the `j` loop is perfectly nested inside the `i` loop and
++  // below is how we find that.
++
++  // We don't care about the outer-loop's induction variable's uses within the
++  // inner-loop, so we filter out these uses.
++  //
++  // This filter tells `getForwardSlice` (below) to only collect operations
++  // which produce results defined above (i.e. outside) the inner-loop's body.
++  //
++  // Since `outerLoop.getInductionVar()` is a block argument (to the
++  // outer-loop's body), the filter effectively collects uses of
++  // `outerLoop.getInductionVar()` inside the outer-loop but outside the
++  // inner-loop.
++  forwardSliceOptions.filter = [&](mlir::Operation *op) {
++    return mlir::areValuesDefinedAbove(op->getResults(), innerLoop.getRegion());
++  };
++
++  llvm::SetVector<mlir::Operation *> indVarSlice;
++  // The forward slice of the `i` loop's IV will be the 2 ops in line 1 & 2
++  // above. Uses of `%i_idx` inside the `j` loop are not collected because of
++  // the filter.
++  mlir::getForwardSlice(outerLoop.getInductionVar(), &indVarSlice,
++                        forwardSliceOptions);
++  llvm::DenseSet<mlir::Operation *> indVarSet(indVarSlice.begin(),
++                                              indVarSlice.end());
++
++  llvm::DenseSet<mlir::Operation *> outerLoopBodySet;
++  // The following walk collects ops inside `outerLoop` that are **not**:
++  // * the outer-loop itself,
++  // * or the inner-loop,
++  // * or the `fir.result` op (the outer-loop's terminator).
++  //
++  // For the above example, this will also populate `outerLoopBodySet` with ops
++  // in line 1 & 2 since we skip the `i` loop, the `j` loop, and the terminator.
++  outerLoop.walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *op) {
++    if (op == outerLoop)
++      return mlir::WalkResult::advance();
++
++    if (op == innerLoop)
++      return mlir::WalkResult::skip();
++
++    if (mlir::isa<fir::ResultOp>(op))
++      return mlir::WalkResult::advance();
++
++    outerLoopBodySet.insert(op);
++    return mlir::WalkResult::advance();
++  });
++
++  // If `outerLoopBodySet` ends up having the same ops as `indVarSet`, then
++  // `outerLoop` only contains ops that setup its induction variable +
++  // `innerLoop` + the `fir.result` terminator. In other words, `innerLoop` is
++  // perfectly nested inside `outerLoop`.
++  bool result = (outerLoopBodySet == indVarSet);
++  mlir::Location loc = outerLoop.getLoc();
++  LLVM_DEBUG(DBGS() << "Loop pair starting at location " << loc << " is"
++                    << (result ? "" : " not") << " perfectly nested\n");
++
++  return result;
++}
++
++/// Starting with `currentLoop` collect a perfectly nested loop nest, if any.
++/// This function collects as much as possible loops in the nest; it case it
++/// fails to recognize a certain nested loop as part of the nest it just returns
++/// the parent loops it discovered before.
++mlir::LogicalResult collectLoopNest(fir::DoLoopOp currentLoop,
++                                    LoopNest &loopNest) {
++  assert(currentLoop.getUnordered());
++
++  while (true) {
++    loopNest.insert(currentLoop);
++    llvm::SmallVector<fir::DoLoopOp> unorderedLoops;
++
++    for (auto nestedLoop : currentLoop.getRegion().getOps<fir::DoLoopOp>())
++      if (nestedLoop.getUnordered())
++        unorderedLoops.push_back(nestedLoop);
++
++    if (unorderedLoops.empty())
++      break;
++
++    // Having more than one unordered loop means that we are not dealing with a
++    // perfect loop nest (i.e. a mulit-range `do concurrent` loop); which is the
++    // case we are after here.
++    if (unorderedLoops.size() > 1)
++      return mlir::failure();
++
++    fir::DoLoopOp nestedUnorderedLoop = unorderedLoops.front();
++
++    if (!isPerfectlyNested(currentLoop, nestedUnorderedLoop))
++      return mlir::failure();
++
++    currentLoop = nestedUnorderedLoop;
++  }
++
++  return mlir::success();
++}
++} // namespace looputils
++
+ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+ public:
+   using mlir::OpConversionPattern<fir::DoLoopOp>::OpConversionPattern;
+@@ -31,6 +158,14 @@ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+   mlir::LogicalResult
+   matchAndRewrite(fir::DoLoopOp doLoop, OpAdaptor adaptor,
+                   mlir::ConversionPatternRewriter &rewriter) const override {
++    looputils::LoopNest loopNest;
++    bool hasRemainingNestedLoops =
++        failed(looputils::collectLoopNest(doLoop, loopNest));
++    if (hasRemainingNestedLoops)
++      mlir::emitWarning(doLoop.getLoc(),
++                        "Some `do concurent` loops are not perfectly-nested. "
++                        "These will be serialized.");
++
+     // TODO This will be filled in with the next PRs that upstreams the rest of
+     // the ROCm implementaion.
+     return mlir::success();
+diff --git a/flang/test/Transforms/DoConcurrent/loop_nest_test.f90 b/flang/test/Transforms/DoConcurrent/loop_nest_test.f90
+new file mode 100644
+index 0000000000000..0d21b31519728
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/loop_nest_test.f90
+@@ -0,0 +1,89 @@
++! Tests loop-nest detection algorithm for do-concurrent mapping.
++
++! REQUIRES: asserts
++
++! RUN: %flang_fc1 -emit-hlfir  -fopenmp -fdo-concurrent-to-openmp=host \
++! RUN:   -mmlir -debug %s -o - 2> %t.log || true
++
++! RUN: FileCheck %s < %t.log
++
++program main
++  implicit none
++
++contains
++
++subroutine foo(n)
++  implicit none
++  integer :: n, m
++  integer :: i, j, k
++  integer :: x
++  integer, dimension(n) :: a
++  integer, dimension(n, n, n) :: b
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is perfectly nested
++  do concurrent(i=1:n, j=1:bar(n*m, n/m))
++    a(i) = n
++  end do
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is perfectly nested
++  do concurrent(i=bar(n, x):n, j=1:bar(n*m, n/m))
++    a(i) = n
++  end do
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is not perfectly nested
++  do concurrent(i=bar(n, x):n)
++    do concurrent(j=1:bar(n*m, n/m))
++      a(i) = n
++    end do
++  end do
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is not perfectly nested
++  do concurrent(i=1:n)
++    x = 10
++    do concurrent(j=1:m)
++      b(i,j,k) = i * j + k
++    end do
++  end do
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is not perfectly nested
++  do concurrent(i=1:n)
++    do concurrent(j=1:m)
++      b(i,j,k) = i * j + k
++    end do
++    x = 10
++  end do
++
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is not perfectly nested
++  do concurrent(i=1:n)
++    do concurrent(j=1:m)
++      b(i,j,k) = i * j + k
++      x = 10
++    end do
++  end do
++
++  ! Verify the (i,j) and (j,k) pairs of loops are detected as perfectly nested.
++  !
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 3]]:{{.*}}) is perfectly nested
++  ! CHECK: Loop pair starting at location
++  ! CHECK: loc("{{.*}}":[[# @LINE + 1]]:{{.*}}) is perfectly nested
++  do concurrent(i=bar(n, x):n, j=1:bar(n*m, n/m), k=1:bar(n*m, bar(n*m, n/m)))
++    a(i) = n
++  end do
++end subroutine
++
++pure function bar(n, m)
++    implicit none
++    integer, intent(in) :: n, m
++    integer :: bar
++
++    bar = n + m
++end function
++
++end program main

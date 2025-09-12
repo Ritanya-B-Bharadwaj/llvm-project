@@ -1,0 +1,191 @@
+diff --git a/flang/lib/Optimizer/Transforms/OMPEarlyOutlining.cpp b/flang/lib/Optimizer/Transforms/OMPEarlyOutlining.cpp
+index 355a687d5f885..92fbdd0bbf5d4 100644
+--- a/flang/lib/Optimizer/Transforms/OMPEarlyOutlining.cpp
++++ b/flang/lib/Optimizer/Transforms/OMPEarlyOutlining.cpp
+@@ -1,6 +1,7 @@
+ #include "flang/Optimizer/Dialect/FIRDialect.h"
+ #include "flang/Optimizer/Dialect/FIROps.h"
+ #include "flang/Optimizer/Dialect/FIRType.h"
++#include "flang/Optimizer/HLFIR/HLFIROps.h"
+ #include "flang/Optimizer/Support/InternalNames.h"
+ #include "flang/Optimizer/Transforms/Passes.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+@@ -99,6 +100,20 @@ class OMPEarlyOutliningPass
+       return;
+     }
+ 
++    // Clone into the outlined function all hlfir.declare ops that define inputs
++    // to the target region and set up remapping of its inputs and outputs.
++    if (auto declareOp = mlir::dyn_cast_if_present<hlfir::DeclareOp>(
++            varPtr.getDefiningOp())) {
++      auto clone = llvm::cast<hlfir::DeclareOp>(
++          cloneArgAndChildren(builder, declareOp, inputs, newInputs));
++      mlir::Value newBase = clone.getBase();
++      mlir::Value newOrigBase = clone.getOriginalBase();
++      mapInfoMap.map(varPtr, newOrigBase);
++      valueMap.map(declareOp.getBase(), newBase);
++      valueMap.map(declareOp.getOriginalBase(), newOrigBase);
++      return;
++    }
++
+     if (isAddressOfGlobalDeclareTarget(varPtr)) {
+       fir::AddrOfOp addrOp =
+           mlir::dyn_cast<fir::AddrOfOp>(varPtr.getDefiningOp());
+@@ -127,19 +142,46 @@ class OMPEarlyOutliningPass
+     llvm::SetVector<mlir::Value> inputs;
+     mlir::Region &targetRegion = targetOp.getRegion();
+     mlir::getUsedValuesDefinedAbove(targetRegion, inputs);
+-    
+-    // filter out declareTarget and map entries which are specially handled
++
++    // Collect all map info. Even non-used maps must be collected to avoid ICEs.
++    for (mlir::Value oper : targetOp->getOperands()) {
++      if (auto mapEntry =
++              mlir::dyn_cast<mlir::omp::MapInfoOp>(oper.getDefiningOp())) {
++        if (!inputs.contains(mapEntry.getVarPtr()))
++          inputs.insert(mapEntry.getVarPtr());
++      }
++    }
++
++    // Filter out declare-target and map entries which are specially handled
+     // at the moment, so we do not wish these to end up as function arguments
+     // which would just be more noise in the IR.
++    llvm::SmallVector<mlir::Value> blockArgs;
+     for (llvm::SetVector<mlir::Value>::iterator iter = inputs.begin(); iter != inputs.end();) {
+       if (mlir::isa_and_nonnull<mlir::omp::MapInfoOp>(iter->getDefiningOp()) ||
+           isAddressOfGlobalDeclareTarget(*iter)) {
+         iter = inputs.erase(iter);
++      } else if (auto declareOp = mlir::dyn_cast_if_present<hlfir::DeclareOp>(
++                     iter->getDefiningOp())) {
++        // Gather hlfir.declare arguments to be added later, after the
++        // hlfir.declare operation itself has been removed as an input.
++        blockArgs.push_back(declareOp.getMemref());
++        if (mlir::Value shape = declareOp.getShape())
++          blockArgs.push_back(shape);
++        for (mlir::Value typeParam : declareOp.getTypeparams())
++          blockArgs.push_back(typeParam);
++        iter = inputs.erase(iter);
+       } else {
+         ++iter;
+       }
+     }
+ 
++    // Add function arguments to the list of inputs if they are used by an
++    // hlfir.declare operation.
++    for (mlir::Value arg : blockArgs) {
++      if (!arg.getDefiningOp() && !inputs.contains(arg))
++        inputs.insert(arg);
++    }
++
+     // Create new function and initialize
+     mlir::FunctionType funcType = builder.getFunctionType(
+         mlir::TypeRange(inputs.getArrayRef()), mlir::TypeRange());
+@@ -218,7 +260,7 @@ class OMPEarlyOutliningPass
+     return newFunc;
+   }
+ 
+-  // Returns true if a target region was found int the function.
++  // Returns true if a target region was found in the function.
+   bool outlineTargetOps(mlir::OpBuilder &builder,
+                         mlir::func::FuncOp &functionOp,
+                         mlir::ModuleOp &moduleOp,
+diff --git a/flang/test/Lower/OpenMP/FIR/array-bounds.f90 b/flang/test/Lower/OpenMP/FIR/array-bounds.f90
+index 697ff44176b3f..748257f8dcc30 100644
+--- a/flang/test/Lower/OpenMP/FIR/array-bounds.f90
++++ b/flang/test/Lower/OpenMP/FIR/array-bounds.f90
+@@ -48,7 +48,7 @@ end subroutine read_write_section
+ module assumed_array_routines
+     contains
+ !DEVICE-LABEL: func.func @_QMassumed_array_routinesPassumed_shape_array_omp_outline_0(
+-!DEVICE-SAME: %[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.box<!fir.array<?xi32>>) attributes {omp.declare_target = #omp.declaretarget<device_type = (host), capture_clause = (to)>, omp.outline_parent_name = "_QMassumed_array_routinesPassumed_shape_array"} {
++!DEVICE-SAME: %[[ARG0:.*]]: !fir.ref<i32>, %[[ARG1:.*]]: !fir.box<!fir.array<?xi32>>, %[[ARG2:.*]]: !fir.ref<!fir.array<?xi32>>) attributes {omp.declare_target = #omp.declaretarget<device_type = (host), capture_clause = (to)>, omp.outline_parent_name = "_QMassumed_array_routinesPassumed_shape_array"} {
+ !DEVICE: %[[C0:.*]] = arith.constant 1 : index
+ !DEVICE: %[[C1:.*]] = arith.constant 4 : index
+ !DEVICE: %[[C2:.*]] = arith.constant 0 : index
+diff --git a/flang/test/Lower/OpenMP/FIR/declare-target-implicit-tarop-cap.f90 b/flang/test/Lower/OpenMP/declare-target-implicit-tarop-cap.f90
+similarity index 87%
+rename from flang/test/Lower/OpenMP/FIR/declare-target-implicit-tarop-cap.f90
+rename to flang/test/Lower/OpenMP/declare-target-implicit-tarop-cap.f90
+index cee24883f4715..0f548600f7601 100644
+--- a/flang/test/Lower/OpenMP/FIR/declare-target-implicit-tarop-cap.f90
++++ b/flang/test/Lower/OpenMP/declare-target-implicit-tarop-cap.f90
+@@ -1,7 +1,7 @@
+-!RUN: %flang_fc1 -emit-fir -fopenmp %s -o - | FileCheck %s
+-!RUN: %flang_fc1 -emit-fir -fopenmp -fopenmp-is-device %s -o - | FileCheck %s  --check-prefix=DEVICE
+-!RUN: bbc -emit-fir -fopenmp %s -o - | FileCheck %s
+-!RUN: bbc -emit-fir -fopenmp -fopenmp-is-target-device %s -o - | FileCheck %s --check-prefix=DEVICE
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++!RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-is-device %s -o - | FileCheck %s  --check-prefix=DEVICE
++!RUN: bbc -emit-hlfir -fopenmp %s -o - | FileCheck %s
++!RUN: bbc -emit-hlfir -fopenmp -fopenmp-is-target-device %s -o - | FileCheck %s --check-prefix=DEVICE
+ 
+ ! DEVICE-LABEL: func.func @_QPimplicit_capture
+ ! DEVICE-SAME: {{.*}}attributes {omp.declare_target = #omp.declaretarget<device_type = (nohost), capture_clause = (to)>{{.*}}}
+diff --git a/flang/test/Lower/OpenMP/FIR/function-filtering-2.f90 b/flang/test/Lower/OpenMP/function-filtering-2.f90
+similarity index 73%
+rename from flang/test/Lower/OpenMP/FIR/function-filtering-2.f90
+rename to flang/test/Lower/OpenMP/function-filtering-2.f90
+index 8065467504dd2..8219be5ad1e40 100644
+--- a/flang/test/Lower/OpenMP/FIR/function-filtering-2.f90
++++ b/flang/test/Lower/OpenMP/function-filtering-2.f90
+@@ -1,9 +1,9 @@
+-! RUN: %flang_fc1 -fopenmp -emit-llvm %s -o - | FileCheck --check-prefix=LLVM %s
+-! RUN: %flang_fc1 -fopenmp -emit-mlir %s -o - | FileCheck --check-prefix=MLIR %s
+-! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-llvm %s -o - | FileCheck --check-prefix=LLVM %s
+-! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-mlir %s -o - | FileCheck --check-prefix=MLIR %s
+-! RUN: bbc -fopenmp -emit-fir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
+-! RUN: bbc -fopenmp -fopenmp-is-target-device -emit-fir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
++! RUN: %flang_fc1 -fopenmp -flang-experimental-hlfir -emit-llvm %s -o - | FileCheck --check-prefix=LLVM %s
++! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - | FileCheck --check-prefix=MLIR %s
++! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -flang-experimental-hlfir -emit-llvm %s -o - | FileCheck --check-prefix=LLVM %s
++! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-hlfir %s -o - | FileCheck --check-prefix=MLIR %s
++! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
++! RUN: bbc -fopenmp -fopenmp-is-target-device -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
+ 
+ ! MLIR: func.func @{{.*}}implicit_invocation() attributes {omp.declare_target = #omp.declaretarget<device_type = (nohost), capture_clause = (to)>}
+ ! MLIR: return
+diff --git a/flang/test/Lower/OpenMP/FIR/function-filtering.f90 b/flang/test/Lower/OpenMP/function-filtering.f90
+similarity index 66%
+rename from flang/test/Lower/OpenMP/FIR/function-filtering.f90
+rename to flang/test/Lower/OpenMP/function-filtering.f90
+index c0ca351b9b335..3de14aa4709fc 100644
+--- a/flang/test/Lower/OpenMP/FIR/function-filtering.f90
++++ b/flang/test/Lower/OpenMP/function-filtering.f90
+@@ -1,9 +1,9 @@
+-! RUN: %flang_fc1 -fopenmp -emit-llvm %s -o - | FileCheck --check-prefixes=LLVM-HOST,LLVM-ALL %s
+-! RUN: %flang_fc1 -fopenmp -emit-mlir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
+-! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-llvm %s -o - | FileCheck --check-prefixes=LLVM-DEVICE,LLVM-ALL %s
+-! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-mlir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
+-! RUN: bbc -fopenmp -emit-fir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
+-! RUN: bbc -fopenmp -fopenmp-is-target-device -emit-fir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
++! RUN: %flang_fc1 -fopenmp -flang-experimental-hlfir -emit-llvm %s -o - | FileCheck --check-prefixes=LLVM-HOST,LLVM-ALL %s
++! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
++! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -flang-experimental-hlfir -emit-llvm %s -o - | FileCheck --check-prefixes=LLVM-DEVICE,LLVM-ALL %s
++! RUN: %flang_fc1 -fopenmp -fopenmp-is-target-device -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
++! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-HOST,MLIR-ALL %s
++! RUN: bbc -fopenmp -fopenmp-is-target-device -emit-hlfir %s -o - | FileCheck --check-prefixes=MLIR-DEVICE,MLIR-ALL %s
+ 
+ ! Check that the correct LLVM IR functions are kept for the host and device
+ ! after running the whole set of translation and transformation passes from
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 025f102f0fbf8..b60c25340b8d3 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -2046,13 +2046,13 @@ createDeviceArgumentAccessor(llvm::Argument &arg, llvm::Value *input,
+                                : llvm::Type::getInt64Ty(builder.getContext()),
+                            ompBuilder.M.getDataLayout().getAllocaAddrSpace());
+   llvm::Value *addrAscast =
+-      builder.CreatePointerBitCastOrAddrSpaceCast(addr, input->getType());
+-  builder.CreateStore(&arg, addrAscast);
++      arg.getType()->isPointerTy()
++          ? builder.CreatePointerBitCastOrAddrSpaceCast(addr, input->getType())
++          : addr;
+ 
++  builder.CreateStore(&arg, addrAscast);
+   builder.restoreIP(codeGenIP);
+-
+   retVal = builder.CreateLoad(arg.getType(), addrAscast);
+-
+   return builder.saveIP();
+ }
+ 

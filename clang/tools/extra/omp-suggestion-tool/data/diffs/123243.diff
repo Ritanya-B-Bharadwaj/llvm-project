@@ -1,0 +1,912 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index be3b1fbde8c3c..57b9cdb008b32 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3572,6 +3572,7 @@ struct OmpTraitProperty {
+ // Trait-set-selectors:
+ //    [D]evice, [T]arget_device, [C]onstruct, [I]mplementation, [U]ser.
+ struct OmpTraitSelectorName {
++  std::string ToString() const;
+   CharBlock source;
+   UNION_CLASS_BOILERPLATE(OmpTraitSelectorName);
+   ENUM_CLASS(Value, Arch, Atomic_Default_Mem_Order, Condition, Device_Num,
+@@ -3596,6 +3597,7 @@ struct OmpTraitSelector {
+ //    CONSTRUCT | DEVICE | IMPLEMENTATION | USER |  // since 5.0
+ //    TARGET_DEVICE                                 // since 5.1
+ struct OmpTraitSetSelectorName {
++  std::string ToString() const;
+   CharBlock source;
+   ENUM_CLASS(Value, Construct, Device, Implementation, Target_Device, User)
+   WRAPPER_CLASS_BOILERPLATE(OmpTraitSetSelectorName, Value);
+diff --git a/flang/include/flang/Semantics/openmp-modifiers.h b/flang/include/flang/Semantics/openmp-modifiers.h
+index 5d5c5e97faf41..7cdbf65adebe1 100644
+--- a/flang/include/flang/Semantics/openmp-modifiers.h
++++ b/flang/include/flang/Semantics/openmp-modifiers.h
+@@ -72,6 +72,7 @@ DECLARE_DESCRIPTOR(parser::OmpAlignModifier);
+ DECLARE_DESCRIPTOR(parser::OmpAllocatorComplexModifier);
+ DECLARE_DESCRIPTOR(parser::OmpAllocatorSimpleModifier);
+ DECLARE_DESCRIPTOR(parser::OmpChunkModifier);
++DECLARE_DESCRIPTOR(parser::OmpContextSelector);
+ DECLARE_DESCRIPTOR(parser::OmpDependenceType);
+ DECLARE_DESCRIPTOR(parser::OmpDeviceModifier);
+ DECLARE_DESCRIPTOR(parser::OmpDirectiveNameModifier);
+diff --git a/flang/lib/Parser/parse-tree.cpp b/flang/lib/Parser/parse-tree.cpp
+index a414f226058e3..251b6919cf52f 100644
+--- a/flang/lib/Parser/parse-tree.cpp
++++ b/flang/lib/Parser/parse-tree.cpp
+@@ -281,6 +281,26 @@ OmpTaskDependenceType::Value OmpDependClause::TaskDep::GetTaskDepType() const {
+   }
+ }
+ 
++std::string OmpTraitSelectorName::ToString() const {
++  return common::visit( //
++      common::visitors{
++          [&](Value v) { //
++            return std::string(EnumToString(v));
++          },
++          [&](llvm::omp::Directive d) {
++            return llvm::omp::getOpenMPDirectiveName(d).str();
++          },
++          [&](const std::string &s) { //
++            return s;
++          },
++      },
++      u);
++}
++
++std::string OmpTraitSetSelectorName::ToString() const {
++  return std::string(EnumToString(v));
++}
++
+ } // namespace Fortran::parser
+ 
+ template <typename C> static llvm::omp::Clause getClauseIdForClass(C &&) {
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 035064ecf3a46..3a59809a0262a 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -9,6 +9,8 @@
+ #include "check-omp-structure.h"
+ #include "definable.h"
+ #include "flang/Evaluate/check-expression.h"
++#include "flang/Evaluate/expression.h"
++#include "flang/Evaluate/type.h"
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Semantics/expression.h"
+ #include "flang/Semantics/openmp-modifiers.h"
+@@ -2985,7 +2987,6 @@ CHECK_SIMPLE_CLAUSE(Severity, OMPC_severity)
+ CHECK_SIMPLE_CLAUSE(Message, OMPC_message)
+ CHECK_SIMPLE_CLAUSE(Filter, OMPC_filter)
+ CHECK_SIMPLE_CLAUSE(Otherwise, OMPC_otherwise)
+-CHECK_SIMPLE_CLAUSE(When, OMPC_when)
+ CHECK_SIMPLE_CLAUSE(AdjustArgs, OMPC_adjust_args)
+ CHECK_SIMPLE_CLAUSE(AppendArgs, OMPC_append_args)
+ CHECK_SIMPLE_CLAUSE(MemoryOrder, OMPC_memory_order)
+@@ -4537,14 +4538,513 @@ void OmpStructureChecker::Enter(const parser::OmpClause::OmpxBare &x) {
+   }
+ }
+ 
+-void OmpStructureChecker::Enter(const parser::OmpContextSelector &ctxSel) {
++void OmpStructureChecker::Enter(const parser::OmpClause::When &x) {
++  CheckAllowedClause(llvm::omp::Clause::OMPC_when);
++  OmpVerifyModifiers(
++      x.v, llvm::omp::OMPC_when, GetContext().clauseSource, context_);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpContextSelector &ctx) {
+   EnterDirectiveNest(ContextSelectorNest);
++
++  using SetName = parser::OmpTraitSetSelectorName;
++  std::map<SetName::Value, const SetName *> visited;
++
++  for (const parser::OmpTraitSetSelector &traitSet : ctx.v) {
++    auto &name{std::get<SetName>(traitSet.t)};
++    auto [prev, unique]{visited.insert(std::make_pair(name.v, &name))};
++    if (!unique) {
++      std::string showName{parser::ToUpperCaseLetters(name.ToString())};
++      parser::MessageFormattedText txt(
++          "Repeated trait set name %s in a context specifier"_err_en_US,
++          showName);
++      parser::Message message(name.source, txt);
++      message.Attach(prev->second->source,
++          "Previous trait set %s provided here"_en_US, showName);
++      context_.Say(std::move(message));
++    }
++    CheckTraitSetSelector(traitSet);
++  }
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OmpContextSelector &) {
+   ExitDirectiveNest(ContextSelectorNest);
+ }
+ 
++std::optional<evaluate::DynamicType> OmpStructureChecker::GetDynamicType(
++    const common::Indirection<parser::Expr> &parserExpr) {
++  // Indirection<parser::Expr>      parserExpr
++  //  `- parser::Expr               ^.value()
++  const parser::TypedExpr &typedExpr{parserExpr.value().typedExpr};
++  // ForwardOwningPointer           typedExpr
++  // `- GenericExprWrapper          ^.get()
++  //    `- std::optional<Expr>      ^->v
++  if (auto maybeExpr{typedExpr.get()->v}) {
++    return maybeExpr->GetType();
++  } else {
++    return std::nullopt;
++  }
++}
++
++const std::list<parser::OmpTraitProperty> &
++OmpStructureChecker::GetTraitPropertyList(
++    const parser::OmpTraitSelector &trait) {
++  static const std::list<parser::OmpTraitProperty> empty{};
++  auto &[_, maybeProps]{trait.t};
++  if (maybeProps) {
++    using PropertyList = std::list<parser::OmpTraitProperty>;
++    return std::get<PropertyList>(maybeProps->t);
++  } else {
++    return empty;
++  }
++}
++
++std::optional<llvm::omp::Clause> OmpStructureChecker::GetClauseFromProperty(
++    const parser::OmpTraitProperty &property) {
++  using MaybeClause = std::optional<llvm::omp::Clause>;
++
++  // The parser for OmpClause will only succeed if the clause was
++  // given with all required arguments.
++  // If this is a string or complex extension with a clause name,
++  // treat it as a clause and let the trait checker deal with it.
++
++  auto getClauseFromString{[&](const std::string &s) -> MaybeClause {
++    auto id{llvm::omp::getOpenMPClauseKind(parser::ToLowerCaseLetters(s))};
++    if (id != llvm::omp::Clause::OMPC_unknown) {
++      return id;
++    } else {
++      return std::nullopt;
++    }
++  }};
++
++  return common::visit( //
++      common::visitors{
++          [&](const parser::OmpTraitPropertyName &x) -> MaybeClause {
++            return getClauseFromString(x.v);
++          },
++          [&](const common::Indirection<parser::OmpClause> &x) -> MaybeClause {
++            return x.value().Id();
++          },
++          [&](const parser::ScalarExpr &x) -> MaybeClause {
++            return std::nullopt;
++          },
++          [&](const parser::OmpTraitPropertyExtension &x) -> MaybeClause {
++            using ExtProperty = parser::OmpTraitPropertyExtension;
++            if (auto *name{std::get_if<parser::OmpTraitPropertyName>(&x.u)}) {
++              return getClauseFromString(name->v);
++            } else if (auto *cpx{std::get_if<ExtProperty::Complex>(&x.u)}) {
++              return getClauseFromString(
++                  std::get<parser::OmpTraitPropertyName>(cpx->t).v);
++            }
++            return std::nullopt;
++          },
++      },
++      property.u);
++}
++
++void OmpStructureChecker::CheckTraitSelectorList(
++    const std::list<parser::OmpTraitSelector> &traits) {
++  // [6.0:322:20]
++  // Each trait-selector-name may only be specified once in a trait selector
++  // set.
++
++  // Cannot store OmpTraitSelectorName directly, because it's not copyable.
++  using TraitName = parser::OmpTraitSelectorName;
++  using BareName = decltype(TraitName::u);
++  std::map<BareName, const TraitName *> visited;
++
++  for (const parser::OmpTraitSelector &trait : traits) {
++    auto &name{std::get<TraitName>(trait.t)};
++
++    auto [prev, unique]{visited.insert(std::make_pair(name.u, &name))};
++    if (!unique) {
++      std::string showName{parser::ToUpperCaseLetters(name.ToString())};
++      parser::MessageFormattedText txt(
++          "Repeated trait name %s in a trait set"_err_en_US, showName);
++      parser::Message message(name.source, txt);
++      message.Attach(prev->second->source,
++          "Previous trait %s provided here"_en_US, showName);
++      context_.Say(std::move(message));
++    }
++  }
++}
++
++void OmpStructureChecker::CheckTraitSetSelector(
++    const parser::OmpTraitSetSelector &traitSet) {
++
++  // Trait Set      |           Allowed traits | D-traits | X-traits | Score |
++  //
++  // Construct      |     Simd, directive-name |      Yes |       No |    No |
++  // Device         |          Arch, Isa, Kind |       No |      Yes |    No |
++  // Implementation | Atomic_Default_Mem_Order |       No |      Yes |   Yes |
++  //                |      Extension, Requires |          |          |       |
++  //                |                   Vendor |          |          |       |
++  // Target_Device  |    Arch, Device_Num, Isa |       No |      Yes |    No |
++  //                |                Kind, Uid |          |          |       |
++  // User           |                Condition |       No |       No |   Yes |
++
++  struct TraitSetConfig {
++    std::set<parser::OmpTraitSelectorName::Value> allowed;
++    bool allowsDirectiveTraits;
++    bool allowsExtensionTraits;
++    bool allowsScore;
++  };
++
++  using SName = parser::OmpTraitSetSelectorName::Value;
++  using TName = parser::OmpTraitSelectorName::Value;
++
++  static const std::map<SName, TraitSetConfig> configs{
++      {SName::Construct, //
++          {{TName::Simd}, true, false, false}},
++      {SName::Device, //
++          {{TName::Arch, TName::Isa, TName::Kind}, false, true, false}},
++      {SName::Implementation, //
++          {{TName::Atomic_Default_Mem_Order, TName::Extension, TName::Requires,
++               TName::Vendor},
++              false, true, true}},
++      {SName::Target_Device, //
++          {{TName::Arch, TName::Device_Num, TName::Isa, TName::Kind,
++               TName::Uid},
++              false, true, false}},
++      {SName::User, //
++          {{TName::Condition}, false, false, true}},
++  };
++
++  auto checkTraitSet{[&](const TraitSetConfig &config) {
++    auto &[setName, traits]{traitSet.t};
++    auto usn{parser::ToUpperCaseLetters(setName.ToString())};
++
++    // Check if there are any duplicate traits.
++    CheckTraitSelectorList(traits);
++
++    for (const parser::OmpTraitSelector &trait : traits) {
++      auto &[traitName, maybeProps]{trait.t};
++
++      // Check allowed traits
++      common::visit( //
++          common::visitors{
++              [&](parser::OmpTraitSelectorName::Value v) {
++                if (!config.allowed.count(v)) {
++                  context_.Say(traitName.source,
++                      "%s is not a valid trait for %s trait set"_err_en_US,
++                      parser::ToUpperCaseLetters(traitName.ToString()), usn);
++                }
++              },
++              [&](llvm::omp::Directive) {
++                if (!config.allowsDirectiveTraits) {
++                  context_.Say(traitName.source,
++                      "Directive name is not a valid trait for %s trait set"_err_en_US,
++                      usn);
++                }
++              },
++              [&](const std::string &) {
++                if (!config.allowsExtensionTraits) {
++                  context_.Say(traitName.source,
++                      "Extension traits are not valid for %s trait set"_err_en_US,
++                      usn);
++                }
++              },
++          },
++          traitName.u);
++
++      // Check score
++      if (maybeProps) {
++        auto &[maybeScore, _]{maybeProps->t};
++        if (maybeScore) {
++          CheckTraitScore(*maybeScore);
++        }
++      }
++
++      // Check the properties of the individual traits
++      CheckTraitSelector(traitSet, trait);
++    }
++  }};
++
++  checkTraitSet(
++      configs.at(std::get<parser::OmpTraitSetSelectorName>(traitSet.t).v));
++}
++
++void OmpStructureChecker::CheckTraitScore(const parser::OmpTraitScore &score) {
++  // [6.0:322:23]
++  // A score-expression must be a non-negative constant integer expression.
++  if (auto value{GetIntValue(score)}; !value || value <= 0) {
++    context_.Say(score.source,
++        "SCORE expression must be a non-negative constant integer expression"_err_en_US);
++  }
++}
++
++bool OmpStructureChecker::VerifyTraitPropertyLists(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  using TraitName = parser::OmpTraitSelectorName;
++  using PropertyList = std::list<parser::OmpTraitProperty>;
++  auto &[traitName, maybeProps]{trait.t};
++
++  auto checkPropertyList{[&](const PropertyList &properties, auto isValid,
++                             const std::string &message) {
++    bool foundInvalid{false};
++    for (const parser::OmpTraitProperty &prop : properties) {
++      if (!isValid(prop)) {
++        if (foundInvalid) {
++          context_.Say(
++              prop.source, "More invalid properties are present"_err_en_US);
++          break;
++        }
++        context_.Say(prop.source, "%s"_err_en_US, message);
++        foundInvalid = true;
++      }
++    }
++    return !foundInvalid;
++  }};
++
++  bool invalid{false};
++
++  if (std::holds_alternative<llvm::omp::Directive>(traitName.u)) {
++    // Directive-name traits don't have properties.
++    if (maybeProps) {
++      context_.Say(trait.source,
++          "Directive-name traits cannot have properties"_err_en_US);
++      invalid = true;
++    }
++  }
++  // Ignore properties on extension traits.
++
++  // See `TraitSelectorParser` in openmp-parser.cpp
++  if (auto *v{std::get_if<TraitName::Value>(&traitName.u)}) {
++    switch (*v) {
++    // name-list properties
++    case parser::OmpTraitSelectorName::Value::Arch:
++    case parser::OmpTraitSelectorName::Value::Extension:
++    case parser::OmpTraitSelectorName::Value::Isa:
++    case parser::OmpTraitSelectorName::Value::Kind:
++    case parser::OmpTraitSelectorName::Value::Uid:
++    case parser::OmpTraitSelectorName::Value::Vendor:
++      if (maybeProps) {
++        auto isName{[](const parser::OmpTraitProperty &prop) {
++          return std::holds_alternative<parser::OmpTraitPropertyName>(prop.u);
++        }};
++        invalid = !checkPropertyList(std::get<PropertyList>(maybeProps->t),
++            isName, "Trait property should be a name");
++      }
++      break;
++    // clause-list
++    case parser::OmpTraitSelectorName::Value::Atomic_Default_Mem_Order:
++    case parser::OmpTraitSelectorName::Value::Requires:
++    case parser::OmpTraitSelectorName::Value::Simd:
++      if (maybeProps) {
++        auto isClause{[&](const parser::OmpTraitProperty &prop) {
++          return GetClauseFromProperty(prop).has_value();
++        }};
++        invalid = !checkPropertyList(std::get<PropertyList>(maybeProps->t),
++            isClause, "Trait property should be a clause");
++      }
++      break;
++    // expr-list
++    case parser::OmpTraitSelectorName::Value::Condition:
++    case parser::OmpTraitSelectorName::Value::Device_Num:
++      if (maybeProps) {
++        auto isExpr{[](const parser::OmpTraitProperty &prop) {
++          return std::holds_alternative<parser::ScalarExpr>(prop.u);
++        }};
++        invalid = !checkPropertyList(std::get<PropertyList>(maybeProps->t),
++            isExpr, "Trait property should be a scalar expression");
++      }
++      break;
++    } // switch
++  }
++
++  return !invalid;
++}
++
++void OmpStructureChecker::CheckTraitSelector(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  using TraitName = parser::OmpTraitSelectorName;
++  auto &[traitName, maybeProps]{trait.t};
++
++  // Only do the detailed checks if the property lists are valid.
++  if (VerifyTraitPropertyLists(traitSet, trait)) {
++    if (std::holds_alternative<llvm::omp::Directive>(traitName.u) ||
++        std::holds_alternative<std::string>(traitName.u)) {
++      // No properties here: directives don't have properties, and
++      // we don't implement any extension traits now.
++      return;
++    }
++
++    // Specific traits we want to check.
++    // Limitations:
++    // (1) The properties for these traits are defined in "Additional
++    // Definitions for the OpenMP API Specification". It's not clear how
++    // to define them in a portable way, and how to verify their validity,
++    // especially if they get replaced by their integer values (in case
++    // they are defined as enums).
++    // (2) These are entirely implementation-defined, and at the moment
++    // there is no known schema to validate these values.
++    auto v{std::get<TraitName::Value>(traitName.u)};
++    switch (v) {
++    case TraitName::Value::Arch:
++      // Unchecked, TBD(1)
++      break;
++    case TraitName::Value::Atomic_Default_Mem_Order:
++      CheckTraitADMO(traitSet, trait);
++      break;
++    case TraitName::Value::Condition:
++      CheckTraitCondition(traitSet, trait);
++      break;
++    case TraitName::Value::Device_Num:
++      CheckTraitDeviceNum(traitSet, trait);
++      break;
++    case TraitName::Value::Extension:
++      // Ignore
++      break;
++    case TraitName::Value::Isa:
++      // Unchecked, TBD(1)
++      break;
++    case TraitName::Value::Kind:
++      // Unchecked, TBD(1)
++      break;
++    case TraitName::Value::Requires:
++      CheckTraitRequires(traitSet, trait);
++      break;
++    case TraitName::Value::Simd:
++      CheckTraitSimd(traitSet, trait);
++      break;
++    case TraitName::Value::Uid:
++      // Unchecked, TBD(2)
++      break;
++    case TraitName::Value::Vendor:
++      // Unchecked, TBD(1)
++      break;
++    }
++  }
++}
++
++void OmpStructureChecker::CheckTraitADMO(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  auto &traitName{std::get<parser::OmpTraitSelectorName>(trait.t)};
++  auto &properties{GetTraitPropertyList(trait)};
++
++  if (properties.size() != 1) {
++    context_.Say(trait.source,
++        "%s trait requires a single clause property"_err_en_US,
++        parser::ToUpperCaseLetters(traitName.ToString()));
++  } else {
++    const parser::OmpTraitProperty &property{properties.front()};
++    auto clauseId{*GetClauseFromProperty(property)};
++    // Check that the clause belongs to the memory-order clause-set.
++    // Clause sets will hopefully be autogenerated at some point.
++    switch (clauseId) {
++    case llvm::omp::Clause::OMPC_acq_rel:
++    case llvm::omp::Clause::OMPC_acquire:
++    case llvm::omp::Clause::OMPC_relaxed:
++    case llvm::omp::Clause::OMPC_release:
++    case llvm::omp::Clause::OMPC_seq_cst:
++      break;
++    default:
++      context_.Say(property.source,
++          "%s trait requires a clause from the memory-order clause set"_err_en_US,
++          parser::ToUpperCaseLetters(traitName.ToString()));
++    }
++
++    using ClauseProperty = common::Indirection<parser::OmpClause>;
++    if (!std::holds_alternative<ClauseProperty>(property.u)) {
++      context_.Say(property.source,
++          "Invalid clause specification for %s"_err_en_US,
++          parser::ToUpperCaseLetters(getClauseName(clauseId)));
++    }
++  }
++}
++
++void OmpStructureChecker::CheckTraitCondition(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  auto &traitName{std::get<parser::OmpTraitSelectorName>(trait.t)};
++  auto &properties{GetTraitPropertyList(trait)};
++
++  if (properties.size() != 1) {
++    context_.Say(trait.source,
++        "%s trait requires a single expression property"_err_en_US,
++        parser::ToUpperCaseLetters(traitName.ToString()));
++  } else {
++    const parser::OmpTraitProperty &property{properties.front()};
++    auto &scalarExpr{std::get<parser::ScalarExpr>(property.u)};
++
++    auto maybeType{GetDynamicType(scalarExpr.thing)};
++    if (!maybeType || maybeType->category() != TypeCategory::Logical) {
++      context_.Say(property.source,
++          "%s trait requires a single LOGICAL expression"_err_en_US,
++          parser::ToUpperCaseLetters(traitName.ToString()));
++    }
++  }
++}
++
++void OmpStructureChecker::CheckTraitDeviceNum(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  auto &traitName{std::get<parser::OmpTraitSelectorName>(trait.t)};
++  auto &properties{GetTraitPropertyList(trait)};
++
++  if (properties.size() != 1) {
++    context_.Say(trait.source,
++        "%s trait requires a single expression property"_err_en_US,
++        parser::ToUpperCaseLetters(traitName.ToString()));
++  }
++  // No other checks at the moment.
++}
++
++void OmpStructureChecker::CheckTraitRequires(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  unsigned version{context_.langOptions().OpenMPVersion};
++  auto &traitName{std::get<parser::OmpTraitSelectorName>(trait.t)};
++  auto &properties{GetTraitPropertyList(trait)};
++
++  for (const parser::OmpTraitProperty &property : properties) {
++    auto clauseId{*GetClauseFromProperty(property)};
++    if (!llvm::omp::isAllowedClauseForDirective(
++            llvm::omp::OMPD_requires, clauseId, version)) {
++      context_.Say(property.source,
++          "%s trait requires a clause from the requirement clause set"_err_en_US,
++          parser::ToUpperCaseLetters(traitName.ToString()));
++    }
++
++    using ClauseProperty = common::Indirection<parser::OmpClause>;
++    if (!std::holds_alternative<ClauseProperty>(property.u)) {
++      context_.Say(property.source,
++          "Invalid clause specification for %s"_err_en_US,
++          parser::ToUpperCaseLetters(getClauseName(clauseId)));
++    }
++  }
++}
++
++void OmpStructureChecker::CheckTraitSimd(
++    const parser::OmpTraitSetSelector &traitSet,
++    const parser::OmpTraitSelector &trait) {
++  unsigned version{context_.langOptions().OpenMPVersion};
++  auto &traitName{std::get<parser::OmpTraitSelectorName>(trait.t)};
++  auto &properties{GetTraitPropertyList(trait)};
++
++  for (const parser::OmpTraitProperty &property : properties) {
++    auto clauseId{*GetClauseFromProperty(property)};
++    if (!llvm::omp::isAllowedClauseForDirective(
++            llvm::omp::OMPD_declare_simd, clauseId, version)) {
++      context_.Say(property.source,
++          "%s trait requires a clause that is allowed on the %s directive"_err_en_US,
++          parser::ToUpperCaseLetters(traitName.ToString()),
++          parser::ToUpperCaseLetters(
++              getDirectiveName(llvm::omp::OMPD_declare_simd)));
++    }
++
++    using ClauseProperty = common::Indirection<parser::OmpClause>;
++    if (!std::holds_alternative<ClauseProperty>(property.u)) {
++      context_.Say(property.source,
++          "Invalid clause specification for %s"_err_en_US,
++          parser::ToUpperCaseLetters(getClauseName(clauseId)));
++    }
++  }
++}
++
+ llvm::StringRef OmpStructureChecker::getClauseName(llvm::omp::Clause clause) {
+   return llvm::omp::getOpenMPClauseName(clause);
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 7412a2071d492..a9ac93a9149d4 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -184,6 +184,32 @@ class OmpStructureChecker
+   // specific clause related
+   void CheckAllowedMapTypes(const parser::OmpMapType::Value &,
+       const std::list<parser::OmpMapType::Value> &);
++
++  std::optional<evaluate::DynamicType> GetDynamicType(
++      const common::Indirection<parser::Expr> &);
++  const std::list<parser::OmpTraitProperty> &GetTraitPropertyList(
++      const parser::OmpTraitSelector &);
++  std::optional<llvm::omp::Clause> GetClauseFromProperty(
++      const parser::OmpTraitProperty &);
++
++  void CheckTraitSelectorList(const std::list<parser::OmpTraitSelector> &);
++  void CheckTraitSetSelector(const parser::OmpTraitSetSelector &);
++  void CheckTraitScore(const parser::OmpTraitScore &);
++  bool VerifyTraitPropertyLists(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitSelector(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitADMO(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitCondition(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitDeviceNum(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitRequires(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++  void CheckTraitSimd(
++      const parser::OmpTraitSetSelector &, const parser::OmpTraitSelector &);
++
+   llvm::StringRef getClauseName(llvm::omp::Clause clause) override;
+   llvm::StringRef getDirectiveName(llvm::omp::Directive directive) override;
+ 
+diff --git a/flang/lib/Semantics/openmp-modifiers.cpp b/flang/lib/Semantics/openmp-modifiers.cpp
+index 9f2896229bb7f..73ad7751ee517 100644
+--- a/flang/lib/Semantics/openmp-modifiers.cpp
++++ b/flang/lib/Semantics/openmp-modifiers.cpp
+@@ -156,6 +156,23 @@ const OmpModifierDescriptor &OmpGetDescriptor<parser::OmpChunkModifier>() {
+   return desc;
+ }
+ 
++template <>
++const OmpModifierDescriptor &OmpGetDescriptor<parser::OmpContextSelector>() {
++  static const OmpModifierDescriptor desc{
++      /*name=*/"context-selector",
++      /*props=*/
++      {
++          {50, {OmpProperty::Required, OmpProperty::Unique}},
++      },
++      /*clauses=*/
++      {
++          // The MATCH clause takes a selector as an argument, not modifier.
++          {50, {Clause::OMPC_when}},
++      },
++  };
++  return desc;
++}
++
+ template <>
+ const OmpModifierDescriptor &OmpGetDescriptor<parser::OmpDependenceType>() {
+   static const OmpModifierDescriptor desc{
+diff --git a/flang/test/Parser/OpenMP/metadirective.f90 b/flang/test/Parser/OpenMP/metadirective.f90
+index af6c3bbefacf2..359f0d8be7a65 100644
+--- a/flang/test/Parser/OpenMP/metadirective.f90
++++ b/flang/test/Parser/OpenMP/metadirective.f90
+@@ -22,17 +22,17 @@ subroutine f00
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f01
+-  !$omp metadirective when(device={kind(host), device_num(1)}: nothing)
++  !$omp metadirective when(target_device={kind(host), device_num(1)}: nothing)
+ end
+ 
+ !UNPARSE: SUBROUTINE f01
+-!UNPARSE: !$OMP METADIRECTIVE  WHEN(DEVICE={KIND(host), DEVICE_NUM(1_4)}: NOTHING)
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(TARGET_DEVICE={KIND(host), DEVICE_NUM(1_4)}: NOTHING)
+ !UNPARSE: END SUBROUTINE
+ 
+ !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
+ !PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
+ !PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
+-!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Device
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Target_Device
+ !PARSE-TREE: | | | OmpTraitSelector
+ !PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Kind
+ !PARSE-TREE: | | | | Properties
+@@ -95,12 +95,12 @@ subroutine f03
+ 
+ subroutine f04
+   !$omp metadirective &
+-  !$omp & when(implementation={extension(haha(1), foo(baz, "bar"(1)))}: nothing)
++  !$omp when(implementation={extension_trait(haha(1), foo(baz, "bar"(1)))}: nothing)
+ end
+ 
+ !UNPARSE: SUBROUTINE f04
+-!UNPARSE: !$OMP METADIRECTIVE  WHEN(IMPLEMENTATION={EXTENSION(haha(1_4), foo(baz,bar(1_4)))}: &
+-!UNPARSE: !$OMP&NOTHING)
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(IMPLEMENTATION={extension_trait(haha(1_4), foo(baz,bar(1_4&
++!UNPARSE: !$OMP&)))}: NOTHING)
+ !UNPARSE: END SUBROUTINE
+ 
+ !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
+@@ -108,7 +108,7 @@ subroutine f04
+ !PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
+ !PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Implementation
+ !PARSE-TREE: | | | OmpTraitSelector
+-!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Extension
++!PARSE-TREE: | | | | OmpTraitSelectorName -> string = 'extension_trait'
+ !PARSE-TREE: | | | | Properties
+ !PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyExtension -> Complex
+ !PARSE-TREE: | | | | | | OmpTraitPropertyName -> string = 'haha'
+diff --git a/flang/test/Semantics/OpenMP/metadirective-common.f90 b/flang/test/Semantics/OpenMP/metadirective-common.f90
+new file mode 100644
+index 0000000000000..4988fae9e8edc
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/metadirective-common.f90
+@@ -0,0 +1,37 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++! Common context selector tests
++
++subroutine f00
++  !$omp metadirective &
++  !$omp & when(implementation={vendor("this")}, &
++!ERROR: Repeated trait set name IMPLEMENTATION in a context specifier
++  !$omp &      implementation={requires(unified_shared_memory)}: nothing)
++end
++
++subroutine f01
++  !$omp metadirective &
++!ERROR: Repeated trait name ISA in a trait set
++  !$omp & when(device={isa("this"), isa("that")}: nothing)
++end
++
++subroutine f02
++  !$omp metadirective &
++!ERROR: SCORE expression must be a non-negative constant integer expression
++  !$omp & when(user={condition(score(-2): .true.)}: nothing)
++end
++
++subroutine f03(x)
++  integer :: x
++  !$omp metadirective &
++!ERROR: SCORE expression must be a non-negative constant integer expression
++  !$omp & when(user={condition(score(x): .true.)}: nothing)
++end
++
++subroutine f04
++  !$omp metadirective &
++!ERROR: Trait property should be a scalar expression
++!ERROR: More invalid properties are present
++  !$omp & when(target_device={device_num("device", "foo"(1))}: nothing)
++end
++
+diff --git a/flang/test/Semantics/OpenMP/metadirective-construct.f90 b/flang/test/Semantics/OpenMP/metadirective-construct.f90
+new file mode 100644
+index 0000000000000..1dd23b1dca67b
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/metadirective-construct.f90
+@@ -0,0 +1,33 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++! The CONSTRUCT trait set
++
++subroutine f00
++  !$omp metadirective &
++!ERROR: CONDITION is not a valid trait for CONSTRUCT trait set
++  !$omp & when(construct={condition(.true.)}: nothing)
++end
++
++subroutine f01
++  !$omp metadirective &
++!ERROR: Directive-name traits cannot have properties
++  !$omp & when(construct={parallel(nowait), simd}: nothing)
++end
++
++subroutine f02
++  !$omp metadirective &
++!ERROR: SIMD trait requires a clause that is allowed on the DECLARE SIMD directive
++  !$omp & when(construct={simd(nowait)}: nothing)
++end
++
++subroutine f03
++  !$omp metadirective &
++!ERROR: Extension traits are not valid for CONSTRUCT trait set
++  !$omp & when(construct={fred(1)}: nothing)
++end
++
++subroutine f04
++  !$omp metadirective &
++!This is ok
++  !$omp & when(construct={parallel, simd(simdlen(32), notinbranch)}: nothing)
++end
+diff --git a/flang/test/Semantics/OpenMP/metadirective-device.f90 b/flang/test/Semantics/OpenMP/metadirective-device.f90
+new file mode 100644
+index 0000000000000..fb11499066247
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/metadirective-device.f90
+@@ -0,0 +1,36 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++! The DEVICE and TARGET_DEVICE trait sets
++
++subroutine f00
++  !$omp metadirective &
++!ERROR: DEVICE_NUM is not a valid trait for DEVICE trait set
++  !$omp & when(device={device_num(10)}: nothing)
++end
++
++subroutine f01
++  !$omp metadirective &
++!This is ok: all traits are valid
++  !$omp & when(device={arch("some-arch"), isa("some-isa"), kind("some-kind")}:&
++  !$omp & nothing)
++end
++
++subroutine f02
++  !$omp metadirective &
++!This is ok: all traits are valid
++  !$omp & when(target_device={arch("some-arch"), device_num(10), &
++  !$omp & isa("some-isa"), kind("some-kind"), uid("some-uid")}: nothing)
++end
++
++subroutine f03
++  !$omp metadirective &
++!This is ok: extension traits are allowed
++  !$omp & when(device={some_new_trait}: nothing)
++end
++
++subroutine f04
++  !$omp metadirective &
++!This is ok: extension traits are allowed
++  !$omp & when(target_device={another_new_trait(12, 21)}: nothing)
++end
++
+diff --git a/flang/test/Semantics/OpenMP/metadirective-implementation.f90 b/flang/test/Semantics/OpenMP/metadirective-implementation.f90
+new file mode 100644
+index 0000000000000..7a7642158fc29
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/metadirective-implementation.f90
+@@ -0,0 +1,33 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++! The IMPLEMENTATION trait set
++
++subroutine f00
++  !$omp metadirective &
++!ERROR: Trait property should be a clause
++  !$omp & when(implementation={atomic_default_mem_order(0)}: nothing)
++end
++
++subroutine f01
++  !$omp metadirective &
++!ERROR: ATOMIC_DEFAULT_MEM_ORDER trait requires a clause from the memory-order clause set
++  !$omp & when(implementation={atomic_default_mem_order(nowait)}: nothing)
++end
++
++subroutine f02
++  !$omp metadirective &
++!ERROR: REQUIRES trait requires a clause from the requirement clause set
++!ERROR: Invalid clause specification for SHARED
++  !$omp & when(implementation={requires(shared)}: nothing)
++end
++
++subroutine f03
++  !$omp metadirective &
++!This is ok
++  !$omp & when(implementation={ &
++  !$omp &         atomic_default_mem_order(relaxed), &
++  !$omp &         extension("foo"), &
++  !$omp &         requires(unified_address),
++  !$omp &         vendor(some_vendor) &
++  !$omp &      }: nothing)
++end
+diff --git a/flang/test/Semantics/OpenMP/metadirective-user.f90 b/flang/test/Semantics/OpenMP/metadirective-user.f90
+new file mode 100644
+index 0000000000000..c4f037d57a9d9
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/metadirective-user.f90
+@@ -0,0 +1,29 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=52
++
++! The USER trait set
++
++subroutine f00(x)
++  integer :: x
++  !$omp metadirective &
++!ERROR: CONDITION trait requires a single LOGICAL expression
++  !$omp & when(user={condition(score(2): x)}: nothing)
++end
++
++subroutine f01
++  !$omp metadirective &
++!ERROR: CONDITION trait requires a single expression property
++  !$omp & when(user={condition(.true., .false.)}: nothing)
++end
++
++subroutine f02
++  !$omp metadirective &
++!ERROR: Extension traits are not valid for USER trait set
++  !$omp & when(user={fred}: nothing)
++end
++
++subroutine f03(x)
++  integer :: x
++  !$omp metadirective &
++!This is ok
++  !$omp & when(user={condition(x > 0)}: nothing)
++end

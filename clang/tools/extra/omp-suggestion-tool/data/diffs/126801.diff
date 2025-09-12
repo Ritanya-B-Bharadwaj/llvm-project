@@ -1,0 +1,106 @@
+diff --git a/clang/lib/CodeGen/CodeGenModule.h b/clang/lib/CodeGen/CodeGenModule.h
+index 0956296e2d5d8..c6f6fd5b9a7bd 100644
+--- a/clang/lib/CodeGen/CodeGenModule.h
++++ b/clang/lib/CodeGen/CodeGenModule.h
+@@ -1067,7 +1067,8 @@ class CodeGenModule : public CodeGenTypeCache {
+   bool shouldEmitRTTI(bool ForEH = false) {
+     return (ForEH || getLangOpts().RTTI) && !getLangOpts().CUDAIsDevice &&
+            !(getLangOpts().OpenMP && getLangOpts().OpenMPIsTargetDevice &&
+-             (getTriple().isNVPTX() || getTriple().isAMDGPU()));
++             (getTriple().isNVPTX() || getTriple().isAMDGPU() ||
++              getTriple().isSPIRV()));
+   }
+ 
+   /// Get the address of the RTTI descriptor for the given type.
+diff --git a/clang/test/OpenMP/spirv_variant_match.cpp b/clang/test/OpenMP/spirv_variant_match.cpp
+new file mode 100644
+index 0000000000000..b37858bc3008b
+--- /dev/null
++++ b/clang/test/OpenMP/spirv_variant_match.cpp
+@@ -0,0 +1,46 @@
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple x86_64-unknown-unknown -fopenmp-targets=spirv64-intel -emit-llvm-bc %s -o %t-host.bc -DDEVICE
++// RUN: %clang_cc1 -verify -triple spirv64-intel -aux-triple x86_64-unknown-unknown -fopenmp -fopenmp-is-target-device \
++// RUN:-fopenmp-host-ir-file-path %t-host.bc -nogpulib %s -emit-llvm -DDEVICE -o - | FileCheck %s
++
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple x86_64-unknown-unknown -fopenmp-targets=spirv64-intel -emit-llvm-bc %s -o %t-host.bc -DTARGET
++// RUN: %clang_cc1 -verify -triple spirv64-intel -aux-triple x86_64-unknown-unknown -fopenmp -fopenmp-is-target-device \
++// RUN: -fopenmp-host-ir-file-path %t-host.bc -nogpulib %s -emit-llvm -DTARGET -o - | FileCheck %s
++
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple x86_64-unknown-unknown -fopenmp-targets=spirv64-intel -emit-llvm-bc %s -o %t-host.bc -DTARGET_KIND
++// RUN: %clang_cc1 -verify -triple spirv64-intel -aux-triple x86_64-unknown-unknown -fopenmp -fopenmp-is-target-device \
++// RUN: -fopenmp-host-ir-file-path %t-host.bc -nogpulib %s -emit-llvm -DTARGET_KIND -o - | FileCheck %s
++
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple x86_64-unknown-unknown -fopenmp-targets=spirv64-intel -emit-llvm-bc %s -o %t-host.bc
++// RUN: %clang_cc1 -verify -triple spirv64-intel -aux-triple x86_64-unknown-unknown -fopenmp -fopenmp-is-target-device \
++// RUN: -fopenmp-host-ir-file-path %t-host.bc -nogpulib %s -emit-llvm -o - | FileCheck %s
++
++// expected-no-diagnostics
++
++#pragma omp declare target
++int foo() { return 0; }
++
++#ifdef DEVICE
++#pragma omp begin declare variant match(device = {arch(spirv64)})
++#elif defined(TARGET)
++#pragma omp begin declare variant match(target_device = {arch(spirv64)})
++#elif defined(TARGET_KIND)
++#pragma omp begin declare variant match(target_device = {kind(gpu)})
++#else
++#pragma omp begin declare variant match(device = {kind(gpu)})
++#endif
++
++int foo() { return 1; }
++#pragma omp end declare variant
++#pragma omp end declare target
++
++// CHECK-DAG: define{{.*}} @{{"_Z[0-9]+foo\$ompvariant\$.*"}}()
++
++// CHECK-DAG: call spir_func noundef i32 @{{"_Z[0-9]+foo\$ompvariant\$.*"}}()
++
++int main() {
++  int res;
++#pragma omp target map(from \
++                       : res)
++  res = foo();
++  return res;
++}
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+index 44a9a37c70597..f974cfc78c8dd 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+@@ -1269,6 +1269,7 @@ __OMP_TRAIT_PROPERTY(device, arch, x86_64)
+ __OMP_TRAIT_PROPERTY(device, arch, amdgcn)
+ __OMP_TRAIT_PROPERTY(device, arch, nvptx)
+ __OMP_TRAIT_PROPERTY(device, arch, nvptx64)
++__OMP_TRAIT_PROPERTY(device, arch, spirv64)
+ 
+ __OMP_TRAIT_SET(target_device)
+ 
+@@ -1301,6 +1302,7 @@ __OMP_TRAIT_PROPERTY(target_device, arch, x86_64)
+ __OMP_TRAIT_PROPERTY(target_device, arch, amdgcn)
+ __OMP_TRAIT_PROPERTY(target_device, arch, nvptx)
+ __OMP_TRAIT_PROPERTY(target_device, arch, nvptx64)
++__OMP_TRAIT_PROPERTY(target_device, arch, spirv64)
+ 
+ __OMP_TRAIT_SET(implementation)
+ 
+diff --git a/llvm/lib/Frontend/OpenMP/OMPContext.cpp b/llvm/lib/Frontend/OpenMP/OMPContext.cpp
+index 5e13da172d677..2edfd786c5c23 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPContext.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPContext.cpp
+@@ -52,6 +52,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
+     case Triple::amdgcn:
+     case Triple::nvptx:
+     case Triple::nvptx64:
++    case Triple::spirv64:
+       ActiveTraits.set(unsigned(TraitProperty::target_device_kind_gpu));
+       break;
+     default:
+@@ -98,6 +99,7 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
+     case Triple::amdgcn:
+     case Triple::nvptx:
+     case Triple::nvptx64:
++    case Triple::spirv64:
+       ActiveTraits.set(unsigned(TraitProperty::device_kind_gpu));
+       ActiveTraits.set(unsigned(TraitProperty::target_device_kind_gpu));
+       break;

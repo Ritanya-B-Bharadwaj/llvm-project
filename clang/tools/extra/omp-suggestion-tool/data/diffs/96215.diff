@@ -1,0 +1,489 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 27eea2b133b3c..8da5914ae9c70 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1005,7 +1005,8 @@ bool ClauseProcessor::processReduction(
+ 
+         // Copy local lists into the output.
+         llvm::copy(reductionVars, std::back_inserter(result.reductionVars));
+-        llvm::copy(reduceVarByRef, std::back_inserter(result.reduceVarByRef));
++        llvm::copy(reduceVarByRef,
++                   std::back_inserter(result.reductionVarsByRef));
+         llvm::copy(reductionDeclSymbols,
+                    std::back_inserter(result.reductionDeclSymbols));
+ 
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+index de7959db489e9..0b7028f19e6b8 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+@@ -94,6 +94,7 @@ struct IfClauseOps {
+ 
+ struct InReductionClauseOps {
+   llvm::SmallVector<Value> inReductionVars;
++  llvm::SmallVector<bool> inReductionVarsByRef;
+   llvm::SmallVector<Attribute> inReductionDeclSymbols;
+ };
+ 
+@@ -177,7 +178,7 @@ struct ProcBindClauseOps {
+ 
+ struct ReductionClauseOps {
+   llvm::SmallVector<Value> reductionVars;
+-  llvm::SmallVector<bool> reduceVarByRef;
++  llvm::SmallVector<bool> reductionVarsByRef;
+   llvm::SmallVector<Attribute> reductionDeclSymbols;
+ };
+ 
+@@ -198,6 +199,7 @@ struct SimdlenClauseOps {
+ 
+ struct TaskReductionClauseOps {
+   llvm::SmallVector<Value> taskReductionVars;
++  llvm::SmallVector<bool> taskReductionVarsByRef;
+   llvm::SmallVector<Attribute> taskReductionDeclSymbols;
+ };
+ 
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index f28911adccd02..fff937fc35c3d 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -246,6 +246,7 @@ def TeamsOp : OpenMP_Op<"teams", [
+                        Variadic<AnyType>:$allocate_vars,
+                        Variadic<AnyType>:$allocators_vars,
+                        Variadic<OpenMP_PointerLikeType>:$reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$reductions);
+ 
+   let regions = (region AnyRegion:$region);
+@@ -262,8 +263,8 @@ def TeamsOp : OpenMP_Op<"teams", [
+     | `thread_limit` `(` $thread_limit `:` type($thread_limit) `)`
+     | `reduction` `(`
+         custom<ReductionVarList>(
+-          $reduction_vars, type($reduction_vars), $reductions
+-        ) `)`
++          $reduction_vars, type($reduction_vars), $reduction_vars_byref,
++          $reductions ) `)`
+     | `allocate` `(`
+         custom<AllocateAndAllocator>(
+           $allocate_vars, type($allocate_vars),
+@@ -306,7 +307,9 @@ def SectionsOp : OpenMP_Op<"sections", [AttrSizedOperandSegments,
+     by the accumulator it uses and accumulators must not be repeated in the same
+     reduction. The reduction declaration specifies how to combine the values
+     from each section into the final value, which is available in the
+-    accumulator after all the sections complete.
++    accumulator after all the sections complete. True values in
++    reduction_vars_byref indicate that the reduction variable should be passed
++    by reference.
+ 
+     The $allocators_vars and $allocate_vars parameters are a variadic list of values
+     that specify the memory allocator to be used to obtain storage for private values.
+@@ -315,6 +318,7 @@ def SectionsOp : OpenMP_Op<"sections", [AttrSizedOperandSegments,
+     implicit barrier at the end of the construct.
+   }];
+   let arguments = (ins Variadic<OpenMP_PointerLikeType>:$reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$reductions,
+                        Variadic<AnyType>:$allocate_vars,
+                        Variadic<AnyType>:$allocators_vars,
+@@ -329,7 +333,8 @@ def SectionsOp : OpenMP_Op<"sections", [AttrSizedOperandSegments,
+   let assemblyFormat = [{
+     oilist( `reduction` `(`
+               custom<ReductionVarList>(
+-                $reduction_vars, type($reduction_vars), $reductions
++                $reduction_vars, type($reduction_vars), $reduction_vars_byref,
++                $reductions
+               ) `)`
+           | `allocate` `(`
+               custom<AllocateAndAllocator>(
+@@ -786,6 +791,8 @@ def TaskOp : OpenMP_Op<"task", [AttrSizedOperandSegments,
+ 
+     The `in_reduction` clause specifies that this particular task (among all the
+     tasks in current taskgroup, if any) participates in a reduction.
++    `in_reduction_vars_byref` indicates whether each reduction variable should
++    be passed by value or by reference.
+ 
+     The `priority` clause is a hint for the priority of the generated task.
+     The `priority` is a non-negative integer expression that provides a hint for
+@@ -811,6 +818,7 @@ def TaskOp : OpenMP_Op<"task", [AttrSizedOperandSegments,
+                        UnitAttr:$untied,
+                        UnitAttr:$mergeable,
+                        Variadic<OpenMP_PointerLikeType>:$in_reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$in_reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$in_reductions,
+                        Optional<I32>:$priority,
+                        OptionalAttr<TaskDependArrayAttr>:$depends,
+@@ -828,7 +836,8 @@ def TaskOp : OpenMP_Op<"task", [AttrSizedOperandSegments,
+           |`mergeable` $mergeable
+           |`in_reduction` `(`
+               custom<ReductionVarList>(
+-                $in_reduction_vars, type($in_reduction_vars), $in_reductions
++                $in_reduction_vars, type($in_reduction_vars),
++                $in_reduction_vars_byref, $in_reductions
+               ) `)`
+           |`priority` `(` $priority `)`
+           |`allocate` `(`
+@@ -955,8 +964,10 @@ def TaskloopOp : OpenMP_Op<"taskloop", [AttrSizedOperandSegments,
+                        UnitAttr:$untied,
+                        UnitAttr:$mergeable,
+                        Variadic<OpenMP_PointerLikeType>:$in_reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$in_reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$in_reductions,
+                        Variadic<OpenMP_PointerLikeType>:$reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$reductions,
+                        Optional<IntLikeType>:$priority,
+                        Variadic<AnyType>:$allocate_vars,
+@@ -978,11 +989,13 @@ def TaskloopOp : OpenMP_Op<"taskloop", [AttrSizedOperandSegments,
+           |`mergeable` $mergeable
+           |`in_reduction` `(`
+               custom<ReductionVarList>(
+-                $in_reduction_vars, type($in_reduction_vars), $in_reductions
++                $in_reduction_vars, type($in_reduction_vars),
++                $in_reduction_vars_byref, $in_reductions
+               ) `)`
+           |`reduction` `(`
+               custom<ReductionVarList>(
+-                $reduction_vars, type($reduction_vars), $reductions
++                $reduction_vars, type($reduction_vars), $reduction_vars_byref,
++                $reductions
+               ) `)`
+           |`priority` `(` $priority `:` type($priority) `)`
+           |`allocate` `(`
+@@ -1033,6 +1046,7 @@ def TaskgroupOp : OpenMP_Op<"taskgroup", [AttrSizedOperandSegments,
+   }];
+ 
+   let arguments = (ins Variadic<OpenMP_PointerLikeType>:$task_reduction_vars,
++                       OptionalAttr<DenseBoolArrayAttr>:$task_reduction_vars_byref,
+                        OptionalAttr<SymbolRefArrayAttr>:$task_reductions,
+                        Variadic<AnyType>:$allocate_vars,
+                        Variadic<AnyType>:$allocators_vars);
+@@ -1046,7 +1060,8 @@ def TaskgroupOp : OpenMP_Op<"taskgroup", [AttrSizedOperandSegments,
+   let assemblyFormat = [{
+     oilist(`task_reduction` `(`
+               custom<ReductionVarList>(
+-                $task_reduction_vars, type($task_reduction_vars), $task_reductions
++                $task_reduction_vars, type($task_reduction_vars),
++                $task_reduction_vars_byref, $task_reductions
+               ) `)`
+           |`allocate` `(`
+               custom<AllocateAndAllocator>(
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 110873011fe35..7a3714d6b2d27 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -48,6 +48,11 @@ static ArrayAttr makeArrayAttr(MLIRContext *context,
+   return attrs.empty() ? nullptr : ArrayAttr::get(context, attrs);
+ }
+ 
++static DenseBoolArrayAttr
++makeDenseBoolArrayAttr(MLIRContext *ctx, const ArrayRef<bool> boolArray) {
++  return boolArray.empty() ? nullptr : DenseBoolArrayAttr::get(ctx, boolArray);
++}
++
+ namespace {
+ struct MemRefPointerLikeModel
+     : public PointerLikeType::ExternalModel<MemRefPointerLikeModel,
+@@ -460,7 +465,7 @@ static ParseResult parseClauseWithRegionArgs(
+             return success();
+           })))
+     return failure();
+-  isByRef = DenseBoolArrayAttr::get(parser.getContext(), isByRefVec);
++  isByRef = makeDenseBoolArrayAttr(parser.getContext(), isByRefVec);
+ 
+   auto *argsBegin = regionPrivateArgs.begin();
+   MutableArrayRef argsSubrange(argsBegin + regionArgOffset,
+@@ -552,7 +557,7 @@ static void printParallelRegion(OpAsmPrinter &p, Operation *op, Region &region,
+     mlir::SmallVector<bool> isByRefVec;
+     isByRefVec.resize(privateVarTypes.size(), false);
+     DenseBoolArrayAttr isByRef =
+-        DenseBoolArrayAttr::get(op->getContext(), isByRefVec);
++        makeDenseBoolArrayAttr(op->getContext(), isByRefVec);
+ 
+     printClauseWithRegionArgs(p, op, argsSubrange, "private",
+                               privateVarOperands, privateVarTypes, isByRef,
+@@ -568,18 +573,22 @@ static void printParallelRegion(OpAsmPrinter &p, Operation *op, Region &region,
+ static ParseResult
+ parseReductionVarList(OpAsmParser &parser,
+                       SmallVectorImpl<OpAsmParser::UnresolvedOperand> &operands,
+-                      SmallVectorImpl<Type> &types,
++                      SmallVectorImpl<Type> &types, DenseBoolArrayAttr &isByRef,
+                       ArrayAttr &redcuctionSymbols) {
+   SmallVector<SymbolRefAttr> reductionVec;
++  SmallVector<bool> isByRefVec;
+   if (failed(parser.parseCommaSeparatedList([&]() {
++        ParseResult optionalByref = parser.parseOptionalKeyword("byref");
+         if (parser.parseAttribute(reductionVec.emplace_back()) ||
+             parser.parseArrow() ||
+             parser.parseOperand(operands.emplace_back()) ||
+             parser.parseColonType(types.emplace_back()))
+           return failure();
++        isByRefVec.push_back(optionalByref.succeeded());
+         return success();
+       })))
+     return failure();
++  isByRef = makeDenseBoolArrayAttr(parser.getContext(), isByRefVec);
+   SmallVector<Attribute> reductions(reductionVec.begin(), reductionVec.end());
+   redcuctionSymbols = ArrayAttr::get(parser.getContext(), reductions);
+   return success();
+@@ -589,11 +598,21 @@ parseReductionVarList(OpAsmParser &parser,
+ static void printReductionVarList(OpAsmPrinter &p, Operation *op,
+                                   OperandRange reductionVars,
+                                   TypeRange reductionTypes,
++                                  std::optional<DenseBoolArrayAttr> isByRef,
+                                   std::optional<ArrayAttr> reductions) {
+-  for (unsigned i = 0, e = reductions->size(); i < e; ++i) {
++  auto getByRef = [&](unsigned i) -> const char * {
++    if (!isByRef || !*isByRef)
++      return "";
++    assert(isByRef->empty() || i < isByRef->size());
++    if (!isByRef->empty() && (*isByRef)[i])
++      return "byref ";
++    return "";
++  };
++
++  for (unsigned i = 0, e = reductionVars.size(); i < e; ++i) {
+     if (i != 0)
+       p << ", ";
+-    p << (*reductions)[i] << " -> " << reductionVars[i] << " : "
++    p << getByRef(i) << (*reductions)[i] << " -> " << reductionVars[i] << " : "
+       << reductionVars[i].getType();
+   }
+ }
+@@ -602,16 +621,12 @@ static void printReductionVarList(OpAsmPrinter &p, Operation *op,
+ static LogicalResult
+ verifyReductionVarList(Operation *op, std::optional<ArrayAttr> reductions,
+                        OperandRange reductionVars,
+-                       std::optional<ArrayRef<bool>> byRef = std::nullopt) {
++                       std::optional<ArrayRef<bool>> byRef) {
+   if (!reductionVars.empty()) {
+     if (!reductions || reductions->size() != reductionVars.size())
+       return op->emitOpError()
+              << "expected as many reduction symbol references "
+                 "as reduction variables";
+-    if (mlir::isa<omp::WsloopOp, omp::ParallelOp>(op))
+-      assert(byRef);
+-    else
+-      assert(!byRef); // TODO: support byref reductions on other operations
+     if (byRef && byRef->size() != reductionVars.size())
+       return op->emitError() << "expected as many reduction variable by "
+                                 "reference attributes as reduction variables";
+@@ -1453,7 +1468,7 @@ void ParallelOp::build(OpBuilder &builder, OperationState &state,
+   ParallelOp::build(builder, state, clauses.ifVar, clauses.numThreadsVar,
+                     clauses.allocateVars, clauses.allocatorVars,
+                     clauses.reductionVars,
+-                    DenseBoolArrayAttr::get(ctx, clauses.reduceVarByRef),
++                    makeDenseBoolArrayAttr(ctx, clauses.reductionVarsByRef),
+                     makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+                     clauses.procBindKindAttr, clauses.privateVars,
+                     makeArrayAttr(ctx, clauses.privatizers));
+@@ -1551,6 +1566,7 @@ void TeamsOp::build(OpBuilder &builder, OperationState &state,
+                  clauses.numTeamsUpperVar, clauses.ifVar,
+                  clauses.threadLimitVar, clauses.allocateVars,
+                  clauses.allocatorVars, clauses.reductionVars,
++                 makeDenseBoolArrayAttr(ctx, clauses.reductionVarsByRef),
+                  makeArrayAttr(ctx, clauses.reductionDeclSymbols));
+ }
+ 
+@@ -1582,7 +1598,8 @@ LogicalResult TeamsOp::verify() {
+     return emitError(
+         "expected equal sizes for allocate and allocator variables");
+ 
+-  return verifyReductionVarList(*this, getReductions(), getReductionVars());
++  return verifyReductionVarList(*this, getReductions(), getReductionVars(),
++                                getReductionVarsByref());
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1594,6 +1611,7 @@ void SectionsOp::build(OpBuilder &builder, OperationState &state,
+   MLIRContext *ctx = builder.getContext();
+   // TODO Store clauses in op: reductionByRefAttr, privateVars, privatizers.
+   SectionsOp::build(builder, state, clauses.reductionVars,
++                    makeDenseBoolArrayAttr(ctx, clauses.reductionVarsByRef),
+                     makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+                     clauses.allocateVars, clauses.allocatorVars,
+                     clauses.nowaitAttr);
+@@ -1604,7 +1622,8 @@ LogicalResult SectionsOp::verify() {
+     return emitError(
+         "expected equal sizes for allocate and allocator variables");
+ 
+-  return verifyReductionVarList(*this, getReductions(), getReductionVars());
++  return verifyReductionVarList(*this, getReductions(), getReductionVars(),
++                                getReductionVarsByref());
+ }
+ 
+ LogicalResult SectionsOp::verifyRegions() {
+@@ -1693,7 +1712,7 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+   // privatizers.
+   WsloopOp::build(builder, state, clauses.linearVars, clauses.linearStepVars,
+                   clauses.reductionVars,
+-                  DenseBoolArrayAttr::get(ctx, clauses.reduceVarByRef),
++                  makeDenseBoolArrayAttr(ctx, clauses.reductionVarsByRef),
+                   makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+                   clauses.scheduleValAttr, clauses.scheduleChunkVar,
+                   clauses.scheduleModAttr, clauses.scheduleSimdAttr,
+@@ -1892,6 +1911,7 @@ void TaskOp::build(OpBuilder &builder, OperationState &state,
+   TaskOp::build(
+       builder, state, clauses.ifVar, clauses.finalVar, clauses.untiedAttr,
+       clauses.mergeableAttr, clauses.inReductionVars,
++      makeDenseBoolArrayAttr(ctx, clauses.inReductionVarsByRef),
+       makeArrayAttr(ctx, clauses.inReductionDeclSymbols), clauses.priorityVar,
+       makeArrayAttr(ctx, clauses.dependTypeAttrs), clauses.dependVars,
+       clauses.allocateVars, clauses.allocatorVars);
+@@ -1903,7 +1923,8 @@ LogicalResult TaskOp::verify() {
+   return failed(verifyDependVars)
+              ? verifyDependVars
+              : verifyReductionVarList(*this, getInReductions(),
+-                                      getInReductionVars());
++                                      getInReductionVars(),
++                                      getInReductionVarsByref());
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1913,14 +1934,17 @@ LogicalResult TaskOp::verify() {
+ void TaskgroupOp::build(OpBuilder &builder, OperationState &state,
+                         const TaskgroupClauseOps &clauses) {
+   MLIRContext *ctx = builder.getContext();
+-  TaskgroupOp::build(builder, state, clauses.taskReductionVars,
+-                     makeArrayAttr(ctx, clauses.taskReductionDeclSymbols),
+-                     clauses.allocateVars, clauses.allocatorVars);
++  TaskgroupOp::build(
++      builder, state, clauses.taskReductionVars,
++      makeDenseBoolArrayAttr(ctx, clauses.taskReductionVarsByRef),
++      makeArrayAttr(ctx, clauses.taskReductionDeclSymbols),
++      clauses.allocateVars, clauses.allocatorVars);
+ }
+ 
+ LogicalResult TaskgroupOp::verify() {
+   return verifyReductionVarList(*this, getTaskReductions(),
+-                                getTaskReductionVars());
++                                getTaskReductionVars(),
++                                getTaskReductionVarsByref());
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1934,7 +1958,9 @@ void TaskloopOp::build(OpBuilder &builder, OperationState &state,
+   TaskloopOp::build(
+       builder, state, clauses.ifVar, clauses.finalVar, clauses.untiedAttr,
+       clauses.mergeableAttr, clauses.inReductionVars,
++      makeDenseBoolArrayAttr(ctx, clauses.inReductionVarsByRef),
+       makeArrayAttr(ctx, clauses.inReductionDeclSymbols), clauses.reductionVars,
++      makeDenseBoolArrayAttr(ctx, clauses.reductionVarsByRef),
+       makeArrayAttr(ctx, clauses.reductionDeclSymbols), clauses.priorityVar,
+       clauses.allocateVars, clauses.allocatorVars, clauses.grainsizeVar,
+       clauses.numTasksVar, clauses.nogroupAttr);
+@@ -1952,10 +1978,11 @@ LogicalResult TaskloopOp::verify() {
+   if (getAllocateVars().size() != getAllocatorsVars().size())
+     return emitError(
+         "expected equal sizes for allocate and allocator variables");
+-  if (failed(
+-          verifyReductionVarList(*this, getReductions(), getReductionVars())) ||
++  if (failed(verifyReductionVarList(*this, getReductions(), getReductionVars(),
++                                    getReductionVarsByref())) ||
+       failed(verifyReductionVarList(*this, getInReductions(),
+-                                    getInReductionVars())))
++                                    getInReductionVars(),
++                                    getInReductionVarsByref())))
+     return failure();
+ 
+   if (!getReductionVars().empty() && getNogroup())
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index af66d0c65dab8..7475f771f41a1 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -1007,6 +1007,14 @@ func.func @omp_teams(%lb : i32, %ub : i32, %if_cond : i1, %num_threads : i32,
+     omp.terminator
+   }
+ 
++  // Test reduction byref
++  // CHECK: omp.teams reduction(byref @add_f32 -> %{{.+}} : !llvm.ptr) {
++  omp.teams reduction(byref @add_f32 -> %0 : !llvm.ptr) {
++    %1 = arith.constant 2.0 : f32
++    // CHECK: omp.terminator
++    omp.terminator
++  }
++
+   // Test allocate.
+   // CHECK: omp.teams allocate(%{{.+}} : memref<i32> -> %{{.+}} : memref<i32>)
+   omp.teams allocate(%data_var : memref<i32> -> %data_var : memref<i32>) {
+@@ -1038,6 +1046,27 @@ func.func @sections_reduction() {
+   return
+ }
+ 
++// CHECK-LABEL: func @sections_reduction_byref
++func.func @sections_reduction_byref() {
++  %c1 = arith.constant 1 : i32
++  %0 = llvm.alloca %c1 x i32 : (i32) -> !llvm.ptr
++  // CHECK: omp.sections reduction(byref @add_f32 -> {{.+}} : !llvm.ptr)
++  omp.sections reduction(byref @add_f32 -> %0 : !llvm.ptr) {
++    // CHECK: omp.section
++    omp.section {
++      %1 = arith.constant 2.0 : f32
++      omp.terminator
++    }
++    // CHECK: omp.section
++    omp.section {
++      %1 = arith.constant 3.0 : f32
++      omp.terminator
++    }
++    omp.terminator
++  }
++  return
++}
++
+ // CHECK: omp.declare_reduction
+ // CHECK-LABEL: @add2_f32
+ omp.declare_reduction @add2_f32 : f32
+@@ -1970,6 +1999,15 @@ func.func @omp_task(%bool_var: i1, %i64_var: i64, %i32_var: i32, %data_var: memr
+     omp.terminator
+   }
+ 
++  // Checking `in_reduction` clause (mixed) byref
++  // CHECK: omp.task in_reduction(byref @add_f32 -> %[[redn_var1]] : !llvm.ptr, @add_f32 -> %[[redn_var2]] : !llvm.ptr) {
++  omp.task in_reduction(byref @add_f32 -> %0 : !llvm.ptr, @add_f32 -> %1 : !llvm.ptr) {
++    // CHECK: "test.foo"() : () -> ()
++    "test.foo"() : () -> ()
++    // CHECK: omp.terminator
++    omp.terminator
++  }
++
+   // Checking priority clause
+   // CHECK: omp.task priority(%[[i32_var]]) {
+   omp.task priority(%i32_var) {
+@@ -1991,8 +2029,8 @@ func.func @omp_task(%bool_var: i1, %i64_var: i64, %i32_var: i32, %data_var: memr
+   // Checking multiple clauses
+   // CHECK: omp.task if(%[[bool_var]]) final(%[[bool_var]]) untied
+   omp.task if(%bool_var) final(%bool_var) untied
+-      // CHECK-SAME: in_reduction(@add_f32 -> %[[redn_var1]] : !llvm.ptr, @add_f32 -> %[[redn_var2]] : !llvm.ptr)
+-      in_reduction(@add_f32 -> %0 : !llvm.ptr, @add_f32 -> %1 : !llvm.ptr)
++      // CHECK-SAME: in_reduction(@add_f32 -> %[[redn_var1]] : !llvm.ptr, byref @add_f32 -> %[[redn_var2]] : !llvm.ptr)
++      in_reduction(@add_f32 -> %0 : !llvm.ptr, byref @add_f32 -> %1 : !llvm.ptr)
+       // CHECK-SAME: priority(%[[i32_var]])
+       priority(%i32_var)
+       // CHECK-SAME: allocate(%[[data_var]] : memref<i32> -> %[[data_var]] : memref<i32>)
+@@ -2247,8 +2285,26 @@ func.func @omp_taskloop(%lb: i32, %ub: i32, %step: i32) -> () {
+     }
+   }
+ 
+-  // CHECK: omp.taskloop reduction(@add_f32 -> %{{.+}} : !llvm.ptr, @add_f32 -> %{{.+}} : !llvm.ptr) {
+-  omp.taskloop reduction(@add_f32 -> %testf32 : !llvm.ptr, @add_f32 -> %testf32_2 : !llvm.ptr) {
++  // Checking byref attribute for in_reduction
++  // CHECK: omp.taskloop in_reduction(byref @add_f32 -> %{{.+}} : !llvm.ptr, @add_f32 -> %{{.+}} : !llvm.ptr) {
++  omp.taskloop in_reduction(byref @add_f32 -> %testf32 : !llvm.ptr, @add_f32 -> %testf32_2 : !llvm.ptr) {
++    omp.loop_nest (%i, %j) : i32 = (%lb, %ub) to (%ub, %lb) step (%step, %step) {
++      // CHECK: omp.yield
++      omp.yield
++    }
++  }
++
++  // CHECK: omp.taskloop reduction(byref @add_f32 -> %{{.+}} : !llvm.ptr, @add_f32 -> %{{.+}} : !llvm.ptr) {
++  omp.taskloop reduction(byref @add_f32 -> %testf32 : !llvm.ptr, @add_f32 -> %testf32_2 : !llvm.ptr) {
++    omp.loop_nest (%i, %j) : i32 = (%lb, %ub) to (%ub, %lb) step (%step, %step) {
++      // CHECK: omp.yield
++      omp.yield
++    }
++  }
++
++  // check byref attrbute for reduction
++  // CHECK: omp.taskloop reduction(byref @add_f32 -> %{{.+}} : !llvm.ptr, byref @add_f32 -> %{{.+}} : !llvm.ptr) {
++  omp.taskloop reduction(byref @add_f32 -> %testf32 : !llvm.ptr, byref @add_f32 -> %testf32_2 : !llvm.ptr) {
+     omp.loop_nest (%i, %j) : i32 = (%lb, %ub) to (%ub, %lb) step (%step, %step) {
+       // CHECK: omp.yield
+       omp.yield
