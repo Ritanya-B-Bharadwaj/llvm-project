@@ -31,6 +31,9 @@ class SanitizerArgs {
 
   std::vector<std::string> UserIgnorelistFiles;
   std::vector<std::string> SystemIgnorelistFiles;
+
+  std::vector<std::string> UserWhitelistFiles;
+
   std::vector<std::string> CoverageAllowlistFiles;
   std::vector<std::string> CoverageIgnorelistFiles;
   std::vector<std::string> BinaryMetadataIgnorelistFiles;

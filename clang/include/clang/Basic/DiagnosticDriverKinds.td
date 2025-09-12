@@ -891,3 +891,11 @@ def warn_drv_gcc_install_dir_libstdcxx : Warning<
     "containing libstdc++ include directories; '%0' would be chosen over '%1'">,
     InGroup<DiagGroup<"gcc-install-dir-libstdcxx">>;
 }
+
+def err_drv_malformed_sanitizer_whitelist : Error<
+  "malformed sanitizer whitelist: '%0'"> {
+  let CategoryName = "Sanitizer Diagnostics";
+  let Component = "Driver";
+}
+
+
