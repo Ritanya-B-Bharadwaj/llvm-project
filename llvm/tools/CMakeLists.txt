@@ -57,6 +57,7 @@ add_llvm_implicit_projects()
 
 add_llvm_external_project(polly)
 
+
 # libclc depends on clang
 add_llvm_external_project(libclc)
 
@@ -71,8 +72,11 @@ if (LLVM_TOOL_LLVM_DRIVER_BUILD)
   # This is explicitly added at the end _after_ all tool projects so that it can
   # scrape up tools from other projects into itself.
   add_subdirectory(llvm-driver)
+  add_subdirectory(omp-pr-summary)
+
   # This must be here otherwise CMake complains in add_llvm_tool_symlink that
   # it can't add_custom_command that happens after llvm-driver is built because
   # llvm-driver was not created in that directory.
   generate_driver_tool_targets()
 endif()
+
