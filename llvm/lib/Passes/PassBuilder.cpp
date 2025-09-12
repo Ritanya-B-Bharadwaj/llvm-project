@@ -13,7 +13,6 @@
 /// pipelines.
 ///
 //===----------------------------------------------------------------------===//
-
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/AliasAnalysisEvaluator.h"
@@ -192,6 +191,7 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/CFGuard.h"
+#include "llvm/Transforms/CLIFileNameGlobal/CLIFileNameGlobal.h"
 #include "llvm/Transforms/Coroutines/CoroAnnotationElide.h"
 #include "llvm/Transforms/Coroutines/CoroCleanup.h"
 #include "llvm/Transforms/Coroutines/CoroConditionalWrapper.h"
@@ -526,6 +526,14 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
 #include "llvm/Passes/MachinePassRegistry.def"
     });
   }
+  registerPipelineParsingCallback([](StringRef Name, ModulePassManager &MPM,
+                                     ArrayRef<PassBuilder::PipelineElement>) {
+    if (Name == "cli-filename-global") {
+      MPM.addPass(CLIFileNameGlobal());
+      return true;
+    }
+    return false;
+  });
 }
 
 void PassBuilder::registerModuleAnalyses(ModuleAnalysisManager &MAM) {
@@ -1869,8 +1877,8 @@ Error PassBuilder::parseModulePass(ModulePassManager &MPM,
 #define MODULE_ANALYSIS(NAME, CREATE_PASS)                                     \
   if (Name == "require<" NAME ">") {                                           \
     MPM.addPass(                                                               \
-        RequireAnalysisPass<                                                   \
-            std::remove_reference_t<decltype(CREATE_PASS)>, Module>());        \
+        RequireAnalysisPass<std::remove_reference_t<decltype(CREATE_PASS)>,    \
+                            Module>());                                        \
     return Error::success();                                                   \
   }                                                                            \
   if (Name == "invalidate<" NAME ">") {                                        \
@@ -1996,10 +2004,10 @@ Error PassBuilder::parseCGSCCPass(CGSCCPassManager &CGPM,
   }
 #define CGSCC_ANALYSIS(NAME, CREATE_PASS)                                      \
   if (Name == "require<" NAME ">") {                                           \
-    CGPM.addPass(RequireAnalysisPass<                                          \
-                 std::remove_reference_t<decltype(CREATE_PASS)>,               \
-                 LazyCallGraph::SCC, CGSCCAnalysisManager, LazyCallGraph &,    \
-                 CGSCCUpdateResult &>());                                      \
+    CGPM.addPass(                                                              \
+        RequireAnalysisPass<std::remove_reference_t<decltype(CREATE_PASS)>,    \
+                            LazyCallGraph::SCC, CGSCCAnalysisManager,          \
+                            LazyCallGraph &, CGSCCUpdateResult &>());          \
     return Error::success();                                                   \
   }                                                                            \
   if (Name == "invalidate<" NAME ">") {                                        \
@@ -2117,8 +2125,8 @@ Error PassBuilder::parseFunctionPass(FunctionPassManager &FPM,
 #define FUNCTION_ANALYSIS(NAME, CREATE_PASS)                                   \
   if (Name == "require<" NAME ">") {                                           \
     FPM.addPass(                                                               \
-        RequireAnalysisPass<                                                   \
-            std::remove_reference_t<decltype(CREATE_PASS)>, Function>());      \
+        RequireAnalysisPass<std::remove_reference_t<decltype(CREATE_PASS)>,    \
+                            Function>());                                      \
     return Error::success();                                                   \
   }                                                                            \
   if (Name == "invalidate<" NAME ">") {                                        \
@@ -2206,10 +2214,10 @@ Error PassBuilder::parseLoopPass(LoopPassManager &LPM,
   }
 #define LOOP_ANALYSIS(NAME, CREATE_PASS)                                       \
   if (Name == "require<" NAME ">") {                                           \
-    LPM.addPass(RequireAnalysisPass<                                           \
-                std::remove_reference_t<decltype(CREATE_PASS)>, Loop,          \
-                LoopAnalysisManager, LoopStandardAnalysisResults &,            \
-                LPMUpdater &>());                                              \
+    LPM.addPass(                                                               \
+        RequireAnalysisPass<std::remove_reference_t<decltype(CREATE_PASS)>,    \
+                            Loop, LoopAnalysisManager,                         \
+                            LoopStandardAnalysisResults &, LPMUpdater &>());   \
     return Error::success();                                                   \
   }                                                                            \
   if (Name == "invalidate<" NAME ">") {                                        \
@@ -2397,12 +2405,14 @@ Error PassBuilder::parsePassPipeline(ModulePassManager &MPM,
       Pipeline = {{"function", std::move(*Pipeline)}};
     } else if (isLoopNestPassName(FirstName, LoopPipelineParsingCallbacks,
                                   UseMemorySSA)) {
-      Pipeline = {{"function", {{UseMemorySSA ? "loop-mssa" : "loop",
-                                 std::move(*Pipeline)}}}};
+      Pipeline = {
+          {"function",
+           {{UseMemorySSA ? "loop-mssa" : "loop", std::move(*Pipeline)}}}};
     } else if (isLoopPassName(FirstName, LoopPipelineParsingCallbacks,
                               UseMemorySSA)) {
-      Pipeline = {{"function", {{UseMemorySSA ? "loop-mssa" : "loop",
-                                 std::move(*Pipeline)}}}};
+      Pipeline = {
+          {"function",
+           {{UseMemorySSA ? "loop-mssa" : "loop", std::move(*Pipeline)}}}};
     } else if (isMachineFunctionPassName(
                    FirstName, MachineFunctionPipelineParsingCallbacks)) {
       Pipeline = {{"function", {{"machine-function", std::move(*Pipeline)}}}};
