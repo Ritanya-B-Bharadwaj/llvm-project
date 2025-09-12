@@ -386,6 +386,11 @@ cl::opt<bool> llvm::PrintPipelinePasses(
     cl::desc("Print a '-passes' compatible string describing the pipeline "
              "(best-effort only)."));
 
+static llvm::cl::opt<bool> PrintOptPasses(
+    "print-opt-passes",
+    llvm::cl::desc("Print only optimization passes"),
+    llvm::cl::init(false), llvm::cl::Hidden);
+
 AnalysisKey NoOpModuleAnalysis::Key;
 AnalysisKey NoOpCGSCCAnalysis::Key;
 AnalysisKey NoOpFunctionAnalysis::Key;
@@ -483,6 +488,23 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
     : TM(TM), PTO(PTO), PGOOpt(PGOOpt), PIC(PIC) {
   if (TM)
     TM->registerPassBuilderCallbacks(*this);
+  if (PrintOptPasses && PIC) {
+    PIC->registerBeforeNonSkippedPassCallback(
+        [](llvm::StringRef PassID, llvm::Any) {
+            if (PassID.contains("Opt") || PassID.contains("Combine") || PassID.contains("DCE") ||
+                PassID.contains("Simplify") || PassID.contains("Vector") || PassID.contains("Unroll") ||
+                PassID.contains("Inlining") || PassID.contains("Promote") || PassID.contains("GVN") ||
+                PassID.contains("Reassociate") || PassID.contains("SROA") || PassID.contains("MemCpy") ||
+                PassID.contains("BDCE") || PassID.contains("Speculative") || PassID.contains("Loop") ||
+                PassID.contains("Correlated") || PassID.contains("ConstraintElimination") ||
+                PassID.contains("DivRemPairs") || PassID.contains("CallSiteSplitting") ||
+                PassID.contains("Float2Int") || PassID.contains("ADCE")) {
+                llvm::errs() << "Optimization pass: " << PassID << "\n";
+            }
+    });
+  }
+
+
   if (PIC) {
     PIC->registerClassToPassNameCallback([this, PIC]() {
       // MSVC requires this to be captured if it's used inside decltype.
@@ -490,7 +512,7 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
       (void)this;
 #define MODULE_PASS(NAME, CREATE_PASS)                                         \
   PIC->addClassToPassName(decltype(CREATE_PASS)::name(), NAME);
-#define MODULE_PASS_WITH_PARAMS(NAME, CLASS, CREATE_PASS, PARSER, PARAMS)      \
+	#define MODULE_PASS_WITH_PARAMS(NAME, CLASS, CREATE_PASS, PARSER, PARAMS)      \
   PIC->addClassToPassName(CLASS, NAME);
 #define MODULE_ANALYSIS(NAME, CREATE_PASS)                                     \
   PIC->addClassToPassName(decltype(CREATE_PASS)::name(), NAME);
