@@ -1,0 +1,217 @@
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index ace4fb99581e3..62a53b85ce098 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -1075,14 +1075,14 @@ void tools::addLTOOptions(const ToolChain &ToolChain, const ArgList &Args,
+ 
+ /// Adds the '-lcgpu' and '-lmgpu' libraries to the compilation to include the
+ /// LLVM C library for GPUs.
+-static void addOpenMPDeviceLibC(const ToolChain &TC, const ArgList &Args,
++static void addOpenMPDeviceLibC(const Compilation &C, const ArgList &Args,
+                                 ArgStringList &CmdArgs) {
+   if (Args.hasArg(options::OPT_nogpulib) || Args.hasArg(options::OPT_nolibc))
+     return;
+ 
+   // Check the resource directory for the LLVM libc GPU declarations. If it's
+   // found we can assume that LLVM was built with support for the GPU libc.
+-  SmallString<256> LibCDecls(TC.getDriver().ResourceDir);
++  SmallString<256> LibCDecls(C.getDriver().ResourceDir);
+   llvm::sys::path::append(LibCDecls, "include", "llvm_libc_wrappers",
+                           "llvm-libc-decls");
+   bool HasLibC = llvm::sys::fs::exists(LibCDecls) &&
+@@ -1090,38 +1090,23 @@ static void addOpenMPDeviceLibC(const ToolChain &TC, const ArgList &Args,
+   if (!Args.hasFlag(options::OPT_gpulibc, options::OPT_nogpulibc, HasLibC))
+     return;
+ 
+-  // We don't have access to the offloading toolchains here, so determine from
+-  // the arguments if we have any active NVPTX or AMDGPU toolchains.
+-  llvm::DenseSet<const char *> Libraries;
+-  if (const Arg *Targets = Args.getLastArg(options::OPT_fopenmp_targets_EQ)) {
+-    if (llvm::any_of(Targets->getValues(),
+-                     [](auto S) { return llvm::Triple(S).isAMDGPU(); })) {
+-      Libraries.insert("-lcgpu-amdgpu");
+-      Libraries.insert("-lmgpu-amdgpu");
+-    }
+-    if (llvm::any_of(Targets->getValues(),
+-                     [](auto S) { return llvm::Triple(S).isNVPTX(); })) {
+-      Libraries.insert("-lcgpu-nvptx");
+-      Libraries.insert("-lmgpu-nvptx");
+-    }
+-  }
++  SmallVector<const ToolChain *> ToolChains;
++  auto TCRange = C.getOffloadToolChains(Action::OFK_OpenMP);
++  for (auto TI = TCRange.first, TE = TCRange.second; TI != TE; ++TI)
++    ToolChains.push_back(TI->second);
+ 
+-  for (StringRef Arch : Args.getAllArgValues(options::OPT_offload_arch_EQ)) {
+-    if (llvm::any_of(llvm::split(Arch, ","), [](StringRef Str) {
+-          return IsAMDGpuArch(StringToCudaArch(Str));
+-        })) {
+-      Libraries.insert("-lcgpu-amdgpu");
+-      Libraries.insert("-lmgpu-amdgpu");
+-    }
+-    if (llvm::any_of(llvm::split(Arch, ","), [](StringRef Str) {
+-          return IsNVIDIAGpuArch(StringToCudaArch(Str));
+-        })) {
+-      Libraries.insert("-lcgpu-nvptx");
+-      Libraries.insert("-lmgpu-nvptx");
+-    }
++  if (llvm::any_of(ToolChains, [](const ToolChain *TC) {
++        return TC->getTriple().isAMDGPU();
++      })) {
++    CmdArgs.push_back("-lcgpu-amdgpu");
++    CmdArgs.push_back("-lmgpu-amdgpu");
++  }
++  if (llvm::any_of(ToolChains, [](const ToolChain *TC) {
++        return TC->getTriple().isNVPTX();
++      })) {
++    CmdArgs.push_back("-lcgpu-nvptx");
++    CmdArgs.push_back("-lmgpu-nvptx");
+   }
+-
+-  llvm::append_range(CmdArgs, Libraries);
+ }
+ 
+ void tools::addOpenMPRuntimeLibraryPath(const ToolChain &TC,
+@@ -1153,9 +1138,10 @@ void tools::addArchSpecificRPath(const ToolChain &TC, const ArgList &Args,
+   }
+ }
+ 
+-bool tools::addOpenMPRuntime(ArgStringList &CmdArgs, const ToolChain &TC,
+-                             const ArgList &Args, bool ForceStaticHostRuntime,
+-                             bool IsOffloadingHost, bool GompNeedsRT) {
++bool tools::addOpenMPRuntime(const Compilation &C, ArgStringList &CmdArgs,
++                             const ToolChain &TC, const ArgList &Args,
++                             bool ForceStaticHostRuntime, bool IsOffloadingHost,
++                             bool GompNeedsRT) {
+   if (!Args.hasFlag(options::OPT_fopenmp, options::OPT_fopenmp_EQ,
+                     options::OPT_fno_openmp, false))
+     return false;
+@@ -1196,7 +1182,7 @@ bool tools::addOpenMPRuntime(ArgStringList &CmdArgs, const ToolChain &TC,
+     CmdArgs.push_back("-lomptarget.devicertl");
+ 
+   if (IsOffloadingHost)
+-    addOpenMPDeviceLibC(TC, Args, CmdArgs);
++    addOpenMPDeviceLibC(C, Args, CmdArgs);
+ 
+   addArchSpecificRPath(TC, Args, CmdArgs);
+   addOpenMPRuntimeLibraryPath(TC, Args, CmdArgs);
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.h b/clang/lib/Driver/ToolChains/CommonArgs.h
+index bb37be4bd6ea0..5581905db3114 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.h
++++ b/clang/lib/Driver/ToolChains/CommonArgs.h
+@@ -111,8 +111,8 @@ void addOpenMPRuntimeLibraryPath(const ToolChain &TC,
+                                  const llvm::opt::ArgList &Args,
+                                  llvm::opt::ArgStringList &CmdArgs);
+ /// Returns true, if an OpenMP runtime has been added.
+-bool addOpenMPRuntime(llvm::opt::ArgStringList &CmdArgs, const ToolChain &TC,
+-                      const llvm::opt::ArgList &Args,
++bool addOpenMPRuntime(const Compilation &C, llvm::opt::ArgStringList &CmdArgs,
++                      const ToolChain &TC, const llvm::opt::ArgList &Args,
+                       bool ForceStaticHostRuntime = false,
+                       bool IsOffloadingHost = false, bool GompNeedsRT = false);
+ 
+diff --git a/clang/lib/Driver/ToolChains/Darwin.cpp b/clang/lib/Driver/ToolChains/Darwin.cpp
+index c7682c7f1d337..caf6c4a444fdc 100644
+--- a/clang/lib/Driver/ToolChains/Darwin.cpp
++++ b/clang/lib/Driver/ToolChains/Darwin.cpp
+@@ -686,7 +686,7 @@ void darwin::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+   }
+ 
+   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs))
+-    addOpenMPRuntime(CmdArgs, getToolChain(), Args);
++    addOpenMPRuntime(C, CmdArgs, getToolChain(), Args);
+ 
+   if (isObjCRuntimeLinked(Args) &&
+       !Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
+diff --git a/clang/lib/Driver/ToolChains/DragonFly.cpp b/clang/lib/Driver/ToolChains/DragonFly.cpp
+index b59a172bd6ae8..1dbc46763c115 100644
+--- a/clang/lib/Driver/ToolChains/DragonFly.cpp
++++ b/clang/lib/Driver/ToolChains/DragonFly.cpp
+@@ -136,7 +136,7 @@ void dragonfly::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+ 
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) && !Static;
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX()) {
+       if (ToolChain.ShouldLinkCXXStdlib(Args))
+diff --git a/clang/lib/Driver/ToolChains/FreeBSD.cpp b/clang/lib/Driver/ToolChains/FreeBSD.cpp
+index c5757ddebb0f3..a8ee6540001ee 100644
+--- a/clang/lib/Driver/ToolChains/FreeBSD.cpp
++++ b/clang/lib/Driver/ToolChains/FreeBSD.cpp
+@@ -295,7 +295,7 @@ void freebsd::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) &&
+                         !Args.hasArg(options::OPT_static);
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX()) {
+       if (ToolChain.ShouldLinkCXXStdlib(Args))
+diff --git a/clang/lib/Driver/ToolChains/Gnu.cpp b/clang/lib/Driver/ToolChains/Gnu.cpp
+index a9c9d2475809d..dedbfac6cb25d 100644
+--- a/clang/lib/Driver/ToolChains/Gnu.cpp
++++ b/clang/lib/Driver/ToolChains/Gnu.cpp
+@@ -598,7 +598,7 @@ void tools::gnutools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+ 
+       // FIXME: Only pass GompNeedsRT = true for platforms with libgomp that
+       // require librt. Most modern Linux platforms do, but some may not.
+-      if (addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP,
++      if (addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP,
+                            JA.isHostOffloading(Action::OFK_OpenMP),
+                            /* GompNeedsRT= */ true))
+         // OpenMP runtimes implies pthreads when using the GNU toolchain.
+diff --git a/clang/lib/Driver/ToolChains/Haiku.cpp b/clang/lib/Driver/ToolChains/Haiku.cpp
+index 30464e2229e65..346652a7e4bd8 100644
+--- a/clang/lib/Driver/ToolChains/Haiku.cpp
++++ b/clang/lib/Driver/ToolChains/Haiku.cpp
+@@ -107,7 +107,7 @@ void haiku::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+                    options::OPT_r)) {
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) && !Static;
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX() && ToolChain.ShouldLinkCXXStdlib(Args))
+       ToolChain.AddCXXStdlibLibArgs(Args, CmdArgs);
+diff --git a/clang/lib/Driver/ToolChains/NetBSD.cpp b/clang/lib/Driver/ToolChains/NetBSD.cpp
+index 0eec8fddabd5d..d54f228829494 100644
+--- a/clang/lib/Driver/ToolChains/NetBSD.cpp
++++ b/clang/lib/Driver/ToolChains/NetBSD.cpp
+@@ -311,7 +311,7 @@ void netbsd::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+                    options::OPT_r)) {
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) && !Static;
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX()) {
+       if (ToolChain.ShouldLinkCXXStdlib(Args))
+diff --git a/clang/lib/Driver/ToolChains/OpenBSD.cpp b/clang/lib/Driver/ToolChains/OpenBSD.cpp
+index 6da6728585df9..e20d9fb1cfc41 100644
+--- a/clang/lib/Driver/ToolChains/OpenBSD.cpp
++++ b/clang/lib/Driver/ToolChains/OpenBSD.cpp
+@@ -221,7 +221,7 @@ void openbsd::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+                    options::OPT_r)) {
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) && !Static;
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX()) {
+       if (ToolChain.ShouldLinkCXXStdlib(Args))
+diff --git a/clang/lib/Driver/ToolChains/Solaris.cpp b/clang/lib/Driver/ToolChains/Solaris.cpp
+index 5d7f0ae2a392a..7126e018ca5b6 100644
+--- a/clang/lib/Driver/ToolChains/Solaris.cpp
++++ b/clang/lib/Driver/ToolChains/Solaris.cpp
+@@ -211,7 +211,7 @@ void solaris::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+     // Use the static OpenMP runtime with -static-openmp
+     bool StaticOpenMP = Args.hasArg(options::OPT_static_openmp) &&
+                         !Args.hasArg(options::OPT_static);
+-    addOpenMPRuntime(CmdArgs, ToolChain, Args, StaticOpenMP);
++    addOpenMPRuntime(C, CmdArgs, ToolChain, Args, StaticOpenMP);
+ 
+     if (D.CCCIsCXX()) {
+       if (ToolChain.ShouldLinkCXXStdlib(Args))

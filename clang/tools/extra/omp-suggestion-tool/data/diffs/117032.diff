@@ -1,0 +1,402 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 63fddc424182b..150a07d1142f6 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -484,6 +484,8 @@ class ParseTreeDumper {
+   NODE(parser, OmpAtomicCapture)
+   NODE(OmpAtomicCapture, Stmt1)
+   NODE(OmpAtomicCapture, Stmt2)
++  NODE(parser, OmpAtomicCompare)
++  NODE(parser, OmpAtomicCompareIfStmt)
+   NODE(parser, OmpAtomicRead)
+   NODE(parser, OmpAtomicUpdate)
+   NODE(parser, OmpAtomicWrite)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 22b7f9acd1af5..b8ae734596128 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4126,6 +4126,20 @@ struct OmpAtomicCapture {
+       t;
+ };
+ 
++struct OmpAtomicCompareIfStmt {
++  UNION_CLASS_BOILERPLATE(OmpAtomicCompareIfStmt);
++  std::variant<common::Indirection<IfStmt>, common::Indirection<IfConstruct>> u;
++};
++
++// ATOMIC COMPARE (OpenMP 5.1, OPenMP 5.2 spec: 15.8.4)
++struct OmpAtomicCompare {
++  TUPLE_CLASS_BOILERPLATE(OmpAtomicCompare);
++  CharBlock source;
++  std::tuple<OmpAtomicClauseList, Verbatim, OmpAtomicClauseList,
++      OmpAtomicCompareIfStmt, std::optional<OmpEndAtomic>>
++      t;
++};
++
+ // ATOMIC
+ struct OmpAtomic {
+   TUPLE_CLASS_BOILERPLATE(OmpAtomic);
+@@ -4138,11 +4152,11 @@ struct OmpAtomic {
+ // 2.17.7 atomic ->
+ //        ATOMIC [atomic-clause-list] atomic-construct [atomic-clause-list] |
+ //        ATOMIC [atomic-clause-list]
+-//        atomic-construct -> READ | WRITE | UPDATE | CAPTURE
++//        atomic-construct -> READ | WRITE | UPDATE | CAPTURE | COMPARE
+ struct OpenMPAtomicConstruct {
+   UNION_CLASS_BOILERPLATE(OpenMPAtomicConstruct);
+   std::variant<OmpAtomicRead, OmpAtomicWrite, OmpAtomicCapture, OmpAtomicUpdate,
+-      OmpAtomic>
++      OmpAtomicCompare, OmpAtomic>
+       u;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index a2779213a1a15..80a17e97ee67f 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2896,6 +2896,10 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                                           parser::OmpAtomicClauseList>(
+                 converter, atomicCapture, loc);
+           },
++          [&](const parser::OmpAtomicCompare &atomicCompare) {
++            mlir::Location loc = converter.genLocation(atomicCompare.source);
++            TODO(loc, "OpenMP atomic compare");
++          },
+       },
+       atomicConstruct.u);
+ }
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 630acf9a6b256..5295cbcff09bc 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -912,6 +912,17 @@ TYPE_PARSER("ATOMIC" >>
+         Parser<OmpAtomicClauseList>{} / endOmpLine, statement(assignmentStmt),
+         statement(assignmentStmt), Parser<OmpEndAtomic>{} / endOmpLine)))
+ 
++TYPE_PARSER(construct<OmpAtomicCompareIfStmt>(indirect(Parser<IfStmt>{})) ||
++    construct<OmpAtomicCompareIfStmt>(indirect(Parser<IfConstruct>{})))
++
++// OMP ATOMIC [MEMORY-ORDER-CLAUSE-LIST] COMPARE [MEMORY-ORDER-CLAUSE-LIST]
++TYPE_PARSER("ATOMIC" >>
++    sourced(construct<OmpAtomicCompare>(
++        Parser<OmpAtomicClauseList>{} / maybe(","_tok), verbatim("COMPARE"_tok),
++        Parser<OmpAtomicClauseList>{} / endOmpLine,
++        Parser<OmpAtomicCompareIfStmt>{},
++        maybe(Parser<OmpEndAtomic>{} / endOmpLine))))
++
+ // OMP ATOMIC [MEMORY-ORDER-CLAUSE-LIST] UPDATE [MEMORY-ORDER-CLAUSE-LIST]
+ TYPE_PARSER("ATOMIC" >>
+     sourced(construct<OmpAtomicUpdate>(
+@@ -934,6 +945,7 @@ TYPE_PARSER("ATOMIC" >>
+ // Atomic Construct
+ TYPE_PARSER(construct<OpenMPAtomicConstruct>(Parser<OmpAtomicRead>{}) ||
+     construct<OpenMPAtomicConstruct>(Parser<OmpAtomicCapture>{}) ||
++    construct<OpenMPAtomicConstruct>(Parser<OmpAtomicCompare>{}) ||
+     construct<OpenMPAtomicConstruct>(Parser<OmpAtomicWrite>{}) ||
+     construct<OpenMPAtomicConstruct>(Parser<OmpAtomicUpdate>{}) ||
+     construct<OpenMPAtomicConstruct>(Parser<OmpAtomic>{}))
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4d6aaceb69c18..1e97262d66981 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2520,6 +2520,16 @@ class UnparseVisitor {
+     Word("!$OMP END ATOMIC\n");
+     EndOpenMP();
+   }
++  void Unparse(const OmpAtomicCompare &x) {
++    BeginOpenMP();
++    Word("!$OMP ATOMIC");
++    Walk(std::get<0>(x.t));
++    Word(" COMPARE");
++    Walk(std::get<2>(x.t));
++    Put("\n");
++    EndOpenMP();
++    Walk(std::get<OmpAtomicCompareIfStmt>(x.t));
++  }
+   void Unparse(const OmpAtomicRead &x) {
+     BeginOpenMP();
+     Word("!$OMP ATOMIC");
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 9cac652216fcf..0cf9493695607 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2408,6 +2408,23 @@ void OmpStructureChecker::CheckAtomicUpdateStmt(
+   ErrIfAllocatableVariable(var);
+ }
+ 
++void OmpStructureChecker::CheckAtomicCompareConstruct(
++    const parser::OmpAtomicCompare &atomicCompareConstruct) {
++
++  // TODO: Check that the if-stmt is `if (var == expr) var = new`
++  //       [with or without then/end-do]
++
++  unsigned version{context_.langOptions().OpenMPVersion};
++  if (version < 51) {
++    context_.Say(atomicCompareConstruct.source,
++        "%s construct not allowed in %s, %s"_err_en_US,
++        atomicCompareConstruct.source, ThisVersion(version), TryVersion(51));
++  }
++
++  // TODO: More work needed here. Some of the Update restrictions need to
++  // be added, but Update isn't the same either.
++}
++
+ // TODO: Allow cond-update-stmt once compare clause is supported.
+ void OmpStructureChecker::CheckAtomicCaptureConstruct(
+     const parser::OmpAtomicCapture &atomicCaptureConstruct) {
+@@ -2553,6 +2570,16 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+                 &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
+             CheckAtomicCaptureConstruct(atomicCapture);
+           },
++          [&](const parser::OmpAtomicCompare &atomicCompare) {
++            const auto &dir{std::get<parser::Verbatim>(atomicCompare.t)};
++            PushContextAndClauseSets(
++                dir.source, llvm::omp::Directive::OMPD_atomic);
++            CheckAtomicMemoryOrderClause(
++                &std::get<0>(atomicCompare.t), &std::get<2>(atomicCompare.t));
++            CheckHintClause<const parser::OmpAtomicClauseList>(
++                &std::get<0>(atomicCompare.t), &std::get<2>(atomicCompare.t));
++            CheckAtomicCompareConstruct(atomicCompare);
++          },
+       },
+       x.u);
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index df21ebac0f6d7..6b4fb51c2d99c 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -213,6 +213,7 @@ class OmpStructureChecker
+   void CheckAtomicCaptureStmt(const parser::AssignmentStmt &);
+   void CheckAtomicWriteStmt(const parser::AssignmentStmt &);
+   void CheckAtomicCaptureConstruct(const parser::OmpAtomicCapture &);
++  void CheckAtomicCompareConstruct(const parser::OmpAtomicCompare &);
+   void CheckAtomicConstructStructure(const parser::OpenMPAtomicConstruct &);
+   void CheckDistLinear(const parser::OpenMPLoopConstruct &x);
+   void CheckSIMDNest(const parser::OpenMPConstruct &x);
+diff --git a/flang/test/Lower/OpenMP/Todo/atomic-compare.f90 b/flang/test/Lower/OpenMP/Todo/atomic-compare.f90
+new file mode 100644
+index 0000000000000..88ec6fe910b9e
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/atomic-compare.f90
+@@ -0,0 +1,11 @@
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -fopenmp-version=51 -o - %s 2>&1 | FileCheck %s
++
++! CHECK: not yet implemented: OpenMP atomic compare
++program p
++  integer :: x
++  logical :: r
++  !$omp atomic compare
++  if (x .eq. 0) then
++     x = 2
++  end if
++end program p
+diff --git a/flang/test/Parser/OpenMP/atomic-compare.f90 b/flang/test/Parser/OpenMP/atomic-compare.f90
+new file mode 100644
+index 0000000000000..5cd02698ff482
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/atomic-compare.f90
+@@ -0,0 +1,16 @@
++! RUN: not %flang_fc1  -fopenmp-version=51 -fopenmp %s 2>&1 | FileCheck %s
++! OpenMP version for documentation purposes only - it isn't used until Sema.
++! This is testing for Parser errors that bail out before Sema. 
++program main
++   implicit none
++   integer :: i, j = 10
++   logical :: r
++
++  !CHECK: error: expected OpenMP construct
++  !$omp atomic compare write
++  r =  i .eq. j + 1
++
++  !CHECK: error: expected end of line
++  !$omp atomic compare num_threads(4)
++  r = i .eq. j
++end program main
+diff --git a/flang/test/Parser/OpenMP/atomic-unparse.f90 b/flang/test/Parser/OpenMP/atomic-unparse.f90
+index f9d8ec5d5c681..64fa79fb1d1a2 100644
+--- a/flang/test/Parser/OpenMP/atomic-unparse.f90
++++ b/flang/test/Parser/OpenMP/atomic-unparse.f90
+@@ -3,6 +3,7 @@
+ program main
+    implicit none
+    integer :: i, j = 10
++   integer :: k
+ !READ
+ !$omp atomic read
+    i = j
+@@ -121,6 +122,49 @@ program main
+    i = j
+ !$omp end atomic
+ 
++!COMPARE
++!$omp atomic compare
++   if (k == i) k = j
++!$omp atomic seq_cst compare
++   if (k == j) then
++      k = i
++   end if
++!$omp atomic compare seq_cst
++   if (k .eq. j) then
++      k = i
++   end if
++!$omp atomic release compare
++   if (i .eq. j) k = i
++!$omp atomic compare release
++   if (i .eq. j) then
++      i = k
++   end if
++!$omp atomic acq_rel compare
++   if (k .eq. j) then
++      j = i
++   end if
++!$omp atomic compare acq_rel
++   if (i .eq. j) then
++      i = k
++   end if
++!$omp atomic acquire compare
++   if (i .eq. j + 1) then
++      i = j
++   end if
++   
++!$omp atomic compare acquire
++   if (i .eq. j) then
++      i = k
++   end if
++!$omp atomic relaxed compare
++   if (i .eq. j) then
++      i = k
++   end if
++!$omp atomic compare relaxed
++   if (i .eq. k) then
++      i = j
++   end if
++
+ !ATOMIC
+ !$omp atomic
+    i = j
+@@ -205,6 +249,20 @@ end program main
+ !CHECK: !$OMP ATOMIC CAPTURE RELAXED
+ !CHECK: !$OMP END ATOMIC
+ 
++!COMPARE
++
++!CHECK: !$OMP ATOMIC COMPARE
++!CHECK: !$OMP ATOMIC SEQ_CST COMPARE
++!CHECK: !$OMP ATOMIC COMPARE SEQ_CST
++!CHECK: !$OMP ATOMIC RELEASE COMPARE
++!CHECK: !$OMP ATOMIC COMPARE RELEASE
++!CHECK: !$OMP ATOMIC ACQ_REL COMPARE
++!CHECK: !$OMP ATOMIC COMPARE ACQ_REL
++!CHECK: !$OMP ATOMIC ACQUIRE COMPARE
++!CHECK: !$OMP ATOMIC COMPARE ACQUIRE
++!CHECK: !$OMP ATOMIC RELAXED COMPARE
++!CHECK: !$OMP ATOMIC COMPARE RELAXED
++
+ !ATOMIC
+ !CHECK: !$OMP ATOMIC
+ !CHECK: !$OMP ATOMIC SEQ_CST
+diff --git a/flang/test/Semantics/OpenMP/atomic-compare.f90 b/flang/test/Semantics/OpenMP/atomic-compare.f90
+new file mode 100644
+index 0000000000000..85644ad909107
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/atomic-compare.f90
+@@ -0,0 +1,79 @@
++! REQUIRES: openmp_runtime
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=51
++  use omp_lib
++  implicit none
++  ! Check atomic compare. This combines elements from multiple other "atomic*.f90", as
++  ! to avoid having several files with just a few lines in them. atomic compare needs
++  ! higher openmp version than the others, so need a separate file.
++  
++
++  real a, b, c
++  a = 1.0
++  b = 2.0
++  c = 3.0
++  !$omp parallel num_threads(4)
++  ! First a few things that should compile without error.
++  !$omp atomic seq_cst, compare
++  if (b .eq. a) then
++     b = c
++  end if
++
++  !$omp atomic seq_cst compare
++  if (a .eq. b) a = c
++  !$omp end atomic
++
++  !$omp atomic compare acquire hint(OMP_LOCK_HINT_CONTENDED)
++  if (b .eq. a) b = c
++
++  !$omp atomic release hint(OMP_LOCK_HINT_UNCONTENDED) compare
++  if (b .eq. a) b = c
++
++  !$omp atomic compare seq_cst
++  if (b .eq. c) b = a
++
++  !$omp atomic hint(1) acq_rel compare
++  if (b .eq. a) b = c
++  !$omp end atomic
++
++  ! Check for error conditions:
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
++  !$omp atomic seq_cst seq_cst compare
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
++  !$omp atomic compare seq_cst seq_cst
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one SEQ_CST clause can appear on the COMPARE directive
++  !$omp atomic seq_cst compare seq_cst
++  if (b .eq. c) b = a
++
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
++  !$omp atomic acquire acquire compare
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
++  !$omp atomic compare acquire acquire
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one ACQUIRE clause can appear on the COMPARE directive
++  !$omp atomic acquire compare acquire
++  if (b .eq. c) b = a
++
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one RELAXED clause can appear on the COMPARE directive
++  !$omp atomic relaxed relaxed compare
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one RELAXED clause can appear on the COMPARE directive
++  !$omp atomic compare relaxed relaxed
++  if (b .eq. c) b = a
++  !ERROR: More than one memory order clause not allowed on OpenMP Atomic construct
++  !ERROR: At most one RELAXED clause can appear on the COMPARE directive
++  !$omp atomic relaxed compare relaxed
++  if (b .eq. c) b = a
++
++  !$omp end parallel
++end
+diff --git a/flang/test/Semantics/OpenMP/atomic.f90 b/flang/test/Semantics/OpenMP/atomic.f90
+index 44f06b7460bf1..0e100871ea9b4 100644
+--- a/flang/test/Semantics/OpenMP/atomic.f90
++++ b/flang/test/Semantics/OpenMP/atomic.f90
+@@ -35,6 +35,7 @@
+   a = a + 1
+   !ERROR: expected 'UPDATE'
+   !ERROR: expected 'WRITE'
++  !ERROR: expected 'COMPARE'
+   !ERROR: expected 'CAPTURE'
+   !ERROR: expected 'READ'
+   !$omp atomic num_threads(4)
+@@ -49,6 +50,7 @@
+ 
+   !ERROR: expected 'UPDATE'
+   !ERROR: expected 'WRITE'
++  !ERROR: expected 'COMPARE'
+   !ERROR: expected 'CAPTURE'
+   !ERROR: expected 'READ'
+   !$omp atomic num_threads write

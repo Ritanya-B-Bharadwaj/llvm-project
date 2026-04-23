@@ -1,0 +1,236 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 3b3c6bdc448d7..72c6ecf9a6cf5 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -639,7 +639,6 @@ class ParseTreeDumper {
+   NODE(parser, OmpTaskReductionClause)
+   NODE(OmpTaskReductionClause, Modifier)
+   NODE(parser, OmpInitializerProc)
+-  NODE(parser, OmpInitializerExpr)
+   NODE(parser, OmpInitializerClause)
+   NODE(parser, OmpReductionIdentifier)
+   NODE(parser, OmpAllocateClause)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index f11859bb09ddb..7727746535441 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4252,12 +4252,10 @@ struct OmpInitializerProc {
+   TUPLE_CLASS_BOILERPLATE(OmpInitializerProc);
+   std::tuple<ProcedureDesignator, std::list<ActualArgSpec>> t;
+ };
+-WRAPPER_CLASS(OmpInitializerExpr, Expr);
+-
+ // Initialization for declare reduction construct
+ struct OmpInitializerClause {
+   UNION_CLASS_BOILERPLATE(OmpInitializerClause);
+-  std::variant<OmpInitializerProc, OmpInitializerExpr> u;
++  std::variant<OmpInitializerProc, AssignmentStmt> u;
+ };
+ 
+ // Ref: [4.5:199-201], [5.0:288-290], [5.1:321-322], [5.2:115-117]
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 43cd2ea1eb0e6..bbce8b1c7b392 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -1176,12 +1176,11 @@ TYPE_PARSER(construct<OmpBlockDirective>(first(
+ TYPE_PARSER(sourced(construct<OmpBeginBlockDirective>(
+     sourced(Parser<OmpBlockDirective>{}), Parser<OmpClauseList>{})))
+ 
+-TYPE_PARSER(construct<OmpInitializerExpr>("OMP_PRIV =" >> expr))
+ TYPE_PARSER(construct<OmpInitializerProc>(Parser<ProcedureDesignator>{},
+     parenthesized(many(maybe(","_tok) >> Parser<ActualArgSpec>{}))))
+ 
+ TYPE_PARSER(construct<OmpInitializerClause>(
+-    construct<OmpInitializerClause>(Parser<OmpInitializerExpr>{}) ||
++    construct<OmpInitializerClause>(assignmentStmt) ||
+     construct<OmpInitializerClause>(Parser<OmpInitializerProc>{})))
+ 
+ // 2.16 Declare Reduction Construct
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 1df17b6d7382b..667da7533d3a8 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2705,11 +2705,15 @@ class UnparseVisitor {
+     Walk(std::get<std::list<ActualArgSpec>>(x.t));
+     Put(")");
+   }
+-  void Unparse(const OmpInitializerExpr &x) {
+-    Word("OMP_PRIV = ");
+-    Walk(x.v);
++  void Unparse(const OmpInitializerClause &x) {
++    // Don't let the visitor go to the normal AssignmentStmt Unparse function,
++    // it adds an extra newline that we don't want.
++    if (const auto *assignment{std::get_if<AssignmentStmt>(&x.u)}) {
++      Walk(assignment->t, "=");
++    } else {
++      Walk(x.u);
++    }
+   }
+-  void Unparse(const OmpInitializerClause &x) { Walk(x.u); }
+   void Unparse(const OpenMPDeclareReductionConstruct &x) {
+     BeginOpenMP();
+     Word("!$OMP DECLARE REDUCTION ");
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 4f80cdca0f4bb..4dc0f02ac11d3 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1758,14 +1758,46 @@ void OmpVisitor::ProcessReductionSpecifier(
+           &MakeSymbol(*name, MiscDetails{MiscDetails::Kind::ConstructName});
+     }
+   }
+-  // Creating a new scope in case the combiner expression (or clauses) use
+-  // reerved identifiers, like "omp_in". This is a temporary solution until
+-  // we deal with these in a more thorough way.
+-  PushScope(Scope::Kind::OtherConstruct, nullptr);
+-  Walk(std::get<parser::OmpTypeNameList>(spec.t));
+-  Walk(std::get<std::optional<parser::OmpReductionCombiner>>(spec.t));
+-  Walk(clauses);
+-  PopScope();
++
++  auto &typeList{std::get<parser::OmpTypeNameList>(spec.t)};
++
++  // Create a temporary variable declaration for the four variables
++  // used in the reduction specifier and initializer (omp_out, omp_in,
++  // omp_priv and omp_orig), with the type in the  typeList.
++  //
++  // In theory it would be possible to create only variables that are
++  // actually used, but that requires walking the entire parse-tree of the
++  // expressions, and finding the relevant variables [there may well be other
++  // variables involved too].
++  //
++  // This allows doing semantic analysis where the type is a derived type
++  // e.g omp_out%x = omp_out%x + omp_in%x.
++  //
++  // These need to be temporary (in their own scope). If they are created
++  // as variables in the outer scope, if there's more than one type in the
++  // typelist, duplicate symbols will be reported.
++  const parser::CharBlock ompVarNames[]{
++      {"omp_in", 6}, {"omp_out", 7}, {"omp_priv", 8}, {"omp_orig", 8}};
++
++  for (auto &t : typeList.v) {
++    PushScope(Scope::Kind::OtherConstruct, nullptr);
++    BeginDeclTypeSpec();
++    // We need to walk t.u because Walk(t) does it's own BeginDeclTypeSpec.
++    Walk(t.u);
++
++    const DeclTypeSpec *typeSpec{GetDeclTypeSpec()};
++    assert(typeSpec && "We should have a type here");
++
++    for (auto &nm : ompVarNames) {
++      ObjectEntityDetails details{};
++      details.set_type(*typeSpec);
++      MakeSymbol(nm, Attrs{}, std::move(details));
++    }
++    EndDeclTypeSpec();
++    Walk(std::get<std::optional<parser::OmpReductionCombiner>>(spec.t));
++    Walk(clauses);
++    PopScope();
++  }
+ }
+ 
+ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+diff --git a/flang/test/Parser/OpenMP/declare-reduction-unparse.f90 b/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
+index f0ab99f5cfb5f..7b1b569d87f78 100644
+--- a/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
++++ b/flang/test/Parser/OpenMP/declare-reduction-unparse.f90
+@@ -44,7 +44,7 @@ end function func
+ program main
+   integer :: my_var
+ !CHECK: !$OMP DECLARE REDUCTION (my_add_red:INTEGER: omp_out=omp_out+omp_in
+-!CHECK-NEXT: ) INITIALIZER(OMP_PRIV = 0_4)
++!CHECK-NEXT: ) INITIALIZER(omp_priv=0_4)
+ 
+   !$omp declare reduction (my_add_red : integer : omp_out = omp_out + omp_in) initializer (omp_priv=0)
+   my_var = 0
+@@ -58,4 +58,4 @@ end program main
+ !PARSE-TREE:        OmpReductionIdentifier -> ProcedureDesignator -> Name = 'my_add_red'
+ !PARSE-TREE:        DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec
+ !PARSE-TREE:        OmpReductionCombiner -> AssignmentStmt = 'omp_out=omp_out+omp_in'
+-!PARSE-TREE:        OmpInitializerClause -> OmpInitializerExpr -> Expr = '0_4'
++!PARSE-TREE:        OmpInitializerClause -> AssignmentStmt = 'omp_priv=0_4'
+diff --git a/flang/test/Parser/OpenMP/metadirective-dirspec.f90 b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+index 73520c41fe77d..872cf5d46d34a 100644
+--- a/flang/test/Parser/OpenMP/metadirective-dirspec.f90
++++ b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+@@ -92,10 +92,10 @@ subroutine f03
+     integer :: x
+   endtype
+   type :: tt2
+-    real :: a
++    real :: x
+   endtype
+   !$omp metadirective when(user={condition(.true.)}: &
+-  !$omp & declare reduction(+ : tt1, tt2 : omp_out = omp_in + omp_out))
++  !$omp & declare reduction(+ : tt1, tt2 : omp_out%x = omp_in%x + omp_out%x))
+ end
+ 
+ !UNPARSE: SUBROUTINE f03
+@@ -103,9 +103,9 @@ subroutine f03
+ !UNPARSE:   INTEGER :: x
+ !UNPARSE:  END TYPE
+ !UNPARSE:  TYPE :: tt2
+-!UNPARSE:   REAL :: a
++!UNPARSE:   REAL :: x
+ !UNPARSE:  END TYPE
+-!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(.true._4)}: DECLARE REDUCTION(+:tt1,tt2: omp_out=omp_in+omp_out
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(.true._4)}: DECLARE REDUCTION(+:tt1,tt2: omp_out%x=omp_in%x+omp_out%x
+ !UNPARSE: ))
+ !UNPARSE: END SUBROUTINE
+ 
+@@ -127,15 +127,20 @@ subroutine f03
+ !PARSE-TREE: | | | | | Name = 'tt1'
+ !PARSE-TREE: | | | | OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
+ !PARSE-TREE: | | | | | Name = 'tt2'
+-!PARSE-TREE: | | | | OmpReductionCombiner -> AssignmentStmt = 'omp_out=omp_in+omp_out'
+-!PARSE-TREE: | | | | | Variable = 'omp_out'
+-!PARSE-TREE: | | | | | | Designator -> DataRef -> Name = 'omp_out'
+-!PARSE-TREE: | | | | | Expr = 'omp_in+omp_out'
++!PARSE-TREE: | | | | OmpReductionCombiner -> AssignmentStmt = 'omp_out%x=omp_in%x+omp_out%x'
++!PARSE-TREE: | | | | | | Designator -> DataRef -> StructureComponent
++!PARSE-TREE: | | | | | | | DataRef -> Name = 'omp_out'
++!PARSE-TREE: | | | | | | | Name = 'x'
++!PARSE-TREE: | | | | | Expr = 'omp_in%x+omp_out%x'
+ !PARSE-TREE: | | | | | | Add
+-!PARSE-TREE: | | | | | | | Expr = 'omp_in'
+-!PARSE-TREE: | | | | | | | | Designator -> DataRef -> Name = 'omp_in'
+-!PARSE-TREE: | | | | | | | Expr = 'omp_out'
+-!PARSE-TREE: | | | | | | | | Designator -> DataRef -> Name = 'omp_out'
++!PARSE-TREE: | | | | | | | Expr = 'omp_in%x'
++!PARSE-TREE: | | | | | | | | Designator -> DataRef -> StructureComponent
++!PARSE-TREE: | | | | | | | | | DataRef -> Name = 'omp_in'
++!PARSE-TREE: | | | | | | | | | Name = 'x'
++!PARSE-TREE: | | | | | | | Expr = 'omp_out%x'
++!PARSE-TREE: | | | | | | | | Designator -> DataRef -> StructureComponent
++!PARSE-TREE: | | | | | | | | | DataRef -> Name = 'omp_out'
++!PARSE-TREE: | | | | | | | | | Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f04
+diff --git a/flang/test/Semantics/OpenMP/declare-reduction.f90 b/flang/test/Semantics/OpenMP/declare-reduction.f90
+index e61af0430575f..11612f01f0f2d 100644
+--- a/flang/test/Semantics/OpenMP/declare-reduction.f90
++++ b/flang/test/Semantics/OpenMP/declare-reduction.f90
+@@ -18,7 +18,11 @@ end subroutine initme
+   end interface
+   !$omp declare reduction(red_add:integer(4):omp_out=omp_out+omp_in) initializer(initme(omp_priv,0))
+ !CHECK: red_add: Misc ConstructName
+-!CHECK: Subprogram scope: initme  
++!CHECK: Subprogram scope: initme
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: INTEGER(4)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: INTEGER(4)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: INTEGER(4)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: INTEGER(4)
+ !$omp simd reduction(red_add:res)
+   do i=1,n
+      res=res+x(i)
+@@ -32,6 +36,9 @@ program main
+   !$omp declare reduction (my_add_red : integer : omp_out = omp_out + omp_in) initializer (omp_priv=0)
+ 
+ !CHECK: my_add_red: Misc ConstructName
++!CHECK: omp_in size=4 offset=0: ObjectEntity type: INTEGER(4)
++!CHECK: omp_orig size=4 offset=4: ObjectEntity type: INTEGER(4)
++!CHECK: omp_out size=4 offset=8: ObjectEntity type: INTEGER(4)
++!CHECK: omp_priv size=4 offset=12: ObjectEntity type: INTEGER(4)
+   
+ end program main
+-

@@ -1,0 +1,471 @@
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index fecc56d1b7dfe..82d8d8dd98ea2 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -36,9 +36,12 @@ void DataSharingProcessor::processStep1(
+ }
+ 
+ void DataSharingProcessor::processStep2(mlir::Operation *op, bool isLoop) {
+-  insPt = firOpBuilder.saveInsertionPoint();
+-  copyLastPrivatize(op);
+-  firOpBuilder.restoreInsertionPoint(insPt);
++  // 'sections' lastprivate is handled by genOMP()
++  if (!mlir::isa<mlir::omp::SectionsOp>(op)) {
++    insPt = firOpBuilder.saveInsertionPoint();
++    copyLastPrivatize(op);
++    firOpBuilder.restoreInsertionPoint(insPt);
++  }
+ 
+   if (isLoop) {
+     // push deallocs out of the loop
+@@ -143,6 +146,10 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
+ }
+ 
+ bool DataSharingProcessor::needBarrier() {
++  // Emit implicit barrier to synchronize threads and avoid data races on
++  // initialization of firstprivate variables and post-update of lastprivate
++  // variables.
++  // Emit implicit barrier for linear clause. Maybe on somewhere else.
+   for (const Fortran::semantics::Symbol *sym : privatizedSymbols) {
+     if (sym->test(Fortran::semantics::Symbol::Flag::OmpFirstPrivate) &&
+         sym->test(Fortran::semantics::Symbol::Flag::OmpLastPrivate))
+@@ -152,13 +159,6 @@ bool DataSharingProcessor::needBarrier() {
+ }
+ 
+ void DataSharingProcessor::insertBarrier() {
+-  // Emit implicit barrier to synchronize threads and avoid data races on
+-  // initialization of firstprivate variables and post-update of lastprivate
+-  // variables.
+-  // FIXME: Emit barrier for lastprivate clause when 'sections' directive has
+-  // 'nowait' clause. Otherwise, emit barrier when 'sections' directive has
+-  // both firstprivate and lastprivate clause.
+-  // Emit implicit barrier for linear clause. Maybe on somewhere else.
+   if (needBarrier())
+     firOpBuilder.create<mlir::omp::BarrierOp>(converter.getCurrentLocation());
+ }
+@@ -176,76 +176,7 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+     if (clause.id != llvm::omp::OMPC_lastprivate)
+       continue;
+     // TODO: Add lastprivate support for simd construct
+-    if (mlir::isa<mlir::omp::SectionOp>(op)) {
+-      if (&eval == &eval.parentConstruct->getLastNestedEvaluation()) {
+-        // For `omp.sections`, lastprivatized variables occur in
+-        // lexically final `omp.section` operation. The following FIR
+-        // shall be generated for the same:
+-        //
+-        // omp.sections lastprivate(...) {
+-        //  omp.section {...}
+-        //  omp.section {...}
+-        //  omp.section {
+-        //      fir.allocate for `private`/`firstprivate`
+-        //      <More operations here>
+-        //      fir.if %true {
+-        //          ^%lpv_update_blk
+-        //      }
+-        //  }
+-        // }
+-        //
+-        // To keep code consistency while handling privatization
+-        // through this control flow, add a `fir.if` operation
+-        // that always evaluates to true, in order to create
+-        // a dedicated sub-region in `omp.section` where
+-        // lastprivate FIR can reside. Later canonicalizations
+-        // will optimize away this operation.
+-        if (!eval.lowerAsUnstructured()) {
+-          auto ifOp = firOpBuilder.create<fir::IfOp>(
+-              op->getLoc(),
+-              firOpBuilder.createIntegerConstant(
+-                  op->getLoc(), firOpBuilder.getIntegerType(1), 0x1),
+-              /*else*/ false);
+-          firOpBuilder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+-
+-          const Fortran::parser::OpenMPConstruct *parentOmpConstruct =
+-              eval.parentConstruct->getIf<Fortran::parser::OpenMPConstruct>();
+-          assert(parentOmpConstruct &&
+-                 "Expected a valid enclosing OpenMP construct");
+-          const Fortran::parser::OpenMPSectionsConstruct *sectionsConstruct =
+-              std::get_if<Fortran::parser::OpenMPSectionsConstruct>(
+-                  &parentOmpConstruct->u);
+-          assert(sectionsConstruct &&
+-                 "Expected an enclosing omp.sections construct");
+-          const Fortran::parser::OmpClauseList &sectionsEndClauseList =
+-              std::get<Fortran::parser::OmpClauseList>(
+-                  std::get<Fortran::parser::OmpEndSectionsDirective>(
+-                      sectionsConstruct->t)
+-                      .t);
+-          for (const Fortran::parser::OmpClause &otherClause :
+-               sectionsEndClauseList.v)
+-            if (std::get_if<Fortran::parser::OmpClause::Nowait>(&otherClause.u))
+-              // Emit implicit barrier to synchronize threads and avoid data
+-              // races on post-update of lastprivate variables when `nowait`
+-              // clause is present.
+-              firOpBuilder.create<mlir::omp::BarrierOp>(
+-                  converter.getCurrentLocation());
+-          firOpBuilder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+-          lastPrivIP = firOpBuilder.saveInsertionPoint();
+-          firOpBuilder.setInsertionPoint(ifOp);
+-          insPt = firOpBuilder.saveInsertionPoint();
+-        } else {
+-          // Lastprivate operation is inserted at the end
+-          // of the lexically last section in the sections
+-          // construct
+-          mlir::OpBuilder::InsertionGuard unstructuredSectionsGuard(
+-              firOpBuilder);
+-          mlir::Operation *lastOper = op->getRegion(0).back().getTerminator();
+-          firOpBuilder.setInsertionPoint(lastOper);
+-          lastPrivIP = firOpBuilder.saveInsertionPoint();
+-        }
+-      }
+-    } else if (mlir::isa<mlir::omp::WsloopOp>(op)) {
++    if (mlir::isa<mlir::omp::WsloopOp>(op)) {
+       // Update the original variable just before exiting the worksharing
+       // loop. Conversion as follows:
+       //
+@@ -297,6 +228,8 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+       assert(loopIV && "loopIV was not set");
+       firOpBuilder.create<fir::StoreOp>(loopOp.getLoc(), v, loopIV);
+       lastPrivIP = firOpBuilder.saveInsertionPoint();
++    } else if (mlir::isa<mlir::omp::SectionsOp>(op)) {
++      // Already handled by genOMP()
+     } else {
+       TODO(converter.getCurrentLocation(),
+            "lastprivate clause in constructs other than "
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 6758f980b8b27..44011ad78f2e2 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1460,14 +1460,11 @@ genSectionOp(Fortran::lower::AbstractConverter &converter,
+              Fortran::lower::SymMap &symTable,
+              Fortran::semantics::SemanticsContext &semaCtx,
+              Fortran::lower::pft::Evaluation &eval, bool genNested,
+-             mlir::Location loc, const List<Clause> &clauses) {
+-  // Currently only private/firstprivate clause is handled, and
+-  // all privatization is done within `omp.section` operations.
++             mlir::Location loc) {
+   return genOpWithBody<mlir::omp::SectionOp>(
+       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, eval,
+                         llvm::omp::Directive::OMPD_section)
+-          .setGenNested(genNested)
+-          .setClauses(&clauses));
++          .setGenNested(genNested));
+ }
+ 
+ static mlir::omp::SectionsOp
+@@ -2478,22 +2475,60 @@ genOMP(Fortran::lower::AbstractConverter &converter,
+                   /*outerCombined=*/true);
+   }
+ 
++  // Insert privatizations before SECTIONS
++  symTable.pushScope();
++  DataSharingProcessor dsp(converter, semaCtx, clauses, eval);
++  dsp.processStep1();
++
+   // SECTIONS construct.
+-  genSectionsOp(converter, symTable, semaCtx, eval, currentLocation, clauseOps);
++  mlir::omp::SectionsOp sectionsOp = genSectionsOp(
++      converter, symTable, semaCtx, eval, currentLocation, clauseOps);
+ 
+   // Generate nested SECTION operations recursively.
+   const auto &sectionBlocks =
+       std::get<Fortran::parser::OmpSectionBlocks>(sectionsConstruct.t);
+   auto &firOpBuilder = converter.getFirOpBuilder();
+   auto ip = firOpBuilder.saveInsertionPoint();
++  mlir::omp::SectionOp lastSectionOp;
+   for (const auto &[nblock, neval] :
+        llvm::zip(sectionBlocks.v, eval.getNestedEvaluations())) {
+     symTable.pushScope();
+-    genSectionOp(converter, symTable, semaCtx, neval, /*genNested=*/true,
+-                 currentLocation, clauses);
++    lastSectionOp = genSectionOp(converter, symTable, semaCtx, neval,
++                                 /*genNested=*/true, currentLocation);
+     symTable.popScope();
+     firOpBuilder.restoreInsertionPoint(ip);
+   }
++
++  // For `omp.sections`, lastprivatized variables occur in
++  // lexically final `omp.section` operation.
++  bool hasLastPrivate = false;
++  if (lastSectionOp) {
++    for (const Clause &clause : clauses) {
++      if (const auto *lastPrivate =
++              std::get_if<clause::Lastprivate>(&clause.u)) {
++        hasLastPrivate = true;
++        firOpBuilder.setInsertionPoint(
++            lastSectionOp.getRegion().back().getTerminator());
++        mlir::OpBuilder::InsertPoint lastPrivIP =
++            converter.getFirOpBuilder().saveInsertionPoint();
++        const auto &objList = std::get<1>(lastPrivate->t);
++        for (const Object &obj : objList) {
++          Fortran::semantics::Symbol *sym = obj.id();
++          converter.copyHostAssociateVar(*sym, &lastPrivIP);
++        }
++      }
++    }
++  }
++
++  // Perform DataSharingProcessor's step2 out of SECTIONS
++  firOpBuilder.setInsertionPointAfter(sectionsOp.getOperation());
++  dsp.processStep2(sectionsOp, false);
++  // Emit implicit barrier to synchronize threads and avoid data
++  // races on post-update of lastprivate variables when `nowait`
++  // clause is present.
++  if (clauseOps.nowaitAttr && hasLastPrivate)
++    firOpBuilder.create<mlir::omp::BarrierOp>(converter.getCurrentLocation());
++  symTable.popScope();
+ }
+ 
+ static void genOMP(Fortran::lower::AbstractConverter &converter,
+diff --git a/flang/test/Lower/OpenMP/sections.f90 b/flang/test/Lower/OpenMP/sections.f90
+index 018848e635733..a93d6e34e3742 100644
+--- a/flang/test/Lower/OpenMP/sections.f90
++++ b/flang/test/Lower/OpenMP/sections.f90
+@@ -10,12 +10,12 @@
+ !CHECK:   %[[COUNT_DECL:.*]]:2 = hlfir.declare %[[COUNT]] {uniq_name = "_QFEcount"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:   %[[ETA:.*]] = fir.alloca f32 {bindc_name = "eta", uniq_name = "_QFEeta"}
+ !CHECK:   %[[CONST_1:.*]] = arith.constant 4 : i64
++!CHECK:   %[[PRIVATE_ETA:.*]] = fir.alloca f32 {bindc_name = "eta", pinned, uniq_name = "_QFEeta"}
++!CHECK:   %[[PRIVATE_ETA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ETA]] {uniq_name = "_QFEeta"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
++!CHECK:   %[[PRIVATE_DOUBLE_COUNT:.*]] = fir.alloca i32 {bindc_name = "double_count", pinned, uniq_name = "_QFEdouble_count"} 
++!CHECK:   %[[PRIVATE_DOUBLE_COUNT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_DOUBLE_COUNT]] {uniq_name = "_QFEdouble_count"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:   omp.sections allocate(%[[CONST_1]] : i64 -> %[[COUNT_DECL]]#1 : !fir.ref<i32>)  {
+ !CHECK:     omp.section {
+-!CHECK:       %[[PRIVATE_ETA:.*]] = fir.alloca f32 {bindc_name = "eta", pinned, uniq_name = "_QFEeta"}
+-!CHECK:       %[[PRIVATE_ETA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ETA]] {uniq_name = "_QFEeta"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT:.*]] = fir.alloca i32 {bindc_name = "double_count", pinned, uniq_name = "_QFEdouble_count"} 
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_DOUBLE_COUNT]] {uniq_name = "_QFEdouble_count"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:       %[[CONST5:.*]] = arith.constant 5 : i32
+ !CHECK:       hlfir.assign %[[CONST5]] to %[[COUNT_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:       %[[TEMP_COUNT:.*]] = fir.load %[[COUNT_DECL]]#0 : !fir.ref<i32>
+@@ -26,10 +26,6 @@
+ !CHECK:       omp.terminator
+ !CHECK:     }
+ !CHECK:     omp.section {
+-!CHECK:       %[[PRIVATE_ETA:.*]] = fir.alloca f32 {bindc_name = "eta", pinned, uniq_name = "_QFEeta"}
+-!CHECK:       %[[PRIVATE_ETA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ETA]] {uniq_name = "_QFEeta"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT:.*]] = fir.alloca i32 {bindc_name = "double_count", pinned, uniq_name = "_QFEdouble_count"} 
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_DOUBLE_COUNT]] {uniq_name = "_QFEdouble_count"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:       %[[TEMP:.*]] = fir.load %[[PRIVATE_DOUBLE_COUNT_DECL]]#0 : !fir.ref<i32>
+ !CHECK:       %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK:       %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+@@ -37,10 +33,6 @@
+ !CHECK:       omp.terminator
+ !CHECK:     }
+ !CHECK:     omp.section {
+-!CHECK:       %[[PRIVATE_ETA:.*]] = fir.alloca f32 {bindc_name = "eta", pinned, uniq_name = "_QFEeta"}
+-!CHECK:       %[[PRIVATE_ETA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ETA]] {uniq_name = "_QFEeta"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT:.*]] = fir.alloca i32 {bindc_name = "double_count", pinned, uniq_name = "_QFEdouble_count"} 
+-!CHECK:       %[[PRIVATE_DOUBLE_COUNT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_DOUBLE_COUNT]] {uniq_name = "_QFEdouble_count"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:       %[[TEMP:.*]] = fir.load %[[PRIVATE_ETA_DECL]]#0 : !fir.ref<f32>
+ !CHECK:       %[[CONST:.*]] = arith.constant 7.000000e+00 : f32
+ !CHECK:       %[[RESULT:.*]] = arith.subf %[[TEMP]], %[[CONST]] {{.*}}: f32
+@@ -88,12 +80,12 @@ end program sample
+ 
+ !CHECK: func @_QPfirstprivate(%[[ARG:.*]]: !fir.ref<f32> {fir.bindc_name = "alpha"}) {
+ !CHECK:   %[[ARG_DECL:.*]]:2 = hlfir.declare %[[ARG]] {uniq_name = "_QFfirstprivateEalpha"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>) 
++!CHECK:   %[[PRIVATE_ALPHA:.*]] = fir.alloca f32 {bindc_name = "alpha", pinned, uniq_name = "_QFfirstprivateEalpha"}
++!CHECK:   %[[PRIVATE_ALPHA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ALPHA]] {uniq_name = "_QFfirstprivateEalpha"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
++!CHECK:   %[[TEMP:.*]] = fir.load %[[ARG_DECL]]#0 : !fir.ref<f32>
++!CHECK:   hlfir.assign %[[TEMP]] to %[[PRIVATE_ALPHA_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
+ !CHECK:   omp.sections {
+ !CHECK:     omp.section  {
+-!CHECK:         %[[PRIVATE_ALPHA:.*]] = fir.alloca f32 {bindc_name = "alpha", pinned, uniq_name = "_QFfirstprivateEalpha"}
+-!CHECK:         %[[PRIVATE_ALPHA_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_ALPHA]] {uniq_name = "_QFfirstprivateEalpha"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-!CHECK:         %[[TEMP:.*]] = fir.load %[[ARG_DECL]]#0 : !fir.ref<f32>
+-!CHECK:         hlfir.assign %[[TEMP]] to %[[PRIVATE_ALPHA_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
+ !CHECK:       omp.terminator
+ !CHECK:     }
+ !CHECK:     omp.terminator
+@@ -126,11 +118,11 @@ subroutine lastprivate()
+         integer :: x
+ !CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
++!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: omp.sections   {
+ 	!$omp sections lastprivate(x)
+ !CHECK: omp.section {
+-!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+-!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[CONST10:.*]] = arith.constant 10 : i32
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.muli %[[CONST10]], %[[TEMP]] : i32
+@@ -141,17 +133,12 @@ subroutine lastprivate()
+             x = x * 10
+ 
+ !CHECK: omp.section {
+-!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+-!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK: %[[TRUE:.*]] = arith.constant true
+-!CHECK: fir.if %[[TRUE]] {
+ !CHECK: %[[TEMP1:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: hlfir.assign %[[TEMP1]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+-!CHECK: }
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+@@ -160,14 +147,14 @@ subroutine lastprivate()
+ !CHECK: }
+     !$omp end sections
+ 
+-!CHECK: omp.sections   {
+-    !$omp sections firstprivate(x) lastprivate(x)
+-!CHECK: omp.section {
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+ !CHECK: omp.barrier
++!CHECK: omp.sections {
++    !$omp sections firstprivate(x) lastprivate(x)
++!CHECK: omp.section {
+ !CHECK: %[[CONST:.*]] = arith.constant 10 : i32
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.muli %[[CONST]], %[[TEMP]] : i32
+@@ -177,20 +164,12 @@ subroutine lastprivate()
+         !$omp section
+             x = x * 10
+ !CHECK: omp.section {
+-!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+-!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+-!CHECK: omp.barrier
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK: %[[TRUE:.*]] = arith.constant true
+-!CHECK: fir.if %[[TRUE]] {
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+-!CHECK: }
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+@@ -199,14 +178,14 @@ subroutine lastprivate()
+ !CHECK: }
+     !$omp end sections
+ 
+-!CHECK: omp.sections nowait {
+-    !$omp sections firstprivate(x) lastprivate(x)
+-!CHECK: omp.section {
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+ !CHECK: omp.barrier
++!CHECK: omp.sections nowait {
++    !$omp sections firstprivate(x) lastprivate(x)
++!CHECK: omp.section {
+ !CHECK: %[[CONST:.*]] = arith.constant 10 : i32
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.muli %[[CONST]], %[[TEMP]] : i32
+@@ -216,33 +195,25 @@ subroutine lastprivate()
+         !$omp section
+             x = x * 10
+ !CHECK: omp.section {
+-!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+-!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+-!CHECK: omp.barrier
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[TEMP]], %[[CONST]] : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_X_DECL]]#0 : i32, !fir.ref<i32>
+-!CHECK: %[[TRUE:.*]] = arith.constant true
+-!CHECK: fir.if %[[TRUE]] {
+ !CHECK: %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+ !CHECK: hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
+-!CHECK: omp.barrier
+-!CHECK: }
+ !CHECK: omp.terminator
+ !CHECK: }
+         !$omp section
+             x = x + 1
+ !CHECK: omp.terminator
+ !CHECK: }
++!CHECK: omp.barrier
+      !$omp end sections nowait
+ 
+-!CHECK: omp.sections {
+-!CHECK: omp.section {
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivateEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivateEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: omp.sections {
++!CHECK: omp.section {
+ !CHECK: cf.br ^bb1
+ !CHECK: ^bb1:  // pred: ^bb0
+ !CHECK: %[[INNER_PRIVATE_X:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
+@@ -257,7 +228,6 @@ subroutine lastprivate()
+ !CHECK: }
+ !CHECK: return
+ !CHECK: }
+-
+     !$omp sections lastprivate(x)
+         !$omp section
+                 goto 30
+@@ -265,14 +235,42 @@ subroutine lastprivate()
+     !$omp end sections
+ end subroutine
+ 
++!CHECK-LABEL: func @_QPlastprivate2
++!CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFlastprivate2Ex"}
++!CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFlastprivate2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFlastprivate2Ey"}
++!CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFlastprivate2Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[PRIVATE_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFlastprivate2Ex"}
++!CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFlastprivate2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[PRIVATE_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFlastprivate2Ey"}
++!CHECK: %[[PRIVATE_Y_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_Y]] {uniq_name = "_QFlastprivate2Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: omp.sections {
++!CHECK:   omp.section {
++!CHECK:     %[[TEMP:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     %[[TEMP2:.*]] = fir.load %[[PRIVATE_Y_DECL]]#0 : !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP2]] to %[[Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     omp.terminator
++!CHECK:   }
++!CHECK:   omp.terminator
++!CHECK: }
++subroutine lastprivate2()
++    integer :: x, y
++
++    !$omp sections lastprivate(x) lastprivate(y)
++        !$omp section
++          x = y + 1
++    !$omp end sections
++end subroutine
++
+ !CHECK-LABEL: func @_QPunstructured_sections_privatization
+ subroutine unstructured_sections_privatization()
+ !CHECK: %[[X:.*]] = fir.alloca f32 {bindc_name = "x", uniq_name = "_QFunstructured_sections_privatizationEx"}
+ !CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFunstructured_sections_privatizationEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-!CHECK: omp.sections {
+-!CHECK: omp.section {
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca f32 {bindc_name = "x", pinned, uniq_name = "_QFunstructured_sections_privatizationEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFunstructured_sections_privatizationEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
++!CHECK: omp.sections {
++!CHECK: omp.section {
+ !CHECK: cf.br ^bb1
+ !CHECK: ^bb1:  // pred: ^bb0
+ !CHECK: %[[INNER_PRIVATE_X:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<f32>
+@@ -288,12 +286,12 @@ subroutine unstructured_sections_privatization()
+             goto 40
+         40  x = x + 1
+     !$omp end sections
+-!CHECK: omp.sections {
+-!CHECK: omp.section {
+ !CHECK: %[[PRIVATE_X:.*]] = fir.alloca f32 {bindc_name = "x", pinned, uniq_name = "_QFunstructured_sections_privatizationEx"}
+ !CHECK: %[[PRIVATE_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_X]] {uniq_name = "_QFunstructured_sections_privatizationEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ !CHECK: %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<f32>
+ !CHECK: hlfir.assign %[[TEMP]] to %[[PRIVATE_X_DECL]]#0 temporary_lhs : f32, !fir.ref<f32>
++!CHECK: omp.sections {
++!CHECK: omp.section {
+ !CHECK: cf.br ^bb1
+ !CHECK: ^bb1:
+ !CHECK: %[[INNER_PRIVATE_X:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<f32>

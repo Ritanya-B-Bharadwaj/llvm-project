@@ -1,0 +1,527 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 3b3c6bdc448d7..ded97c3fb02f9 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -489,6 +489,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpOtherwiseClause)
+   NODE(parser, OmpWhenClause)
+   NODE(OmpWhenClause, Modifier)
++  NODE(parser, OmpDirectiveName)
+   NODE(parser, OmpDirectiveSpecification)
+   NODE(parser, OmpTraitPropertyName)
+   NODE(parser, OmpTraitScore)
+@@ -586,7 +587,6 @@ class ParseTreeDumper {
+   NODE(OmpFromClause, Modifier)
+   NODE(parser, OmpExpectation)
+   NODE_ENUM(OmpExpectation, Value)
+-  NODE(parser, OmpDirectiveNameModifier)
+   NODE(parser, OmpHoldsClause)
+   NODE(parser, OmpIfClause)
+   NODE(OmpIfClause, Modifier)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index f11859bb09ddb..cd0be4453ac33 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3464,6 +3464,19 @@ WRAPPER_CLASS(PauseStmt, std::optional<StopCode>);
+ struct OmpClause;
+ struct OmpDirectiveSpecification;
+ 
++struct OmpDirectiveName {
++  // No boilerplates: this class should be copyable, movable, etc.
++  constexpr OmpDirectiveName() = default;
++  constexpr OmpDirectiveName(const OmpDirectiveName &) = default;
++  // Construct from an already parsed text. Use Verbatim for this because
++  // Verbatim's source corresponds to an actual source location.
++  // This allows "construct<OmpDirectiveName>(Verbatim("<name>"))".
++  OmpDirectiveName(const Verbatim &name);
++  using WrapperTrait = std::true_type;
++  CharBlock source;
++  llvm::omp::Directive v{llvm::omp::Directive::OMPD_unknown};
++};
++
+ // 2.1 Directives or clauses may accept a list or extended-list.
+ //     A list item is a variable, array section or common block name (enclosed
+ //     in slashes). An extended list item is a list item or a procedure Name.
+@@ -3794,9 +3807,7 @@ struct OmpDeviceModifier {
+ // [*] The IF clause is allowed on CANCEL in OpenMP 4.5, but only without
+ // the directive-name-modifier. For the sake of uniformity CANCEL can be
+ // considered a valid value in 4.5 as well.
+-struct OmpDirectiveNameModifier {
+-  WRAPPER_CLASS_BOILERPLATE(OmpDirectiveNameModifier, llvm::omp::Directive);
+-};
++using OmpDirectiveNameModifier = OmpDirectiveName;
+ 
+ // Ref: [5.1:205-209], [5.2:166-168]
+ //
+@@ -4493,7 +4504,12 @@ struct OmpClauseList {
+ struct OmpDirectiveSpecification {
+   CharBlock source;
+   TUPLE_CLASS_BOILERPLATE(OmpDirectiveSpecification);
+-  std::tuple<llvm::omp::Directive, std::optional<std::list<OmpArgument>>,
++  llvm::omp::Directive DirId() const { //
++    return std::get<OmpDirectiveName>(t).v;
++  }
++  const OmpClauseList &Clauses() const;
++
++  std::tuple<OmpDirectiveName, std::optional<std::list<OmpArgument>>,
+       std::optional<OmpClauseList>>
+       t;
+ };
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 43cd2ea1eb0e6..dd43ede796b98 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -27,15 +27,40 @@ namespace Fortran::parser {
+ constexpr auto startOmpLine = skipStuffBeforeStatement >> "!$OMP "_sptok;
+ constexpr auto endOmpLine = space >> endOfLine;
+ 
++// Given a parser P for a wrapper class, invoke P, and if it succeeds return
++// the wrapped object.
++template <typename Parser> struct UnwrapParser {
++  static_assert(
++      Parser::resultType::WrapperTrait::value && "Wrapper class required");
++  using resultType = decltype(Parser::resultType::v);
++  constexpr UnwrapParser(Parser p) : parser_(p) {}
++
++  std::optional<resultType> Parse(ParseState &state) const {
++    if (auto result{parser_.Parse(state)}) {
++      return result->v;
++    }
++    return std::nullopt;
++  }
++
++private:
++  const Parser parser_;
++};
++
++template <typename Parser> constexpr auto unwrap(const Parser &p) {
++  return UnwrapParser<Parser>(p);
++}
++
+ /// Parse OpenMP directive name (this includes compound directives).
+ struct OmpDirectiveNameParser {
+-  using resultType = llvm::omp::Directive;
++  using resultType = OmpDirectiveName;
+   using Token = TokenStringMatch<false, false>;
+ 
+   std::optional<resultType> Parse(ParseState &state) const {
+     for (const NameWithId &nid : directives()) {
+       if (attempt(Token(nid.first.data())).Parse(state)) {
+-        return nid.second;
++        OmpDirectiveName n;
++        n.v = nid.second;
++        return n;
+       }
+     }
+     return std::nullopt;
+@@ -218,7 +243,7 @@ TYPE_PARSER(construct<OmpTraitSelectorName::Value>(
+ TYPE_PARSER(sourced(construct<OmpTraitSelectorName>(
+     // Parse predefined names first (because of SIMD).
+     construct<OmpTraitSelectorName>(Parser<OmpTraitSelectorName::Value>{}) ||
+-    construct<OmpTraitSelectorName>(OmpDirectiveNameParser{}) ||
++    construct<OmpTraitSelectorName>(unwrap(OmpDirectiveNameParser{})) ||
+     // identifier-or-string for extensions
+     construct<OmpTraitSelectorName>(
+         applyFunction(nameToString, Parser<Name>{})) ||
+@@ -775,9 +800,9 @@ TYPE_PARSER(construct<OmpMessageClause>(expr))
+ 
+ TYPE_PARSER(construct<OmpHoldsClause>(indirect(expr)))
+ TYPE_PARSER(construct<OmpAbsentClause>(many(maybe(","_tok) >>
+-    construct<llvm::omp::Directive>(OmpDirectiveNameParser{}))))
++    construct<llvm::omp::Directive>(unwrap(OmpDirectiveNameParser{})))))
+ TYPE_PARSER(construct<OmpContainsClause>(many(maybe(","_tok) >>
+-    construct<llvm::omp::Directive>(OmpDirectiveNameParser{}))))
++    construct<llvm::omp::Directive>(unwrap(OmpDirectiveNameParser{})))))
+ 
+ TYPE_PARSER("ABSENT" >> construct<OmpClause>(construct<OmpClause::Absent>(
+                             parenthesized(Parser<OmpAbsentClause>{}))) ||
+@@ -972,7 +997,7 @@ TYPE_PARSER(sourced(construct<OmpErrorDirective>(
+ // --- Parsers for directives and constructs --------------------------
+ 
+ TYPE_PARSER(sourced(construct<OmpDirectiveSpecification>( //
+-    OmpDirectiveNameParser{},
++    sourced(OmpDirectiveNameParser{}),
+     maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
+     maybe(Parser<OmpClauseList>{}))))
+ 
+diff --git a/flang/lib/Parser/parse-tree.cpp b/flang/lib/Parser/parse-tree.cpp
+index 251b6919cf52f..95575e76c1149 100644
+--- a/flang/lib/Parser/parse-tree.cpp
++++ b/flang/lib/Parser/parse-tree.cpp
+@@ -253,6 +253,23 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Name &x) {
+   return os << x.ToString();
+ }
+ 
++OmpDirectiveName::OmpDirectiveName(const Verbatim &name) {
++  std::string_view nameView{name.source.begin(), name.source.size()};
++  std::string nameLower{ToLowerCaseLetters(nameView)};
++  // The function getOpenMPDirectiveKind will return OMPD_unknown in two cases:
++  // (1) if the given string doesn't match any actual directive, or
++  // (2) if the given string was "unknown".
++  // The Verbatim(<token>) parser will succeed as long as the given token
++  // matches the source.
++  // Since using "construct<OmpDirectiveName>(verbatim(...))" will succeed
++  // if the verbatim parser succeeds, in order to get OMPD_unknown the
++  // token given to Verbatim must be invalid. Because it's an internal issue
++  // asserting is ok.
++  v = llvm::omp::getOpenMPDirectiveKind(nameLower);
++  assert(v != llvm::omp::Directive::OMPD_unknown && "Invalid directive name");
++  source = name.source;
++}
++
+ OmpDependenceType::Value OmpDoacross::GetDepType() const {
+   return common::visit( //
+       common::visitors{
+@@ -319,4 +336,12 @@ namespace Fortran::parser {
+ llvm::omp::Clause OmpClause::Id() const {
+   return std::visit([](auto &&s) { return getClauseIdForClass(s); }, u);
+ }
++
++const OmpClauseList &OmpDirectiveSpecification::Clauses() const {
++  static OmpClauseList empty{std::move(decltype(OmpClauseList::v){})};
++  if (auto &clauses = std::get<std::optional<OmpClauseList>>(t)) {
++    return *clauses;
++  }
++  return empty;
++}
+ } // namespace Fortran::parser
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 1df17b6d7382b..4f5c05dc2aa25 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2095,7 +2095,7 @@ class UnparseVisitor {
+   }
+   void Unparse(const OmpDirectiveSpecification &x) {
+     using ArgList = std::list<parser::OmpArgument>;
+-    Walk(std::get<llvm::omp::Directive>(x.t));
++    Walk(std::get<OmpDirectiveName>(x.t));
+     if (auto &args{std::get<std::optional<ArgList>>(x.t)}) {
+       Put("(");
+       Walk(*args);
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index c6ed211549401..f24d9f54f5fed 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -625,18 +625,28 @@ void OmpStructureChecker::CheckHintClause(
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpDirectiveSpecification &x) {
+-  PushContextAndClauseSets(x.source, std::get<llvm::omp::Directive>(x.t));
++  // OmpDirectiveSpecification exists on its own only in METADIRECTIVE.
++  // In other cases it's a part of other constructs that handle directive
++  // context stack by themselves.
++  if (GetDirectiveNest(MetadirectiveNest)) {
++    PushContextAndClauseSets(
++        std::get<parser::OmpDirectiveName>(x.t).source, x.DirId());
++  }
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OmpDirectiveSpecification &) {
+-  dirContext_.pop_back();
++  if (GetDirectiveNest(MetadirectiveNest)) {
++    dirContext_.pop_back();
++  }
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpMetadirectiveDirective &x) {
++  EnterDirectiveNest(MetadirectiveNest);
+   PushContextAndClauseSets(x.source, llvm::omp::Directive::OMPD_metadirective);
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OmpMetadirectiveDirective &) {
++  ExitDirectiveNest(MetadirectiveNest);
+   dirContext_.pop_back();
+ }
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index b70ea58cf5578..496915aa44496 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -326,7 +326,8 @@ class OmpStructureChecker
+     TargetNest,
+     DeclarativeNest,
+     ContextSelectorNest,
+-    LastType = ContextSelectorNest,
++    MetadirectiveNest,
++    LastType = MetadirectiveNest,
+   };
+   int directiveNest_[LastType + 1] = {0};
+ 
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 38888a4dc1461..977c2fef34091 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -352,7 +352,7 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+   }
+ 
+   bool Pre(const parser::OmpDirectiveSpecification &x) {
+-    PushContext(x.source, std::get<llvm::omp::Directive>(x.t));
++    PushContext(x.source, x.DirId());
+     return true;
+   }
+   void Post(const parser::OmpDirectiveSpecification &) { PopContext(); }
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 4f80cdca0f4bb..e57abf8ac0912 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1775,11 +1775,10 @@ bool OmpVisitor::Pre(const parser::OmpDirectiveSpecification &x) {
+   // Disable the semantic analysis for it for now to allow the compiler to
+   // parse METADIRECTIVE without flagging errors.
+   AddOmpSourceRange(x.source);
+-  auto dirId{std::get<llvm::omp::Directive>(x.t)};
+   auto &maybeArgs{std::get<std::optional<std::list<parser::OmpArgument>>>(x.t)};
+   auto &maybeClauses{std::get<std::optional<parser::OmpClauseList>>(x.t)};
+ 
+-  switch (dirId) {
++  switch (x.DirId()) {
+   case llvm::omp::Directive::OMPD_declare_mapper:
+     if (maybeArgs && maybeClauses) {
+       const parser::OmpArgument &first{maybeArgs->front()};
+diff --git a/flang/test/Parser/OpenMP/if-clause.f90 b/flang/test/Parser/OpenMP/if-clause.f90
+index b3e3913f8bd1c..d7ab86ca6d2cf 100644
+--- a/flang/test/Parser/OpenMP/if-clause.f90
++++ b/flang/test/Parser/OpenMP/if-clause.f90
+@@ -11,34 +11,34 @@ program openmp_parse_if
+ 
+   ! CHECK: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
+   ! CHECK-NEXT: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = target update
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = target update
+   !$omp target update if(target update: cond) to(i)
+ 
+   ! CHECK: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target enter data
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = target enter data
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = target enter data
+   !$omp target enter data map(to: i) if(target enter data: cond)
+ 
+   ! CHECK: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target exit data
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = target exit data
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = target exit data
+   !$omp target exit data map(from: i) if(target exit data: cond)
+ 
+   ! CHECK: OmpBlockDirective -> llvm::omp::Directive = target data
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = target data
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = target data
+   !$omp target data map(tofrom: i) if(target data: cond)
+   !$omp end target data
+ 
+   ! CHECK: OmpLoopDirective -> llvm::omp::Directive = target teams distribute parallel do simd
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = target
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = target
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = teams
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = teams
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = parallel
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = parallel
+   ! CHECK: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = simd
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = simd
+   !$omp target teams distribute parallel do simd if(target: cond) &
+   !$omp&    if(teams: cond) if(parallel: cond) if(simd: cond)
+   do i = 1, 10
+@@ -47,13 +47,13 @@ program openmp_parse_if
+ 
+   ! CHECK: OmpBlockDirective -> llvm::omp::Directive = task
+   ! CHECK-NEXT: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: OmpDirectiveNameModifier -> llvm::omp::Directive = task
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = task
+   !$omp task if(task: cond)
+   !$omp end task
+ 
+   ! CHECK: OmpLoopDirective -> llvm::omp::Directive = taskloop
+   ! CHECK-NEXT: OmpClause -> If -> OmpIfClause
+-  ! CHECK-NEXT: DirectiveNameModifier -> llvm::omp::Directive = taskloop
++  ! CHECK-NEXT: OmpDirectiveName -> llvm::omp::Directive = taskloop
+   !$omp taskloop if(taskloop: cond)
+   do i = 1, 10
+   end do
+diff --git a/flang/test/Parser/OpenMP/metadirective-dirspec.f90 b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+index 73520c41fe77d..bf749d1f48c10 100644
+--- a/flang/test/Parser/OpenMP/metadirective-dirspec.f90
++++ b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+@@ -25,7 +25,7 @@ subroutine f00(x)
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = allocate
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = allocate
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+@@ -51,7 +51,7 @@ subroutine f01(x)
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = critical
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = critical
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+@@ -76,7 +76,7 @@ subroutine f02
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare mapper
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare mapper
+ !PARSE-TREE: | | | OmpArgument -> OmpMapperSpecifier
+ !PARSE-TREE: | | | | Name = 'mymapper'
+ !PARSE-TREE: | | | | TypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
+@@ -120,7 +120,7 @@ subroutine f03
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare reduction
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare reduction
+ !PARSE-TREE: | | | OmpArgument -> OmpReductionSpecifier
+ !PARSE-TREE: | | | | OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
+ !PARSE-TREE: | | | | OmpTypeNameList -> OmpTypeSpecifier -> TypeSpec -> DerivedTypeSpec
+@@ -158,7 +158,7 @@ subroutine f04
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare simd
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare simd
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f04'
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: ImplicitPart ->
+@@ -183,7 +183,7 @@ subroutine f05
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare target
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare target
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'f05'
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: ImplicitPart ->
+@@ -210,7 +210,7 @@ subroutine f06(x, y)
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = flush
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'y'
+ !PARSE-TREE: | | | OmpClauseList ->
+@@ -237,6 +237,6 @@ subroutine f07
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = threadprivate
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = threadprivate
+ !PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 't'
+ !PARSE-TREE: | | | OmpClauseList ->
+diff --git a/flang/test/Parser/OpenMP/metadirective-v50.f90 b/flang/test/Parser/OpenMP/metadirective-v50.f90
+index d7c3121b8f1b8..6fef3376470a6 100644
+--- a/flang/test/Parser/OpenMP/metadirective-v50.f90
++++ b/flang/test/Parser/OpenMP/metadirective-v50.f90
+@@ -24,8 +24,8 @@ subroutine f01
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: | OmpClause -> Default -> OmpDefaultClause -> OmpDirectiveSpecification
+-!PARSE-TREE: | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | OmpClauseList ->
+diff --git a/flang/test/Parser/OpenMP/metadirective.f90 b/flang/test/Parser/OpenMP/metadirective.f90
+index dce31c2e7db26..1185ac897ecf6 100644
+--- a/flang/test/Parser/OpenMP/metadirective.f90
++++ b/flang/test/Parser/OpenMP/metadirective.f90
+@@ -20,7 +20,7 @@ subroutine f00
+ !PARSE-TREE: | | | OmpTraitSelector
+ !PARSE-TREE: | | | | OmpTraitSelectorName -> llvm::omp::Directive = parallel
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f01
+@@ -47,7 +47,7 @@ subroutine f01
+ !PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '1_4'
+ !PARSE-TREE: | | | | | | LiteralConstant -> IntLiteralConstant = '1'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f02
+@@ -74,7 +74,7 @@ subroutine f02
+ !PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '7_4'
+ !PARSE-TREE: | | | | | | LiteralConstant -> IntLiteralConstant = '7'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f03
+@@ -98,7 +98,7 @@ subroutine f03
+ !PARSE-TREE: | | | | Properties
+ !PARSE-TREE: | | | | | OmpTraitProperty -> OmpClause -> AcqRel
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f04
+@@ -132,7 +132,7 @@ subroutine f04
+ !PARSE-TREE: | | | | | | | OmpTraitPropertyExtension -> Scalar -> Expr = '1_4'
+ !PARSE-TREE: | | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f05(x)
+@@ -168,12 +168,12 @@ subroutine f05(x)
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = parallel do
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = parallel do
+ !PARSE-TREE: | | | OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
+ !PARSE-TREE: | | | | Modifier -> OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
+ !PARSE-TREE: | | | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
+ !PARSE-TREE: | OmpClause -> Otherwise -> OmpOtherwiseClause -> OmpDirectiveSpecification
+-!PARSE-TREE: | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | OmpClauseList ->
+ 
+ subroutine f06
+@@ -207,7 +207,7 @@ subroutine f06
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = nothing
+ !PARSE-TREE: | | | OmpClauseList ->
+ 
+ subroutine f07
+@@ -232,7 +232,7 @@ subroutine f07
+ !PARSE-TREE: | | | | Properties
+ !PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyName -> string = 'amd'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare simd
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare simd
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: | OmpClause -> When -> OmpWhenClause
+ !PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
+@@ -244,8 +244,8 @@ subroutine f07
+ !PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
+ !PARSE-TREE: | | | | | | | bool = 'true'
+ !PARSE-TREE: | | OmpDirectiveSpecification
+-!PARSE-TREE: | | | llvm::omp::Directive = declare target
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare target
+ !PARSE-TREE: | | | OmpClauseList ->
+ !PARSE-TREE: | OmpClause -> Otherwise -> OmpOtherwiseClause -> OmpDirectiveSpecification
+-!PARSE-TREE: | | llvm::omp::Directive = nothing
+-!PARSE-TREE: | | OmpClauseList ->
+\ No newline at end of file
++!PARSE-TREE: | | OmpDirectiveName -> llvm::omp::Directive = nothing
++!PARSE-TREE: | | OmpClauseList ->

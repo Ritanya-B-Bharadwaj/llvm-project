@@ -1,0 +1,611 @@
+diff --git a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+index 231df63bbae92..c78dd7f14e503 100644
+--- a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
++++ b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+@@ -106,10 +106,16 @@ std::string OpenMPCounterVisitor::getName(const OmpWrapperType &w) {
+   return getName(*std::get<const OpenMPDeclarativeConstruct *>(w));
+ }
+ std::string OpenMPCounterVisitor::getName(const OpenMPDeclarativeConstruct &c) {
+-  return std::visit(
+-      [&](const auto &o) -> std::string {
+-        const CharBlock &source{std::get<Verbatim>(o.t).source};
+-        return normalize_construct_name(source.ToString());
++  return std::visit( //
++      Fortran::common::visitors{
++          [&](const OpenMPUtilityConstruct &o) -> std::string {
++            const CharBlock &source{o.source};
++            return normalize_construct_name(source.ToString());
++          },
++          [&](const auto &o) -> std::string {
++            const CharBlock &source{std::get<Verbatim>(o.t).source};
++            return normalize_construct_name(source.ToString());
++          },
+       },
+       c.u);
+ }
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 9df7c6d5e39c3..b693e001e5e4b 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4342,7 +4342,7 @@ struct OpenMPDeclarativeConstruct {
+   std::variant<OpenMPDeclarativeAllocate, OpenMPDeclareMapperConstruct,
+       OpenMPDeclareReductionConstruct, OpenMPDeclareSimdConstruct,
+       OpenMPDeclareTargetConstruct, OpenMPThreadprivate,
+-      OpenMPRequiresConstruct>
++      OpenMPRequiresConstruct, OpenMPUtilityConstruct>
+       u;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index fe6d82125a9e0..0a84162291573 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2586,6 +2586,10 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+ //===----------------------------------------------------------------------===//
+ // OpenMPDeclarativeConstruct visitors
+ //===----------------------------------------------------------------------===//
++static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
++                   semantics::SemanticsContext &semaCtx,
++                   lower::pft::Evaluation &eval,
++                   const parser::OpenMPUtilityConstruct &);
+ 
+ static void
+ genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 0a0a29002de27..75bb64d06ed0f 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -1090,7 +1090,9 @@ TYPE_PARSER(startOmpLine >>
+             construct<OpenMPDeclarativeConstruct>(
+                 Parser<OpenMPRequiresConstruct>{}) ||
+             construct<OpenMPDeclarativeConstruct>(
+-                Parser<OpenMPThreadprivate>{})) /
++                Parser<OpenMPThreadprivate>{}) ||
++            construct<OpenMPDeclarativeConstruct>(
++                Parser<OpenMPUtilityConstruct>{})) /
+             endOmpLine))
+ 
+ // Block Construct
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4fe57f3e348d3..58820476c51bc 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2631,81 +2631,64 @@ class UnparseVisitor {
+     }
+   }
+   void Unparse(const OpenMPDeclareReductionConstruct &x) {
++    BeginOpenMP();
++    Word("!$OMP DECLARE REDUCTION ");
+     Put("(");
+     Walk(std::get<OmpReductionIdentifier>(x.t)), Put(" : ");
+     Walk(std::get<std::list<DeclarationTypeSpec>>(x.t), ","), Put(" : ");
+     Walk(std::get<OmpReductionCombiner>(x.t));
+     Put(")");
+     Walk(std::get<std::optional<OmpReductionInitializerClause>>(x.t));
++    EndOpenMP();
+   }
+-  bool Pre(const OpenMPDeclarativeConstruct &x) {
++
++  void Unparse(const OpenMPDeclareMapperConstruct &z) {
+     BeginOpenMP();
+-    Word("!$OMP ");
+-    return common::visit(
+-        common::visitors{
+-            [&](const OpenMPDeclarativeAllocate &z) {
+-              Word("ALLOCATE (");
+-              Walk(std::get<OmpObjectList>(z.t));
+-              Put(")");
+-              Walk(std::get<OmpClauseList>(z.t));
+-              Put("\n");
+-              EndOpenMP();
+-              return false;
+-            },
+-            [&](const OpenMPDeclareMapperConstruct &z) {
+-              Word("DECLARE MAPPER (");
+-              const auto &spec{std::get<OmpDeclareMapperSpecifier>(z.t)};
+-              if (auto mapname{std::get<std::optional<Name>>(spec.t)}) {
+-                Walk(mapname);
+-                Put(":");
+-              }
+-              Walk(std::get<TypeSpec>(spec.t));
+-              Put("::");
+-              Walk(std::get<Name>(spec.t));
+-              Put(")");
++    Word("!$OMP DECLARE MAPPER (");
++    const auto &spec{std::get<OmpDeclareMapperSpecifier>(z.t)};
++    if (auto mapname{std::get<std::optional<Name>>(spec.t)}) {
++      Walk(mapname);
++      Put(":");
++    }
++    Walk(std::get<TypeSpec>(spec.t));
++    Put("::");
++    Walk(std::get<Name>(spec.t));
++    Put(")");
+ 
+-              Walk(std::get<OmpClauseList>(z.t));
+-              Put("\n");
+-              return false;
+-            },
+-            [&](const OpenMPDeclareReductionConstruct &) {
+-              Word("DECLARE REDUCTION ");
+-              return true;
+-            },
+-            [&](const OpenMPDeclareSimdConstruct &y) {
+-              Word("DECLARE SIMD ");
+-              Walk("(", std::get<std::optional<Name>>(y.t), ")");
+-              Walk(std::get<OmpClauseList>(y.t));
+-              Put("\n");
+-              EndOpenMP();
+-              return false;
+-            },
+-            [&](const OpenMPDeclareTargetConstruct &) {
+-              Word("DECLARE TARGET ");
+-              return true;
+-            },
+-            [&](const OpenMPRequiresConstruct &y) {
+-              Word("REQUIRES ");
+-              Walk(std::get<OmpClauseList>(y.t));
+-              Put("\n");
+-              EndOpenMP();
+-              return false;
+-            },
+-            [&](const OpenMPThreadprivate &) {
+-              Word("THREADPRIVATE (");
+-              return true;
+-            },
+-        },
+-        x.u);
++    Walk(std::get<OmpClauseList>(z.t));
++    Put("\n");
++    EndOpenMP();
++  }
++  void Unparse(const OpenMPDeclareSimdConstruct &y) {
++    BeginOpenMP();
++    Word("!$OMP DECLARE SIMD ");
++    Walk("(", std::get<std::optional<Name>>(y.t), ")");
++    Walk(std::get<OmpClauseList>(y.t));
++    Put("\n");
++    EndOpenMP();
+   }
+-  void Post(const OpenMPDeclarativeConstruct &) {
++  void Unparse(const OpenMPDeclareTargetConstruct &x) {
++    BeginOpenMP();
++    Word("!$OMP DECLARE TARGET ");
++    Walk(std::get<parser::OmpDeclareTargetSpecifier>(x.t));
+     Put("\n");
+     EndOpenMP();
+   }
+-  void Post(const OpenMPThreadprivate &) {
++  void Unparse(const OpenMPRequiresConstruct &y) {
++    BeginOpenMP();
++    Word("!$OMP REQUIRES ");
++    Walk(std::get<OmpClauseList>(y.t));
++    Put("\n");
++    EndOpenMP();
++  }
++  void Unparse(const OpenMPThreadprivate &x) {
++    BeginOpenMP();
++    Word("!$OMP THREADPRIVATE (");
++    Walk(std::get<parser::OmpObjectList>(x.t));
+     Put(")\n");
+     EndOpenMP();
+   }
++
+   bool Pre(const OmpMessageClause &x) {
+     Walk(x.v);
+     return false;
+diff --git a/flang/lib/Semantics/canonicalize-omp.cpp b/flang/lib/Semantics/canonicalize-omp.cpp
+index 0481b3d41f501..5164f1dc6faab 100644
+--- a/flang/lib/Semantics/canonicalize-omp.cpp
++++ b/flang/lib/Semantics/canonicalize-omp.cpp
+@@ -50,6 +50,43 @@ class CanonicalizationOfOmp {
+ 
+   void Post(parser::ExecutionPart &body) { RewriteOmpAllocations(body); }
+ 
++  // Pre-visit all constructs that have both a specification part and
++  // an execution part, and store the connection between the two.
++  bool Pre(parser::BlockConstruct &x) {
++    auto *spec = &std::get<parser::BlockSpecificationPart>(x.t).v;
++    auto *block = &std::get<parser::Block>(x.t);
++    blockForSpec_.insert(std::make_pair(spec, block));
++    return true;
++  }
++  bool Pre(parser::MainProgram &x) {
++    auto *spec = &std::get<parser::SpecificationPart>(x.t);
++    auto *block = &std::get<parser::ExecutionPart>(x.t).v;
++    blockForSpec_.insert(std::make_pair(spec, block));
++    return true;
++  }
++  bool Pre(parser::FunctionSubprogram &x) {
++    auto *spec = &std::get<parser::SpecificationPart>(x.t);
++    auto *block = &std::get<parser::ExecutionPart>(x.t).v;
++    blockForSpec_.insert(std::make_pair(spec, block));
++    return true;
++  }
++  bool Pre(parser::SubroutineSubprogram &x) {
++    auto *spec = &std::get<parser::SpecificationPart>(x.t);
++    auto *block = &std::get<parser::ExecutionPart>(x.t).v;
++    blockForSpec_.insert(std::make_pair(spec, block));
++    return true;
++  }
++  bool Pre(parser::SeparateModuleSubprogram &x) {
++    auto *spec = &std::get<parser::SpecificationPart>(x.t);
++    auto *block = &std::get<parser::ExecutionPart>(x.t).v;
++    blockForSpec_.insert(std::make_pair(spec, block));
++    return true;
++  }
++
++  void Post(parser::SpecificationPart &spec) {
++    CanonicalizeUtilityConstructs(spec);
++  }
++
+ private:
+   template <typename T> T *GetConstructIf(parser::ExecutionPartConstruct &x) {
+     if (auto *y{std::get_if<parser::ExecutableConstruct>(&x.u)}) {
+@@ -155,6 +192,131 @@ class CanonicalizationOfOmp {
+     }
+   }
+ 
++  // Canonicalization of utility constructs.
++  //
++  // This addresses the issue of utility constructs that appear at the
++  // boundary between the specification and the execution parts, e.g.
++  //   subroutine foo
++  //     integer :: x     ! Specification
++  //     !$omp nothing
++  //     x = 1            ! Execution
++  //     ...
++  //   end
++  //
++  // Utility constructs (error and nothing) can appear in both the
++  // specification part and the execution part, except "error at(execution)",
++  // which cannot be present in the specification part (whereas any utility
++  // construct can be in the execution part).
++  // When a utility construct is at the boundary, it should preferably be
++  // parsed as an element of the execution part, but since the specification
++  // part is parsed first, the utility construct ends up belonging to the
++  // specification part.
++  //
++  // To allow the likes of the following code to compile, move all utility
++  // construct that are at the end of the specification part to the beginning
++  // of the execution part.
++  //
++  // subroutine foo
++  //   !$omp error at(execution)  ! Initially parsed as declarative construct.
++  //                              ! Move it to the execution part.
++  // end
++
++  void CanonicalizeUtilityConstructs(parser::SpecificationPart &spec) {
++    auto found = blockForSpec_.find(&spec);
++    if (found == blockForSpec_.end()) {
++      // There is no corresponding execution part, so there is nothing to do.
++      return;
++    }
++    parser::Block &block = *found->second;
++
++    // There are two places where an OpenMP declarative construct can
++    // show up in the tuple in specification part:
++    // (1) in std::list<OpenMPDeclarativeConstruct>, or
++    // (2) in std::list<DeclarationConstruct>.
++    // The case (1) is only possible is the list (2) is empty.
++
++    auto &omps =
++        std::get<std::list<parser::OpenMPDeclarativeConstruct>>(spec.t);
++    auto &decls = std::get<std::list<parser::DeclarationConstruct>>(spec.t);
++
++    if (!decls.empty()) {
++      MoveUtilityConstructsFromDecls(decls, block);
++    } else {
++      MoveUtilityConstructsFromOmps(omps, block);
++    }
++  }
++
++  void MoveUtilityConstructsFromDecls(
++      std::list<parser::DeclarationConstruct> &decls, parser::Block &block) {
++    // Find the trailing range of DeclarationConstructs that are OpenMP
++    // utility construct, that are to be moved to the execution part.
++    std::list<parser::DeclarationConstruct>::reverse_iterator rlast = [&]() {
++      for (auto rit = decls.rbegin(), rend = decls.rend(); rit != rend; ++rit) {
++        parser::DeclarationConstruct &dc = *rit;
++        if (!std::holds_alternative<parser::SpecificationConstruct>(dc.u)) {
++          return rit;
++        }
++        auto &sc = std::get<parser::SpecificationConstruct>(dc.u);
++        using OpenMPDeclarativeConstruct =
++            common::Indirection<parser::OpenMPDeclarativeConstruct>;
++        if (!std::holds_alternative<OpenMPDeclarativeConstruct>(sc.u)) {
++          return rit;
++        }
++        // Got OpenMPDeclarativeConstruct. If it's not a utility construct
++        // then stop.
++        auto &odc = std::get<OpenMPDeclarativeConstruct>(sc.u).value();
++        if (!std::holds_alternative<parser::OpenMPUtilityConstruct>(odc.u)) {
++          return rit;
++        }
++      }
++      return decls.rend();
++    }();
++
++    std::transform(decls.rbegin(), rlast, std::front_inserter(block),
++        [](parser::DeclarationConstruct &dc) {
++          auto &sc = std::get<parser::SpecificationConstruct>(dc.u);
++          using OpenMPDeclarativeConstruct =
++              common::Indirection<parser::OpenMPDeclarativeConstruct>;
++          auto &oc = std::get<OpenMPDeclarativeConstruct>(sc.u).value();
++          auto &ut = std::get<parser::OpenMPUtilityConstruct>(oc.u);
++
++          return parser::ExecutionPartConstruct(parser::ExecutableConstruct(
++              common::Indirection(parser::OpenMPConstruct(std::move(ut)))));
++        });
++
++    decls.erase(rlast.base(), decls.end());
++  }
++
++  void MoveUtilityConstructsFromOmps(
++      std::list<parser::OpenMPDeclarativeConstruct> &omps,
++      parser::Block &block) {
++    using OpenMPDeclarativeConstruct = parser::OpenMPDeclarativeConstruct;
++    // Find the trailing range of OpenMPDeclarativeConstruct that are OpenMP
++    // utility construct, that are to be moved to the execution part.
++    std::list<OpenMPDeclarativeConstruct>::reverse_iterator rlast = [&]() {
++      for (auto rit = omps.rbegin(), rend = omps.rend(); rit != rend; ++rit) {
++        OpenMPDeclarativeConstruct &dc = *rit;
++        if (!std::holds_alternative<parser::OpenMPUtilityConstruct>(dc.u)) {
++          return rit;
++        }
++      }
++      return omps.rend();
++    }();
++
++    std::transform(omps.rbegin(), rlast, std::front_inserter(block),
++        [](parser::OpenMPDeclarativeConstruct &dc) {
++          auto &ut = std::get<parser::OpenMPUtilityConstruct>(dc.u);
++          return parser::ExecutionPartConstruct(parser::ExecutableConstruct(
++              common::Indirection(parser::OpenMPConstruct(std::move(ut)))));
++        });
++
++    omps.erase(rlast.base(), omps.end());
++  }
++
++  // Mapping from the specification parts to the blocks that follow in the
++  // same construct. This is for converting utility constructs to executable
++  // constructs.
++  std::map<parser::SpecificationPart *, parser::Block *> blockForSpec_;
+   parser::Messages &messages_;
+ };
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 3a928c8a0289b..4c6a408a9ef30 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -614,6 +614,14 @@ void OmpStructureChecker::Leave(const parser::OpenMPConstruct &) {
+   deferredNonVariables_.clear();
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OpenMPDeclarativeConstruct &x) {
++  EnterDirectiveNest(DeclarativeNest);
++}
++
++void OmpStructureChecker::Leave(const parser::OpenMPDeclarativeConstruct &x) {
++  ExitDirectiveNest(DeclarativeNest);
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
+   loopStack_.push_back(&x);
+   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
+@@ -1697,6 +1705,16 @@ void OmpStructureChecker::Leave(const parser::OmpErrorDirective &x) {
+   dirContext_.pop_back();
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OmpClause::At &x) {
++  CheckAllowedClause(llvm::omp::Clause::OMPC_at);
++  if (GetDirectiveNest(DeclarativeNest) > 0) {
++    if (x.v.v == parser::OmpAtClause::ActionTime::Execution) {
++      context_.Say(GetContext().clauseSource,
++          "The ERROR directive with AT(EXECUTION) cannot appear in the specification part"_err_en_US);
++    }
++  }
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPExecutableAllocate &x) {
+   isPredefinedAllocator = true;
+   const auto &dir{std::get<parser::Verbatim>(x.t)};
+@@ -2856,7 +2874,6 @@ CHECK_SIMPLE_CLAUSE(Init, OMPC_init)
+ CHECK_SIMPLE_CLAUSE(Use, OMPC_use)
+ CHECK_SIMPLE_CLAUSE(Novariants, OMPC_novariants)
+ CHECK_SIMPLE_CLAUSE(Nocontext, OMPC_nocontext)
+-CHECK_SIMPLE_CLAUSE(At, OMPC_at)
+ CHECK_SIMPLE_CLAUSE(Severity, OMPC_severity)
+ CHECK_SIMPLE_CLAUSE(Message, OMPC_message)
+ CHECK_SIMPLE_CLAUSE(Filter, OMPC_filter)
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 2a4f6fbd618c3..f47c01c00499a 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -73,6 +73,9 @@ class OmpStructureChecker
+ 
+   void Enter(const parser::OpenMPConstruct &);
+   void Leave(const parser::OpenMPConstruct &);
++  void Enter(const parser::OpenMPDeclarativeConstruct &);
++  void Leave(const parser::OpenMPDeclarativeConstruct &);
++
+   void Enter(const parser::OpenMPLoopConstruct &);
+   void Leave(const parser::OpenMPLoopConstruct &);
+   void Enter(const parser::OmpEndLoopDirective &);
+@@ -270,11 +273,12 @@ class OmpStructureChecker
+       const parser::Variable &, const parser::Expr &);
+   inline void ErrIfNonScalarAssignmentStmt(
+       const parser::Variable &, const parser::Expr &);
+-  enum directiveNestType {
++  enum directiveNestType : int {
+     SIMDNest,
+     TargetBlockOnlyTeams,
+     TargetNest,
+-    LastType
++    DeclarativeNest,
++    LastType = DeclarativeNest,
+   };
+   int directiveNest_[LastType + 1] = {0};
+ 
+diff --git a/flang/test/Parser/OpenMP/error-unparse.f90 b/flang/test/Parser/OpenMP/error-unparse.f90
+index 4dd06b736da80..2cb4e1a083a6c 100644
+--- a/flang/test/Parser/OpenMP/error-unparse.f90
++++ b/flang/test/Parser/OpenMP/error-unparse.f90
+@@ -1,23 +1,27 @@
+-! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-unparse-no-sema %s 2>&1 | FileCheck %s
+-! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-dump-parse-tree-no-sema %s 2>&1 | FileCheck %s --check-prefix="PARSE-TREE"
++! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-unparse %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-dump-parse-tree %s 2>&1 | FileCheck %s --check-prefix="PARSE-TREE"
+ program main
+   character(*), parameter :: message = "This is an error"
+   !CHECK: !$OMP ERROR AT(COMPILATION) SEVERITY(WARNING) MESSAGE("some message here")
+   !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpErrorDirective
+   !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Compilation
+   !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Warning
+-  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> LiteralConstant -> CharLiteralConstant
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr = '"some message here"'
++  !PARSE-TREE:  LiteralConstant -> CharLiteralConstant
++  !PARSE-TREE:  string = 'some message here'
+   !$omp error at(compilation) severity(warning) message("some message here")
+-  !CHECK: !$OMP ERROR AT(COMPILATION) SEVERITY(FATAL) MESSAGE(message)
++  !CHECK: !$OMP ERROR AT(COMPILATION) SEVERITY(FATAL) MESSAGE("This is an error")
+   !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpErrorDirective
+   !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Compilation
+   !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Fatal
+-  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> Designator -> DataRef -> Name = 'message'
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr = '"This is an error"'
++  !PARSE-TREE:  Designator -> DataRef -> Name = 'message'
+   !$omp error at(compilation) severity(fatal) message(message)
+-  !CHECK: !$OMP ERROR AT(EXECUTION) SEVERITY(FATAL) MESSAGE(message)
++  !CHECK: !$OMP ERROR AT(EXECUTION) SEVERITY(FATAL) MESSAGE("This is an error")
+   !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpErrorDirective
+   !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Execution
+   !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Fatal
+-  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> Designator ->  DataRef -> Name = 'message'
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr = '"This is an error"'
++  !PARSE-TREE:  Designator ->  DataRef -> Name = 'message'
+   !$omp error at(EXECUTION) severity(fatal) message(message)
+ end program main
+diff --git a/flang/test/Parser/OpenMP/nothing.f90 b/flang/test/Parser/OpenMP/nothing.f90
+index 80c0932087610..22558c493c444 100644
+--- a/flang/test/Parser/OpenMP/nothing.f90
++++ b/flang/test/Parser/OpenMP/nothing.f90
+@@ -11,3 +11,103 @@ subroutine f00
+ 
+ !PARSE-TREE: ExecutionPart -> Block
+ !PARSE-TREE: | | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpNothingDirective
++
++subroutine f01
++  block
++  import, none
++  integer :: x
++  !$omp nothing   ! "nothing" in the execution part
++  x = x+1
++  end block
++end
++
++!UNPARSE: SUBROUTINE f01
++!UNPARSE:  BLOCK
++!UNPARSE:   IMPORT, NONE
++!UNPARSE:   INTEGER x
++!UNPARSE:   !$OMP NOTHING
++!UNPARSE:    x=x+1_4
++!UNPARSE:  END BLOCK
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: BlockStmt ->
++!PARSE-TREE: BlockSpecificationPart -> SpecificationPart
++!PARSE-TREE: | ImportStmt
++!PARSE-TREE: | ImplicitPart ->
++!PARSE-TREE: | DeclarationConstruct -> SpecificationConstruct -> TypeDeclarationStmt
++!PARSE-TREE: | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | EntityDecl
++!PARSE-TREE: | | | Name = 'x'
++!PARSE-TREE: Block
++!PARSE-TREE: | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpNothingDirective
++!PARSE-TREE: | ExecutionPartConstruct -> ExecutableConstruct -> ActionStmt -> AssignmentStmt = 'x=x+1_4'
++!PARSE-TREE: | | Variable = 'x'
++!PARSE-TREE: | | | Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | Expr = 'x+1_4'
++!PARSE-TREE: | | | Add
++!PARSE-TREE: | | | | Expr = 'x'
++!PARSE-TREE: | | | | | Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | | Expr = '1_4'
++!PARSE-TREE: | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: EndBlockStmt ->
++
++subroutine f02
++  integer :: x
++  !$omp nothing
++end
++
++!UNPARSE: SUBROUTINE f02
++!UNPARSE:  INTEGER x
++!UNPARSE:  !$OMP NOTHING
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: SpecificationPart
++!PARSE-TREE: | ImplicitPart ->
++!PARSE-TREE: | DeclarationConstruct -> SpecificationConstruct -> TypeDeclarationStmt
++!PARSE-TREE: | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | EntityDecl
++!PARSE-TREE: | | | Name = 'x'
++!PARSE-TREE: ExecutionPart -> Block
++!PARSE-TREE: | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPUtilityConstruct -> OmpNothingDirective
++
++subroutine f03
++  block
++  !$omp nothing   ! "nothing" in the specification part
++  import, none
++  integer :: x
++  x = x+1
++  end block
++end
++
++!UNPARSE: SUBROUTINE f03
++!UNPARSE:  BLOCK
++!UNPARSE:   !$OMP NOTHING
++!UNPARSE:   IMPORT, NONE
++!UNPARSE:   INTEGER x
++!UNPARSE:    x=x+1_4
++!UNPARSE:  END BLOCK
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPart -> Block
++!PARSE-TREE: | ExecutionPartConstruct -> ExecutableConstruct -> BlockConstruct
++!PARSE-TREE: | | BlockStmt ->
++!PARSE-TREE: | | BlockSpecificationPart -> SpecificationPart
++!PARSE-TREE: | | | OpenMPDeclarativeConstruct -> OpenMPUtilityConstruct -> OmpNothingDirective
++!PARSE-TREE: | | | ImportStmt
++!PARSE-TREE: | | | ImplicitPart ->
++!PARSE-TREE: | | | DeclarationConstruct -> SpecificationConstruct -> TypeDeclarationStmt
++!PARSE-TREE: | | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | | EntityDecl
++!PARSE-TREE: | | | | | Name = 'x'
++!PARSE-TREE: | | Block
++!PARSE-TREE: | | | ExecutionPartConstruct -> ExecutableConstruct -> ActionStmt -> AssignmentStmt = 'x=x+1_4'
++!PARSE-TREE: | | | | Variable = 'x'
++!PARSE-TREE: | | | | | Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | | Expr = 'x+1_4'
++!PARSE-TREE: | | | | | Add
++!PARSE-TREE: | | | | | | Expr = 'x'
++!PARSE-TREE: | | | | | | | Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | | | | Expr = '1_4'
++!PARSE-TREE: | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | EndBlockStmt ->
++!PARSE-TREE: EndSubroutineStmt ->
+\ No newline at end of file
+diff --git a/flang/test/Semantics/OpenMP/error.f90 b/flang/test/Semantics/OpenMP/error.f90
+new file mode 100644
+index 0000000000000..067417a8cda3b
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/error.f90
+@@ -0,0 +1,8 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=51
++
++subroutine f00(x)
++!ERROR: The ERROR directive with AT(EXECUTION) cannot appear in the specification part
++  !$omp error at(execution) message("Haaa!")
++  integer :: x
++end
++

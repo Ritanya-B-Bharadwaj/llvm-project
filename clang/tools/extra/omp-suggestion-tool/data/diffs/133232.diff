@@ -1,0 +1,280 @@
+diff --git a/flang/lib/Lower/ConvertExprToHLFIR.cpp b/flang/lib/Lower/ConvertExprToHLFIR.cpp
+index dc00e0b13f583..09bc1babf079c 100644
+--- a/flang/lib/Lower/ConvertExprToHLFIR.cpp
++++ b/flang/lib/Lower/ConvertExprToHLFIR.cpp
+@@ -279,7 +279,8 @@ class HlfirDesignatorBuilder {
+   gen(const Fortran::evaluate::SymbolRef &symbolRef) {
+     if (std::optional<fir::FortranVariableOpInterface> varDef =
+             getSymMap().lookupVariableDefinition(symbolRef)) {
+-      if (symbolRef->test(Fortran::semantics::Symbol::Flag::CrayPointee)) {
++      if (symbolRef.get().GetUltimate().test(
++              Fortran::semantics::Symbol::Flag::CrayPointee)) {
+         // The pointee is represented with a descriptor inheriting
+         // the shape and type parameters of the pointee.
+         // We have to update the base_addr to point to the current
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index bbb990a8970a1..f905da0a7239d 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2306,7 +2306,7 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
+             // the scope of the parallel region, and not in this scope.
+             // TODO: check whether this should be caught in IsObjectWithDSA
+             !symbol->test(Symbol::Flag::OmpPrivate)) {
+-          if (symbol->test(Symbol::Flag::CrayPointee)) {
++          if (symbol->GetUltimate().test(Symbol::Flag::CrayPointee)) {
+             std::string crayPtrName{
+                 semantics::GetCrayPointer(*symbol).name().ToString()};
+             if (!IsObjectWithDSA(*currScope().FindSymbol(crayPtrName)))
+diff --git a/flang/test/Lower/OpenMP/cray-pointers01.f90 b/flang/test/Lower/OpenMP/cray-pointers01.f90
+new file mode 100644
+index 0000000000000..87692ccbadfe3
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/cray-pointers01.f90
+@@ -0,0 +1,61 @@
++! Test lowering of Cray pointee references.
++! RUN: flang -fc1 -emit-hlfir -fopenmp %s -o - 2>&1 | FileCheck %s
++
++module test_host_assoc_cray_pointer
++  ! CHECK-LABEL: fir.global @_QMtest_host_assoc_cray_pointerEivar : i64
++  real*8 var(*)
++  ! CHECK-LABEL: fir.global  @_QMtest_host_assoc_cray_pointerEvar : !fir.array<?xf64>
++  pointer(ivar,var)
++
++contains
++
++  ! CHECK-LABEL: func.func @_QMtest_host_assoc_cray_pointerPset_cray_pointer()
++  subroutine set_cray_pointer
++    ! CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.box<!fir.ptr<!fir.array<?xf64>>>
++    ! CHECK: %[[IVAR_ADDR:.*]] = fir.address_of(@_QMtest_host_assoc_cray_pointerEivar) : !fir.ref<i64>
++    ! CHECK: %[[IVAR_DECL:.*]]:2 = hlfir.declare %[[IVAR_ADDR]] {uniq_name = "_QMtest_host_assoc_cray_pointerEivar"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
++    ! CHECK: %[[VAR_DECL:.*]]:2 = hlfir.declare %[[ALLOCA]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QMtest_host_assoc_cray_pointerEvar"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>)
++    real*8 pointee(2)
++    pointee(1) = 42.0
++
++    ivar = loc(pointee)
++
++    !$omp parallel default(none) shared(ivar)
++    ! CHECK: omp.parallel
++    ! CHECK: %[[I_01:.*]] = fir.convert %[[IVAR_DECL]]#0 : (!fir.ref<i64>) -> !fir.ref<!fir.ptr<i64>>
++    ! CHECK: %[[I_02:.*]] = fir.load %[[I_01]] : !fir.ref<!fir.ptr<i64>>
++    ! CHECK: %[[I_03:.*]] = fir.convert %[[VAR_DECL]]#0 : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>) -> !fir.ref<!fir.box<none>>
++    ! CHECK: %[[I_04:.*]] = fir.convert %[[I_02]] : (!fir.ptr<i64>) -> !fir.llvm_ptr<i8>
++    ! CHECK: fir.call @_FortranAPointerAssociateScalar(%[[I_03]], %[[I_04]]) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++    print *, var(1)
++    !$omp end parallel
++  end subroutine
++end module
++
++program test_cray_pointers_01
++  real*8, save :: var(*)
++  ! CHECK: %[[BOX_ALLOCA:.*]] = fir.alloca !fir.box<!fir.ptr<!fir.array<?xf64>>>
++  ! CHECK: %[[IVAR_ALLOCA:.*]] = fir.alloca i64 {bindc_name = "ivar", uniq_name = "_QFEivar"}
++  ! CHECK: %[[IVAR_DECL_01:.*]]:2 = hlfir.declare %[[IVAR_ALLOCA]] {uniq_name = "_QFEivar"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
++  pointer(ivar,var)
++  ! CHECK: %[[VAR_DECL_02:.*]]:2 = hlfir.declare %[[BOX_ALLOCA]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEvar"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xf64>>>>)
++
++  real*8 pointee(2)
++  pointee(1) = 42.0
++
++  !$omp parallel default(none) private(ivar) shared(pointee)
++    ! CHECK: omp.parallel private({{.*}} %[[IVAR_DECL_01]]#0 -> %[[ARG0:.*]] : !fir.ref<i64>) {
++    ! CHECK:   %[[IVAR_DECL_02:.*]]:2 = hlfir.declare %[[ARG0]] {uniq_name = "_QFEivar"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
++    ! CHECK:   hlfir.assign %{{.*}} to %[[IVAR_DECL_02]]#0 : i64, !fir.ref<i64>
++    ivar = loc(pointee)
++    ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++    ! CHECK:   %[[CONST_2:.*]] = arith.constant 2 : i32
++    ! CHECK:   {{.*}} = math.fpowi {{.*}}, %[[CONST_2]] fastmath<contract> : f64, i32
++    ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++    var(1) = var(1) ** 2
++    ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++    print *, var(1)
++    ! CHECK:   omp.terminator
++    ! CHECK: }
++  !$omp end parallel
++end program test_cray_pointers_01
+diff --git a/flang/test/Lower/OpenMP/cray-pointers02.f90 b/flang/test/Lower/OpenMP/cray-pointers02.f90
+new file mode 100644
+index 0000000000000..19e4cd09fe50a
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/cray-pointers02.f90
+@@ -0,0 +1,180 @@
++! Test lowering of Cray pointee references.
++! RUN: flang -fc1 -emit-hlfir -fopenmp %s -o - 2>&1 | FileCheck %s
++
++! CHECK-LABEL: func.func @_QQmain() attributes {fir.bindc_name = "test_cray_pointers_02"}
++program test_cray_pointers_02
++    implicit none
++
++    ! CHECK:   fir.call @_QPnone_shared() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPnone_private() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPnone_firstprivate() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPprivate_shared() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPprivate_firstprivate() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPfirstprivate_shared() fastmath<contract> : () -> ()
++    ! CHECK:   fir.call @_QPfirstprivate_private() fastmath<contract> : () -> ()
++    call none_shared()
++    call none_private()
++    call none_firstprivate()
++    call private_shared()
++    call private_firstprivate()
++    call firstprivate_shared()
++    call firstprivate_private()
++    ! CHECK:   return
++    ! CHECK: }
++end program test_cray_pointers_02
++
++! CHECK-LABEL: func.func @_QPnone_shared()
++subroutine none_shared()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(none) shared(ivar)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = arith.divsi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) / 2
++        print '(A24,I6)', 'none_shared', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPnone_private()
++subroutine none_private()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(none) private(ivar) shared(pointee)
++        ! CHECK: omp.parallel
++        ivar = loc(pointee)
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = arith.addi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) + 2
++        print '(A24,I6)', 'none_private', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPnone_firstprivate()
++subroutine none_firstprivate()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(none) firstprivate(ivar)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = arith.muli
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) * 2
++        print '(A24,I6)', 'none_firstprivate', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPprivate_shared()
++subroutine private_shared()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(private) shared(ivar)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = math.ipowi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) ** 2
++        print '(A24,I6)', 'private_shared', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPprivate_firstprivate()
++subroutine private_firstprivate()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(private) firstprivate(ivar)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = arith.subi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) - 2
++        print '(A24,I6)', 'private_firstprivate', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPfirstprivate_shared()
++subroutine firstprivate_shared()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(firstprivate) shared(ivar)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = arith.divsi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        var(1) = var(1) / 2
++        print '(A24,I6)', 'firstprivate_shared', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine
++
++! CHECK-LABEL: func.func @_QPfirstprivate_private()
++subroutine firstprivate_private()
++    implicit none
++    integer var(*)
++    pointer(ivar,var)
++    integer pointee(8)
++
++    pointee(1) = 42
++    ivar = loc(pointee)
++
++    !$omp parallel num_threads(1) default(firstprivate) private(ivar) shared(pointee)
++        ! CHECK: omp.parallel
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   {{.*}} = math.ipowi
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ! CHECK:   fir.call @_FortranAPointerAssociateScalar({{.*}}) fastmath<contract> : (!fir.ref<!fir.box<none>>, !fir.llvm_ptr<i8>) -> ()
++        ivar = loc(pointee)
++        var(1) = var(1) ** 2
++        print '(A24,I6)', 'firstprivate_private', var(1)
++    !$omp end parallel
++    ! CHECK: return
++end subroutine

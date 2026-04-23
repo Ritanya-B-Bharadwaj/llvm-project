@@ -1,0 +1,1009 @@
+diff --git a/clang/include/clang/AST/OpenMPClause.h b/clang/include/clang/AST/OpenMPClause.h
+index b9088eff3bb52..abdf9333e7125 100644
+--- a/clang/include/clang/AST/OpenMPClause.h
++++ b/clang/include/clang/AST/OpenMPClause.h
+@@ -9451,7 +9451,8 @@ struct TargetOMPContext final : public llvm::omp::OMPContext {
+   TargetOMPContext(ASTContext &ASTCtx,
+                    std::function<void(StringRef)> &&DiagUnknownTrait,
+                    const FunctionDecl *CurrentFunctionDecl,
+-                   ArrayRef<llvm::omp::TraitProperty> ConstructTraits);
++                   ArrayRef<llvm::omp::TraitProperty> ConstructTraits,
++                   int DeviceNum);
+ 
+   virtual ~TargetOMPContext() = default;
+ 
+diff --git a/clang/include/clang/Sema/SemaOpenMP.h b/clang/include/clang/Sema/SemaOpenMP.h
+index a056a96f50233..fa244da36a322 100644
+--- a/clang/include/clang/Sema/SemaOpenMP.h
++++ b/clang/include/clang/Sema/SemaOpenMP.h
+@@ -849,6 +849,9 @@ class SemaOpenMP : public SemaBase {
+       ArrayRef<OMPInteropInfo> AppendArgs, SourceLocation AdjustArgsLoc,
+       SourceLocation AppendArgsLoc, SourceRange SR);
+ 
++  /// Called on device_num selector in context selectors.
++  void ActOnOpenMPDeviceNum(Expr *DeviceNumExpr);
++
+   OMPClause *ActOnOpenMPSingleExprClause(OpenMPClauseKind Kind, Expr *Expr,
+                                          SourceLocation StartLoc,
+                                          SourceLocation LParenLoc,
+@@ -1410,6 +1413,13 @@ class SemaOpenMP : public SemaBase {
+ 
+   void handleOMPAssumeAttr(Decl *D, const ParsedAttr &AL);
+ 
++  /// Setter and getter functions for device_num.
++  void setOpenMPDeviceNum(int Num);
++
++  int getOpenMPDeviceNum() const;
++
++  void setOpenMPDeviceNumID(StringRef ID);
++
+ private:
+   void *VarDataSharingAttributesStack;
+ 
+@@ -1480,6 +1490,12 @@ class SemaOpenMP : public SemaBase {
+ 
+   /// All `omp assumes` we encountered so far.
+   SmallVector<OMPAssumeAttr *, 4> OMPAssumeGlobal;
++
++  /// Device number specified by the context selector.
++  int DeviceNum = -1;
++
++  /// Device number identifier specified by the context selector.
++  StringRef DeviceNumID;
+ };
+ 
+ } // namespace clang
+diff --git a/clang/lib/AST/OpenMPClause.cpp b/clang/lib/AST/OpenMPClause.cpp
+index 532933d6183ce..bbf7a4d956548 100644
+--- a/clang/lib/AST/OpenMPClause.cpp
++++ b/clang/lib/AST/OpenMPClause.cpp
+@@ -2927,9 +2927,13 @@ llvm::raw_ostream &clang::operator<<(llvm::raw_ostream &OS,
+ TargetOMPContext::TargetOMPContext(
+     ASTContext &ASTCtx, std::function<void(StringRef)> &&DiagUnknownTrait,
+     const FunctionDecl *CurrentFunctionDecl,
+-    ArrayRef<llvm::omp::TraitProperty> ConstructTraits)
++    ArrayRef<llvm::omp::TraitProperty> ConstructTraits, int DeviceNum)
+     : OMPContext(ASTCtx.getLangOpts().OpenMPIsTargetDevice,
+-                 ASTCtx.getTargetInfo().getTriple()),
++                 ASTCtx.getTargetInfo().getTriple(),
++                 ASTCtx.getLangOpts().OMPTargetTriples.empty()
++                     ? llvm::Triple()
++                     : ASTCtx.getLangOpts().OMPTargetTriples[0],
++                 DeviceNum),
+       FeatureValidityCheck([&](StringRef FeatureName) {
+         return ASTCtx.getTargetInfo().isValidFeatureName(FeatureName);
+       }),
+diff --git a/clang/lib/Parse/ParseOpenMP.cpp b/clang/lib/Parse/ParseOpenMP.cpp
+index 89b83938f352d..77a3695f06cba 100644
+--- a/clang/lib/Parse/ParseOpenMP.cpp
++++ b/clang/lib/Parse/ParseOpenMP.cpp
+@@ -888,7 +888,18 @@ void Parser::parseOMPTraitPropertyKind(OMPTraitProperty &TIProperty,
+   TIProperty.Kind = TraitProperty::invalid;
+ 
+   SourceLocation NameLoc = Tok.getLocation();
+-  StringRef Name = getNameFromIdOrString(*this, Tok, CONTEXT_TRAIT_LVL);
++  StringRef Name;
++  if (Selector == llvm::omp::TraitSelector::target_device_device_num) {
++    Name = "number";
++    TIProperty.Kind = getOpenMPContextTraitPropertyKind(Set, Selector, Name);
++    ExprResult DeviceNumExprResult = ParseExpression();
++    if (DeviceNumExprResult.isUsable()) {
++      Expr *DeviceNumExpr = DeviceNumExprResult.get();
++      Actions.OpenMP().ActOnOpenMPDeviceNum(DeviceNumExpr);
++    }
++    return;
++  }
++  Name = getNameFromIdOrString(*this, Tok, CONTEXT_TRAIT_LVL);
+   if (Name.empty()) {
+     Diag(Tok.getLocation(), diag::note_omp_declare_variant_ctx_options)
+         << CONTEXT_TRAIT_LVL << listOpenMPContextTraitProperties(Set, Selector);
+@@ -918,7 +929,8 @@ void Parser::parseOMPTraitPropertyKind(OMPTraitProperty &TIProperty,
+         << "(<property-name>)";
+     return;
+   }
+-  TraitSelector SelectorForName = getOpenMPContextTraitSelectorKind(Name);
++  TraitSelector SelectorForName =
++      getOpenMPContextTraitSelectorKind(Name, SetForName);
+   if (SelectorForName != TraitSelector::invalid) {
+     Diag(NameLoc, diag::note_omp_declare_variant_ctx_is_a)
+         << Name << CONTEXT_SELECTOR_LVL << CONTEXT_TRAIT_LVL;
+@@ -935,7 +947,7 @@ void Parser::parseOMPTraitPropertyKind(OMPTraitProperty &TIProperty,
+   }
+   for (const auto &PotentialSet :
+        {TraitSet::construct, TraitSet::user, TraitSet::implementation,
+-        TraitSet::device}) {
++        TraitSet::device, TraitSet::target_device}) {
+     TraitProperty PropertyForName =
+         getOpenMPContextTraitPropertyKind(PotentialSet, Selector, Name);
+     if (PropertyForName == TraitProperty::invalid)
+@@ -1062,7 +1074,7 @@ void Parser::parseOMPTraitSelectorKind(OMPTraitSelector &TISelector,
+     return;
+   }
+ 
+-  TISelector.Kind = getOpenMPContextTraitSelectorKind(Name);
++  TISelector.Kind = getOpenMPContextTraitSelectorKind(Name, Set);
+   if (TISelector.Kind != TraitSelector::invalid) {
+     if (checkForDuplicates(*this, Name, NameLoc, Seen, CONTEXT_SELECTOR_LVL))
+       TISelector.Kind = TraitSelector::invalid;
+@@ -1084,7 +1096,7 @@ void Parser::parseOMPTraitSelectorKind(OMPTraitSelector &TISelector,
+   }
+   for (const auto &PotentialSet :
+        {TraitSet::construct, TraitSet::user, TraitSet::implementation,
+-        TraitSet::device}) {
++        TraitSet::device, TraitSet::target_device}) {
+     TraitProperty PropertyForName = getOpenMPContextTraitPropertyKind(
+         PotentialSet, TraitSelector::invalid, Name);
+     if (PropertyForName == TraitProperty::invalid)
+@@ -1259,7 +1271,8 @@ void Parser::parseOMPTraitSetKind(OMPTraitSet &TISet,
+   // It follows diagnosis and helping notes.
+   Diag(NameLoc, diag::warn_omp_declare_variant_ctx_not_a_set) << Name;
+ 
+-  TraitSelector SelectorForName = getOpenMPContextTraitSelectorKind(Name);
++  TraitSelector SelectorForName =
++      getOpenMPContextTraitSelectorKind(Name, TISet.Kind);
+   if (SelectorForName != TraitSelector::invalid) {
+     Diag(NameLoc, diag::note_omp_declare_variant_ctx_is_a)
+         << Name << CONTEXT_SELECTOR_LVL << CONTEXT_SELECTOR_SET_LVL;
+@@ -1276,7 +1289,7 @@ void Parser::parseOMPTraitSetKind(OMPTraitSet &TISet,
+   }
+   for (const auto &PotentialSet :
+        {TraitSet::construct, TraitSet::user, TraitSet::implementation,
+-        TraitSet::device}) {
++        TraitSet::device, TraitSet::target_device}) {
+     TraitProperty PropertyForName = getOpenMPContextTraitPropertyKind(
+         PotentialSet, TraitSelector::invalid, Name);
+     if (PropertyForName == TraitProperty::invalid)
+@@ -2253,7 +2266,8 @@ Parser::DeclGroupPtrTy Parser::ParseOpenMPDeclarativeDirectiveWithExtDecl(
+     TargetOMPContext OMPCtx(
+         ASTCtx, std::move(DiagUnknownTrait),
+         /* CurrentFunctionDecl */ nullptr,
+-        /* ConstructTraits */ ArrayRef<llvm::omp::TraitProperty>());
++        /* ConstructTraits */ ArrayRef<llvm::omp::TraitProperty>(),
++        Actions.OpenMP().getOpenMPDeviceNum());
+ 
+     if (isVariantApplicableInContext(VMI, OMPCtx, /* DeviceSetOnly */ true)) {
+       Actions.OpenMP().ActOnOpenMPBeginDeclareVariant(Loc, TI);
+@@ -2805,7 +2819,8 @@ StmtResult Parser::ParseOpenMPDeclarativeOrExecutableDirective(
+         };
+     TargetOMPContext OMPCtx(ASTContext, std::move(DiagUnknownTrait),
+                             /* CurrentFunctionDecl */ nullptr,
+-                            ArrayRef<llvm::omp::TraitProperty>());
++                            ArrayRef<llvm::omp::TraitProperty>(),
++                            Actions.OpenMP().getOpenMPDeviceNum());
+ 
+     // A single match is returned for OpenMP 5.0
+     int BestIdx = getBestVariantMatchForContext(VMIs, OMPCtx);
+diff --git a/clang/lib/Sema/SemaOpenMP.cpp b/clang/lib/Sema/SemaOpenMP.cpp
+index b83b2b12f4a23..ce07b0add7581 100644
+--- a/clang/lib/Sema/SemaOpenMP.cpp
++++ b/clang/lib/Sema/SemaOpenMP.cpp
+@@ -7134,7 +7134,7 @@ ExprResult SemaOpenMP::ActOnOpenMPCall(ExprResult Call, Scope *Scope,
+   };
+   TargetOMPContext OMPCtx(Context, std::move(DiagUnknownTrait),
+                           SemaRef.getCurFunctionDecl(),
+-                          DSAStack->getConstructTraits());
++                          DSAStack->getConstructTraits(), getOpenMPDeviceNum());
+ 
+   QualType CalleeFnType = CalleeFnDecl->getType();
+ 
+@@ -15631,6 +15631,38 @@ ExprResult SemaOpenMP::VerifyPositiveIntegerConstantInClause(
+   return ICE;
+ }
+ 
++void SemaOpenMP::setOpenMPDeviceNum(int Num) { DeviceNum = Num; }
++
++void SemaOpenMP::setOpenMPDeviceNumID(StringRef ID) { DeviceNumID = ID; }
++
++int SemaOpenMP::getOpenMPDeviceNum() const { return DeviceNum; }
++
++void SemaOpenMP::ActOnOpenMPDeviceNum(Expr *DeviceNumExpr) {
++  llvm::APSInt Result;
++  Expr::EvalResult EvalResult;
++  // Evaluate the expression to an integer value
++  if (!DeviceNumExpr->isValueDependent() &&
++      DeviceNumExpr->EvaluateAsInt(EvalResult, SemaRef.Context)) {
++    // The device expression must evaluate to a non-negative integer value.
++    Result = EvalResult.Val.getInt();
++    if (Result.isNonNegative()) {
++      setOpenMPDeviceNum(Result.getZExtValue());
++    } else {
++      Diag(DeviceNumExpr->getExprLoc(),
++           diag::err_omp_negative_expression_in_clause)
++          << "device_num" << 0 << DeviceNumExpr->getSourceRange();
++    }
++  } else if (auto *DeclRef = dyn_cast<DeclRefExpr>(DeviceNumExpr)) {
++    // Check if the expression is an identifier
++    IdentifierInfo *IdInfo = DeclRef->getDecl()->getIdentifier();
++    if (IdInfo) {
++      setOpenMPDeviceNumID(IdInfo->getName());
++    }
++  } else {
++    Diag(DeviceNumExpr->getExprLoc(), diag::err_expected_expression);
++  }
++}
++
+ OMPClause *SemaOpenMP::ActOnOpenMPSafelenClause(Expr *Len,
+                                                 SourceLocation StartLoc,
+                                                 SourceLocation LParenLoc,
+diff --git a/clang/test/OpenMP/begin_declare_variant_messages.c b/clang/test/OpenMP/begin_declare_variant_messages.c
+index ffa56002f1953..f87714a47dce0 100644
+--- a/clang/test/OpenMP/begin_declare_variant_messages.c
++++ b/clang/test/OpenMP/begin_declare_variant_messages.c
+@@ -32,27 +32,27 @@ const int var;
+ #pragma omp end declare variant
+ #pragma omp begin declare variant match // expected-error {{expected '(' after 'match'}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp begin declare variant match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx=) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx=) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx=yyy) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx=yyy) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx=yyy}) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{extra tokens at the end of '#pragma omp begin declare variant' are ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp begin declare variant match(xxx=yyy}) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{extra tokens at the end of '#pragma omp begin declare variant' are ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx={) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp begin declare variant match(xxx={) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx={vvv, vvv}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx={vvv, vvv}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx={vvv} xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx={vvv} xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+-#pragma omp begin declare variant match(xxx={vvv}) xxx // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{extra tokens at the end of '#pragma omp begin declare variant' are ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp begin declare variant match(xxx={vvv}) xxx // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{extra tokens at the end of '#pragma omp begin declare variant' are ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp end declare variant
+ #pragma omp begin declare variant match(implementation={xxx}) // expected-warning {{'xxx' is not a valid context selector for the context set 'implementation'; selector ignored}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp end declare variant
+diff --git a/clang/test/OpenMP/declare_variant_ast_print.c b/clang/test/OpenMP/declare_variant_ast_print.c
+index 0df10263cde5e..9bd0b6d0d6162 100644
+--- a/clang/test/OpenMP/declare_variant_ast_print.c
++++ b/clang/test/OpenMP/declare_variant_ast_print.c
+@@ -20,6 +20,8 @@ int foo(void);
+ #pragma omp declare variant(foo) match(implementation={vendor(score(5): ibm, xxx, ibm)}, device={kind(cpu, nohost)})
+ #pragma omp declare variant(foo) match(device={kind(host)})
+ #pragma omp declare variant(foo) match(device={kind(nohost), xxx})
++#pragma omp declare variant(foo) match(target_device={kind(host)})
++#pragma omp declare variant(foo) match(target_device={kind(nohost), xxx})
+ #pragma omp declare variant(foo) match(implementation={extension(match_all)})
+ #pragma omp declare variant(foo) match(implementation={extension(match_any)})
+ #pragma omp declare variant(foo) match(implementation={extension(match_none)})
+@@ -29,6 +31,8 @@ int bar(void);
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(implementation={extension(match_none)})
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(implementation={extension(match_any)})
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(implementation={extension(match_all)})
++// CHECK-NEXT: #pragma omp declare variant(foo) match(target_device={kind(nohost)})
++// CHECK-NEXT: #pragma omp declare variant(foo) match(target_device={kind(host)})
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(device={kind(nohost)})
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(device={kind(host)})
+ // CHECK-NEXT: #pragma omp declare variant(foo) match(implementation={vendor(score(5): ibm)}, device={kind(cpu, nohost)})
+diff --git a/clang/test/OpenMP/declare_variant_bind_to_decl.cpp b/clang/test/OpenMP/declare_variant_bind_to_decl.cpp
+index dca18abb36c89..34191417a3934 100644
+--- a/clang/test/OpenMP/declare_variant_bind_to_decl.cpp
++++ b/clang/test/OpenMP/declare_variant_bind_to_decl.cpp
+@@ -29,6 +29,6 @@ int main() {
+ // CHECK-LABEL: define {{[^@]+}}@main
+ // CHECK-SAME: () #[[ATTR1:[0-9]+]] {
+ // CHECK-NEXT:  entry:
+-// CHECK-NEXT:    call void @"_Z74foo$ompvariant$S2$s7$Pppc64le$Pppc64$S3$s9$Pmatch_any$Pbind_to_declarationv"()
++// CHECK-NEXT:    call void @{{"_Z[0-9]+foo\$ompvariant\$.*"}}()
+ // CHECK-NEXT:    ret i32 0
+ //
+diff --git a/clang/test/OpenMP/declare_variant_messages.c b/clang/test/OpenMP/declare_variant_messages.c
+index 0ae276effd1be..14637d8200671 100644
+--- a/clang/test/OpenMP/declare_variant_messages.c
++++ b/clang/test/OpenMP/declare_variant_messages.c
+@@ -16,17 +16,17 @@ int foo(void);
+ #pragma omp declare variant(foo) // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foo) xxx // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foo) match // expected-error {{expected '(' after 'match'}}
+-#pragma omp declare variant(foo) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+-#pragma omp declare variant(foo) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx=) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx=yyy) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx=yyy}) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}} omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+-#pragma omp declare variant(foo) match(xxx={) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+-#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx={vvv, vvv}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx={vvv} xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+-#pragma omp declare variant(foo) match(xxx={vvv}) xxx // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
++#pragma omp declare variant(foo) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp declare variant(foo) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx=) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx=yyy) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx=yyy}) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}} omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
++#pragma omp declare variant(foo) match(xxx={) // expected-error {{expected ')'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={vvv, vvv}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={vvv} xxx) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={vvv}) xxx // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foo) match(implementation={xxx}) // expected-warning {{'xxx' is not a valid context selector for the context set 'implementation'; selector ignored}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foo) match(implementation={vendor}) // expected-warning {{the context selector 'vendor' in context set 'implementation' requires a context property defined in parentheses; selector ignored}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foo) match(implementation={vendor(}) // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context property; property skipped}} expected-note {{context property options are: 'amd' 'arm' 'bsc' 'cray' 'fujitsu' 'gnu' 'ibm' 'intel' 'llvm' 'nec' 'nvidia' 'pgi' 'ti' 'unknown'}} expected-note {{to match this '('}}
+@@ -48,8 +48,18 @@ int foo(void);
+ #pragma omp declare variant(foo) match(device={kind(score(5): host), kind(llvm)}) // expected-warning {{the context selector 'kind' in the context set 'device' cannot have a score ('5'); score ignored}} expected-warning {{the context selector 'kind' was used already in the same 'omp declare variant' directive; selector ignored}} expected-note {{the previous context selector 'kind' used here}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foo) match(device={kind(score(5): nohost), vendor(llvm)}) // expected-warning {{the context selector 'kind' in the context set 'device' cannot have a score ('5'); score ignored}} expected-warning {{the context selector 'vendor' is not valid for the context set 'device'; selector ignored}} expected-note {{the context selector 'vendor' can be nested in the context set 'implementation'; try 'match(implementation={vendor(property)})'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foo) match(implementation={extension("aaa")}) // expected-warning {{'aaa' is not a valid context property for the context selector 'extension' and the context set 'implementation'; property ignored}} expected-note {{context property options are: 'match_all' 'match_any' 'match_none'}} expected-note {{the ignored property spans until here}}
++#pragma omp declare variant(foo) match(target_device={}) // expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'kind' 'device_num' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}}
++#pragma omp declare variant(foo) match(target_device={xxx}) // expected-warning {{'xxx' is not a valid context selector for the context set 'target_device'; selector ignored}} expected-note {{context selector options are: 'kind' 'device_num' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}}
++#pragma omp declare variant(foo) match(target_device={kind}) // expected-warning {{the context selector 'kind' in context set 'target_device' requires a context property defined in parentheses; selector ignored}} expected-note {{the ignored selector spans until here}}
++#pragma omp declare variant(foo) match(target_device={kind(}) // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context property; property skipped}} expected-note {{context property options are: 'host' 'nohost' 'cpu' 'gpu' 'fpga' 'any'}} expected-note {{to match this '('}}
++#pragma omp declare variant(foo) match(target_device={kind()}) // expected-warning {{expected identifier or string literal describing a context property; property skipped}} expected-note {{context property options are: 'host' 'nohost' 'cpu' 'gpu' 'fpga' 'any'}}
++#pragma omp declare variant(foo) match(target_device={device_num}) // expected-warning {{the context selector 'device_num' in context set 'target_device' requires a context property defined in parentheses; selector ignored}} expected-note {{the ignored selector spans until here}} 
++#pragma omp declare variant(foo) match(target_device={device_num()}) // expected-error {{expected expression}}
++#pragma omp declare variant(foo) match(target_device={device_num(-1)}) // expected-error {{argument to 'device_num' clause must be a non-negative integer value}}
++#pragma omp declare variant(foo) match(target_device={device_num(abc)}) // expected-error {{expected expression}} expected-error {{use of undeclared identifier 'abc'}}
+ int bar(void);
+ 
++
+ #pragma omp declare variant(foo) match(implementation = {vendor(score(foo) :llvm)}) // expected-warning {{score expressions in the OpenMP context selector need to be constant; foo is not and will be ignored}}
+ #pragma omp declare variant(foo) match(implementation = {vendor(score(foo()) :llvm)}) // expected-warning {{score expressions in the OpenMP context selector need to be constant; foo() is not and will be ignored}}
+ #pragma omp declare variant(foo) match(implementation = {vendor(score(<expr>) :llvm)}) // expected-error {{expected expression}} expected-error {{use of undeclared identifier 'expr'}} expected-error {{expected expression}}
+@@ -64,10 +74,10 @@ int score_and_cond_non_const(void);
+ #pragma omp declare variant(foo) match(construct={for simd}) // expected-error {{expected ')'}} expected-warning {{expected '}' after the context selectors for the context set "construct"; '}' assumed}} expected-note {{to match this '('}} omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ int construct(void);
+ 
+-#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int a; // expected-error {{'#pragma omp declare variant' can only be applied to functions}}
+ 
+-#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp threadprivate(a) // expected-error {{'#pragma omp declare variant' can only be applied to functions}}
+ int var;
+ #pragma omp threadprivate(var)
+@@ -91,21 +101,21 @@ int main(void);
+ int main(void);
+ 
+ 
+-#pragma omp declare variant(foo) match(xxx={}) // expected-error {{single declaration is expected after 'declare variant' directive}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foo) match(xxx={}) // expected-error {{single declaration is expected after 'declare variant' directive}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int b, c;
+ 
+ int no_proto();
+-#pragma omp declare variant(no_proto) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(no_proto) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int no_proto_too();
+ 
+ int proto1(int);
+ 
+-#pragma omp declare variant(proto1) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(proto1) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int diff_proto(); // expected-note {{previous declaration is here}}
+ 
+ int diff_proto(double); // expected-error {{conflicting types for 'diff_proto'}}
+ 
+-#pragma omp declare variant(no_proto) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(no_proto) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int diff_proto1(double);
+ 
+ int after_use_variant(void);
+@@ -124,24 +134,24 @@ void self_test(int n, int d_no) {
+   self(n);
+ }
+ 
+-#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{'#pragma omp declare variant' cannot be applied for function after first usage; the original function might be used}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{'#pragma omp declare variant' cannot be applied for function after first usage; the original function might be used}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int after_use(void);
+-#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int defined(void) { return 0; }
+ int defined1(void) { return 0; }
+ 
+-#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{'#pragma omp declare variant' cannot be applied to the function that was defined already; the original function might be used}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(after_use_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{'#pragma omp declare variant' cannot be applied to the function that was defined already; the original function might be used}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int defined1(void);
+ 
+ 
+ int diff_cc_variant(void);
+ 
+-#pragma omp declare variant(diff_cc_variant) match(xxx={}) // expected-error {{variant in '#pragma omp declare variant' with type 'int (void)' is incompatible with type 'int (void) __attribute__((vectorcall))'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(diff_cc_variant) match(xxx={}) // expected-error {{variant in '#pragma omp declare variant' with type 'int (void)' is incompatible with type 'int (void) __attribute__((vectorcall))'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ __vectorcall int diff_cc(void);
+ 
+ int diff_ret_variant(void);
+ 
+-#pragma omp declare variant(diff_ret_variant) match(xxx={}) // expected-error {{variant in '#pragma omp declare variant' with type 'int (void)' is incompatible with type 'void (void)'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(diff_ret_variant) match(xxx={}) // expected-error {{variant in '#pragma omp declare variant' with type 'int (void)' is incompatible with type 'void (void)'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ void diff_ret(void);
+ 
+ void incompat_attr_variant(void);
+@@ -173,7 +183,7 @@ void not_marked(void);
+ #pragma omp declare variant(not_marked) match(implementation={vendor(unknown)}, device={kind(cpu)}) // expected-note {{marked as 'declare variant' here}}
+ void marked_variant(void);
+ 
+-#pragma omp declare variant(marked_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{variant function in '#pragma omp declare variant' is itself marked as '#pragma omp declare variant'}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(marked_variant) match(xxx={}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-warning {{variant function in '#pragma omp declare variant' is itself marked as '#pragma omp declare variant'}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ void marked(void);
+ 
+ #pragma omp declare variant(foo) match(device = {isa("foo")})
+@@ -214,3 +224,4 @@ int conflicting_nested_score(void);
+ #pragma omp declare variant(foo) match(user = {condition(1)}) // expected-error {{nested user conditions in OpenMP context selector not supported (yet)}}
+ int conflicting_nested_condition(void);
+ #pragma omp end declare variant
++
+diff --git a/clang/test/OpenMP/declare_variant_messages.cpp b/clang/test/OpenMP/declare_variant_messages.cpp
+index b8a806e7ef75b..2d6e5bfc1f2f2 100644
+--- a/clang/test/OpenMP/declare_variant_messages.cpp
++++ b/clang/test/OpenMP/declare_variant_messages.cpp
+@@ -21,8 +21,8 @@ T foofoo();
+ #pragma omp declare variant(foofoo <int>) // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foofoo <int>) xxx // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foofoo <int>) match // expected-error {{expected '(' after 'match'}}
+-#pragma omp declare variant(foofoo <int>) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+-#pragma omp declare variant(foofoo <int>) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foofoo <int>) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp declare variant(foofoo <int>) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp declare variant(foofoo <int>) match(implementation) // expected-warning {{expected '=' after the context set name "implementation"; '=' assumed}} expected-warning {{expected '{' after the '=' that follows the context set name "implementation"; '{' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foofoo <int>) match(implementation =) // expected-warning {{expected '{' after the '=' that follows the context set name "implementation"; '{' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foofoo <int>) match(implementation = yyy) // expected-warning {{expected '{' after the '=' that follows the context set name "implementation"; '{' assumed}} expected-warning {{'yyy' is not a valid context selector for the context set 'implementation'; selector ignored}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+@@ -63,8 +63,8 @@ int bar();
+ #pragma omp declare variant(foofoo <T>) // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foofoo <T>) xxx // omp50-error {{expected 'match' clause on 'omp declare variant' directive}} omp51-error {{expected 'match', 'adjust_args', or 'append_args' clause on 'omp declare variant' directive}}
+ #pragma omp declare variant(foofoo <T>) match // expected-error {{expected '(' after 'match'}}
+-#pragma omp declare variant(foofoo <T>) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
+-#pragma omp declare variant(foofoo <T>) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(foofoo <T>) match( // expected-error {{expected ')'}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}} expected-note {{to match this '('}}
++#pragma omp declare variant(foofoo <T>) match() // expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ #pragma omp declare variant(foofoo <T>) match(implementation) // expected-warning {{expected '=' after the context set name "implementation"; '=' assumed}} expected-warning {{expected '{' after the '=' that follows the context set name "implementation"; '{' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foofoo <T>) match(implementation =) // expected-warning {{expected '{' after the '=' that follows the context set name "implementation"; '{' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+ #pragma omp declare variant(foofoo <T>) match(implementation = {) // expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-warning {{expected '}' after the context selectors for the context set "implementation"; '}' assumed}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+@@ -200,7 +200,7 @@ int after_use(void);
+ 
+ int fn();
+ int fn(int);
+-#pragma omp declare variant(fn) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int overload(void);
+ 
+ int fn1();
+@@ -211,7 +211,7 @@ int overload1(float);
+ 
+ int fn_constexpr_variant();
+ 
+-#pragma omp declare variant(fn_constexpr_variant) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_constexpr_variant) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ constexpr int fn_constexpr(); // expected-error {{'#pragma omp declare variant' does not support constexpr functions}}
+ 
+ constexpr int fn_constexpr_variant1();
+@@ -221,7 +221,7 @@ int fn_constexpr1();
+ 
+ int fn_sc_variant();
+ 
+-#pragma omp declare variant(fn_sc_variant) match(xxx = {}) // expected-error {{function with '#pragma omp declare variant' has a different storage class}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_sc_variant) match(xxx = {}) // expected-error {{function with '#pragma omp declare variant' has a different storage class}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ static int fn_sc();
+ 
+ static int fn_sc_variant1();
+@@ -231,7 +231,7 @@ int fn_sc1();
+ 
+ int fn_inline_variant();
+ 
+-#pragma omp declare variant(fn_inline_variant) match(xxx = {}) // expected-error {{function with '#pragma omp declare variant' has a different inline specification}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_inline_variant) match(xxx = {}) // expected-error {{function with '#pragma omp declare variant' has a different inline specification}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ inline int fn_inline();
+ 
+ inline int fn_inline_variant1();
+@@ -240,7 +240,7 @@ inline int fn_inline_variant1();
+ int fn_inline1();
+ 
+ auto fn_deduced_variant() { return 0; }
+-#pragma omp declare variant(fn_deduced_variant) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_deduced_variant) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int fn_deduced();
+ 
+ int fn_deduced_variant1();
+@@ -254,7 +254,7 @@ auto fn_deduced3();
+ 
+ auto fn_deduced_variant2() { return 0; }
+ 
+-#pragma omp declare variant(fn_deduced_variant2) match(xxx = {}) // expected-error {{variant in '#pragma omp declare variant' with type 'int ()' is incompatible with type 'float ()'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_deduced_variant2) match(xxx = {}) // expected-error {{variant in '#pragma omp declare variant' with type 'int ()' is incompatible with type 'float ()'}} expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ float fn_deduced2();
+ 
+ 
+@@ -266,7 +266,7 @@ int fn_except() noexcept(false); // expected-note {{previous declaration is here
+ 
+ int fn_except_variant1() noexcept(false); // expected-error {{exception specification in declaration does not match previous declaration}}
+ 
+-#pragma omp declare variant(fn_except_variant1) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(fn_except_variant1) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ int fn_except1() noexcept(true); // expected-note {{previous declaration is here}}
+ 
+ struct SpecialFuncs {
+@@ -275,7 +275,7 @@ struct SpecialFuncs {
+ #pragma omp declare variant(SpecialFuncs::vd) match(implementation = {}) // expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+   SpecialFuncs(); // expected-error {{'#pragma omp declare variant' does not support constructors}}
+ 
+-#pragma omp declare variant(SpecialFuncs::vd) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(SpecialFuncs::vd) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+   ~SpecialFuncs(); // expected-error {{'#pragma omp declare variant' does not support destructors}}
+ 
+   void baz();
+@@ -288,14 +288,14 @@ struct SpecialFuncs {
+ #pragma omp declare variant(SpecialFuncs::dar) match(construct={dispatch}) // expected-error {{'#pragma omp declare variant' does not support virtual functions}}
+ 
+ #pragma omp declare variant(SpecialFuncs::baz) match(implementation = {}) // expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+-#pragma omp declare variant(SpecialFuncs::bar) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(SpecialFuncs::bar) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+ 
+ #pragma omp declare variant(fn_sc_variant1) match(implementation = {}) // expected-error {{variant in '#pragma omp declare variant' with type 'int (*)()' is incompatible with type 'void (SpecialFuncs::*)()'}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+   void foo1();
+   SpecialFuncs& foo(const SpecialFuncs&);
+   SpecialFuncs& bar(SpecialFuncs&&);
+ 
+-#pragma omp declare variant(SpecialFuncs::foo) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp declare variant(SpecialFuncs::foo) match(xxx = {}) // expected-warning {{'xxx' is not a valid context set in a `declare variant`; set ignored}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+   SpecialFuncs& operator=(const SpecialFuncs&) = default; // expected-error {{'#pragma omp declare variant' does not support defaulted functions}}
+ 
+ #pragma omp declare variant(SpecialFuncs::bar) match(implementation = {}) // expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'vendor' 'extension' 'unified_address' 'unified_shared_memory' 'reverse_offload' 'dynamic_allocators' 'atomic_default_mem_order'}} expected-note {{the ignored selector spans until here}}
+diff --git a/clang/test/OpenMP/metadirective_messages.cpp b/clang/test/OpenMP/metadirective_messages.cpp
+index b342a094a7870..7fce9fa446058 100644
+--- a/clang/test/OpenMP/metadirective_messages.cpp
++++ b/clang/test/OpenMP/metadirective_messages.cpp
+@@ -5,7 +5,7 @@
+ void foo() {
+ #pragma omp metadirective // expected-error {{expected expression}}
+   ;
+-#pragma omp metadirective when() // expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
++#pragma omp metadirective when() // expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}} expected-warning {{expected identifier or string literal describing a context set; set skipped}} expected-note {{context set options are: 'construct' 'device' 'target_device' 'implementation' 'user'}} expected-note {{the ignored set spans until here}}
+   ;
+ #pragma omp metadirective when(device{}) // expected-warning {{expected '=' after the context set name "device"; '=' assumed}} expected-warning {{expected identifier or string literal describing a context selector; selector skipped}} expected-note {{context selector options are: 'kind' 'arch' 'isa'}} expected-note {{the ignored selector spans until here}} expected-error {{expected valid context selector in when clause}} expected-error {{expected expression}}
+   ;
+diff --git a/clang/test/OpenMP/nvptx_declare_variant_name_mangling.cpp b/clang/test/OpenMP/nvptx_declare_variant_name_mangling.cpp
+index 0a5690e77a7b5..e128370d821e8 100644
+--- a/clang/test/OpenMP/nvptx_declare_variant_name_mangling.cpp
++++ b/clang/test/OpenMP/nvptx_declare_variant_name_mangling.cpp
+@@ -6,10 +6,10 @@
+ 
+ // CHECK-DAG: @_Z3barv
+ // CHECK-DAG: @_Z3bazv
+-// CHECK-DAG: define{{.*}} @"_Z53bar$ompvariant$S2$s7$Pnvptx$Pnvptx64$S3$s9$Pmatch_anyv"
+-// CHECK-DAG: define{{.*}} @"_Z53baz$ompvariant$S2$s7$Pnvptx$Pnvptx64$S3$s9$Pmatch_anyv"
+-// CHECK-DAG: call noundef i32 @"_Z53bar$ompvariant$S2$s7$Pnvptx$Pnvptx64$S3$s9$Pmatch_anyv"()
+-// CHECK-DAG: call noundef i32 @"_Z53baz$ompvariant$S2$s7$Pnvptx$Pnvptx64$S3$s9$Pmatch_anyv"()
++// CHECK-DAG: define{{.*}} @{{"_Z[0-9]+bar\$ompvariant\$.*"}}
++// CHECK-DAG: define{{.*}} @{{"_Z[0-9]+baz\$ompvariant\$.*"}}
++// CHECK-DAG: call noundef i32 @{{"_Z[0-9]+bar\$ompvariant\$.*"}}()
++// CHECK-DAG: call noundef i32 @{{"_Z[0-9]+baz\$ompvariant\$.*"}}()
+ 
+ #ifndef HEADER
+ #define HEADER
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPContext.h b/llvm/include/llvm/Frontend/OpenMP/OMPContext.h
+index b13b74ceab865..a501eaf2356ff 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPContext.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPContext.h
+@@ -62,7 +62,7 @@ StringRef getOpenMPContextTraitSetName(TraitSet Kind);
+ 
+ /// Parse \p Str and return the trait set it matches or
+ /// TraitSelector::invalid.
+-TraitSelector getOpenMPContextTraitSelectorKind(StringRef Str);
++TraitSelector getOpenMPContextTraitSelectorKind(StringRef Str, TraitSet Set);
+ 
+ /// Return the trait selector for which \p Property is a property.
+ TraitSelector getOpenMPContextTraitSelectorForProperty(TraitProperty Property);
+@@ -139,6 +139,8 @@ struct VariantMatchInfo {
+     // the raw string.
+     if (Property == TraitProperty::device_isa___ANY)
+       ISATraits.push_back(RawString);
++    if (Property == TraitProperty::target_device_isa___ANY)
++      ISATraits.push_back(RawString);
+ 
+     RequiredTraits.set(unsigned(Property));
+     if (Set == TraitSet::construct)
+@@ -155,7 +157,8 @@ struct VariantMatchInfo {
+ /// e.g., device={kind(host)}, and constructs traits which describe the nesting
+ /// in OpenMP constructs at the location.
+ struct OMPContext {
+-  OMPContext(bool IsDeviceCompilation, Triple TargetTriple);
++  OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
++             Triple TargetOffloadTriple, int DeviceNum);
+   virtual ~OMPContext() = default;
+ 
+   void addTrait(TraitProperty Property) {
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+index ee761cb426969..8ea3af101cc94 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPKinds.def
+@@ -1270,6 +1270,38 @@ __OMP_TRAIT_PROPERTY(device, arch, amdgcn)
+ __OMP_TRAIT_PROPERTY(device, arch, nvptx)
+ __OMP_TRAIT_PROPERTY(device, arch, nvptx64)
+ 
++__OMP_TRAIT_SET(target_device)
++
++__OMP_TRAIT_SELECTOR(target_device, kind, true)
++
++__OMP_TRAIT_PROPERTY(target_device, kind, host)
++__OMP_TRAIT_PROPERTY(target_device, kind, nohost)
++__OMP_TRAIT_PROPERTY(target_device, kind, cpu)
++__OMP_TRAIT_PROPERTY(target_device, kind, gpu)
++__OMP_TRAIT_PROPERTY(target_device, kind, fpga)
++__OMP_TRAIT_PROPERTY(target_device, kind, any)
++
++__OMP_TRAIT_SELECTOR(target_device, device_num, true)
++
++__OMP_TRAIT_PROPERTY(target_device, device_num, number)
++
++__OMP_TRAIT_SELECTOR(target_device, arch, true)
++
++__OMP_TRAIT_PROPERTY(target_device, arch, arm)
++__OMP_TRAIT_PROPERTY(target_device, arch, armeb)
++__OMP_TRAIT_PROPERTY(target_device, arch, aarch64)
++__OMP_TRAIT_PROPERTY(target_device, arch, aarch64_be)
++__OMP_TRAIT_PROPERTY(target_device, arch, aarch64_32)
++__OMP_TRAIT_PROPERTY(target_device, arch, ppc)
++__OMP_TRAIT_PROPERTY(target_device, arch, ppcle)
++__OMP_TRAIT_PROPERTY(target_device, arch, ppc64)
++__OMP_TRAIT_PROPERTY(target_device, arch, ppc64le)
++__OMP_TRAIT_PROPERTY(target_device, arch, x86)
++__OMP_TRAIT_PROPERTY(target_device, arch, x86_64)
++__OMP_TRAIT_PROPERTY(target_device, arch, amdgcn)
++__OMP_TRAIT_PROPERTY(target_device, arch, nvptx)
++__OMP_TRAIT_PROPERTY(target_device, arch, nvptx64)
++
+ __OMP_TRAIT_SET(implementation)
+ 
+ __OMP_TRAIT_SELECTOR(implementation, vendor, true)
+@@ -1311,12 +1343,16 @@ __OMP_TRAIT_SELECTOR_AND_PROPERTY(construct, dispatch)
+ // This allows us to issue warnings wrt. isa only if we match otherwise.
+ __OMP_TRAIT_SELECTOR(device, isa, true)
+ 
++__OMP_TRAIT_SELECTOR(target_device, isa, true)
++
+ // We use "__ANY" as a placeholder in the isa property to denote the
+ // conceptual "any", not the literal `any` used in kind. The string we
+ // we use is not important except that it will show up in diagnostics.
+ OMP_TRAIT_PROPERTY(device_isa___ANY, device, device_isa,
+                    "<any, entirely target dependent>")
+ 
++OMP_TRAIT_PROPERTY(target_device_isa___ANY, target_device, target_device_isa,
++                   "<any, entirely target dependent>")
+ 
+ #undef OMP_TRAIT_SET
+ #undef __OMP_TRAIT_SET
+diff --git a/llvm/lib/Frontend/OpenMP/OMPContext.cpp b/llvm/lib/Frontend/OpenMP/OMPContext.cpp
+index c26f5b49b6008..dd8a0475d0c14 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPContext.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPContext.cpp
+@@ -24,44 +24,90 @@
+ using namespace llvm;
+ using namespace omp;
+ 
+-OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple) {
+-  // Add the appropriate device kind trait based on the triple and the
+-  // IsDeviceCompilation flag.
+-  ActiveTraits.set(unsigned(IsDeviceCompilation
+-                                ? TraitProperty::device_kind_nohost
+-                                : TraitProperty::device_kind_host));
+-  switch (TargetTriple.getArch()) {
+-  case Triple::arm:
+-  case Triple::armeb:
+-  case Triple::aarch64:
+-  case Triple::aarch64_be:
+-  case Triple::aarch64_32:
+-  case Triple::loongarch64:
+-  case Triple::mips:
+-  case Triple::mipsel:
+-  case Triple::mips64:
+-  case Triple::mips64el:
+-  case Triple::ppc:
+-  case Triple::ppcle:
+-  case Triple::ppc64:
+-  case Triple::ppc64le:
+-  case Triple::systemz:
+-  case Triple::x86:
+-  case Triple::x86_64:
+-    ActiveTraits.set(unsigned(TraitProperty::device_kind_cpu));
+-    break;
+-  case Triple::amdgcn:
+-  case Triple::nvptx:
+-  case Triple::nvptx64:
+-    ActiveTraits.set(unsigned(TraitProperty::device_kind_gpu));
+-    break;
+-  default:
+-    break;
++OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple,
++                       Triple TargetOffloadTriple, int DeviceNum) {
++  // Add the appropriate target device kind trait based on the target triple
++  if (!TargetOffloadTriple.getTriple().empty() && DeviceNum > -1) {
++    // If target triple is present, then target device is not a host
++    ActiveTraits.set(unsigned(TraitProperty::target_device_kind_nohost));
++    switch (TargetOffloadTriple.getArch()) {
++    case Triple::arm:
++    case Triple::armeb:
++    case Triple::aarch64:
++    case Triple::aarch64_be:
++    case Triple::aarch64_32:
++    case Triple::mips:
++    case Triple::mipsel:
++    case Triple::mips64:
++    case Triple::mips64el:
++    case Triple::ppc:
++    case Triple::ppcle:
++    case Triple::ppc64:
++    case Triple::ppc64le:
++    case Triple::systemz:
++    case Triple::x86:
++    case Triple::x86_64:
++      ActiveTraits.set(unsigned(TraitProperty::target_device_kind_cpu));
++      break;
++    case Triple::amdgcn:
++    case Triple::nvptx:
++    case Triple::nvptx64:
++      ActiveTraits.set(unsigned(TraitProperty::target_device_kind_gpu));
++      break;
++    default:
++      break;
++    }
++    // Add the appropriate device architecture trait based on the triple.
++#define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
++  if (TraitSelector::TraitSelectorEnum == TraitSelector::target_device_arch) { \
++    if (TargetOffloadTriple.getArch() ==                                       \
++        TargetOffloadTriple.getArchTypeForLLVMName(Str))                       \
++      ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
++    if (StringRef(Str) == "x86_64" &&                                          \
++        TargetOffloadTriple.getArch() == Triple::x86_64)                       \
++      ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
+   }
++  } else {
++    // Add the appropriate device kind trait based on the triple and the
++    // IsDeviceCompilation flag.
++    ActiveTraits.set(unsigned(IsDeviceCompilation
++                                  ? TraitProperty::device_kind_nohost
++                                  : TraitProperty::device_kind_host));
++    ActiveTraits.set(unsigned(TraitProperty::target_device_kind_host));
++    switch (TargetTriple.getArch()) {
++    case Triple::arm:
++    case Triple::armeb:
++    case Triple::aarch64:
++    case Triple::aarch64_be:
++    case Triple::aarch64_32:
++    case Triple::mips:
++    case Triple::mipsel:
++    case Triple::mips64:
++    case Triple::mips64el:
++    case Triple::ppc:
++    case Triple::ppcle:
++    case Triple::ppc64:
++    case Triple::ppc64le:
++    case Triple::systemz:
++    case Triple::x86:
++    case Triple::x86_64:
++      ActiveTraits.set(unsigned(TraitProperty::device_kind_cpu));
++      ActiveTraits.set(unsigned(TraitProperty::target_device_kind_cpu));
++      break;
++    case Triple::amdgcn:
++    case Triple::nvptx:
++    case Triple::nvptx64:
++      ActiveTraits.set(unsigned(TraitProperty::device_kind_gpu));
++      ActiveTraits.set(unsigned(TraitProperty::target_device_kind_gpu));
++      break;
++    default:
++      break;
++    }
+ 
+-  // Add the appropriate device architecture trait based on the triple.
++    // Add the appropriate device architecture trait based on the triple.
+ #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
+-  if (TraitSelector::TraitSelectorEnum == TraitSelector::device_arch) {        \
++  if (TraitSelector::TraitSelectorEnum == TraitSelector::device_arch ||        \
++      TraitSelector::TraitSelectorEnum == TraitSelector::target_device_arch) { \
+     if (TargetTriple.getArch() == TargetTriple.getArchTypeForLLVMName(Str))    \
+       ActiveTraits.set(unsigned(TraitProperty::Enum));                         \
+     if (StringRef(Str) == "x86_64" &&                                          \
+@@ -70,29 +116,30 @@ OMPContext::OMPContext(bool IsDeviceCompilation, Triple TargetTriple) {
+   }
+ #include "llvm/Frontend/OpenMP/OMPKinds.def"
+ 
+-  // TODO: What exactly do we want to see as device ISA trait?
+-  //       The discussion on the list did not seem to have come to an agreed
+-  //       upon solution.
++    // TODO: What exactly do we want to see as device ISA trait?
++    //       The discussion on the list did not seem to have come to an agreed
++    //       upon solution.
+ 
+-  // LLVM is the "OpenMP vendor" but we could also interpret vendor as the
+-  // target vendor.
+-  ActiveTraits.set(unsigned(TraitProperty::implementation_vendor_llvm));
++    // LLVM is the "OpenMP vendor" but we could also interpret vendor as the
++    // target vendor.
++    ActiveTraits.set(unsigned(TraitProperty::implementation_vendor_llvm));
+ 
+-  // The user condition true is accepted but not false.
+-  ActiveTraits.set(unsigned(TraitProperty::user_condition_true));
++    // The user condition true is accepted but not false.
++    ActiveTraits.set(unsigned(TraitProperty::user_condition_true));
+ 
+-  // This is for sure some device.
+-  ActiveTraits.set(unsigned(TraitProperty::device_kind_any));
++    // This is for sure some device.
++    ActiveTraits.set(unsigned(TraitProperty::device_kind_any));
+ 
+-  LLVM_DEBUG({
+-    dbgs() << "[" << DEBUG_TYPE
+-           << "] New OpenMP context with the following properties:\n";
+-    for (unsigned Bit : ActiveTraits.set_bits()) {
+-      TraitProperty Property = TraitProperty(Bit);
+-      dbgs() << "\t " << getOpenMPContextTraitPropertyFullName(Property)
+-             << "\n";
+-    }
+-  });
++    LLVM_DEBUG({
++      dbgs() << "[" << DEBUG_TYPE
++             << "] New OpenMP context with the following properties:\n";
++      for (unsigned Bit : ActiveTraits.set_bits()) {
++        TraitProperty Property = TraitProperty(Bit);
++        dbgs() << "\t " << getOpenMPContextTraitPropertyFullName(Property)
++               << "\n";
++      }
++    });
++  }
+ }
+ 
+ /// Return true if \p C0 is a subset of \p C1. Note that both arrays are
+@@ -213,6 +260,10 @@ static int isVariantApplicableInContextHelper(
+       IsActiveTrait = llvm::all_of(VMI.ISATraits, [&](StringRef RawString) {
+         return Ctx.matchesISATrait(RawString);
+       });
++    if (Property == TraitProperty::target_device_isa___ANY)
++      IsActiveTrait = llvm::all_of(VMI.ISATraits, [&](StringRef RawString) {
++        return Ctx.matchesISATrait(RawString);
++      });
+ 
+     if (std::optional<bool> Result = HandleTrait(Property, IsActiveTrait))
+       return *Result;
+@@ -298,6 +349,9 @@ static APInt getVariantMatchScore(const VariantMatchInfo &VMI,
+     case TraitSet::device:
+       // Handled separately below.
+       break;
++    case TraitSet::target_device:
++      // TODO: Handling separately.
++      break;
+     case TraitSet::invalid:
+       llvm_unreachable("Unknown trait set is not to be used!");
+     }
+@@ -305,6 +359,8 @@ static APInt getVariantMatchScore(const VariantMatchInfo &VMI,
+     // device={kind(any)} is "as if" no kind selector was specified.
+     if (Property == TraitProperty::device_kind_any)
+       continue;
++    if (Property == TraitProperty::target_device_kind_any)
++      continue;
+ 
+     switch (getOpenMPContextTraitSelectorForProperty(Property)) {
+     case TraitSelector::device_kind:
+@@ -316,6 +372,15 @@ static APInt getVariantMatchScore(const VariantMatchInfo &VMI,
+     case TraitSelector::device_isa:
+       Score += (1ULL << (NoConstructTraits + 2));
+       continue;
++    case TraitSelector::target_device_kind:
++      Score += (1ULL << (NoConstructTraits + 0));
++      continue;
++    case TraitSelector::target_device_arch:
++      Score += (1ULL << (NoConstructTraits + 1));
++      continue;
++    case TraitSelector::target_device_isa:
++      Score += (1ULL << (NoConstructTraits + 2));
++      continue;
+     default:
+       continue;
+     }
+@@ -412,7 +477,14 @@ StringRef llvm::omp::getOpenMPContextTraitSetName(TraitSet Kind) {
+   llvm_unreachable("Unknown trait set!");
+ }
+ 
+-TraitSelector llvm::omp::getOpenMPContextTraitSelectorKind(StringRef S) {
++TraitSelector llvm::omp::getOpenMPContextTraitSelectorKind(StringRef S,
++                                                           TraitSet Set) {
++  if (Set == TraitSet::target_device && S == "kind")
++    return TraitSelector::target_device_kind;
++  if (Set == TraitSet::target_device && S == "arch")
++    return TraitSelector::target_device_arch;
++  if (Set == TraitSet::target_device && S == "isa")
++    return TraitSelector::target_device_isa;
+   return StringSwitch<TraitSelector>(S)
+ #define OMP_TRAIT_SELECTOR(Enum, TraitSetEnum, Str, ReqProp)                   \
+   .Case(Str, TraitSelector::Enum)
+@@ -445,6 +517,9 @@ TraitProperty llvm::omp::getOpenMPContextTraitPropertyKind(
+   // up to the target to decide if the feature is available.
+   if (Set == TraitSet::device && Selector == TraitSelector::device_isa)
+     return TraitProperty::device_isa___ANY;
++  if (Set == TraitSet::target_device &&
++      Selector == TraitSelector::target_device_isa)
++    return TraitProperty::target_device_isa___ANY;
+ #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
+   if (Set == TraitSet::TraitSetEnum && Str == S)                               \
+     return TraitProperty::Enum;
+@@ -466,6 +541,8 @@ StringRef llvm::omp::getOpenMPContextTraitPropertyName(TraitProperty Kind,
+                                                        StringRef RawString) {
+   if (Kind == TraitProperty::device_isa___ANY)
+     return RawString;
++  if (Kind == TraitProperty::target_device_isa___ANY)
++    return RawString;
+   switch (Kind) {
+ #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
+   case TraitProperty::Enum:                                                    \
+@@ -488,7 +565,8 @@ bool llvm::omp::isValidTraitSelectorForTraitSet(TraitSelector Selector,
+                                                 TraitSet Set,
+                                                 bool &AllowsTraitScore,
+                                                 bool &RequiresProperty) {
+-  AllowsTraitScore = Set != TraitSet::construct && Set != TraitSet::device;
++  AllowsTraitScore = Set != TraitSet::construct && Set != TraitSet::device &&
++                     Set != TraitSet::target_device;
+   switch (Selector) {
+ #define OMP_TRAIT_SELECTOR(Enum, TraitSetEnum, Str, ReqProp)                   \
+   case TraitSelector::Enum:                                                    \
+diff --git a/llvm/unittests/Frontend/OpenMPContextTest.cpp b/llvm/unittests/Frontend/OpenMPContextTest.cpp
+index 1c999a2d7bf85..f9683ae56e933 100644
+--- a/llvm/unittests/Frontend/OpenMPContextTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPContextTest.cpp
+@@ -33,9 +33,11 @@ TEST_F(OpenMPContextTest, RoundTripAndAssociation) {
+ #define OMP_TRAIT_SELECTOR(Enum, TraitSetEnum, Str, RequiresProperty)          \
+   EXPECT_EQ(TraitSelector::Enum,                                               \
+             getOpenMPContextTraitSelectorKind(                                 \
+-                getOpenMPContextTraitSelectorName(TraitSelector::Enum)));      \
++                getOpenMPContextTraitSelectorName(TraitSelector::Enum),        \
++                TraitSet::TraitSetEnum));                                      \
+   EXPECT_EQ(Str, getOpenMPContextTraitSelectorName(                            \
+-                     getOpenMPContextTraitSelectorKind(Str)));
++                     getOpenMPContextTraitSelectorKind(                        \
++                         Str, TraitSet::TraitSetEnum)));
+ #define OMP_TRAIT_PROPERTY(Enum, TraitSetEnum, TraitSelectorEnum, Str)         \
+   EXPECT_EQ(TraitProperty::Enum,                                               \
+             getOpenMPContextTraitPropertyKind(                                 \
+@@ -68,10 +70,10 @@ TEST_F(OpenMPContextTest, ValidNesting) {
+ }
+ 
+ TEST_F(OpenMPContextTest, ApplicabilityNonConstruct) {
+-  OMPContext HostLinux(false, Triple("x86_64-unknown-linux"));
+-  OMPContext DeviceLinux(true, Triple("x86_64-unknown-linux"));
+-  OMPContext HostNVPTX(false, Triple("nvptx64-nvidia-cuda"));
+-  OMPContext DeviceNVPTX(true, Triple("nvptx64-nvidia-cuda"));
++  OMPContext HostLinux(false, Triple("x86_64-unknown-linux"), Triple(), -1);
++  OMPContext DeviceLinux(true, Triple("x86_64-unknown-linux"), Triple(), -1);
++  OMPContext HostNVPTX(false, Triple("nvptx64-nvidia-cuda"), Triple(), -1);
++  OMPContext DeviceNVPTX(true, Triple("nvptx64-nvidia-cuda"), Triple(), -1);
+ 
+   VariantMatchInfo Empty;
+   EXPECT_TRUE(isVariantApplicableInContext(Empty, HostLinux));
+@@ -129,19 +131,21 @@ TEST_F(OpenMPContextTest, ApplicabilityNonConstruct) {
+ }
+ 
+ TEST_F(OpenMPContextTest, ApplicabilityAllTraits) {
+-  OMPContext HostLinuxParallelParallel(false, Triple("x86_64-unknown-linux"));
++  OMPContext HostLinuxParallelParallel(false, Triple("x86_64-unknown-linux"),
++                                       Triple(), -1);
+   HostLinuxParallelParallel.addTrait(
+       TraitProperty::construct_parallel_parallel);
+   HostLinuxParallelParallel.addTrait(
+       TraitProperty::construct_parallel_parallel);
+-  OMPContext DeviceLinuxTargetParallel(true, Triple("x86_64-unknown-linux"));
++  OMPContext DeviceLinuxTargetParallel(true, Triple("x86_64-unknown-linux"),
++                                       Triple(), -1);
+   DeviceLinuxTargetParallel.addTrait(TraitProperty::construct_target_target);
+   DeviceLinuxTargetParallel.addTrait(
+       TraitProperty::construct_parallel_parallel);
+-  OMPContext HostNVPTXFor(false, Triple("nvptx64-nvidia-cuda"));
++  OMPContext HostNVPTXFor(false, Triple("nvptx64-nvidia-cuda"), Triple(), -1);
+   HostNVPTXFor.addTrait(TraitProperty::construct_for_for);
+-  OMPContext DeviceNVPTXTargetTeamsParallel(true,
+-                                            Triple("nvptx64-nvidia-cuda"));
++  OMPContext DeviceNVPTXTargetTeamsParallel(true, Triple("nvptx64-nvidia-cuda"),
++                                            Triple(), -1);
+   DeviceNVPTXTargetTeamsParallel.addTrait(
+       TraitProperty::construct_target_target);
+   DeviceNVPTXTargetTeamsParallel.addTrait(TraitProperty::construct_teams_teams);

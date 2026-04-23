@@ -1,0 +1,150 @@
+diff --git a/clang/lib/Driver/ToolChains/AMDGPU.h b/clang/lib/Driver/ToolChains/AMDGPU.h
+index aad6bc75dffaf..bc941a40445ad 100644
+--- a/clang/lib/Driver/ToolChains/AMDGPU.h
++++ b/clang/lib/Driver/ToolChains/AMDGPU.h
+@@ -146,9 +146,24 @@ class LLVM_LIBRARY_VISIBILITY ROCMToolChain : public AMDGPUToolChain {
+   getCommonDeviceLibNames(const llvm::opt::ArgList &DriverArgs,
+                           const std::string &GPUArch,
+                           bool isOpenMP = false) const;
++
+   SanitizerMask getSupportedSanitizers() const override {
+     return SanitizerKind::Address;
+   }
++
++  void diagnoseUnsupportedSanitizers(const llvm::opt::ArgList &Args) const {
++    if (!Args.hasFlag(options::OPT_fgpu_sanitize, options::OPT_fno_gpu_sanitize,
++                      true))
++      return;
++    auto &Diags = getDriver().getDiags();
++    for (auto *A : Args.filtered(options::OPT_fsanitize_EQ)) {
++      SanitizerMask K =
++          parseSanitizerValue(A->getValue(), /*Allow Groups*/ false);
++      if (K != SanitizerKind::Address)
++        Diags.Report(clang::diag::warn_drv_unsupported_option_for_target)
++            << A->getAsString(Args) << getTriple().str();
++    }
++  }
+ };
+ 
+ } // end namespace toolchains
+diff --git a/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp b/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
+index 24d244ba6f0e1..00bf9c7338edd 100644
+--- a/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
++++ b/clang/lib/Driver/ToolChains/AMDGPUOpenMP.cpp
+@@ -37,6 +37,8 @@ AMDGPUOpenMPToolChain::AMDGPUOpenMPToolChain(const Driver &D,
+   // Lookup binaries into the driver directory, this is used to
+   // discover the 'amdgpu-arch' executable.
+   getProgramPaths().push_back(getDriver().Dir);
++  // Diagnose unsupported sanitizer options only once.
++  diagnoseUnsupportedSanitizers(Args);
+ }
+ 
+ void AMDGPUOpenMPToolChain::addClangTargetOptions(
+@@ -71,10 +73,10 @@ llvm::opt::DerivedArgList *AMDGPUOpenMPToolChain::TranslateArgs(
+ 
+   const OptTable &Opts = getDriver().getOpts();
+ 
+-  for (Arg *A : Args) {
+-    if (!llvm::is_contained(*DAL, A))
++  for (Arg *A : Args)
++    if (!shouldSkipSanitizeOption(*this, Args, BoundArch, A) &&
++        !llvm::is_contained(*DAL, A))
+       DAL->append(A);
+-  }
+ 
+   if (!BoundArch.empty()) {
+     DAL->eraseArg(options::OPT_march_EQ);
+diff --git a/clang/lib/Driver/ToolChains/HIPAMD.cpp b/clang/lib/Driver/ToolChains/HIPAMD.cpp
+index 158a252075984..0e50eddd6b3d2 100644
+--- a/clang/lib/Driver/ToolChains/HIPAMD.cpp
++++ b/clang/lib/Driver/ToolChains/HIPAMD.cpp
+@@ -216,17 +216,8 @@ HIPAMDToolChain::HIPAMDToolChain(const Driver &D, const llvm::Triple &Triple,
+   // Lookup binaries into the driver directory, this is used to
+   // discover the clang-offload-bundler executable.
+   getProgramPaths().push_back(getDriver().Dir);
+-
+   // Diagnose unsupported sanitizer options only once.
+-  if (!Args.hasFlag(options::OPT_fgpu_sanitize, options::OPT_fno_gpu_sanitize,
+-                    true))
+-    return;
+-  for (auto *A : Args.filtered(options::OPT_fsanitize_EQ)) {
+-    SanitizerMask K = parseSanitizerValue(A->getValue(), /*AllowGroups=*/false);
+-    if (K != SanitizerKind::Address)
+-      D.getDiags().Report(clang::diag::warn_drv_unsupported_option_for_target)
+-          << A->getAsString(Args) << getTriple().str();
+-  }
++  diagnoseUnsupportedSanitizers(Args);
+ }
+ 
+ void HIPAMDToolChain::addClangTargetOptions(
+diff --git a/clang/test/Driver/amdgpu-openmp-sanitize-options.c b/clang/test/Driver/amdgpu-openmp-sanitize-options.c
+new file mode 100644
+index 0000000000000..ac25d7fd802e1
+--- /dev/null
++++ b/clang/test/Driver/amdgpu-openmp-sanitize-options.c
+@@ -0,0 +1,65 @@
++// REQUIRES: x86-registered-target, amdgpu-registered-target
++
++// Fail on invalid ROCm Path.
++// RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ -fsanitize=address -fgpu-sanitize -nogpuinc --rocm-path=%S/Inputs/rocm-invalid  %s 2>&1 \
++// RUN:   | FileCheck --check-prefix=FAIL %s
++
++// Enable multiple sanitizer's apart from ASan with invalid rocm-path.
++// RUN:   not %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ -fsanitize=address -fsanitize=leak -fgpu-sanitize --rocm-path=%S/Inputs/rocm-invalid -nogpuinc  %s 2>&1 \
++// RUN:   | FileCheck --check-prefixes=NOTSUPPORTED,FAIL %s
++
++// Memory, Leak, UndefinedBehaviour and Thread Sanitizer are not supported on AMDGPU.
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ -fsanitize=address -fsanitize=leak -fgpu-sanitize --rocm-path=%S/Inputs/rocm -nogpuinc  %s 2>&1 \
++// RUN:   | FileCheck --check-prefix=NOTSUPPORTED %s
++
++// GPU ASan Enabled Test Cases
++// ASan enabled for amdgpu-arch [gfx908]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908 -fsanitize=address -fgpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=NOXNACK,GPUSAN %s
++
++// GPU ASan enabled for amdgpu-arch [gfx908:xnack-]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack- -fsanitize=address -fgpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=XNACKNEG,GPUSAN %s
++
++// GPU ASan enabled for amdgpu-arch [gfx908:xnack+]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ -fsanitize=address -fgpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=GPUSAN %s
++
++// ASan enabled for multiple amdgpu-arch [gfx908:xnack+,gfx900:xnack+]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ --offload-arch=gfx900:xnack+ -fsanitize=address -fgpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=GPUSAN %s
++
++// GPU ASan Disabled Test Cases
++// ASan disabled for amdgpu-arch [gfx908]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908 -fsanitize=address -fno-gpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=NOGPUSAN %s
++
++// GPU ASan disabled for amdgpu-arch [gfx908:xnack-]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack- -fsanitize=address -fno-gpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=NOGPUSAN %s
++
++// GPU ASan disabled for amdgpu-arch [gfx908:xnack+]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ -fsanitize=address -fno-gpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=NOGPUSAN %s
++
++// ASan disabled for amdgpu-arch [gfx908:xnack+,gfx900:xnack+]
++// RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp --offload-arch=gfx908:xnack+ --offload-arch=gfx900:xnack+ -fsanitize=address -fno-gpu-sanitize --rocm-path=%S/Inputs/rocm %s 2>&1 \
++// RUN:   | FileCheck -check-prefixes=NOGPUSAN %s
++
++// FAIL-DAG: error: cannot find ROCm device library for ABI version 5; provide its path via '--rocm-path' or '--rocm-device-lib-path', or pass '-nogpulib' to build without ROCm device library
++// NOTSUPPORTED-DAG: warning: ignoring '-fsanitize=leak' option as it is not currently supported for target 'amdgcn-amd-amdhsa'
++
++// NOXNACK: warning: ignoring '-fsanitize=address' option for offload arch 'gfx908' as it is not currently supported there. Use it with an offload arch containing 'xnack+' instead
++// XNACKNEG: warning: ignoring '-fsanitize=address' option for offload arch 'gfx908:xnack-' as it is not currently supported there. Use it with an offload arch containing 'xnack+' instead
++
++// GPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "x86_64-unknown-linux-gnu".* "-fopenmp".* "-fsanitize=address".* "-fopenmp-targets=amdgcn-amd-amdhsa".* "-x" "c".*}}
++// GPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "amdgcn-amd-amdhsa" "-aux-triple" "x86_64-unknown-linux-gnu".* "-emit-llvm-bc".* "-target-cpu" "(gfx908|gfx900)".* "-fopenmp".* "-fsanitize=address".* "-x" "c".*}}
++// GPUSAN: {{"[^"]*clang-offload-packager[^"]*" "-o".* "--image=file=.*.bc,triple=amdgcn-amd-amdhsa,arch=gfx908(:xnack\-|:xnack\+)?,kind=openmp(,feature=(\-xnack|\+xnack))?"}}
++// GPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "x86_64-unknown-linux-gnu".* "-fopenmp".* "-fsanitize=address".* "-fopenmp-targets=amdgcn-amd-amdhsa".* "-x" "ir".*}}
++// GPUSAN: {{"[^"]*clang-linker-wrapper[^"]*" "--host-triple=x86_64-unknown-linux-gnu" "--linker-path=[^"]*".* "--whole-archive" "[^"]*libclang_rt.asan_static.a".* "--whole-archive" "[^"]*libclang_rt.asan.a".*}}
++
++// NOGPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "x86_64-unknown-linux-gnu".* "-fopenmp".* "-fsanitize=address".* "-fopenmp-targets=amdgcn-amd-amdhsa".* "-x" "c".*}}
++// NOGPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "amdgcn-amd-amdhsa" "-aux-triple" "x86_64-unknown-linux-gnu".* "-emit-llvm-bc".* "-target-cpu" "(gfx908|gfx900)".* "-fopenmp".* "-x" "c".*}}
++// NOGPUSAN: {{"[^"]*clang-offload-packager[^"]*" "-o".* "--image=file=.*.bc,triple=amdgcn-amd-amdhsa,arch=gfx908(:xnack\-|:xnack\+)?,kind=openmp(,feature=(\-xnack|\+xnack))?"}}
++// NOGPUSAN: {{"[^"]*clang[^"]*" "-cc1" "-triple" "x86_64-unknown-linux-gnu".* "-fopenmp".* "-fsanitize=address".* "-fopenmp-targets=amdgcn-amd-amdhsa".* "-x" "ir".*}}
++// NOGPUSAN: {{"[^"]*clang-linker-wrapper[^"]*" "--host-triple=x86_64-unknown-linux-gnu" "--linker-path=[^"]*".* "--whole-archive" "[^"]*libclang_rt.asan_static.a".* "--whole-archive" "[^"]*libclang_rt.asan.a".*}}

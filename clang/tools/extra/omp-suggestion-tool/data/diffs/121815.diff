@@ -1,0 +1,472 @@
+diff --git a/flang/docs/ParserCombinators.md b/flang/docs/ParserCombinators.md
+index 7cb77deba2197..076e76f703c49 100644
+--- a/flang/docs/ParserCombinators.md
++++ b/flang/docs/ParserCombinators.md
+@@ -141,7 +141,7 @@ collect the values that they return.
+ * `applyLambda([](&&x){}, p1, p2, ...)` is the same thing, but for lambdas
+   and other function objects.
+ * `applyMem(mf, p1, p2, ...)` is the same thing, but invokes a member
+-  function of the result of the first parser for updates in place.
++  function of the result of the first parser.
+ 
+ ### Token Parsers
+ Last, we have these basic parsers on which the actual grammar of the Fortran
+diff --git a/flang/include/flang/Parser/characters.h b/flang/include/flang/Parser/characters.h
+index df188d674b9ee..dbdc058c44995 100644
+--- a/flang/include/flang/Parser/characters.h
++++ b/flang/include/flang/Parser/characters.h
+@@ -180,6 +180,8 @@ inline constexpr bool IsValidFortranTokenCharacter(char ch) {
+   case '>':
+   case '[':
+   case ']':
++  case '{': // Used in OpenMP context selector specification
++  case '}': //
+     return true;
+   default:
+     return IsLegalIdentifierStart(ch) || IsDecimalDigit(ch);
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 3331520922bc6..11725991e9c9a 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -476,6 +476,19 @@ class ParseTreeDumper {
+   NODE(parser, NullInit)
+   NODE(parser, ObjectDecl)
+   NODE(parser, OldParameterStmt)
++  NODE(parser, OmpTraitPropertyName)
++  NODE(parser, OmpTraitScore)
++  NODE(parser, OmpTraitPropertyExtension)
++  NODE(OmpTraitPropertyExtension, ExtensionValue)
++  NODE(parser, OmpTraitProperty)
++  NODE(parser, OmpTraitSelectorName)
++  NODE_ENUM(OmpTraitSelectorName, Value)
++  NODE(parser, OmpTraitSelector)
++  NODE(OmpTraitSelector, Properties)
++  NODE(parser, OmpTraitSetSelectorName)
++  NODE_ENUM(OmpTraitSetSelectorName, Value)
++  NODE(parser, OmpTraitSetSelector)
++  NODE(parser, OmpContextSelectorSpecification)
+   NODE(parser, OmpMapper)
+   NODE(parser, OmpMapType)
+   NODE_ENUM(OmpMapType, Value)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 941d70d387629..00d85aa05fb3a 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3453,6 +3453,9 @@ WRAPPER_CLASS(PauseStmt, std::optional<StopCode>);
+ 
+ // --- Common definitions
+ 
++struct OmpClause;
++struct OmpClauseList;
++
+ // 2.1 Directives or clauses may accept a list or extended-list.
+ //     A list item is a variable, array section or common block name (enclosed
+ //     in slashes). An extended list item is a list item or a procedure Name.
+@@ -3474,6 +3477,150 @@ WRAPPER_CLASS(OmpObjectList, std::list<OmpObject>);
+ 
+ #define MODIFIERS() std::optional<std::list<Modifier>>
+ 
++inline namespace traits {
++// trait-property-name ->
++//    identifier | string-literal
++//
++// This is a bit of a problematic case. The spec says that a word in quotes,
++// and the same word without quotes are equivalent. We currently parse both
++// as a string, but it's likely just a temporary solution.
++//
++// The problem is that trait-property can be (among other things) a
++// trait-property-name or a trait-property-expression. A simple identifier
++// can be either, there is no reasonably simple way of telling them apart
++// in the parser. There is a similar issue with extensions. Some of that
++// disambiguation may need to be done in the "canonicalization" pass and
++// then some of those AST nodes would be rewritten into different ones.
++//
++struct OmpTraitPropertyName {
++  CharBlock source;
++  WRAPPER_CLASS_BOILERPLATE(OmpTraitPropertyName, std::string);
++};
++
++// trait-score ->
++//    SCORE(non-negative-const-integer-expression)
++struct OmpTraitScore {
++  CharBlock source;
++  WRAPPER_CLASS_BOILERPLATE(OmpTraitScore, ScalarIntExpr);
++};
++
++// trait-property-extension ->
++//    trait-property-name (trait-property-value, ...)
++// trait-property-value ->
++//    trait-property-name |
++//    scalar-integer-expression |
++//    trait-property-extension
++//
++// The grammar in OpenMP 5.2+ spec is ambiguous, the above is a different
++// version (but equivalent) that doesn't have ambiguities.
++// The ambiguity is in
++//   trait-property:
++//      trait-property-name          <- (a)
++//      trait-property-clause
++//      trait-property-expression    <- (b)
++//      trait-property-extension     <- this conflicts with (a) and (b)
++//   trait-property-extension:
++//      trait-property-name          <- conflict with (a)
++//      identifier(trait-property-extension[, trait-property-extension[, ...]])
++//      constant integer expression  <- conflict with (b)
++//
++struct OmpTraitPropertyExtension {
++  CharBlock source;
++  TUPLE_CLASS_BOILERPLATE(OmpTraitPropertyExtension);
++  struct ExtensionValue {
++    CharBlock source;
++    UNION_CLASS_BOILERPLATE(ExtensionValue);
++    std::variant<OmpTraitPropertyName, ScalarExpr,
++        common::Indirection<OmpTraitPropertyExtension>>
++        u;
++  };
++  using ExtensionList = std::list<ExtensionValue>;
++  std::tuple<OmpTraitPropertyName, ExtensionList> t;
++};
++
++// trait-property ->
++//    trait-property-name | OmpClause |
++//    trait-property-expression | trait-property-extension
++// trait-property-expression ->
++//    scalar-logical-expression | scalar-integer-expression
++//
++// The parser for a logical expression will accept an integer expression,
++// and if it's not logical, it will flag an error later. The same thing
++// will happen if the scalar integer expression sees a logical expresion.
++// To avoid this, parse all expressions as scalar expressions.
++struct OmpTraitProperty {
++  CharBlock source;
++  UNION_CLASS_BOILERPLATE(OmpTraitProperty);
++  std::variant<OmpTraitPropertyName, common::Indirection<OmpClause>,
++      ScalarExpr, // trait-property-expresion
++      OmpTraitPropertyExtension>
++      u;
++};
++
++// trait-selector-name ->
++//    KIND |              DT       // name-list (host, nohost, +/add-def-doc)
++//    ISA |               DT       // name-list (isa_name, ... /impl-defined)
++//    ARCH |              DT       // name-list (arch_name, ... /impl-defined)
++//    directive-name |    C        // no properties
++//    SIMD |              C        // clause-list (from declare_simd)
++//                                 // (at least simdlen, inbranch/notinbranch)
++//    DEVICE_NUM |        T        // device-number
++//    UID |               T        // unique-string-id /impl-defined
++//    VENDOR |            I        // name-list (vendor-id /add-def-doc)
++//    EXTENSION |         I        // name-list (ext_name /impl-defined)
++//    ATOMIC_DEFAULT_MEM_ORDER I | // value of admo
++//    REQUIRES |          I        // clause-list (from requires)
++//    CONDITION           U        // logical-expr
++//
++// Trait-set-selectors:
++//    [D]evice, [T]arget_device, [C]onstruct, [I]mplementation, [U]ser.
++struct OmpTraitSelectorName {
++  CharBlock source;
++  UNION_CLASS_BOILERPLATE(OmpTraitSelectorName);
++  ENUM_CLASS(Value, Arch, Atomic_Default_Mem_Order, Condition, Device_Num,
++      Extension, Isa, Kind, Requires, Simd, Uid, Vendor)
++  std::variant<Value, llvm::omp::Directive> u;
++};
++
++// trait-selector ->
++//    trait-selector-name |
++//    trait-selector-name ([trait-score:] trait-property, ...)
++struct OmpTraitSelector {
++  CharBlock source;
++  TUPLE_CLASS_BOILERPLATE(OmpTraitSelector);
++  struct Properties {
++    TUPLE_CLASS_BOILERPLATE(Properties);
++    std::tuple<std::optional<OmpTraitScore>, std::list<OmpTraitProperty>> t;
++  };
++  std::tuple<OmpTraitSelectorName, std::optional<Properties>> t;
++};
++
++// trait-set-selector-name ->
++//    CONSTRUCT | DEVICE | IMPLEMENTATION | USER |  // since 5.0
++//    TARGET_DEVICE                                 // since 5.1
++struct OmpTraitSetSelectorName {
++  CharBlock source;
++  ENUM_CLASS(Value, Construct, Device, Implementation, Target_Device, User)
++  WRAPPER_CLASS_BOILERPLATE(OmpTraitSetSelectorName, Value);
++};
++
++// trait-set-selector ->
++//    trait-set-selector-name = {trait-selector, ...}
++struct OmpTraitSetSelector {
++  CharBlock source;
++  TUPLE_CLASS_BOILERPLATE(OmpTraitSetSelector);
++  std::tuple<OmpTraitSetSelectorName, std::list<OmpTraitSelector>> t;
++};
++
++// context-selector-specification ->
++//    trait-set-selector, ...
++struct OmpContextSelectorSpecification { // Modifier
++  CharBlock source;
++  WRAPPER_CLASS_BOILERPLATE(
++      OmpContextSelectorSpecification, std::list<OmpTraitSetSelector>);
++};
++} // namespace traits
++
+ inline namespace modifier {
+ // For uniformity, in all keyword modifiers the name of the type defined
+ // by ENUM_CLASS is "Value", e.g.
+@@ -3744,6 +3891,9 @@ struct OmpVariableCategory {
+   ENUM_CLASS(Value, Aggregate, All, Allocatable, Pointer, Scalar)
+   WRAPPER_CLASS_BOILERPLATE(OmpVariableCategory, Value);
+ };
++
++// context-selector
++using OmpContextSelector = traits::OmpContextSelectorSpecification;
+ } // namespace modifier
+ 
+ // --- Clauses
+diff --git a/flang/lib/Parser/basic-parsers.h b/flang/lib/Parser/basic-parsers.h
+index 515b5993d6737..1a8c14e7048f6 100644
+--- a/flang/lib/Parser/basic-parsers.h
++++ b/flang/lib/Parser/basic-parsers.h
+@@ -580,11 +580,11 @@ template <typename PA> inline constexpr auto defaulted(PA p) {
+ // applyLambda(f, ...) is the same concept extended to std::function<> functors.
+ // It is not constexpr.
+ //
+-// Member function application is supported by applyMem(f, a).  If the
+-// parser a succeeds and returns some value ax, the result is that returned
+-// by ax.f().  Additional parser arguments can be specified to supply their
+-// results to the member function call, so applyMem(f, a, b) succeeds if
+-// both a and b do so and returns the result of calling ax.f(std::move(bx)).
++// Member function application is supported by applyMem(&C::f, a).  If the
++// parser a succeeds and returns some value ax of type C, the result is that
++// returned by ax.f().  Additional parser arguments can be specified to supply
++// their results to the member function call, so applyMem(&C::f, a, b) succeeds
++// if both a and b do so and returns the result of calling ax.f(std::move(bx)).
+ 
+ // Runs a sequence of parsers until one fails or all have succeeded.
+ // Collects their results in a std::tuple<std::optional<>...>.
+@@ -654,39 +654,31 @@ inline /* not constexpr */ auto applyLambda(
+ }
+ 
+ // Member function application
+-template <typename OBJPARSER, typename... PARSER> class AMFPHelper {
+-  using resultType = typename OBJPARSER::resultType;
+-
+-public:
+-  using type = void (resultType::*)(typename PARSER::resultType &&...);
+-};
+-template <typename OBJPARSER, typename... PARSER>
+-using ApplicableMemberFunctionPointer =
+-    typename AMFPHelper<OBJPARSER, PARSER...>::type;
+-
+-template <typename OBJPARSER, typename... PARSER, std::size_t... J>
+-inline auto ApplyHelperMember(
+-    ApplicableMemberFunctionPointer<OBJPARSER, PARSER...> mfp,
+-    ApplyArgs<OBJPARSER, PARSER...> &&args, std::index_sequence<J...>) ->
+-    typename OBJPARSER::resultType {
+-  ((*std::get<0>(args)).*mfp)(std::move(*std::get<J + 1>(args))...);
+-  return std::get<0>(std::move(args));
++template <typename MEMFUNC, typename OBJPARSER, typename... PARSER,
++    std::size_t... J>
++inline auto ApplyHelperMember(MEMFUNC mfp,
++    ApplyArgs<OBJPARSER, PARSER...> &&args, std::index_sequence<J...>) {
++  return ((*std::get<0>(args)).*mfp)(std::move(*std::get<J + 1>(args))...);
+ }
+ 
+-template <typename OBJPARSER, typename... PARSER> class ApplyMemberFunction {
+-  using funcType = ApplicableMemberFunctionPointer<OBJPARSER, PARSER...>;
++template <typename MEMFUNC, typename OBJPARSER, typename... PARSER>
++class ApplyMemberFunction {
++  static_assert(std::is_member_function_pointer_v<MEMFUNC>);
++  using funcType = MEMFUNC;
+ 
+ public:
+-  using resultType = typename OBJPARSER::resultType;
++  using resultType =
++      std::invoke_result_t<MEMFUNC, typename OBJPARSER::resultType, PARSER...>;
++
+   constexpr ApplyMemberFunction(const ApplyMemberFunction &) = default;
+-  constexpr ApplyMemberFunction(funcType f, OBJPARSER o, PARSER... p)
++  constexpr ApplyMemberFunction(MEMFUNC f, OBJPARSER o, PARSER... p)
+       : function_{f}, parsers_{o, p...} {}
+   std::optional<resultType> Parse(ParseState &state) const {
+     ApplyArgs<OBJPARSER, PARSER...> results;
+     using Sequence1 = std::index_sequence_for<OBJPARSER, PARSER...>;
+     using Sequence2 = std::index_sequence_for<PARSER...>;
+     if (ApplyHelperArgs(parsers_, results, state, Sequence1{})) {
+-      return ApplyHelperMember<OBJPARSER, PARSER...>(
++      return ApplyHelperMember<MEMFUNC, OBJPARSER, PARSER...>(
+           function_, std::move(results), Sequence2{});
+     } else {
+       return std::nullopt;
+@@ -698,11 +690,11 @@ template <typename OBJPARSER, typename... PARSER> class ApplyMemberFunction {
+   const std::tuple<OBJPARSER, PARSER...> parsers_;
+ };
+ 
+-template <typename OBJPARSER, typename... PARSER>
++template <typename MEMFUNC, typename OBJPARSER, typename... PARSER>
+ inline constexpr auto applyMem(
+-    ApplicableMemberFunctionPointer<OBJPARSER, PARSER...> mfp,
+-    const OBJPARSER &objParser, PARSER... parser) {
+-  return ApplyMemberFunction<OBJPARSER, PARSER...>{mfp, objParser, parser...};
++    MEMFUNC memfn, const OBJPARSER &objParser, PARSER... parser) {
++  return ApplyMemberFunction<MEMFUNC, OBJPARSER, PARSER...>{
++      memfn, objParser, parser...};
+ }
+ 
+ // As is done with function application via applyFunction() above, class
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 894c458a335b2..5ff91da082c85 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -153,6 +153,83 @@ static TypeDeclarationStmt makeIterSpecDecl(std::list<ObjectName> &&names) {
+       makeEntityList(std::move(names)));
+ }
+ 
++// --- Parsers for context traits -------------------------------------
++
++static std::string nameToString(Name &&name) { return name.ToString(); }
++
++TYPE_PARSER(sourced(construct<OmpTraitPropertyName>( //
++    (space >> charLiteralConstantWithoutKind) ||
++    applyFunction(nameToString, Parser<Name>{}))))
++
++TYPE_PARSER(sourced(construct<OmpTraitScore>( //
++    "SCORE" >> parenthesized(scalarIntExpr))))
++
++TYPE_PARSER(sourced(construct<OmpTraitPropertyExtension::ExtensionValue>(
++    // Parse nested extension first.
++    construct<OmpTraitPropertyExtension::ExtensionValue>(
++        indirect(Parser<OmpTraitPropertyExtension>{})) ||
++    construct<OmpTraitPropertyExtension::ExtensionValue>(
++        Parser<OmpTraitPropertyName>{}) ||
++    construct<OmpTraitPropertyExtension::ExtensionValue>(scalarExpr))))
++
++TYPE_PARSER(sourced(construct<OmpTraitPropertyExtension>( //
++    Parser<OmpTraitPropertyName>{},
++    parenthesized(nonemptySeparated(
++        Parser<OmpTraitPropertyExtension::ExtensionValue>{}, ","_tok)))))
++
++TYPE_PARSER(sourced(construct<OmpTraitProperty>(
++    // Try clause first, then extension before OmpTraitPropertyName.
++    construct<OmpTraitProperty>(indirect(Parser<OmpClause>{})) ||
++    construct<OmpTraitProperty>(Parser<OmpTraitPropertyExtension>{}) ||
++    construct<OmpTraitProperty>(Parser<OmpTraitPropertyName>{}) ||
++    construct<OmpTraitProperty>(scalarExpr))))
++
++TYPE_PARSER(construct<OmpTraitSelectorName::Value>(
++    "ARCH" >> pure(OmpTraitSelectorName::Value::Arch) ||
++    "ATOMIC_DEFAULT_MEM_ORDER" >>
++        pure(OmpTraitSelectorName::Value::Atomic_Default_Mem_Order) ||
++    "CONDITION" >> pure(OmpTraitSelectorName::Value::Condition) ||
++    "DEVICE_NUM" >> pure(OmpTraitSelectorName::Value::Device_Num) ||
++    "EXTENSION" >> pure(OmpTraitSelectorName::Value::Extension) ||
++    "ISA" >> pure(OmpTraitSelectorName::Value::Isa) ||
++    "KIND" >> pure(OmpTraitSelectorName::Value::Kind) ||
++    "REQUIRES" >> pure(OmpTraitSelectorName::Value::Requires) ||
++    "SIMD" >> pure(OmpTraitSelectorName::Value::Simd) ||
++    "UID" >> pure(OmpTraitSelectorName::Value::Uid) ||
++    "VENDOR" >> pure(OmpTraitSelectorName::Value::Vendor)))
++
++TYPE_PARSER(sourced(construct<OmpTraitSelectorName>(
++    // Parse predefined names first (because of SIMD).
++    construct<OmpTraitSelectorName>(Parser<OmpTraitSelectorName::Value>{}) ||
++    construct<OmpTraitSelectorName>(OmpDirectiveNameParser{}))))
++
++TYPE_PARSER(construct<OmpTraitSelector::Properties>(
++    maybe(Parser<OmpTraitScore>{} / ":"_tok),
++    nonemptySeparated(Parser<OmpTraitProperty>{}, ","_tok)))
++
++TYPE_PARSER(sourced(construct<OmpTraitSelector>( //
++    Parser<OmpTraitSelectorName>{}, //
++    maybe(parenthesized(Parser<OmpTraitSelector::Properties>{})))))
++
++TYPE_PARSER(construct<OmpTraitSetSelectorName::Value>(
++    "CONSTRUCT" >> pure(OmpTraitSetSelectorName::Value::Construct) ||
++    "DEVICE" >> pure(OmpTraitSetSelectorName::Value::Device) ||
++    "IMPLEMENTATION" >> pure(OmpTraitSetSelectorName::Value::Implementation) ||
++    "TARGET_DEVICE" >> pure(OmpTraitSetSelectorName::Value::Target_Device) ||
++    "USER" >> pure(OmpTraitSetSelectorName::Value::User)))
++
++TYPE_PARSER(sourced(construct<OmpTraitSetSelectorName>(
++    Parser<OmpTraitSetSelectorName::Value>{})))
++
++TYPE_PARSER(sourced(construct<OmpTraitSetSelector>( //
++    Parser<OmpTraitSetSelectorName>{},
++    "=" >> braced(nonemptySeparated(Parser<OmpTraitSelector>{}, ","_tok)))))
++
++TYPE_PARSER(sourced(construct<OmpContextSelectorSpecification>(
++    nonemptySeparated(Parser<OmpTraitSetSelector>{}, ","_tok))))
++
++// Parser<OmpContextSelector> == Parser<traits::OmpContextSelectorSpecification>
++
+ // --- Parsers for clause modifiers -----------------------------------
+ 
+ TYPE_PARSER(construct<OmpAlignment>(scalarIntExpr))
+diff --git a/flang/lib/Parser/token-parsers.h b/flang/lib/Parser/token-parsers.h
+index fe6bc1f69f576..3e0c59b89d964 100644
+--- a/flang/lib/Parser/token-parsers.h
++++ b/flang/lib/Parser/token-parsers.h
+@@ -215,6 +215,10 @@ template <class PA> inline constexpr auto bracketed(const PA &p) {
+   return "[" >> p / "]";
+ }
+ 
++template <class PA> inline constexpr auto braced(const PA &p) {
++  return "{" >> p / "}";
++}
++
+ // Quoted character literal constants.
+ struct CharLiteralChar {
+   using resultType = std::pair<char, bool /* was escaped */>;
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 58820476c51bc..7bf404bba2c3e 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2067,6 +2067,38 @@ class UnparseVisitor {
+   }
+ 
+   // OpenMP Clauses & Directives
++  void Unparse(const llvm::omp::Directive &x) {
++    Word(llvm::omp::getOpenMPDirectiveName(x).str());
++  }
++  void Unparse(const OmpTraitScore &x) {
++    Word("SCORE(");
++    Walk(x.v);
++    Put(")");
++  }
++  void Unparse(const OmpTraitPropertyExtension &x) {
++    Walk(std::get<OmpTraitPropertyName>(x.t));
++    Put("(");
++    Walk(std::get<OmpTraitPropertyExtension::ExtensionList>(x.t), ",");
++    Put(")");
++  }
++  void Unparse(const OmpTraitSelector &x) {
++    Walk(std::get<OmpTraitSelectorName>(x.t));
++    Walk(std::get<std::optional<OmpTraitSelector::Properties>>(x.t));
++  }
++  void Unparse(const OmpTraitSelector::Properties &x) {
++    Put("(");
++    Walk(std::get<std::optional<OmpTraitScore>>(x.t), ": ");
++    Walk(std::get<std::list<OmpTraitProperty>>(x.t));
++    Put(")");
++  }
++  void Unparse(const OmpTraitSetSelector &x) {
++    Walk(std::get<OmpTraitSetSelectorName>(x.t));
++    Put("={");
++    Walk(std::get<std::list<OmpTraitSelector>>(x.t));
++    Put("}");
++  }
++  void Unparse(const OmpContextSelectorSpecification &x) { Walk(x.v, ", "); }
++
+   void Unparse(const OmpObject &x) {
+     common::visit(common::visitors{
+                       [&](const Designator &y) { Walk(y); },
+@@ -2916,6 +2948,9 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(OmpPrescriptiveness, Value) // OMP prescriptiveness
+   WALK_NESTED_ENUM(OmpMapType, Value) // OMP map-type
+   WALK_NESTED_ENUM(OmpMapTypeModifier, Value) // OMP map-type-modifier
++  WALK_NESTED_ENUM(OmpTraitSelectorName, Value)
++  WALK_NESTED_ENUM(OmpTraitSetSelectorName, Value)
++
+ #undef WALK_NESTED_ENUM
+   void Unparse(const ReductionOperator::Operator x) {
+     switch (x) {

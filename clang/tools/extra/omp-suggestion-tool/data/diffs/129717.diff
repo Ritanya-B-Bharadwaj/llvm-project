@@ -1,0 +1,1826 @@
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 6b0d783fb8c30..781b0dfceff9e 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -307,8 +307,10 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+     auto ifOp = firOpBuilder.create<fir::IfOp>(loc, cmpOp, /*else*/ false);
+     firOpBuilder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+     for (auto [v, loopIV] : llvm::zip_equal(vs, loopIVs)) {
+-      assert(loopIV && "loopIV was not set");
+-      firOpBuilder.createStoreWithConvert(loc, v, loopIV);
++      hlfir::Entity loopIVEntity{loopIV};
++      loopIVEntity =
++          hlfir::derefPointersAndAllocatables(loc, firOpBuilder, loopIVEntity);
++      firOpBuilder.create<hlfir::AssignOp>(loc, v, loopIVEntity);
+     }
+     lastPrivIP = firOpBuilder.saveInsertionPoint();
+   } else if (mlir::isa<mlir::omp::SectionsOp>(op)) {
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 7970d77da8a6b..b1568cc12a05a 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -789,8 +789,12 @@ createAndSetPrivatizedLoopVar(lower::AbstractConverter &converter,
+ 
+   firOpBuilder.restoreInsertionPoint(insPt);
+   mlir::Value cvtVal = firOpBuilder.createConvert(loc, tempTy, indexVal);
+-  mlir::Operation *storeOp = firOpBuilder.create<fir::StoreOp>(
+-      loc, cvtVal, converter.getSymbolAddress(*sym));
++  hlfir::Entity lhs{converter.getSymbolAddress(*sym)};
++
++  lhs = hlfir::derefPointersAndAllocatables(loc, firOpBuilder, lhs);
++
++  mlir::Operation *storeOp =
++      firOpBuilder.create<hlfir::AssignOp>(loc, cvtVal, lhs);
+   return storeOp;
+ }
+ 
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90
+index 8098cd53e9d2e..d8ec69120468b 100644
+--- a/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/distribute-standalone-private.f90
+@@ -31,7 +31,7 @@ end subroutine standalone_distribute
+ ! CHECK:               %[[VAR_PRIV_DECL:.*]]:2 = hlfir.declare %[[VAR_ARG]]
+ ! CHECK:               %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_ARG]]
+ 
+-! CHECK:               fir.store %{{.*}} to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:               hlfir.assign %{{.*}} to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:               %{{.*}} = fir.load %[[VAR_PRIV_DECL]]#0 : !fir.ref<i32>
+ ! CHECK:               %{{.*}} = fir.load %[[I_PRIV_DECL]]#0 : !fir.ref<i32>
+ ! CHECK:               arith.addi %{{.*}}, %{{.*}} : i32
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/wsloop.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/wsloop.f90
+index 221d08669f899..1634e00d34be1 100644
+--- a/flang/test/Lower/OpenMP/DelayedPrivatization/wsloop.f90
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/wsloop.f90
+@@ -28,7 +28,7 @@ end subroutine wsloop_private
+ ! CHECK:       omp.loop_nest (%[[IV:.*]]) : i32 = {{.*}} {
+ ! CHECK:         %[[X_PRIV_DECL:.*]]:2 = hlfir.declare %[[X_ARG]] {uniq_name = "{{.*}}x"}
+ ! CHECK:         %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_ARG]] {uniq_name = "{{.*}}i"}
+-! CHECK:         fir.store %[[IV]] to %[[I_PRIV_DECL]]#1
++! CHECK:         hlfir.assign %[[IV]] to %[[I_PRIV_DECL]]#1
+ ! CHECK:         %[[X_VAL:.*]] = fir.load %[[X_PRIV_DECL]]#0
+ ! CHECK:         %[[I_VAL:.*]] = fir.load %[[I_PRIV_DECL]]#0
+ ! CHECK:         %[[ADD_VAL:.*]] = arith.addi %[[X_VAL]], %[[I_VAL]]
+diff --git a/flang/test/Lower/OpenMP/Todo/omp-default-clause-inner-loop.f90 b/flang/test/Lower/OpenMP/Todo/omp-default-clause-inner-loop.f90
+index 10879c53dc0c5..7447e24d236fa 100644
+--- a/flang/test/Lower/OpenMP/Todo/omp-default-clause-inner-loop.f90
++++ b/flang/test/Lower/OpenMP/Todo/omp-default-clause-inner-loop.f90
+@@ -14,7 +14,7 @@
+ ! CHECK: %[[const_3:.*]] = arith.constant 1 : i32
+ ! CHECK: omp.wsloop private(@{{.*}} %{{.*}} -> %[[TEMP:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT: omp.loop_nest (%[[ARG:.*]]) : i32 = (%[[const_1]]) to (%[[const_2]]) inclusive step (%[[const_3]]) {
+-! CHECK: fir.store %[[ARG]] to %[[TEMP]] : !fir.ref<i32>
++! CHECK: hlfir.assign %[[ARG]] to %[[TEMP]] : i32, !fir.ref<i32>
+ ! EXPECTED: %[[temp_1:.*]] = fir.load %[[PRIVATE_Z]] : !fir.ref<i32>
+ ! CHECK: %[[temp_1:.*]] = fir.load %{{.*}} : !fir.ref<i32>
+ ! CHECK: %[[temp_2:.*]] = fir.load %[[TEMP]] : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/copyin.f90 b/flang/test/Lower/OpenMP/copyin.f90
+index 0e8fe0eaeed87..f2c7d8c441ccb 100644
+--- a/flang/test/Lower/OpenMP/copyin.f90
++++ b/flang/test/Lower/OpenMP/copyin.f90
+@@ -161,7 +161,7 @@ subroutine copyin_derived_type()
+ ! CHECK:             omp.wsloop private(@{{.*}} %{{.*}} -> %[[VAL_6:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_11]]) to (%[[VAL_12]]) inclusive step (%[[VAL_13]]) {
+ ! CHECK:                 %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]] {uniq_name = "_QFcombined_parallel_worksharing_loopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_7]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_14]] to %[[VAL_7]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 fir.call @_QPsub4(%[[VAL_9]]#1) fastmath<contract> : (!fir.ref<i32>) -> ()
+ ! CHECK:                 omp.yield
+ ! CHECK:               }
+@@ -326,7 +326,7 @@ subroutine common_1()
+ ! CHECK:             omp.wsloop private(@{{.*}} %{{.*}} -> %[[VAL_19:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_37:.*]]) : i32 = (%[[VAL_34]]) to (%[[VAL_35]]) inclusive step (%[[VAL_36]]) {
+ ! CHECK:             %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFcommon_2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_37]] to %[[VAL_20]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_37]] to %[[VAL_20]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_39:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_40:.*]] = arith.addi %[[VAL_38]], %[[VAL_39]] : i32
+diff --git a/flang/test/Lower/OpenMP/critical.f90 b/flang/test/Lower/OpenMP/critical.f90
+index 99a4426ab0453..50844aa7d2f2d 100644
+--- a/flang/test/Lower/OpenMP/critical.f90
++++ b/flang/test/Lower/OpenMP/critical.f90
+@@ -42,7 +42,7 @@ subroutine predetermined_privatization()
+     !CHECK: omp.wsloop private(@{{.*}} %{{.*}} -> %[[PRIV_I_ALLOC:.*]] : !fir.ref<i32>)
+     !CHECK: omp.loop_nest (%[[IV:[^[:space:]]+]])
+     !CHECK: %[[PRIV_I_DECL:.*]]:2 = hlfir.declare %[[PRIV_I_ALLOC]]
+-    !CHECK: fir.store %[[IV]] to %[[PRIV_I_DECL]]#1
++    !CHECK: hlfir.assign %[[IV]] to %[[PRIV_I_DECL]]#1
+     !CHECK: omp.critical
+     !$omp critical
+     a(i) = a(i-1) + 1
+diff --git a/flang/test/Lower/OpenMP/default-clause.f90 b/flang/test/Lower/OpenMP/default-clause.f90
+index fcc8d033eea0f..ef4f4a416286f 100644
+--- a/flang/test/Lower/OpenMP/default-clause.f90
++++ b/flang/test/Lower/OpenMP/default-clause.f90
+@@ -291,7 +291,7 @@ subroutine nested_default_clause_test4
+ !CHECK: omp.loop_nest (%[[ARG:.*]]) : i32 = (%[[CONST_LB]]) to (%[[CONST_UB]]) inclusive step (%[[CONST_STEP]]) {
+ !CHECK: %[[X_DECLARE:.*]]:2 = hlfir.declare %[[X_ALLOCA]] {{.*}}
+ !CHECK: %[[LOOP_VAR_DECLARE:.*]]:2 = hlfir.declare %[[LOOP_VAR_ALLOCA]] {{.*}}
+-!CHECK: fir.store %[[ARG]] to %[[LOOP_VAR_DECLARE]]#1 : !fir.ref<i32>
++!CHECK: hlfir.assign %[[ARG]] to %[[LOOP_VAR_DECLARE]]#1 : i32, !fir.ref<i32>
+ !CHECK: %[[LOADED_X:.*]] = fir.load %[[X_DECLARE]]#0 : !fir.ref<i32>
+ !CHECK: %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK: %[[RESULT:.*]] = arith.addi %[[LOADED_X]], %[[CONST]] : i32
+@@ -324,7 +324,7 @@ subroutine nested_default_clause_test5
+ ! CHECK: omp.wsloop private(@{{.*}} %{{.*}} -> %[[LOOP_VAR:.*]] : !fir.ref<i32>) {
+ !CHECK: omp.loop_nest (%[[ARG:.*]]) : i32 = (%[[CONST_LB]]) to (%[[CONST_UB]]) inclusive step (%[[CONST_STEP]]) {
+ !CHECK: %[[LOOP_VAR_DECLARE:.*]]:2 = hlfir.declare %[[LOOP_VAR]] {{.*}}
+-!CHECK: fir.store %[[ARG]] to %[[LOOP_VAR_DECLARE]]#1 : !fir.ref<i32>
++!CHECK: hlfir.assign %[[ARG]] to %[[LOOP_VAR_DECLARE]]#1 : i32, !fir.ref<i32>
+ !CHECK: %[[LOADED_X:.*]] = fir.load %[[X_VAR_DECLARE]]#0 : !fir.ref<i32>
+ !CHECK: %[[CONST:.*]] = arith.constant 1 : i32
+ !CHECK: %[[ADD:.*]] = arith.addi %[[LOADED_X]], %[[CONST]] : i32
+diff --git a/flang/test/Lower/OpenMP/generic-loop-rewriting.f90 b/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
+index 0699c36c69519..fcecc6e808d73 100644
+--- a/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
++++ b/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
+@@ -50,7 +50,7 @@ end subroutine target_teams_loop
+ !CHECK:                   omp.loop_nest (%{{.*}}) : i32 = 
+ !CHECK-SAME:                (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+ !CHECK:                     %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ARG]]
+-!CHECK:                     fir.store %{{.*}} to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++!CHECK:                     hlfir.assign %{{.*}} to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ !CHECK:                   }
+ !CHECK:                 }
+ !CHECK:               }
+diff --git a/flang/test/Lower/OpenMP/lastprivate-allocatable.f90 b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+index fd8338393dd88..b9ae9e7dedc11 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+@@ -17,7 +17,7 @@
+ !                        if this is the last iteration
+ ! CHECK:                 fir.if %{{.*}} {
+ !                          store loop IV
+-! CHECK:                   fir.store %{{.*}} to %[[VAL_18]]#1 : !fir.ref<i32>
++! CHECK:                   hlfir.assign %{{.*}} to %[[VAL_18]]#1 : i32, !fir.ref<i32>
+ !                          assign private variable to original copy: realloc
+ ! CHECK:                   %[[VAL_23:.*]] = fir.load %[[VAL_16]]#0 : !fir.ref<!fir.box<!fir.heap<i32>>>
+ ! CHECK:                   %[[VAL_24:.*]] = fir.box_addr %[[VAL_23]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
+diff --git a/flang/test/Lower/OpenMP/lastprivate-commonblock.f90 b/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
+index c059382bf634c..beb4e79698702 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-commonblock.f90
+@@ -22,7 +22,7 @@
+ !CHECK:          %[[V_GT:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK:          %[[LAST_ITER:.*]] = arith.select %[[NEG_STEP]], %[[V_LT]], %[[V_GT]] : i1
+ !CHECK:          fir.if %[[LAST_ITER]] {
+-!CHECK:            fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK:            hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ !CHECK:            %[[PRIVATE_X_VAL:.*]] = fir.load %[[PRIVATE_X_DECL]]#0 : !fir.ref<f32>
+ !CHECK:            hlfir.assign %[[PRIVATE_X_VAL]] to %[[X_DECL]]#0 : f32, !fir.ref<f32>
+ !CHECK:            %[[PRIVATE_Y_VAL:.*]] = fir.load %[[PRIVATE_Y_DECL]]#0 : !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/lastprivate-iv.f90 b/flang/test/Lower/OpenMP/lastprivate-iv.f90
+index aacefd8b59c0f..7918b47a400b9 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-iv.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-iv.f90
+@@ -1,5 +1,6 @@
+ ! Test LASTPRIVATE with iteration variable.
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck --check-prefix=CHECK-FIR %s
+ 
+ !CHECK-LABEL: func @_QPlastprivate_iv_inc
+ 
+@@ -12,7 +13,7 @@
+ !CHECK:      omp.wsloop private(@{{.*}} %{{.*}} -> %[[I_MEM:.*]] : !fir.ref<i32>) {
+ !CHECK-NEXT:   omp.loop_nest (%[[IV:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+ !CHECK:          %[[I:.*]]:2 = hlfir.declare %[[I_MEM]] {uniq_name = "_QFlastprivate_iv_incEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK:          fir.store %[[IV]] to %[[I]]#1 : !fir.ref<i32>
++!CHECK:          hlfir.assign %[[IV]] to %[[I]]#1 : i32, !fir.ref<i32>
+ !CHECK:          %[[V:.*]] = arith.addi %[[IV]], %[[STEP]] : i32
+ !CHECK:          %[[C0:.*]] = arith.constant 0 : i32
+ !CHECK:          %[[STEP_NEG:.*]] = arith.cmpi slt, %[[STEP]], %[[C0]] : i32
+@@ -20,7 +21,7 @@
+ !CHECK:          %[[V_GT:.*]] = arith.cmpi sgt, %[[V]], %[[UB]] : i32
+ !CHECK:          %[[CMP:.*]] = arith.select %[[STEP_NEG]], %[[V_LT]], %[[V_GT]] : i1
+ !CHECK:          fir.if %[[CMP]] {
+-!CHECK:            fir.store %[[V]] to %[[I]]#1 : !fir.ref<i32>
++!CHECK:            hlfir.assign %[[V]] to %[[I]]#1 : i32, !fir.ref<i32>
+ !CHECK:            %[[I_VAL:.*]] = fir.load %[[I]]#0 : !fir.ref<i32>
+ !CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 : i32, !fir.ref<i32>
+ !CHECK:          }
+@@ -46,7 +47,7 @@ subroutine lastprivate_iv_inc()
+ !CHECK:      omp.wsloop private(@{{.*}} %{{.*}} -> %[[I_MEM:.*]] : !fir.ref<i32>) {
+ !CHECK-NEXT:   omp.loop_nest (%[[IV:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+ !CHECK:          %[[I:.*]]:2 = hlfir.declare %[[I_MEM]] {uniq_name = "_QFlastprivate_iv_decEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK:          fir.store %[[IV]] to %[[I]]#1 : !fir.ref<i32>
++!CHECK:          hlfir.assign %[[IV]] to %[[I]]#1 : i32, !fir.ref<i32>
+ !CHECK:          %[[V:.*]] = arith.addi %[[IV]], %[[STEP]] : i32
+ !CHECK:          %[[C0:.*]] = arith.constant 0 : i32
+ !CHECK:          %[[STEP_NEG:.*]] = arith.cmpi slt, %[[STEP]], %[[C0]] : i32
+@@ -54,7 +55,7 @@ subroutine lastprivate_iv_inc()
+ !CHECK:          %[[V_GT:.*]] = arith.cmpi sgt, %[[V]], %[[UB]] : i32
+ !CHECK:          %[[CMP:.*]] = arith.select %[[STEP_NEG]], %[[V_LT]], %[[V_GT]] : i1
+ !CHECK:          fir.if %[[CMP]] {
+-!CHECK:            fir.store %[[V]] to %[[I]]#1 : !fir.ref<i32>
++!CHECK:            hlfir.assign %[[V]] to %[[I]]#1 : i32, !fir.ref<i32>
+ !CHECK:            %[[I_VAL:.*]] = fir.load %[[I]]#0 : !fir.ref<i32>
+ !CHECK:            hlfir.assign %[[I_VAL]] to %[[I2]]#0 : i32, !fir.ref<i32>
+ !CHECK:          }
+@@ -78,13 +79,48 @@ subroutine lastprivate_iv_i1
+ !CHECK:    omp.wsloop private({{.*}})
+ !CHECK:      omp.loop_nest
+ !CHECK:        fir.if %{{.*}} {
+-!CHECK:          %[[I8_VAL:.*]] = fir.convert %{{.*}} : (i32) -> i8
+-!CHECK:          fir.store %[[I8_VAL]] to %[[IV:.*]]#1 : !fir.ref<i8>
++!CHECK:          hlfir.assign %{{.*}} to %[[IV:.*]]#1 : i32, !fir.ref<i8>
+ !CHECK:          %[[IV_VAL:.*]] = fir.load %[[IV]]#0 : !fir.ref<i8>
+ !CHECK:          hlfir.assign %[[IV_VAL]] to %{{.*}}#0 : i8, !fir.ref<i8>
+ !CHECK:        }
++
++
+   !$omp do lastprivate(i1)
+   do i1=1,8
+   enddo
+ !$omp end do
+ end subroutine
++
++!CHECK:    omp.wsloop private(@_QFlastprivate_iv_pointerEi_private_box_ptr_i32 %{{.*}}#0 -> %[[PRIVATE_IV:.*]] : !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++!CHECK:      omp.loop_nest (%[[LOOP_INDEX:.*]]) : i64 
++!CHECK:        %[[PRIVATE_IV_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_IV]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFlastprivate_iv_pointerEi"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK:        %[[LOOP_INDEX_INCR:.*]] = arith.addi %[[LOOP_INDEX]], %{{.*}} : i64
++!CHECK:        fir.if %{{.*}} {
++!CHECK:          %[[PRIVATE_IV_BOX:.*]] = fir.load %[[PRIVATE_IV_DECL]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK:          %[[PRIVATE_IV_ADDR:.*]] = fir.box_addr %[[PRIVATE_IV_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
++!CHECK:          hlfir.assign %[[LOOP_INDEX_INCR]] to %[[PRIVATE_IV_ADDR]] : i64, !fir.ptr<i32>
++!CHECK:        }
++!CHECK:        omp.yield
++!CHECK:      }
++!CHECK:    }
++
++!CHECK-FIR:    omp.wsloop private(@_QFlastprivate_iv_pointerEi_private_box_ptr_i32 %{{.*}} -> %[[PRIVATE_IV:.*]] : !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++!CHECK-FIR:      omp.loop_nest (%[[LOOP_INDEX:.*]]) : i64
++!CHECK-FIR:        %[[PRIVATE_IV_DECL:.*]] = fir.declare %[[PRIVATE_IV]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFlastprivate_iv_pointerEi"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK-FIR:        %[[LOOP_INDEX_INCR:.*]] = arith.addi %[[LOOP_INDEX]], %{{.*}} : i64
++!CHECK-FIR:        fir.if %{{.*}} {
++!CHECK-FIR:          %[[PRIVATE_IV_BOX:.*]] = fir.load %[[PRIVATE_IV_DECL]] : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK-FIR:          %[[PRIVATE_IV_ADDR:.*]] = fir.box_addr %[[PRIVATE_IV_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
++!CHECK-FIR:          %[[LOOP_INDEX_CVT:.*]] = fir.convert %[[LOOP_INDEX_INCR]] : (i64) -> i32
++!CHECK-FIR:          fir.store %[[LOOP_INDEX_CVT]] to %[[PRIVATE_IV_ADDR]] : !fir.ptr<i32>
++!CHECK-FIR:        }
++!CHECK-FIR:        omp.yield
++!CHECK-FIR:      }
++subroutine lastprivate_iv_pointer()
++  integer, pointer :: i
++
++  !$omp do lastprivate(i)
++  do i = 1, 20
++  end do
++  !$omp end do
++end subroutine
+diff --git a/flang/test/Lower/OpenMP/lastprivate-simd.f90 b/flang/test/Lower/OpenMP/lastprivate-simd.f90
+index 75f5ebfe42f39..df42b35637de7 100644
+--- a/flang/test/Lower/OpenMP/lastprivate-simd.f90
++++ b/flang/test/Lower/OpenMP/lastprivate-simd.f90
+@@ -39,9 +39,9 @@ subroutine simd_ivs
+ ! CHECK:         %[[IDO3_PRIV_DECL:.*]]:2 = hlfir.declare %[[IDO3_PRIV_ARG]] {uniq_name = "{{.*}}Eido3"}
+ 
+ ! CHECK:         fir.if %33 {
+-! CHECK:           fir.store %{{.*}} to %[[IDO1_PRIV_DECL]]#1
+-! CHECK:           fir.store %{{.*}} to %[[IDO2_PRIV_DECL]]#1
+-! CHECK:           fir.store %{{.*}} to %[[IDO3_PRIV_DECL]]#1
++! CHECK:           hlfir.assign %{{.*}} to %[[IDO1_PRIV_DECL]]#1
++! CHECK:           hlfir.assign %{{.*}} to %[[IDO2_PRIV_DECL]]#1
++! CHECK:           hlfir.assign %{{.*}} to %[[IDO3_PRIV_DECL]]#1
+ ! CHECK:           %[[IDO1_VAL:.*]] = fir.load %[[IDO1_PRIV_DECL]]#0
+ ! CHECK:           hlfir.assign %[[IDO1_VAL]] to %[[IDO1_HOST_DECL]]#0
+ ! CHECK:           %[[IDO2_VAL:.*]] = fir.load %[[IDO2_PRIV_DECL]]#0
+diff --git a/flang/test/Lower/OpenMP/loop-directive.f90 b/flang/test/Lower/OpenMP/loop-directive.f90
+index 795f2a440fd0d..123dfffa350d7 100644
+--- a/flang/test/Lower/OpenMP/loop-directive.f90
++++ b/flang/test/Lower/OpenMP/loop-directive.f90
+@@ -15,7 +15,7 @@ subroutine test_no_clauses()
+   ! CHECK: omp.simd private(@[[I_PRIV]] %{{.*}}#0 -> %[[ARG:.*]] : !fir.ref<i32>) {
+   ! CHECK-NEXT:   omp.loop_nest (%[[IV:.*]]) : i32 = (%{{.*}}) to (%{{.*}}) {{.*}} {
+   ! CHECK:          %[[ARG_DECL:.*]]:2 = hlfir.declare %[[ARG]]
+-  ! CHECK:          fir.store %[[IV]] to %[[ARG_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:          hlfir.assign %[[IV]] to %[[ARG_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:        }
+   ! CHECK: }
+   !$omp loop
+diff --git a/flang/test/Lower/OpenMP/loop-pointer-variable.f90 b/flang/test/Lower/OpenMP/loop-pointer-variable.f90
+new file mode 100644
+index 0000000000000..67a179a3b79ee
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/loop-pointer-variable.f90
+@@ -0,0 +1,43 @@
++! This test checks lowering of OpenMP loops with pointer or allocatable loop index variable
++
++!RUN: bbc -emit-hlfir -fopenmp %s -o - 2>&1 | FileCheck %s
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - 2>&1 | FileCheck %s
++
++!CHECK-LABEL: QQmain
++program loop_var
++  integer, pointer :: ip1, ip2
++  integer, allocatable :: ia1
++
++!CHECK:  omp.wsloop private(@_QFEip1_private_box_ptr_i32 %{{.*}}#0 -> %[[IP1_PVT:.*]], @_QFEip2_private_box_ptr_i32 %{{.*}}#0 -> %[[IP2_PVT:.*]] : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK:  omp.loop_nest (%[[IP1_INDX:.*]], %[[IP2_INDX:.*]]) : i64 = ({{.*}}) to ({{.*}}) inclusive step ({{.*}})
++!CHECK:    %[[IP1_PVT_DECL:.*]]:2 = hlfir.declare %[[IP1_PVT]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEip1"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK:    %[[IP2_PVT_DECL:.*]]:2 = hlfir.declare %[[IP2_PVT]] {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFEip2"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
++!CHECK:    %[[IP1:.*]] = fir.convert %[[IP1_INDX]] : (i64) -> i32
++!CHECK:    %[[IP1_BOX:.*]] = fir.load %[[IP1_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK:    %[[IP1_ADDR:.*]] = fir.box_addr %[[IP1_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
++!CHECK:    hlfir.assign %[[IP1]] to %[[IP1_ADDR]] : i32, !fir.ptr<i32>
++!CHECK:    %[[IP2:.*]] = fir.convert %[[IP2_INDX]] : (i64) -> i32
++!CHECK:    %[[IP2_BOX:.*]] = fir.load %[[IP2_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>
++!CHECK:    %[[IP2_ADDR:.*]] = fir.box_addr %[[IP2_BOX]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
++!CHECK:    hlfir.assign %[[IP2]] to %[[IP2_ADDR]] : i32, !fir.ptr<i32>
++!CHECK:    omp.yield
++  !$omp do collapse(2)
++  do ip1 = 1, 10
++    do ip2 = 1, 20
++    end do
++  end do
++  !$omp end do
++
++!CHECK:    omp.simd private(@_QFEia1_private_box_heap_i32 %{{.*}}#0 -> %[[IA1_PVT:.*]] : !fir.ref<!fir.box<!fir.heap<i32>>>)
++!CHECK:      omp.loop_nest (%[[IA1_INDX:.*]]) : i64 = ({{.*}}) to ({{.*}}) inclusive step ({{.*}})
++!CHECK:        %[[IA1_PVT_DECL:.*]]:2 = hlfir.declare %[[IA1_PVT]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFEia1"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
++!CHECK:        %[[IA1:.*]] = fir.convert %[[IA1_INDX]] : (i64) -> i32
++!CHECK:        %[[IA1_BOX:.*]] = fir.load %[[IA1_PVT_DECL]]#1 : !fir.ref<!fir.box<!fir.heap<i32>>>
++!CHECK:        %[[IA1_ADDR:.*]] = fir.box_addr %[[IA1_BOX]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
++!CHECK:        hlfir.assign %[[IA1]] to %[[IA1_ADDR]] : i32, !fir.heap<i32>
++!CHECK:        omp.yield
++  !$omp simd
++  do ia1 = 1, 10
++  end do
++  !$omp end simd
++end program
+diff --git a/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90 b/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
+index 531413c124f81..27bbd9f59cf1a 100644
+--- a/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
++++ b/flang/test/Lower/OpenMP/parallel-lastprivate-clause-scalar.f90
+@@ -34,7 +34,7 @@
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ 
+ ! Testing lastprivate val update
+ !CHECK: hlfir.assign %[[ARG1_PVT_DECL]]#0 to %[[ARG1_DECL]]#0 : !fir.ref<!fir.char<1,5>>, !fir.ref<!fir.char<1,5>>
+@@ -70,7 +70,7 @@ subroutine lastprivate_character(arg1)
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ 
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE_DECL]]#0 : !fir.ref<i32>
+@@ -110,7 +110,7 @@ subroutine lastprivate_int(arg1)
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-DAG: %[[CLONE_LD1:.*]] = fir.load %[[CLONE1_DECL]]#0 : !fir.ref<i32>
+ !CHECK-DAG: hlfir.assign %[[CLONE_LD1]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+@@ -152,7 +152,7 @@ subroutine mult_lastprivate_int(arg1, arg2)
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ !Testing lastprivate val update
+ !CHECK-DAG: %[[CLONE_LD2:.*]] = fir.load %[[CLONE2_DECL]]#0 : !fir.ref<i32>
+ !CHECK-DAG: hlfir.assign %[[CLONE_LD2]] to %[[ARG2_DECL]]#0 : i32, !fir.ref<i32>
+@@ -196,7 +196,7 @@ subroutine mult_lastprivate_int2(arg1, arg2)
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE2_DECL]]#0 : !fir.ref<i32>
+ !CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG2_DECL]]#0 : i32, !fir.ref<i32>
+@@ -240,7 +240,7 @@ subroutine firstpriv_lastpriv_int(arg1, arg2)
+ !CHECK: %[[T3:.*]] = arith.cmpi sgt, %[[V]], %{{.*}} : i32
+ !CHECK: %[[IV_CMP:.*]] = arith.select %[[T1]], %[[T2]], %[[T3]] : i1
+ !CHECK: fir.if %[[IV_CMP]] {
+-!CHECK: fir.store %[[V]] to %{{.*}} : !fir.ref<i32>
++!CHECK: hlfir.assign %[[V]] to %{{.*}} : i32, !fir.ref<i32>
+ ! Testing lastprivate val update
+ !CHECK-NEXT: %[[CLONE_LD:.*]] = fir.load %[[CLONE1_DECL]]#0 : !fir.ref<i32>
+ !CHECK-NEXT: hlfir.assign %[[CLONE_LD]] to %[[ARG1_DECL]]#0 : i32, !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-private-clause-fixes.f90 b/flang/test/Lower/OpenMP/parallel-private-clause-fixes.f90
+index 2c34e33a0f4c1..2bd394eb265c2 100644
+--- a/flang/test/Lower/OpenMP/parallel-private-clause-fixes.f90
++++ b/flang/test/Lower/OpenMP/parallel-private-clause-fixes.f90
+@@ -52,7 +52,7 @@
+ ! CHECK-DAG:           %[[PRIV_I_DECL:.*]]:2 = hlfir.declare %[[PRIV_I]] {uniq_name = "_QFmultiple_private_fixEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK-DAG:           %[[PRIV_J_DECL:.*]]:2 = hlfir.declare %[[PRIV_J]] {uniq_name = "_QFmultiple_private_fixEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK-DAG:           %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFmultiple_private_fixEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:               fir.store %[[VAL_6]] to %[[PRIV_I_DECL]]#1 : !fir.ref<i32>
++! CHECK:               hlfir.assign %[[VAL_6]] to %[[PRIV_I_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:               %[[VAL_7:.*]] = arith.constant 1 : i32
+ ! CHECK:               %[[VAL_8:.*]] = fir.convert %[[VAL_7]] : (i32) -> index
+ ! CHECK:               %[[VAL_9:.*]] = fir.load %[[GAMA_DECL]]#0 : !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/parallel-private-clause.f90 b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+index e4dd4189c5e87..f05443372c48d 100644
+--- a/flang/test/Lower/OpenMP/parallel-private-clause.f90
++++ b/flang/test/Lower/OpenMP/parallel-private-clause.f90
+@@ -274,7 +274,7 @@ subroutine simple_loop_1
+   !$OMP DO
+   do i=1, 9
+   ! FIRDialect:      %[[ALLOCA_IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "_QFsimple_loop_1Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! FIRDialect:      fir.store %[[I]] to %[[ALLOCA_IV_DECL]]#1 : !fir.ref<i32>
++  ! FIRDialect:      hlfir.assign %[[I]] to %[[ALLOCA_IV_DECL]]#1 : i32, !fir.ref<i32>
+   ! FIRDialect:      %[[LOAD_IV:.*]] = fir.load %[[ALLOCA_IV_DECL]]#0 : !fir.ref<i32>
+   ! FIRDialect:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}} : (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -302,7 +302,7 @@ subroutine simple_loop_2
+   do i=1, 9
+   ! FIRDialect:     %[[R_DECL:.*]]:2 = hlfir.declare %[[R]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "{{.*}}Er"} : (!fir.ref<!fir.box<!fir.heap<f32>>>) -> (!fir.ref<!fir.box<!fir.heap<f32>>>, !fir.ref<!fir.box<!fir.heap<f32>>>)
+   ! FIRDialect:     %[[ALLOCA_IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "{{.*}}Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! FIRDialect:     fir.store %[[I]] to %[[ALLOCA_IV_DECL]]#1 : !fir.ref<i32>
++  ! FIRDialect:     hlfir.assign %[[I]] to %[[ALLOCA_IV_DECL]]#1 : i32, !fir.ref<i32>
+   ! FIRDialect:     %[[LOAD_IV:.*]] = fir.load %[[ALLOCA_IV_DECL]]#0 : !fir.ref<i32>
+   ! FIRDialect:     fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -330,7 +330,7 @@ subroutine simple_loop_3
+ 
+   ! FIRDialect:      %[[ALLOCA_IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "{{.*}}Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-  ! FIRDialect:      fir.store %[[I]] to %[[ALLOCA_IV_DECL:.*]]#1 : !fir.ref<i32>
++  ! FIRDialect:      hlfir.assign %[[I]] to %[[ALLOCA_IV_DECL:.*]]#1 : i32, !fir.ref<i32>
+   ! FIRDialect:      %[[LOAD_IV:.*]] = fir.load %[[ALLOCA_IV_DECL]]#0 : !fir.ref<i32>
+   ! FIRDialect:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -354,7 +354,7 @@ subroutine simd_loop_1
+   ! FIRDialect-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   !$OMP SIMD PRIVATE(r)
+   do i=1, 9
+-  ! FIRDialect:     fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++  ! FIRDialect:     hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+   ! FIRDialect:     %[[LOAD_IV:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+   ! FIRDialect:     fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+index 021f5d1ba2ef7..47fcd3d8941b1 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+@@ -101,7 +101,7 @@ program reduce
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_18:.*]]) : i32 = (%[[VAL_14]]) to (%[[VAL_15]]) inclusive step (%[[VAL_16]]) {
+ ! CHECK:                 %[[VAL_13:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_19:.*]]:2 = hlfir.declare %[[VAL_17]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+-! CHECK:                 fir.store %[[VAL_18]] to %[[VAL_13]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_18]] to %[[VAL_13]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.load %[[VAL_13]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_21:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:                 %[[VAL_22:.*]] = arith.constant 1 : index
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+index fd620c4080dbc..a3ad7c67971f2 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-pointer-array.f90
+@@ -113,7 +113,7 @@ program reduce
+ ! CHECK:               omp.loop_nest (%[[VAL_28:.*]]) : i32 = (%[[VAL_24]]) to (%[[VAL_25]]) inclusive step (%[[VAL_26]]) {
+ ! CHECK:                 %[[VAL_23:.*]]:2 = hlfir.declare %[[VAL_22]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_27]] {fortran_attrs = {{.*}}<pointer>, uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>)
+-! CHECK:                 fir.store %[[VAL_28]] to %[[VAL_23]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_28]] to %[[VAL_23]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_23]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_29]]#0 : !fir.ref<!fir.box<!fir.ptr<!fir.array<?xi32>>>>
+ ! CHECK:                 %[[VAL_32:.*]] = arith.constant 1 : index
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 194b3fdd98201..552cd00076c83 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -78,7 +78,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_21:.*]]) : i32 = (%[[VAL_17]]) to (%[[VAL_18]]) inclusive step (%[[VAL_19]]) {
+ ! CHECK:                 %[[VAL_16:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFsEc"} : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> (!fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.ref<!fir.box<!fir.array<?xi32>>>)
+-! CHECK:                 fir.store %[[VAL_21]] to %[[VAL_16]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_21]] to %[[VAL_16]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_22]]#0 : !fir.ref<!fir.box<!fir.array<?xi32>>>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_16]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = arith.constant 0 : index
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
+index 3acc21678b9c0..9661f0f864f93 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-firstpriv.f90
+@@ -18,7 +18,7 @@ subroutine omp_do_firstprivate(a)
+   ! CHECK-NEXT: omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_firstprivateEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_firstprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK-NEXT: omp.yield
+   ! CHECK-NEXT: }
+@@ -48,7 +48,7 @@ subroutine omp_do_firstprivate2(a, n)
+   ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2Ea"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[N_PVT_DECL:.*]]:2 = hlfir.declare %[[N_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2En"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_firstprivate2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK: fir.store %[[ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK: hlfir.assign %[[ARG2]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK: omp.yield
+     do i= a, n
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+index a7c0dc3b1b406..72482fc184861 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+@@ -21,7 +21,7 @@ subroutine omp_do_lastprivate(a)
+   ! CHECK:      %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_lastprivateEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK:      %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP]] : i32
+   ! CHECK:      %[[ZERO:.*]] = arith.constant 0 : i32
+@@ -30,7 +30,7 @@ subroutine omp_do_lastprivate(a)
+   ! CHECK:      %[[GT_UB:.*]] = arith.cmpi sgt, %[[NEXT_ARG1]], %[[UB]] : i32
+   ! CHECK:      %[[SEL:.*]] = arith.select %[[STEP_DIR]], %[[LT_UB]], %[[GT_UB]] : i1
+   ! CHECK:      fir.if %[[SEL]] {
+-  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+@@ -65,7 +65,7 @@ subroutine omp_do_lastprivate2(a, n)
+   ! CHECK: %[[N_PVT_DECL:.*]]:2 = hlfir.declare %[[N_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate2En"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-  ! CHECK: fir.store %[[ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK: hlfir.assign %[[ARG2]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK: %[[NEXT_ARG2:.*]] = arith.addi %[[ARG2]], %[[STEP]] : i32
+   ! CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
+@@ -74,7 +74,7 @@ subroutine omp_do_lastprivate2(a, n)
+   ! CHECK: %[[GT_UB:.*]] = arith.cmpi sgt, %[[NEXT_ARG2]], %[[UB]] : i32
+   ! CHECK: %[[SEL:.*]] = arith.select %[[STEP_DIR]], %[[LT_UB]], %[[GT_UB]] : i1
+   ! CHECK: fir.if %[[SEL]] {
+-  ! CHECK:   fir.store %[[NEXT_ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:   hlfir.assign %[[NEXT_ARG2]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:   %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:   hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:   %[[N_PVT_LOAD:.*]] = fir.load %[[N_PVT_DECL]]#0 : !fir.ref<i32>
+@@ -109,8 +109,8 @@ subroutine omp_do_lastprivate_collapse2(a)
+   ! CHECK:      %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK:      %[[J_PVT_DECL:.*]]:2 = hlfir.declare %[[J_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse2Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK-NEXT: fir.store %[[ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG2]] to %[[J_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP1]] : i32
+   ! CHECK:      %[[ZERO1:.*]] = arith.constant 0 : i32
+@@ -126,8 +126,8 @@ subroutine omp_do_lastprivate_collapse2(a)
+   ! CHECK:      %[[SEL2:.*]] = arith.select %[[STEP2_END]], %[[LT_UB2]], %[[GT_UB2]] : i1
+   ! CHECK:      %[[AND:.*]] = arith.andi %[[SEL1]], %[[SEL2]] : i1
+   ! CHECK:      fir.if %[[AND]] {
+-  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+@@ -169,9 +169,9 @@ subroutine omp_do_lastprivate_collapse3(a)
+   ! CHECK:      %[[J_PVT_DECL:.*]]:2 = hlfir.declare %[[J_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+   ! CHECK:      %[[K_PVT_DECL:.*]]:2 = hlfir.declare %[[K_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ek"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK-NEXT: fir.store %[[ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK-NEXT: fir.store %[[ARG3]] to %[[K_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG2]] to %[[J_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK-NEXT: hlfir.assign %[[ARG3]] to %[[K_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+   ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP1]] : i32
+   ! CHECK:      %[[ZERO1:.*]] = arith.constant 0 : i32
+@@ -194,9 +194,9 @@ subroutine omp_do_lastprivate_collapse3(a)
+   ! CHECK:      %[[SEL3:.*]] = arith.select %[[STEP3_END]], %[[LT_UB3]], %[[GT_UB3]] : i1
+   ! CHECK:      %[[AND2:.*]] = arith.andi %[[AND1]], %[[SEL3]] : i1
+   ! CHECK:      fir.if %[[AND2]] {
+-  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
+-  ! CHECK:        fir.store %[[NEXT_ARG3]] to %[[K_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : i32, !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[NEXT_ARG3]] to %[[K_PVT_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 : i32, !fir.ref<i32>
+   ! CHECK:      }
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop.f90 b/flang/test/Lower/OpenMP/parallel-wsloop.f90
+index 7116069e8daa6..d16237b342198 100644
+--- a/flang/test/Lower/OpenMP/parallel-wsloop.f90
++++ b/flang/test/Lower/OpenMP/parallel-wsloop.f90
+@@ -14,7 +14,7 @@ subroutine simple_parallel_do
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+   !$OMP PARALLEL DO
+   do i=1, 9
+-  ! CHECK:      fir.store %[[I]] to %[[IV_ADDR:.*]]#1 : !fir.ref<i32>
++  ! CHECK:      hlfir.assign %[[I]] to %[[IV_ADDR:.*]]#1 : i32, !fir.ref<i32>
+   ! CHECK:      %[[LOAD_IV:.*]] = fir.load %[[IV_ADDR]]#0 : !fir.ref<i32>
+   ! CHECK:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -43,7 +43,7 @@ subroutine parallel_do_with_parallel_clauses(cond, nt)
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+   !$OMP PARALLEL DO IF(cond) NUM_THREADS(nt) PROC_BIND(close)
+   do i=1, 9
+-  ! CHECK:      fir.store %[[I]] to %[[IV_ADDR:.*]]#1 : !fir.ref<i32>
++  ! CHECK:      hlfir.assign %[[I]] to %[[IV_ADDR:.*]]#1 : i32, !fir.ref<i32>
+   ! CHECK:      %[[LOAD_IV:.*]] = fir.load %[[IV_ADDR]]#0 : !fir.ref<i32>
+   ! CHECK:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -68,7 +68,7 @@ subroutine parallel_do_with_clauses(nt)
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+   !$OMP PARALLEL DO NUM_THREADS(nt) SCHEDULE(dynamic)
+   do i=1, 9
+-  ! CHECK:      fir.store %[[I]] to %[[IV_ADDR:.*]]#1 : !fir.ref<i32>
++  ! CHECK:      hlfir.assign %[[I]] to %[[IV_ADDR:.*]]#1 : i32, !fir.ref<i32>
+   ! CHECK:      %[[LOAD_IV:.*]] = fir.load %[[IV_ADDR]]#0 : !fir.ref<i32>
+   ! CHECK:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -102,7 +102,7 @@ subroutine parallel_do_with_privatisation_clauses(cond,nt)
+   do i=1, 9
+   ! CHECK:      %[[PRIVATE_COND_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_COND_REF]] {uniq_name = "_QFparallel_do_with_privatisation_clausesEcond"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+   ! CHECK:      %[[PRIVATE_NT_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_NT_REF]] {uniq_name = "_QFparallel_do_with_privatisation_clausesEnt"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK:      fir.store %[[I]] to %[[IV_ADDR:.*]]#1 : !fir.ref<i32>
++  ! CHECK:      hlfir.assign %[[I]] to %[[IV_ADDR:.*]]#1 : i32, !fir.ref<i32>
+   ! CHECK:      %[[LOAD_IV:.*]] = fir.load %[[IV_ADDR]]#0 : !fir.ref<i32>
+   ! CHECK:      fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+   ! CHECK:      %[[PRIVATE_COND_VAL:.*]] = fir.load %[[PRIVATE_COND_DECL]]#0 : !fir.ref<!fir.logical<4>>
+@@ -152,7 +152,7 @@ end subroutine parallel_private_do
+ ! CHECK:             omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[I_PRIV:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[I:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV]] {uniq_name = "_QFparallel_private_doEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[I]] to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[I]] to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 fir.call @_QPfoo(%[[I_PRIV_DECL]]#1, %[[COND_DECL]]#1, %[[NT_PRIV_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<!fir.logical<4>>, !fir.ref<i32>) -> ()
+ ! CHECK:                 omp.yield
+ ! CHECK:               }
+@@ -197,7 +197,7 @@ end subroutine omp_parallel_multiple_firstprivate_do
+ ! CHECK:             omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[I_PRIV_ADDR:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:          omp.loop_nest (%[[I:.*]]) : i32 = (%[[VAL_8]]) to (%[[VAL_9]]) inclusive step (%[[VAL_10]]) {
+ ! CHECK:                 %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_multiple_firstprivate_doEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[I]] to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[I]] to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 fir.call @_QPbar(%[[I_PRIV_DECL]]#1, %[[A_PRIV_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+ ! CHECK:                 omp.yield
+ ! CHECK:               }
+@@ -240,7 +240,7 @@ end subroutine parallel_do_private
+ ! CHECK:                 %[[NT_PRIV_DECL:.*]]:2 = hlfir.declare %[[NT_PRIV_ADDR]] {uniq_name = "_QFparallel_do_privateEnt"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ADDR]] {uniq_name = "_QFparallel_do_privateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-! CHECK:                 fir.store %[[I]] to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[I]] to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 fir.call @_QPfoo(%[[I_PRIV_DECL]]#1, %[[COND_PRIV_DECL]]#1, %[[NT_PRIV_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<!fir.logical<4>>, !fir.ref<i32>) -> ()
+ ! CHECK:                 omp.yield
+ ! CHECK:               }
+@@ -282,7 +282,7 @@ end subroutine omp_parallel_do_multiple_firstprivate
+ ! CHECK:                 %[[B_PRIV_DECL:.*]]:2 = hlfir.declare %[[B_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_do_multiple_firstprivateEb"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ADDR]] {uniq_name = "_QFomp_parallel_do_multiple_firstprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-! CHECK:                 fir.store %[[I]] to %[[I_PRIV_DECL]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[I]] to %[[I_PRIV_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 fir.call @_QPbar(%[[I_PRIV_DECL]]#1, %[[A_PRIV_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
+ ! CHECK:                 omp.yield
+ ! CHECK:               }
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index fc3d908801ff1..c1f1f4107785c 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -16,7 +16,7 @@ subroutine simd
+   ! CHECK-NEXT: omp.simd private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i=1, 9
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -36,7 +36,7 @@ subroutine simd_with_if_clause(n, threshold)
+   ! CHECK: omp.simd if(%[[COND:.*]]) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -55,7 +55,7 @@ subroutine simd_with_simdlen_clause(n, threshold)
+   ! CHECK: omp.simd simdlen(2) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -75,7 +75,7 @@ subroutine simd_with_simdlen_clause_from_param(n, threshold)
+   ! CHECK: omp.simd simdlen(2) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -95,7 +95,7 @@ subroutine simd_with_simdlen_clause_from_expr_from_param(n, threshold)
+   ! CHECK: omp.simd simdlen(6) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -114,7 +114,7 @@ subroutine simd_with_safelen_clause(n, threshold)
+   ! CHECK: omp.simd safelen(2) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -134,7 +134,7 @@ subroutine simd_with_safelen_clause_from_expr_from_param(n, threshold)
+   ! CHECK: omp.simd safelen(6) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -153,7 +153,7 @@ subroutine simd_with_simdlen_safelen_clause(n, threshold)
+   ! CHECK: omp.simd safelen(2) simdlen(1) private({{.*}}) {
+   ! CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+   do i = 1, n
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: fir.call @_FortranAioOutputInteger32({{.*}}, %[[LD]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -286,7 +286,7 @@ subroutine simd_with_reduction_clause
+   !$omp simd reduction(+:x)
+   do i=1, 9
+     ! CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X_RED]] {uniq_name = "_QFsimd_with_reduction_clauseEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-    ! CHECK: fir.store %[[I]] to %[[LOCAL:.*]]#1 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %[[I]] to %[[LOCAL:.*]]#1 : i32, !fir.ref<i32>
+     ! CHECK: %[[X_LD:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
+     ! CHECK: %[[I_LD:.*]] = fir.load %[[LOCAL]]#0 : !fir.ref<i32>
+     ! CHECK: %[[SUM:.*]] = arith.addi %[[X_LD]], %[[I_LD]] : i32
+diff --git a/flang/test/Lower/OpenMP/stop-stmt-in-region.f90 b/flang/test/Lower/OpenMP/stop-stmt-in-region.f90
+index d817c4e771b31..0e47866c86d4f 100644
+--- a/flang/test/Lower/OpenMP/stop-stmt-in-region.f90
++++ b/flang/test/Lower/OpenMP/stop-stmt-in-region.f90
+@@ -87,7 +87,7 @@ subroutine test_stop_in_region3()
+ ! CHECK:         omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[VAL_0:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:      omp.loop_nest (%[[VAL_6:.*]]) : i32 = (%[[VAL_3]]) to (%[[VAL_4]]) inclusive step (%[[VAL_5]]) {
+ ! CHECK:             %[[VAL_0_DECL:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFtest_stop_in_region4Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             fir.store %[[VAL_6]] to %[[VAL_0_DECL]]#1 : !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_6]] to %[[VAL_0_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:             cf.br ^bb1
+ ! CHECK:           ^bb1:
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant 3 : i32
+diff --git a/flang/test/Lower/OpenMP/target.f90 b/flang/test/Lower/OpenMP/target.f90
+index 3e1680a294b6e..2a0b310d6213e 100644
+--- a/flang/test/Lower/OpenMP/target.f90
++++ b/flang/test/Lower/OpenMP/target.f90
+@@ -590,7 +590,7 @@ subroutine omp_target_parallel_do
+          !CHECK-NEXT: omp.loop_nest (%[[I_VAL:.*]]) : i32
+          do i = 1, 1024
+          !CHECK:     %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_ALLOCA]] {uniq_name = "_QFomp_target_parallel_doEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-           !CHECK:   fir.store %[[I_VAL]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++           !CHECK:   hlfir.assign %[[I_VAL]] to %[[I_PVT_DECL]]#1 : i32, !fir.ref<i32>
+            !CHECK:   %[[C10:.*]] = arith.constant 10 : i32
+            !CHECK:   %[[I_PVT_VAL:.*]] = fir.load %[[I_PVT_DECL]]#0 : !fir.ref<i32>
+            !CHECK:   %[[I_VAL:.*]] = fir.convert %[[I_PVT_VAL]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/unstructured.f90 b/flang/test/Lower/OpenMP/unstructured.f90
+index febefef82ad1a..54d0685e1cf88 100644
+--- a/flang/test/Lower/OpenMP/unstructured.f90
++++ b/flang/test/Lower/OpenMP/unstructured.f90
+@@ -72,7 +72,7 @@ subroutine ss2(n) ! unstructured OpenMP construct; loop exit inside construct
+ ! CHECK:     omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[ALLOCA_2:.*]] : !fir.ref<i32>) {
+ ! CHECK:       omp.loop_nest (%[[ARG1:.*]]) : {{.*}} {
+ ! CHECK:         %[[OMP_LOOP_K_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_2]] {uniq_name = "_QFss3Ek"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:         fir.store %[[ARG1]] to %[[OMP_LOOP_K_DECL]]#1 : !fir.ref<i32>
++! CHECK:         hlfir.assign %[[ARG1]] to %[[OMP_LOOP_K_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:         @_FortranAioBeginExternalListOutput
+ ! CHECK:         %[[LOAD_1:.*]] = fir.load %[[OMP_LOOP_K_DECL]]#0 : !fir.ref<i32>
+ ! CHECK:         @_FortranAioOutputInteger32(%{{.*}}, %[[LOAD_1]])
+@@ -83,7 +83,7 @@ subroutine ss2(n) ! unstructured OpenMP construct; loop exit inside construct
+ ! CHECK:     omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[ALLOCA_1:.*]] : !fir.ref<i32>) {
+ ! CHECK:       omp.loop_nest (%[[ARG2:.*]]) : {{.*}} {
+ ! CHECK:         %[[OMP_LOOP_J_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_1]] {uniq_name = "_QFss3Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:         fir.store %[[ARG2]] to %[[OMP_LOOP_J_DECL]]#1 : !fir.ref<i32>
++! CHECK:         hlfir.assign %[[ARG2]] to %[[OMP_LOOP_J_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:         br ^bb1
+ ! CHECK:       ^bb2:  // 2 preds: ^bb1, ^bb5
+ ! CHECK:         cond_br %{{[0-9]*}}, ^bb3, ^bb6
+@@ -128,7 +128,7 @@ subroutine ss3(n) ! nested unstructured OpenMP constructs
+ ! CHECK:         omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[ALLOCA:.*]] : !fir.ref<i32>) {
+ ! CHECK-NEXT:      omp.loop_nest (%[[ARG:.*]]) : {{.*}} {
+ ! CHECK:             %[[OMP_LOOP_J_DECL:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFss4Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:             fir.store %[[ARG]] to %[[OMP_LOOP_J_DECL]]#1 : !fir.ref<i32>
++! CHECK:             hlfir.assign %[[ARG]] to %[[OMP_LOOP_J_DECL]]#1 : i32, !fir.ref<i32>
+ ! CHECK:             %[[COND:.*]] = arith.cmpi eq, %{{.*}}, %{{.*}}
+ ! CHECK:             %[[COND_XOR:.*]] = arith.xori %[[COND]], %{{.*}}
+ ! CHECK:             fir.if %[[COND_XOR]] {
+diff --git a/flang/test/Lower/OpenMP/wsloop-chunks.f90 b/flang/test/Lower/OpenMP/wsloop-chunks.f90
+index 0a2b962761acb..0d6669851a8c6 100644
+--- a/flang/test/Lower/OpenMP/wsloop-chunks.f90
++++ b/flang/test/Lower/OpenMP/wsloop-chunks.f90
+@@ -22,7 +22,7 @@ program wsloop
+ ! CHECK:         %[[VAL_5:.*]] = arith.constant 1 : i32
+ ! CHECK:         omp.wsloop nowait schedule(static = %[[VAL_2]] : i32) private({{.*}}) {
+ ! CHECK-NEXT:      omp.loop_nest (%[[ARG0:.*]]) : i32 = (%[[VAL_3]]) to (%[[VAL_4]]) inclusive step (%[[VAL_5]]) {
+-! CHECK:             fir.store %[[ARG0]] to %[[STORE_IV:.*]]#1 : !fir.ref<i32>
++! CHECK:             hlfir.assign %[[ARG0]] to %[[STORE_IV:.*]]#1 : i32, !fir.ref<i32>
+ ! CHECK:             %[[LOAD_IV:.*]] = fir.load %[[STORE_IV]]#0 : !fir.ref<i32>
+ ! CHECK:             {{.*}} = fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+ ! CHECK:             omp.yield
+@@ -42,7 +42,7 @@ program wsloop
+ ! CHECK:         %[[VAL_17:.*]] = arith.constant 1 : i32
+ ! CHECK:         omp.wsloop nowait schedule(static = %[[VAL_14]] : i32) private({{.*}}) {
+ ! CHECK-NEXT:      omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[VAL_15]]) to (%[[VAL_16]]) inclusive step (%[[VAL_17]]) {
+-! CHECK:             fir.store %[[ARG1]] to %[[STORE_IV1:.*]]#1 : !fir.ref<i32>
++! CHECK:             hlfir.assign %[[ARG1]] to %[[STORE_IV1:.*]]#1 : i32, !fir.ref<i32>
+ ! CHECK:             %[[VAL_24:.*]] = arith.constant 2 : i32
+ ! CHECK:             %[[LOAD_IV1:.*]] = fir.load %[[STORE_IV1]]#0 : !fir.ref<i32>
+ ! CHECK:             %[[VAL_25:.*]] = arith.muli %[[VAL_24]], %[[LOAD_IV1]] : i32
+@@ -68,7 +68,7 @@ program wsloop
+ ! CHECK:         %[[VAL_32:.*]] = arith.constant 1 : i32
+ ! CHECK:         omp.wsloop nowait schedule(static = %[[VAL_29]] : i32) private({{.*}}) {
+ ! CHECK-NEXT:      omp.loop_nest (%[[ARG2:.*]]) : i32 = (%[[VAL_30]]) to (%[[VAL_31]]) inclusive step (%[[VAL_32]]) {
+-! CHECK:             fir.store %[[ARG2]] to %[[STORE_IV2:.*]]#1 : !fir.ref<i32>
++! CHECK:             hlfir.assign %[[ARG2]] to %[[STORE_IV2:.*]]#1 : i32, !fir.ref<i32>
+ ! CHECK:             %[[VAL_39:.*]] = arith.constant 3 : i32
+ ! CHECK:             %[[LOAD_IV2:.*]] = fir.load %[[STORE_IV2]]#0 : !fir.ref<i32>
+ ! CHECK:             %[[VAL_40:.*]] = arith.muli %[[VAL_39]], %[[LOAD_IV2]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-collapse.f90 b/flang/test/Lower/OpenMP/wsloop-collapse.f90
+index 6d9862e625400..900fb9d5e5fa6 100644
+--- a/flang/test/Lower/OpenMP/wsloop-collapse.f90
++++ b/flang/test/Lower/OpenMP/wsloop-collapse.f90
+@@ -67,9 +67,9 @@ program wsloop_collapse
+ !CHECK:               %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_2]] {uniq_name = "_QFEj"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK:               %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFEk"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ 
+-!CHECK:               fir.store %[[VAL_33]] to %[[VAL_5]]#1 : !fir.ref<i32>
+-!CHECK:               fir.store %[[VAL_34]] to %[[VAL_3]]#1 : !fir.ref<i32>
+-!CHECK:               fir.store %[[VAL_35]] to %[[VAL_1]]#1 : !fir.ref<i32>
++!CHECK:               hlfir.assign %[[VAL_33]] to %[[VAL_5]]#1 : i32, !fir.ref<i32>
++!CHECK:               hlfir.assign %[[VAL_34]] to %[[VAL_3]]#1 : i32, !fir.ref<i32>
++!CHECK:               hlfir.assign %[[VAL_35]] to %[[VAL_1]]#1 : i32, !fir.ref<i32>
+ !CHECK:               %[[VAL_36:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ !CHECK:               %[[VAL_37:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+ !CHECK:               %[[VAL_38:.*]] = arith.addi %[[VAL_36]], %[[VAL_37]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-monotonic.f90 b/flang/test/Lower/OpenMP/wsloop-monotonic.f90
+index e21aa4c678f42..fdfae20f56654 100644
+--- a/flang/test/Lower/OpenMP/wsloop-monotonic.f90
++++ b/flang/test/Lower/OpenMP/wsloop-monotonic.f90
+@@ -16,7 +16,7 @@ program wsloop_dynamic
+ !CHECK:     %[[WS_STEP:.*]] = arith.constant 1 : i32
+ !CHECK:     omp.wsloop nowait schedule(dynamic, monotonic) private({{.*}}) {
+ !CHECK-NEXT:  omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+-!CHECK:         fir.store %[[I]] to %[[ALLOCA_IV:.*]]#1 : !fir.ref<i32>
++!CHECK:         hlfir.assign %[[I]] to %[[ALLOCA_IV:.*]]#1 : i32, !fir.ref<i32>
+ 
+   do i=1, 9
+     print*, i
+diff --git a/flang/test/Lower/OpenMP/wsloop-nonmonotonic.f90 b/flang/test/Lower/OpenMP/wsloop-nonmonotonic.f90
+index 23d3c49c00786..f2c34194f2992 100644
+--- a/flang/test/Lower/OpenMP/wsloop-nonmonotonic.f90
++++ b/flang/test/Lower/OpenMP/wsloop-nonmonotonic.f90
+@@ -18,7 +18,7 @@ program wsloop_dynamic
+ !CHECK:     omp.wsloop nowait schedule(dynamic, nonmonotonic) private(@{{.*}} %{{.*}}#0 -> %[[I_REF:.*]] : !fir.ref<i32>) {
+ !CHECK-NEXT:  omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+ !CHECK:         %[[ALLOCA_IV:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK:         fir.store %[[I]] to %[[ALLOCA_IV]]#1 : !fir.ref<i32>
++!CHECK:         hlfir.assign %[[I]] to %[[ALLOCA_IV]]#1 : i32, !fir.ref<i32>
+ 
+   do i=1, 9
+     print*, i
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+index bc021e7a3b273..880adfb31f6cd 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add-byref.f90
+@@ -92,7 +92,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+@@ -133,7 +133,7 @@ subroutine simple_int_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.convert %[[VAL_14]] : (i32) -> f32
+@@ -175,7 +175,7 @@ subroutine simple_real_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+@@ -215,7 +215,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.convert %[[VAL_13]] : (i32) -> f32
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -266,7 +266,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_int_reductions_same_typeEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = arith.addi %[[VAL_23]], %[[VAL_24]] : i32
+@@ -328,7 +328,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_real_reductions_same_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = fir.convert %[[VAL_24]] : (i32) -> f32
+@@ -398,7 +398,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+ ! CHECK:                 %[[VAL_26:.*]]:2 = hlfir.declare %[[VAL_21]] {uniq_name = "_QFmultiple_reductions_different_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_22]] {uniq_name = "_QFmultiple_reductions_different_typeEw"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+-! CHECK:                 fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_23]] to %[[VAL_15]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_28:.*]] = fir.load %[[VAL_24]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_29:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = arith.addi %[[VAL_28]], %[[VAL_29]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-add.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
+index a355e968b4146..924866838dc1f 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-add.f90
+@@ -60,7 +60,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+@@ -101,7 +101,7 @@ subroutine simple_int_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.convert %[[VAL_14]] : (i32) -> f32
+@@ -143,7 +143,7 @@ subroutine simple_real_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.addi %[[VAL_13]], %[[VAL_14]] : i32
+@@ -183,7 +183,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.convert %[[VAL_13]] : (i32) -> f32
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -234,7 +234,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_int_reductions_same_typeEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = arith.addi %[[VAL_23]], %[[VAL_24]] : i32
+@@ -296,7 +296,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_real_reductions_same_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = fir.convert %[[VAL_24]] : (i32) -> f32
+@@ -366,7 +366,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+ ! CHECK:                 %[[VAL_26:.*]]:2 = hlfir.declare %[[VAL_21]] {uniq_name = "_QFmultiple_reductions_different_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_22]] {uniq_name = "_QFmultiple_reductions_different_typeEw"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+-! CHECK:                 fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_23]] to %[[VAL_15]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_28:.*]] = fir.load %[[VAL_24]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_29:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = arith.addi %[[VAL_28]], %[[VAL_29]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+index d9c75af1fe62c..de9136fe08fb7 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable-array-minmax.f90
+@@ -225,7 +225,7 @@ program reduce15
+ ! CHECK:               omp.loop_nest (%[[VAL_61:.*]]) : i32 = (%[[VAL_57]]) to (%[[VAL_58]]) inclusive step (%[[VAL_59]]) {
+ ! CHECK:                 %[[VAL_56:.*]]:2 = hlfir.declare %[[VAL_55]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_62:.*]]:2 = hlfir.declare %[[VAL_60]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEmaxes"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+-! CHECK:                 fir.store %[[VAL_61]] to %[[VAL_56]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_61]] to %[[VAL_56]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_63:.*]] = fir.load %[[VAL_1]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:                 %[[VAL_64:.*]] = arith.constant 0 : index
+ ! CHECK:                 %[[VAL_65:.*]]:3 = fir.box_dims %[[VAL_63]], %[[VAL_64]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+@@ -266,7 +266,7 @@ program reduce15
+ ! CHECK:               omp.loop_nest (%[[VAL_93:.*]]) : i32 = (%[[VAL_89]]) to (%[[VAL_90]]) inclusive step (%[[VAL_91]]) {
+ ! CHECK:                 %[[VAL_88:.*]]:2 = hlfir.declare %[[VAL_87]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_94:.*]]:2 = hlfir.declare %[[VAL_92]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEmins"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+-! CHECK:                 fir.store %[[VAL_93]] to %[[VAL_88]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_93]] to %[[VAL_88]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_95:.*]] = fir.load %[[VAL_1]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:                 %[[VAL_96:.*]] = arith.constant 0 : index
+ ! CHECK:                 %[[VAL_97:.*]]:3 = fir.box_dims %[[VAL_95]], %[[VAL_96]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+index 7e6d7fddff5a1..af2f3ce797f96 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-allocatable.f90
+@@ -84,7 +84,7 @@ program reduce
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_15:.*]]) : i32 = (%[[VAL_11]]) to (%[[VAL_12]]) inclusive step (%[[VAL_13]]) {
+ ! CHECK:                 %[[VAL_10:.*]]:2 = hlfir.declare %[[VAL_9]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_16:.*]]:2 = hlfir.declare %[[VAL_14]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
+-! CHECK:                 fir.store %[[VAL_15]] to %[[VAL_10]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_15]] to %[[VAL_10]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_17:.*]] = fir.load %[[VAL_10]]#0 : !fir.ref<i32>
+ ! CHECK:                 hlfir.assign %[[VAL_17]] to %[[VAL_16]]#0 realloc : i32, !fir.ref<!fir.box<!fir.heap<i32>>>
+ ! CHECK:                 omp.yield
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index 0e2fc3a24ee1b..9ef0e64629977 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -88,7 +88,7 @@ subroutine reduce(r)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFFreduceEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {fortran_attrs = {{.*}}, uniq_name = "_QFFreduceEr"} : (!fir.ref<!fir.box<!fir.array<?xf64>>>) -> (!fir.ref<!fir.box<!fir.array<?xf64>>>, !fir.ref<!fir.box<!fir.array<?xf64>>>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.convert %[[VAL_13]] : (i32) -> f64
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<!fir.box<!fir.array<?xf64>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index 065923ae3cf31..166d0ad437180 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -83,7 +83,7 @@ program reduce
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:                 %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+-! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_9]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_14]] to %[[VAL_9]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.load %[[VAL_9]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_17:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:                 %[[VAL_18:.*]] = arith.constant 1 : index
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index a25bedb359f4e..4cee25d220a08 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -83,7 +83,7 @@ program reduce
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_14:.*]]) : i32 = (%[[VAL_10]]) to (%[[VAL_11]]) inclusive step (%[[VAL_12]]) {
+ ! CHECK:                 %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_15:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEr"} : (!fir.ref<!fir.box<!fir.array<2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<2xi32>>>, !fir.ref<!fir.box<!fir.array<2xi32>>>)
+-! CHECK:                 fir.store %[[VAL_14]] to %[[VAL_9]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_14]] to %[[VAL_9]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:                 %[[VAL_17:.*]] = arith.constant 1 : index
+ ! CHECK:                 %[[VAL_18:.*]] = hlfir.designate %[[VAL_16]] (%[[VAL_17]])  : (!fir.box<!fir.array<2xi32>>, index) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+index 18dcc3d722886..5602d92e7803b 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand-byref.f90
+@@ -39,7 +39,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_iandEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iandEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
+index eaf07f93c7474..62e74a7c6f185 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-iand.f90
+@@ -31,7 +31,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_iandEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iandEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+index 6be6913f91a33..b1d6d82f93e50 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ieor-byref.f90
+@@ -32,7 +32,7 @@
+ !CHECK-NEXT: omp.loop_nest
+ !CHECK: %[[I_DECL:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFreduction_ieorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRV_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: fir.store %{{.*}} to %[[I_DECL]]#1 : !fir.ref<i32>
++!CHECK: hlfir.assign %{{.*}} to %[[I_DECL]]#1 : i32, !fir.ref<i32>
+ !CHECK: %[[I_32:.*]] = fir.load %[[I_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[I_64:.*]] = fir.convert %[[I_32]] : (i32) -> i64
+ !CHECK: %[[Y_I_REF:.*]] = hlfir.designate %[[Y_DECL]]#0 (%[[I_64]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ieor.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ieor.f90
+index 632dbcf1348ec..1659cfa207a29 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ieor.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ieor.f90
+@@ -21,7 +21,7 @@
+ !CHECK-NEXT: omp.loop_nest
+ !CHECK: %[[I_DECL:.*]]:2 = hlfir.declare %[[I_REF]] {uniq_name = "_QFreduction_ieorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRV_DECL:.+]]:2 = hlfir.declare %[[PRV]] {{.*}} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-!CHECK: fir.store %{{.*}} to %[[I_DECL]]#1 : !fir.ref<i32>
++!CHECK: hlfir.assign %{{.*}} to %[[I_DECL]]#1 : i32, !fir.ref<i32>
+ !CHECK: %[[I_32:.*]] = fir.load %[[I_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[I_64:.*]] = fir.convert %[[I_32]] : (i32) -> i64
+ !CHECK: %[[Y_I_REF:.*]] = hlfir.designate %[[Y_DECL]]#0 (%[[I_64]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+index 90b9d2f61f930..33a464e5a2079 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior-byref.f90
+@@ -37,7 +37,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_iorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iorEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
+index 144bc17cf8b31..f2d95362ce20a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-ior.f90
+@@ -31,7 +31,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_iorEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_iorEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+index e73540a93a71b..7946c8cc62ea4 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and-byref.f90
+@@ -46,7 +46,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -94,7 +94,7 @@ end subroutine simple_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -153,7 +153,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and.f90
+index c059dab5bff5a..2093df1f7e0fd 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-and.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-and.f90
+@@ -38,7 +38,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -86,7 +86,7 @@ end subroutine simple_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -145,7 +145,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+index 5e24ad6f7bb63..d6797d07aef98 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv-byref.f90
+@@ -46,7 +46,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -93,7 +93,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -152,7 +152,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv.f90
+index ad9e869984eac..c76f1ee69fa83 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-eqv.f90
+@@ -38,7 +38,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -85,7 +85,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -144,7 +144,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+index b5bf1d0d0b589..5950fd9984a55 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv-byref.f90
+@@ -46,7 +46,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -94,7 +94,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -155,7 +155,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv.f90
+index ac9fc7f051d88..663edc908df84 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-neqv.f90
+@@ -38,7 +38,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -86,7 +86,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -147,7 +147,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+index 883064884b637..02b287b531a2a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or-byref.f90
+@@ -45,7 +45,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -92,7 +92,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -151,7 +151,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or.f90
+index 312c08d17a14d..4cb7a16bbc460 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-logical-or.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-logical-or.f90
+@@ -38,7 +38,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reductionEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_17]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_20:.*]] = fir.convert %[[VAL_19]] : (i32) -> i64
+@@ -85,7 +85,7 @@ subroutine simple_reduction(y)
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_16:.*]]) : i32 = (%[[VAL_12]]) to (%[[VAL_13]]) inclusive step (%[[VAL_14]]) {
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_17:.*]]:2 = hlfir.declare %[[VAL_15]] {uniq_name = "_QFsimple_reduction_switch_orderEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_16]] to %[[VAL_11]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_16]] to %[[VAL_11]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_18:.*]] = fir.load %[[VAL_11]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_19:.*]] = fir.convert %[[VAL_18]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_20:.*]] = hlfir.designate %[[VAL_7]]#0 (%[[VAL_19]])  : (!fir.ref<!fir.array<100x!fir.logical<4>>>, i64) -> !fir.ref<!fir.logical<4>>
+@@ -144,7 +144,7 @@ subroutine simple_reduction_switch_order(y)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_23]] {uniq_name = "_QFmultiple_reductionsEx"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_28:.*]]:2 = hlfir.declare %[[VAL_24]] {uniq_name = "_QFmultiple_reductionsEy"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+ ! CHECK:                 %[[VAL_29:.*]]:2 = hlfir.declare %[[VAL_25]] {uniq_name = "_QFmultiple_reductionsEz"} : (!fir.ref<!fir.logical<4>>) -> (!fir.ref<!fir.logical<4>>, !fir.ref<!fir.logical<4>>)
+-! CHECK:                 fir.store %[[VAL_26]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_26]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = fir.load %[[VAL_27]]#0 : !fir.ref<!fir.logical<4>>
+ ! CHECK:                 %[[VAL_31:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_32:.*]] = fir.convert %[[VAL_31]] : (i32) -> i64
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+index 07c18f90480bf..3fbae031423d2 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max-byref.f90
+@@ -52,7 +52,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+@@ -81,7 +81,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+@@ -100,7 +100,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_31:.*]]:2 = hlfir.declare %[[VAL_30]] {uniq_name = "_QFreduction_max_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_36]] to %[[VAL_31]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_39:.*]] = fir.convert %[[VAL_38]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_40:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_39]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-max.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
+index 7bdfa0948c747..e70c405b67691 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-max.f90
+@@ -42,7 +42,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+@@ -71,7 +71,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_max_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+@@ -90,7 +90,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_31:.*]]:2 = hlfir.declare %[[VAL_30]] {uniq_name = "_QFreduction_max_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_max_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_36]] to %[[VAL_31]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_39:.*]] = fir.convert %[[VAL_38]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_40:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_39]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+index 88a455f4b45ac..4f5219160a7f7 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min-byref.f90
+@@ -52,7 +52,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_min_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+@@ -81,7 +81,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_min_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+@@ -102,7 +102,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_31:.*]]:2 = hlfir.declare %[[VAL_30]] {uniq_name = "_QFreduction_min_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_36]] to %[[VAL_31]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_39:.*]] = fir.convert %[[VAL_38]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_40:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_39]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
+index 6d4dcf1ab68eb..8b3b86adb1863 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min.f90
+@@ -42,7 +42,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_min_intEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_intEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xi32>>, i64) -> !fir.ref<i32>
+@@ -71,7 +71,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_13:.*]]) : i32 = (%[[VAL_9]]) to (%[[VAL_10]]) inclusive step (%[[VAL_11]]) {
+ ! CHECK:                 %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_7]] {uniq_name = "_QFreduction_min_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_12]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_13]] to %[[VAL_8]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_13]] to %[[VAL_8]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_8]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_16:.*]] = fir.convert %[[VAL_15]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_17:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_16]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+@@ -92,7 +92,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_36:.*]]) : i32 = (%[[VAL_32]]) to (%[[VAL_33]]) inclusive step (%[[VAL_34]]) {
+ ! CHECK:                 %[[VAL_31:.*]]:2 = hlfir.declare %[[VAL_30]] {uniq_name = "_QFreduction_min_realEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_37:.*]]:2 = hlfir.declare %[[VAL_35]] {uniq_name = "_QFreduction_min_realEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_36]] to %[[VAL_31]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_36]] to %[[VAL_31]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_38:.*]] = fir.load %[[VAL_31]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_39:.*]] = fir.convert %[[VAL_38]] : (i32) -> i64
+ ! CHECK:                 %[[VAL_40:.*]] = hlfir.designate %[[VAL_5]]#0 (%[[VAL_39]])  : (!fir.box<!fir.array<?xf32>>, i64) -> !fir.ref<f32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+index db8e59cb09dfa..c76bdda9affce 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-min2.f90
+@@ -41,7 +41,7 @@ program reduce
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_10:.*]]) : i32 = (%[[VAL_6]]) to (%[[VAL_7]]) inclusive step (%[[VAL_8]]) {
+ ! CHECK:                 %[[VAL_5:.*]]:2 = hlfir.declare %[[VAL_4]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_11:.*]]:2 = hlfir.declare %[[VAL_9]] {uniq_name = "_QFEr"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_10]] to %[[VAL_5]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_10]] to %[[VAL_5]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_12:.*]] = fir.load %[[VAL_5]]#0 : !fir.ref<i32>
+ ! CHECK:                 hlfir.assign %[[VAL_12]] to %[[VAL_11]]#0 : i32, !fir.ref<i32>
+ ! CHECK:                 omp.yield
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+index f3b5a3da4dc0b..5ca80db809cdb 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul-byref.f90
+@@ -95,7 +95,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.muli %[[VAL_13]], %[[VAL_14]] : i32
+@@ -131,7 +131,7 @@ subroutine simple_int_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.convert %[[VAL_14]] : (i32) -> f32
+@@ -168,7 +168,7 @@ subroutine simple_real_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.muli %[[VAL_13]], %[[VAL_14]] : i32
+@@ -204,7 +204,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.convert %[[VAL_13]] : (i32) -> f32
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -251,7 +251,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_int_reductions_same_typeEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = arith.muli %[[VAL_23]], %[[VAL_24]] : i32
+@@ -309,7 +309,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_real_reductions_same_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = fir.convert %[[VAL_24]] : (i32) -> f32
+@@ -375,7 +375,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+ ! CHECK:                 %[[VAL_26:.*]]:2 = hlfir.declare %[[VAL_21]] {uniq_name = "_QFmultiple_reductions_different_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_22]] {uniq_name = "_QFmultiple_reductions_different_typeEw"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+-! CHECK:                 fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_23]] to %[[VAL_15]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_28:.*]] = fir.load %[[VAL_24]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_29:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = arith.muli %[[VAL_28]], %[[VAL_29]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
+index 09c44f187f4a2..724fb33c35692 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-mul.f90
+@@ -62,7 +62,7 @@
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reductionEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.muli %[[VAL_13]], %[[VAL_14]] : i32
+@@ -98,7 +98,7 @@ subroutine simple_int_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reductionEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reductionEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = fir.convert %[[VAL_14]] : (i32) -> f32
+@@ -135,7 +135,7 @@ subroutine simple_real_reduction
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_int_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_int_reduction_switch_orderEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_15:.*]] = arith.muli %[[VAL_13]], %[[VAL_14]] : i32
+@@ -171,7 +171,7 @@ subroutine simple_int_reduction_switch_order
+ ! CHECK-NEXT:          omp.loop_nest (%[[VAL_11:.*]]) : i32 = (%[[VAL_7]]) to (%[[VAL_8]]) inclusive step (%[[VAL_9]]) {
+ ! CHECK:                 %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_5]] {uniq_name = "_QFsimple_real_reduction_switch_orderEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_12:.*]]:2 = hlfir.declare %[[VAL_10]] {uniq_name = "_QFsimple_real_reduction_switch_orderEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_11]] to %[[VAL_6]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_11]] to %[[VAL_6]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_13:.*]] = fir.load %[[VAL_6]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_14:.*]] = fir.convert %[[VAL_13]] : (i32) -> f32
+ ! CHECK:                 %[[VAL_15:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<f32>
+@@ -218,7 +218,7 @@ subroutine simple_real_reduction_switch_order
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_int_reductions_same_typeEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_int_reductions_same_typeEy"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_int_reductions_same_typeEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = arith.muli %[[VAL_23]], %[[VAL_24]] : i32
+@@ -276,7 +276,7 @@ subroutine multiple_int_reductions_same_type
+ ! CHECK:                 %[[VAL_20:.*]]:2 = hlfir.declare %[[VAL_16]] {uniq_name = "_QFmultiple_real_reductions_same_typeEx"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFmultiple_real_reductions_same_typeEy"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFmultiple_real_reductions_same_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+-! CHECK:                 fir.store %[[VAL_19]] to %[[VAL_12]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_19]] to %[[VAL_12]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_20]]#0 : !fir.ref<f32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.load %[[VAL_12]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_25:.*]] = fir.convert %[[VAL_24]] : (i32) -> f32
+@@ -342,7 +342,7 @@ subroutine multiple_real_reductions_same_type
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_20]] {uniq_name = "_QFmultiple_reductions_different_typeEy"} : (!fir.ref<i64>) -> (!fir.ref<i64>, !fir.ref<i64>)
+ ! CHECK:                 %[[VAL_26:.*]]:2 = hlfir.declare %[[VAL_21]] {uniq_name = "_QFmultiple_reductions_different_typeEz"} : (!fir.ref<f32>) -> (!fir.ref<f32>, !fir.ref<f32>)
+ ! CHECK:                 %[[VAL_27:.*]]:2 = hlfir.declare %[[VAL_22]] {uniq_name = "_QFmultiple_reductions_different_typeEw"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+-! CHECK:                 fir.store %[[VAL_23]] to %[[VAL_15]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_23]] to %[[VAL_15]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_28:.*]] = fir.load %[[VAL_24]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_29:.*]] = fir.load %[[VAL_15]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_30:.*]] = arith.muli %[[VAL_28]], %[[VAL_29]] : i32
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+index 75773416e4840..15cfd6a349e76 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-multiple-clauses.f90
+@@ -120,7 +120,7 @@ program main
+ ! CHECK:                 %[[VAL_14:.*]]:2 = hlfir.declare %[[VAL_13]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_21:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFEscalar"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
+ ! CHECK:                 %[[VAL_22:.*]]:2 = hlfir.declare %[[VAL_19]] {uniq_name = "_QFEarray"} : (!fir.ref<!fir.box<!fir.array<3x3xf64>>>) -> (!fir.ref<!fir.box<!fir.array<3x3xf64>>>, !fir.ref<!fir.box<!fir.array<3x3xf64>>>)
+-! CHECK:                 fir.store %[[VAL_20]] to %[[VAL_14]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_20]] to %[[VAL_14]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_23:.*]] = fir.load %[[VAL_14]]#0 : !fir.ref<i32>
+ ! CHECK:                 %[[VAL_24:.*]] = fir.convert %[[VAL_23]] : (i32) -> f64
+ ! CHECK:                 hlfir.assign %[[VAL_24]] to %[[VAL_21]]#0 : f64, !fir.ref<f64>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
+index f706e48b8fda8..5bf9429f52285 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-pointer.f90
+@@ -94,7 +94,7 @@ program reduce_pointer
+ ! CHECK:               omp.loop_nest (%[[VAL_24:.*]]) : i32 = (%[[VAL_20]]) to (%[[VAL_21]]) inclusive step (%[[VAL_22]]) {
+ ! CHECK:                 %[[VAL_19:.*]]:2 = hlfir.declare %[[VAL_18]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ ! CHECK:                 %[[VAL_25:.*]]:2 = hlfir.declare %[[VAL_23]] {fortran_attrs = {{.*}}<pointer>, uniq_name = "_QFEv"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+-! CHECK:                 fir.store %[[VAL_24]] to %[[VAL_19]]#1 : !fir.ref<i32>
++! CHECK:                 hlfir.assign %[[VAL_24]] to %[[VAL_19]]#1 : i32, !fir.ref<i32>
+ ! CHECK:                 %[[VAL_26:.*]] = fir.load %[[VAL_25]]#0 : !fir.ref<!fir.box<!fir.ptr<i32>>>
+ ! CHECK:                 %[[VAL_27:.*]] = fir.box_addr %[[VAL_26]] : (!fir.box<!fir.ptr<i32>>) -> !fir.ptr<i32>
+ ! CHECK:                 %[[VAL_28:.*]] = fir.load %[[VAL_27]] : !fir.ptr<i32>
+diff --git a/flang/test/Lower/OpenMP/wsloop-schedule.f90 b/flang/test/Lower/OpenMP/wsloop-schedule.f90
+index 0ff4ce7c3ede3..28f7ef07aa3d9 100644
+--- a/flang/test/Lower/OpenMP/wsloop-schedule.f90
++++ b/flang/test/Lower/OpenMP/wsloop-schedule.f90
+@@ -16,7 +16,7 @@ program wsloop_dynamic
+ !CHECK:      %[[WS_STEP:.*]] = arith.constant 1 : i32
+ !CHECK:      omp.wsloop nowait schedule(runtime, simd) private({{.*}}) {
+ !CHECK-NEXT:   omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+-!CHECK:          fir.store %[[I]] to %[[STORE:.*]]#1 : !fir.ref<i32>
++!CHECK:          hlfir.assign %[[I]] to %[[STORE:.*]]#1 : i32, !fir.ref<i32>
+ 
+   do i=1, 9
+     print*, i
+diff --git a/flang/test/Lower/OpenMP/wsloop-variable.f90 b/flang/test/Lower/OpenMP/wsloop-variable.f90
+index 50b2b3a21ff1e..654631f8d75d8 100644
+--- a/flang/test/Lower/OpenMP/wsloop-variable.f90
++++ b/flang/test/Lower/OpenMP/wsloop-variable.f90
+@@ -25,8 +25,8 @@ program wsloop_variable
+ !CHECK:      omp.wsloop private({{.*}}) {
+ !CHECK-NEXT:   omp.loop_nest (%[[ARG0:.*]], %[[ARG1:.*]]) : i64 = (%[[TMP2]], %[[TMP5]]) to (%[[TMP3]], %[[TMP6]]) inclusive step (%[[TMP4]], %[[TMP7]]) {
+ !CHECK:          %[[ARG0_I16:.*]] = fir.convert %[[ARG0]] : (i64) -> i16
+-!CHECK:          fir.store %[[ARG0_I16]] to %[[STORE_IV0:.*]]#1 : !fir.ref<i16>
+-!CHECK:          fir.store %[[ARG1]] to %[[STORE_IV1:.*]]#1 : !fir.ref<i64>
++!CHECK:          hlfir.assign %[[ARG0_I16]] to %[[STORE_IV0:.*]]#1 : i16, !fir.ref<i16>
++!CHECK:          hlfir.assign %[[ARG1]] to %[[STORE_IV1:.*]]#1 : i64, !fir.ref<i64>
+ !CHECK:          %[[LOAD_IV0:.*]] = fir.load %[[STORE_IV0]]#0 : !fir.ref<i16>
+ !CHECK:          %[[LOAD_IV0_I64:.*]] = fir.convert %[[LOAD_IV0]] : (i16) -> i64
+ !CHECK:          %[[LOAD_IV1:.*]] = fir.load %[[STORE_IV1]]#0 : !fir.ref<i64>
+@@ -51,7 +51,7 @@ program wsloop_variable
+ !CHECK:      omp.wsloop private({{.*}}) {
+ !CHECK-NEXT:   omp.loop_nest (%[[ARG0:.*]]) : i32 = (%[[TMP12]]) to (%[[TMP13]]) inclusive step (%[[TMP14]]) {
+ !CHECK:          %[[ARG0_I16:.*]] = fir.convert %[[ARG0]] : (i32) -> i16
+-!CHECK:          fir.store %[[ARG0_I16]] to %[[STORE3:.*]]#1 : !fir.ref<i16>
++!CHECK:          hlfir.assign %[[ARG0_I16]] to %[[STORE3:.*]]#1 : i16, !fir.ref<i16>
+ !CHECK:          %[[LOAD3:.*]] = fir.load %[[STORE3]]#0 : !fir.ref<i16>
+ !CHECK:          %[[TMP16:.*]] = fir.convert %[[LOAD3]] : (i16) -> f32
+ !CHECK:          hlfir.assign %[[TMP16]] to %{{.*}} : f32, !fir.ref<f32>
+@@ -71,7 +71,7 @@ program wsloop_variable
+ !CHECK:      omp.wsloop private({{.*}}) {
+ !CHECK-NEXT:   omp.loop_nest (%[[ARG1:.*]]) : i64 = (%[[TMP17]]) to (%[[TMP18]]) inclusive step (%[[TMP19]])  {
+ !CHECK:          %[[ARG1_I128:.*]] = fir.convert %[[ARG1]] : (i64) -> i128
+-!CHECK:          fir.store %[[ARG1_I128]] to %[[STORE4:.*]]#1 : !fir.ref<i128>
++!CHECK:          hlfir.assign %[[ARG1_I128]] to %[[STORE4:.*]]#1 : i128, !fir.ref<i128>
+ !CHECK:          %[[LOAD4:.*]] = fir.load %[[STORE4]]#0 : !fir.ref<i128>
+ !CHECK:          %[[TMP21:.*]] = fir.convert %[[LOAD4]] : (i128) -> f32
+ !CHECK:          hlfir.assign %[[TMP21]] to %{{.*}} : f32, !fir.ref<f32>
+@@ -132,7 +132,7 @@ subroutine wsloop_variable_sub
+ !CHECK-NEXT:        omp.loop_nest (%[[VAL_27:.*]]) : i32 = (%[[VAL_22]]) to (%[[VAL_25]]) inclusive step (%[[VAL_26]]) {
+ !CHECK:               %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_2]] {uniq_name = "_QFwsloop_variable_subEi2"} : (!fir.ref<i16>) -> (!fir.ref<i16>, !fir.ref<i16>)
+ !CHECK:               %[[VAL_28:.*]] = fir.convert %[[VAL_27]] : (i32) -> i16
+-!CHECK:               fir.store %[[VAL_28]] to %[[VAL_3]]#1 : !fir.ref<i16>
++!CHECK:               hlfir.assign %[[VAL_28]] to %[[VAL_3]]#1 : i16, !fir.ref<i16>
+ !CHECK:               %[[VAL_29:.*]] = fir.load %[[VAL_7]]#0 : !fir.ref<i128>
+ !CHECK:               %[[VAL_30:.*]] = fir.convert %[[VAL_29]] : (i128) -> index
+ !CHECK:               %[[VAL_31:.*]] = arith.constant 100 : i32
+@@ -178,7 +178,7 @@ subroutine wsloop_variable_sub
+ !CHECK-NEXT:        omp.loop_nest (%[[VAL_53:.*]]) : i32 = (%[[VAL_50]]) to (%[[VAL_51]]) inclusive step (%[[VAL_52]]) {
+ !CHECK:               %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFwsloop_variable_subEi1"} : (!fir.ref<i8>) -> (!fir.ref<i8>, !fir.ref<i8>)
+ !CHECK:               %[[VAL_54:.*]] = fir.convert %[[VAL_53]] : (i32) -> i8
+-!CHECK:               fir.store %[[VAL_54]] to %[[VAL_1]]#1 : !fir.ref<i8>
++!CHECK:               hlfir.assign %[[VAL_54]] to %[[VAL_1]]#1 : i8, !fir.ref<i8>
+ !CHECK:               %[[VAL_55:.*]] = fir.load %[[VAL_1]]#0 : !fir.ref<i8>
+ !CHECK:               %[[VAL_56:.*]] = fir.load %[[VAL_19]]#0 : !fir.ref<i8>
+ !CHECK:               %[[VAL_57:.*]] = arith.cmpi eq, %[[VAL_55]], %[[VAL_56]] : i8
+diff --git a/flang/test/Lower/OpenMP/wsloop.f90 b/flang/test/Lower/OpenMP/wsloop.f90
+index 44b2f585b3a67..809a2672bf033 100644
+--- a/flang/test/Lower/OpenMP/wsloop.f90
++++ b/flang/test/Lower/OpenMP/wsloop.f90
+@@ -15,7 +15,7 @@ subroutine simple_loop
+   !$OMP DO
+   do i=1, 9
+   ! CHECK:          %[[IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "_QFsimple_loopEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK:          fir.store %[[I]] to %[[IV_DECL:.*]]#1 : !fir.ref<i32>
++  ! CHECK:          hlfir.assign %[[I]] to %[[IV_DECL:.*]]#1 : i32, !fir.ref<i32>
+   ! CHECK:          %[[LOAD_IV:.*]] = fir.load %[[IV_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:          fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i
+@@ -37,7 +37,7 @@ subroutine simple_loop_with_step
+   ! CHECK:      omp.wsloop private(@{{.*}} %{{.*}}#0 -> %[[ALLOCA_IV:.*]] : !fir.ref<i32>) {
+   ! CHECK-NEXT:   omp.loop_nest (%[[I:.*]]) : i32 = (%[[WS_LB]]) to (%[[WS_UB]]) inclusive step (%[[WS_STEP]]) {
+   ! CHECK:          %[[IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "_QFsimple_loop_with_stepEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK:          fir.store %[[I]] to %[[IV_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:          hlfir.assign %[[I]] to %[[IV_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:          %[[LOAD_IV:.*]] = fir.load %[[IV_DECL]]#0 : !fir.ref<i32>
+   !$OMP DO
+   do i=1, 9, 2
+@@ -63,7 +63,7 @@ subroutine loop_with_schedule_nowait
+   !$OMP DO SCHEDULE(runtime)
+   do i=1, 9
+   ! CHECK:          %[[IV_DECL:.*]]:2 = hlfir.declare %[[ALLOCA_IV]] {uniq_name = "_QFloop_with_schedule_nowaitEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-  ! CHECK:          fir.store %[[I]] to %[[IV_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:          hlfir.assign %[[I]] to %[[IV_DECL]]#1 : i32, !fir.ref<i32>
+   ! CHECK:          %[[LOAD_IV:.*]] = fir.load %[[IV_DECL]]#0 : !fir.ref<i32>
+   ! CHECK:          fir.call @_FortranAioOutputInteger32({{.*}}, %[[LOAD_IV]]) {{.*}}: (!fir.ref<i8>, i32) -> i1
+     print*, i

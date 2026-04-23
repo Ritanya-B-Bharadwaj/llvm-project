@@ -1,0 +1,563 @@
+diff --git a/flang/test/Integration/OpenMP/map-types-and-sizes.f90 b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+index 591be0b680a51..055fdecc91464 100644
+--- a/flang/test/Integration/OpenMP/map-types-and-sizes.f90
++++ b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+@@ -6,7 +6,7 @@
+ ! added to this directory and sub-directories.
+ !===----------------------------------------------------------------------===!
+ 
+-!RUN: %flang_fc1 -emit-llvm -fopenmp -flang-deprecated-no-hlfir %s -o - | FileCheck %s
++!RUN: %flang_fc1 -emit-llvm -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa -flang-deprecated-no-hlfir %s -o - | FileCheck %s
+ 
+ !===============================================================================
+ ! Check MapTypes for target implicit captures
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index 9cb311834907b..b158c08ff83f3 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -115,6 +115,10 @@ class OpenMPIRBuilderConfig {
+   // Grid Value for the GPU target
+   std::optional<omp::GV> GridValue;
+ 
++  /// When compilation is being done for the OpenMP host (i.e. `IsTargetDevice =
++  /// false`), this contains the list of offloading triples associated, if any.
++  SmallVector<Triple> TargetTriples;
++
+   OpenMPIRBuilderConfig();
+   OpenMPIRBuilderConfig(bool IsTargetDevice, bool IsGPU,
+                         bool OpenMPOffloadMandatory,
+@@ -2183,21 +2187,22 @@ class OpenMPIRBuilder {
+   /// kernel args vector.
+   struct TargetKernelArgs {
+     /// Number of arguments passed to the runtime library.
+-    unsigned NumTargetItems;
++    unsigned NumTargetItems = 0;
+     /// Arguments passed to the runtime library
+     TargetDataRTArgs RTArgs;
+     /// The number of iterations
+-    Value *NumIterations;
++    Value *NumIterations = nullptr;
+     /// The number of teams.
+-    Value *NumTeams;
++    Value *NumTeams = nullptr;
+     /// The number of threads.
+-    Value *NumThreads;
++    Value *NumThreads = nullptr;
+     /// The size of the dynamic shared memory.
+-    Value *DynCGGroupMem;
++    Value *DynCGGroupMem = nullptr;
+     /// True if the kernel has 'no wait' clause.
+-    bool HasNoWait;
++    bool HasNoWait = false;
+ 
+-    /// Constructor for TargetKernelArgs
++    // Constructors for TargetKernelArgs.
++    TargetKernelArgs() {}
+     TargetKernelArgs(unsigned NumTargetItems, TargetDataRTArgs RTArgs,
+                      Value *NumIterations, Value *NumTeams, Value *NumThreads,
+                      Value *DynCGGroupMem, bool HasNoWait)
+@@ -2834,6 +2839,7 @@ class OpenMPIRBuilder {
+   /// Generator for '#omp target'
+   ///
+   /// \param Loc where the target data construct was encountered.
++  /// \param IsOffloadEntry whether it is an offload entry.
+   /// \param CodeGenIP The insertion point where the call to the outlined
+   /// function should be emitted.
+   /// \param EntryInfo The entry information about the function.
+@@ -2847,6 +2853,7 @@ class OpenMPIRBuilder {
+   /// \param Dependencies A vector of DependData objects that carry
+   // dependency information as passed in the depend clause
+   InsertPointTy createTarget(const LocationDescription &Loc,
++                             bool IsOffloadEntry,
+                              OpenMPIRBuilder::InsertPointTy AllocaIP,
+                              OpenMPIRBuilder::InsertPointTy CodeGenIP,
+                              TargetRegionEntryInfo &EntryInfo, int32_t NumTeams,
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 3f8e64315849e..afbb9f9cc1643 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -6768,7 +6768,7 @@ static Function *emitTargetTaskProxyFunction(OpenMPIRBuilder &OMPBuilder,
+   return ProxyFn;
+ }
+ static void emitTargetOutlinedFunction(
+-    OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
++    OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder, bool IsOffloadEntry,
+     TargetRegionEntryInfo &EntryInfo, Function *&OutlinedFn,
+     Constant *&OutlinedFnID, SmallVectorImpl<Value *> &Inputs,
+     OpenMPIRBuilder::TargetBodyGenCallbackTy &CBFunc,
+@@ -6781,8 +6781,8 @@ static void emitTargetOutlinedFunction(
+                                       CBFunc, ArgAccessorFuncCB);
+       };
+ 
+-  OMPBuilder.emitTargetRegionFunction(EntryInfo, GenerateOutlinedFunction, true,
+-                                      OutlinedFn, OutlinedFnID);
++  OMPBuilder.emitTargetRegionFunction(EntryInfo, GenerateOutlinedFunction,
++                                      IsOffloadEntry, OutlinedFn, OutlinedFnID);
+ }
+ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+     Function *OutlinedFn, Value *OutlinedFnID,
+@@ -6898,15 +6898,22 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+ 
+   Builder.restoreIP(TargetTaskBodyIP);
+ 
+-  // emitKernelLaunch makes the necessary runtime call to offload the kernel.
+-  // We then outline all that code into a separate function
+-  // ('kernel_launch_function' in the pseudo code above). This function is then
+-  // called by the target task proxy function (see
+-  // '@.omp_target_task_proxy_func' in the pseudo code above)
+-  // "@.omp_target_task_proxy_func' is generated by emitTargetTaskProxyFunction
+-  Builder.restoreIP(emitKernelLaunch(Builder, OutlinedFn, OutlinedFnID,
+-                                     EmitTargetCallFallbackCB, Args, DeviceID,
+-                                     RTLoc, TargetTaskAllocaIP));
++  if (OutlinedFnID) {
++    // emitKernelLaunch makes the necessary runtime call to offload the kernel.
++    // We then outline all that code into a separate function
++    // ('kernel_launch_function' in the pseudo code above). This function is
++    // then called by the target task proxy function (see
++    // '@.omp_target_task_proxy_func' in the pseudo code above)
++    // "@.omp_target_task_proxy_func' is generated by
++    // emitTargetTaskProxyFunction.
++    Builder.restoreIP(emitKernelLaunch(Builder, OutlinedFn, OutlinedFnID,
++                                       EmitTargetCallFallbackCB, Args, DeviceID,
++                                       RTLoc, TargetTaskAllocaIP));
++  } else {
++    // When OutlinedFnID is set to nullptr, then it's not an offloading call. In
++    // this case, we execute the host implementation directly.
++    Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
++  }
+ 
+   OI.ExitBB = Builder.saveIP().getBlock();
+   OI.PostOutlineCB = [this, ToBeDeleted, Dependencies,
+@@ -7015,11 +7022,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+       Function *TaskCompleteFn =
+           getOrCreateRuntimeFunctionPtr(OMPRTL___kmpc_omp_task_complete_if0);
+       Builder.CreateCall(TaskBeginFn, {Ident, ThreadID, TaskData});
+-      CallInst *CI = nullptr;
+-      if (HasShareds)
+-        CI = Builder.CreateCall(ProxyFn, {ThreadID, TaskData});
+-      else
+-        CI = Builder.CreateCall(ProxyFn, {ThreadID});
++      CallInst *CI = Builder.CreateCall(ProxyFn, {ThreadID, TaskData});
+       CI->setDebugLoc(StaleCI->getDebugLoc());
+       Builder.CreateCall(TaskCompleteFn, {Ident, ThreadID, TaskData});
+     } else if (DepArray) {
+@@ -7052,6 +7055,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+                     << "\n");
+   return Builder.saveIP();
+ }
++
+ void OpenMPIRBuilder::emitOffloadingArraysAndArgs(
+     InsertPointTy AllocaIP, InsertPointTy CodeGenIP, TargetDataInfo &Info,
+     TargetDataRTArgs &RTArgs, MapInfosTy &CombinedInfo, bool IsNonContiguous,
+@@ -7069,6 +7073,37 @@ static void emitTargetCall(
+     SmallVectorImpl<Value *> &Args,
+     OpenMPIRBuilder::GenMapInfoCallbackTy GenMapInfoCB,
+     SmallVector<llvm::OpenMPIRBuilder::DependData> Dependencies = {}) {
++  // Generate a function call to the host fallback implementation of the target
++  // region. This is called by the host when no offload entry was generated for
++  // the target region and when the offloading call fails at runtime.
++  auto &&EmitTargetCallFallbackCB =
++      [&](OpenMPIRBuilder::InsertPointTy IP) -> OpenMPIRBuilder::InsertPointTy {
++    Builder.restoreIP(IP);
++    Builder.CreateCall(OutlinedFn, Args);
++    return Builder.saveIP();
++  };
++
++  bool HasNoWait = false;
++  bool HasDependencies = Dependencies.size() > 0;
++  bool RequiresOuterTargetTask = HasNoWait || HasDependencies;
++
++  // If we don't have an ID for the target region, it means an offload entry
++  // wasn't created. In this case we just run the host fallback directly.
++  if (!OutlinedFnID) {
++    if (RequiresOuterTargetTask) {
++      // Arguments that are intended to be directly forwarded to an
++      // emitKernelLaunch call are pased as nullptr, since OutlinedFnID=nullptr
++      // results in that call not being done.
++      OpenMPIRBuilder::TargetKernelArgs KArgs;
++      Builder.restoreIP(OMPBuilder.emitTargetTask(
++          OutlinedFn, /*OutlinedFnID=*/nullptr, EmitTargetCallFallbackCB, KArgs,
++          /*DeviceID=*/nullptr, /*RTLoc=*/nullptr, AllocaIP, Dependencies,
++          HasNoWait));
++    } else {
++      Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
++    }
++    return;
++  }
+ 
+   OpenMPIRBuilder::TargetDataInfo Info(
+       /*RequiresDevicePointerInfo=*/false,
+@@ -7081,14 +7116,6 @@ static void emitTargetCall(
+                                          /*IsNonContiguous=*/true,
+                                          /*ForEndCall=*/false);
+ 
+-  //  emitKernelLaunch
+-  auto &&EmitTargetCallFallbackCB =
+-      [&](OpenMPIRBuilder::InsertPointTy IP) -> OpenMPIRBuilder::InsertPointTy {
+-    Builder.restoreIP(IP);
+-    Builder.CreateCall(OutlinedFn, Args);
+-    return Builder.saveIP();
+-  };
+-
+   unsigned NumTargetItems = Info.NumberOfPtrs;
+   // TODO: Use correct device ID
+   Value *DeviceID = Builder.getInt64(OMP_DEVICEID_UNDEF);
+@@ -7103,10 +7130,6 @@ static void emitTargetCall(
+   // TODO: Use correct DynCGGroupMem
+   Value *DynCGGroupMem = Builder.getInt32(0);
+ 
+-  bool HasNoWait = false;
+-  bool HasDependencies = Dependencies.size() > 0;
+-  bool RequiresOuterTargetTask = HasNoWait || HasDependencies;
+-
+   OpenMPIRBuilder::TargetKernelArgs KArgs(NumTargetItems, RTArgs, NumIterations,
+                                           NumTeamsVal, NumThreadsVal,
+                                           DynCGGroupMem, HasNoWait);
+@@ -7123,8 +7146,9 @@ static void emitTargetCall(
+         DeviceID, RTLoc, AllocaIP));
+   }
+ }
++
+ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTarget(
+-    const LocationDescription &Loc, InsertPointTy AllocaIP,
++    const LocationDescription &Loc, bool IsOffloadEntry, InsertPointTy AllocaIP,
+     InsertPointTy CodeGenIP, TargetRegionEntryInfo &EntryInfo, int32_t NumTeams,
+     int32_t NumThreads, SmallVectorImpl<Value *> &Args,
+     GenMapInfoCallbackTy GenMapInfoCB,
+@@ -7138,12 +7162,13 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTarget(
+   Builder.restoreIP(CodeGenIP);
+ 
+   Function *OutlinedFn;
+-  Constant *OutlinedFnID;
++  Constant *OutlinedFnID = nullptr;
+   // The target region is outlined into its own function. The LLVM IR for
+   // the target region itself is generated using the callbacks CBFunc
+   // and ArgAccessorFuncCB
+-  emitTargetOutlinedFunction(*this, Builder, EntryInfo, OutlinedFn,
+-                             OutlinedFnID, Args, CBFunc, ArgAccessorFuncCB);
++  emitTargetOutlinedFunction(*this, Builder, IsOffloadEntry, EntryInfo,
++                             OutlinedFn, OutlinedFnID, Args, CBFunc,
++                             ArgAccessorFuncCB);
+ 
+   // If we are not on the target device, then we need to generate code
+   // to make a remote call (offload) to the previously outlined function
+diff --git a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+index cb4c289f409a1..6207792f9f0d0 100644
+--- a/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPIRBuilderTest.cpp
+@@ -5983,8 +5983,8 @@ TEST_F(OpenMPIRBuilderTest, TargetRegion) {
+   TargetRegionEntryInfo EntryInfo("func", 42, 4711, 17);
+   OpenMPIRBuilder::LocationDescription OmpLoc({Builder.saveIP(), DL});
+   Builder.restoreIP(OMPBuilder.createTarget(
+-      OmpLoc, Builder.saveIP(), Builder.saveIP(), EntryInfo, -1, 0, Inputs,
+-      GenMapInfoCB, BodyGenCB, SimpleArgAccessorCB));
++      OmpLoc, /*IsOffloadEntry=*/true, Builder.saveIP(), Builder.saveIP(),
++      EntryInfo, -1, 0, Inputs, GenMapInfoCB, BodyGenCB, SimpleArgAccessorCB));
+   OMPBuilder.finalize();
+   Builder.CreateRetVoid();
+ 
+@@ -6087,7 +6087,8 @@ TEST_F(OpenMPIRBuilderTest, TargetRegionDevice) {
+                                   /*Line=*/3, /*Count=*/0);
+ 
+   Builder.restoreIP(
+-      OMPBuilder.createTarget(Loc, EntryIP, EntryIP, EntryInfo, /*NumTeams=*/-1,
++      OMPBuilder.createTarget(Loc, /*IsOffloadEntry=*/true, EntryIP, EntryIP,
++                              EntryInfo, /*NumTeams=*/-1,
+                               /*NumThreads=*/0, CapturedArgs, GenMapInfoCB,
+                               BodyGenCB, SimpleArgAccessorCB));
+ 
+@@ -6235,7 +6236,8 @@ TEST_F(OpenMPIRBuilderTest, ConstantAllocaRaise) {
+                                   /*Line=*/3, /*Count=*/0);
+ 
+   Builder.restoreIP(
+-      OMPBuilder.createTarget(Loc, EntryIP, EntryIP, EntryInfo, /*NumTeams=*/-1,
++      OMPBuilder.createTarget(Loc, /*IsOffloadEntry=*/true, EntryIP, EntryIP,
++                              EntryInfo, /*NumTeams=*/-1,
+                               /*NumThreads=*/0, CapturedArgs, GenMapInfoCB,
+                               BodyGenCB, SimpleArgAccessorCB));
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index ddee117838697..458d05d5059db 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -3233,6 +3233,8 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   if (!targetOpSupported(opInst))
+     return failure();
+ 
++  llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
++  bool isTargetDevice = ompBuilder->Config.isTargetDevice();
+   auto parentFn = opInst.getParentOfType<LLVM::LLVMFuncOp>();
+   auto targetOp = cast<omp::TargetOp>(opInst);
+   auto &targetRegion = targetOp.getRegion();
+@@ -3240,6 +3242,11 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   SmallVector<Value> mapVars = targetOp.getMapVars();
+   llvm::Function *llvmOutlinedFn = nullptr;
+ 
++  // TODO: It can also be false if a compile-time constant `false` IF clause is
++  // specified.
++  bool isOffloadEntry =
++      isTargetDevice || !ompBuilder->Config.TargetTriples.empty();
++
+   LogicalResult bodyGenStatus = success();
+   using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+   auto bodyCB = [&](InsertPointTy allocaIP,
+@@ -3306,14 +3313,12 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+   auto argAccessorCB = [&](llvm::Argument &arg, llvm::Value *input,
+                            llvm::Value *&retVal, InsertPointTy allocaIP,
+                            InsertPointTy codeGenIP) {
+-    llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
+-
+     // We just return the unaltered argument for the host function
+     // for now, some alterations may be required in the future to
+     // keep host fallback functions working identically to the device
+     // version (e.g. pass ByCopy values should be treated as such on
+     // host and device, currently not always the case)
+-    if (!ompBuilder->Config.isTargetDevice()) {
++    if (!isTargetDevice) {
+       retVal = cast<llvm::Value>(&arg);
+       return codeGenIP;
+     }
+@@ -3339,9 +3344,9 @@ convertOmpTarget(Operation &opInst, llvm::IRBuilderBase &builder,
+                   moduleTranslation, dds);
+ 
+   builder.restoreIP(moduleTranslation.getOpenMPBuilder()->createTarget(
+-      ompLoc, allocaIP, builder.saveIP(), entryInfo, defaultValTeams,
+-      defaultValThreads, kernelInput, genMapInfoCB, bodyCB, argAccessorCB,
+-      dds));
++      ompLoc, isOffloadEntry, allocaIP, builder.saveIP(), entryInfo,
++      defaultValTeams, defaultValThreads, kernelInput, genMapInfoCB, bodyCB,
++      argAccessorCB, dds));
+ 
+   // Remap access operations to declare target reference pointers for the
+   // device, essentially generating extra loadop's as necessary
+@@ -3714,6 +3719,23 @@ LogicalResult OpenMPDialectLLVMIRTranslationInterface::amendOperation(
+               }
+               return failure();
+             })
++      .Case("omp.target_triples",
++            [&](Attribute attr) {
++              if (auto triplesAttr = dyn_cast<ArrayAttr>(attr)) {
++                llvm::OpenMPIRBuilderConfig &config =
++                    moduleTranslation.getOpenMPBuilder()->Config;
++                config.TargetTriples.clear();
++                config.TargetTriples.reserve(triplesAttr.size());
++                for (Attribute tripleAttr : triplesAttr) {
++                  if (auto tripleStrAttr = dyn_cast<StringAttr>(tripleAttr))
++                    config.TargetTriples.emplace_back(tripleStrAttr.getValue());
++                  else
++                    return failure();
++                }
++                return success();
++              }
++              return failure();
++            })
+       .Default([](Attribute) {
+         // Fall through for omp attributes that do not require lowering.
+         return success();
+diff --git a/mlir/test/Target/LLVMIR/omptarget-array-sectioning-host.mlir b/mlir/test/Target/LLVMIR/omptarget-array-sectioning-host.mlir
+index 0016a1f05a2b1..a14214cd8c1cb 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-array-sectioning-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-array-sectioning-host.mlir
+@@ -7,7 +7,7 @@
+ // array bounds to lower to the full size of the array and the sectioned
+ // array to be the size of 3*3*1*element-byte-size (36 bytes in this case).
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @_3d_target_array_section() {
+     %0 = llvm.mlir.addressof @_QFEinarray : !llvm.ptr
+     %1 = llvm.mlir.addressof @_QFEoutarray : !llvm.ptr
+diff --git a/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-host.mlir b/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-host.mlir
+index 8635ea4956706..7c494e80155bb 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-byref-bycopy-generation-host.mlir
+@@ -1,6 +1,6 @@
+ // RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @_QQmain() attributes {fir.bindc_name = "main"} {
+     %0 = llvm.mlir.addressof @_QFEi : !llvm.ptr
+     %1 = llvm.mlir.addressof @_QFEsp : !llvm.ptr
+diff --git a/mlir/test/Target/LLVMIR/omptarget-depend-host-only.mlir b/mlir/test/Target/LLVMIR/omptarget-depend-host-only.mlir
+new file mode 100644
+index 0000000000000..a951593d26741
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-depend-host-only.mlir
+@@ -0,0 +1,33 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++module attributes {omp.is_target_device = false} {
++  llvm.func @omp_target_depend_() {
++    %0 = llvm.mlir.constant(39 : index) : i64
++    %1 = llvm.mlir.constant(1 : index) : i64
++    %2 = llvm.mlir.constant(40 : index) : i64
++    %3 = omp.map.bounds lower_bound(%1 : i64) upper_bound(%0 : i64) extent(%2 : i64) stride(%1 : i64) start_idx(%1 : i64)
++    %4 = llvm.mlir.addressof @_QFEa : !llvm.ptr
++    %5 = omp.map.info var_ptr(%4 : !llvm.ptr, !llvm.array<40 x i32>) map_clauses(from) capture(ByRef) bounds(%3) -> !llvm.ptr {name = "a"}
++    omp.target map_entries(%5 -> %arg0 : !llvm.ptr) depend(taskdependin -> %4 : !llvm.ptr) {
++    ^bb0(%arg0: !llvm.ptr):
++      %6 = llvm.mlir.constant(100 : index) : i32
++      llvm.store %6, %arg0 : i32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++
++  llvm.mlir.global internal @_QFEa() {addr_space = 0 : i32} : !llvm.array<40 x i32> {
++    %0 = llvm.mlir.zero : !llvm.array<40 x i32>
++    llvm.return %0 : !llvm.array<40 x i32>
++  }
++}
++
++// CHECK: define void @omp_target_depend_()
++// CHECK-NOT: define {{.*}} @
++// CHECK-NOT: call i32 @__tgt_target_kernel({{.*}})
++// CHECK: call void @__omp_offloading_[[DEV:.*]]_[[FIL:.*]]_omp_target_depend__l[[LINE:.*]](ptr {{.*}})
++// CHECK-NEXT: ret void
++
++// CHECK: define internal void @__omp_offloading_[[DEV]]_[[FIL]]_omp_target_depend__l[[LINE]](ptr %[[ADDR_A:.*]])
++// CHECK: store i32 100, ptr %[[ADDR_A]], align 4
+diff --git a/mlir/test/Target/LLVMIR/omptarget-depend.mlir b/mlir/test/Target/LLVMIR/omptarget-depend.mlir
+index c386342005e5e..c66fe8f455dfb 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-depend.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-depend.mlir
+@@ -1,4 +1,6 @@
+ // RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @_QQmain() attributes {fir.bindc_name = "main"} {
+     %0 = llvm.mlir.constant(39 : index) : i64
+     %1 = llvm.mlir.constant(0 : index) : i64
+@@ -117,6 +119,7 @@
+     llvm.call @_FortranAProgramEndStatement() {fastmathFlags = #llvm.fastmath<contract>} : () -> ()
+     llvm.return %0 : i32
+   }
++}
+ 
+ // %strucArg holds pointers to shared data.
+ // CHECK: define void @_QQmain() {
+diff --git a/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir b/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir
+index 9b46f84e5050f..f0e301bd70e3b 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-fortran-allocatable-types-host.mlir
+@@ -6,7 +6,7 @@
+ // alongside the omp.map.info, the test utilises mapping of array sections, 
+ // full arrays and individual allocated scalars.
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @_QQmain() {
+     %0 = llvm.mlir.constant(5 : index) : i64
+     %1 = llvm.mlir.constant(2 : index) : i64
+diff --git a/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir b/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir
+index 7273f53d0a3db..396628e1081e9 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-fortran-common-block-host.mlir
+@@ -5,7 +5,7 @@
+ // to LLVM-IR from MLIR when a fortran common block is lowered alongside
+ // the omp.map.info.
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @omp_map_common_block_using_common_block_members() {
+     %0 = llvm.mlir.constant(4 : index) : i64
+     %1 = llvm.mlir.constant(0 : index) : i64
+diff --git a/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir b/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
+index e4d82d4a58c89..8cec94abf968b 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-nested-record-type-mapping-host.mlir
+@@ -7,7 +7,7 @@
+ // derived type) where members of both the nested and outer record type have
+ // members mapped.
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+ llvm.func @_QQmain() {
+     %0 = llvm.mlir.constant(10 : index) : i64
+     %1 = llvm.mlir.constant(4 : index) : i64
+diff --git a/mlir/test/Target/LLVMIR/omptarget-record-type-mapping-host.mlir b/mlir/test/Target/LLVMIR/omptarget-record-type-mapping-host.mlir
+index c7a87e44d6537..bbfcb4eecb3e8 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-record-type-mapping-host.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-record-type-mapping-host.mlir
+@@ -6,7 +6,7 @@
+ // (C++/C class/structure, Fortran derived type) where only members of the record
+ // type are mapped.
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+ llvm.func @_QQmain() {
+     %0 = llvm.mlir.constant(10 : index) : i64
+     %1 = llvm.mlir.constant(4 : index) : i64
+diff --git a/mlir/test/Target/LLVMIR/omptarget-region-host-only.mlir b/mlir/test/Target/LLVMIR/omptarget-region-host-only.mlir
+new file mode 100644
+index 0000000000000..61b6f3b91cd79
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-region-host-only.mlir
+@@ -0,0 +1,54 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++module attributes {omp.is_target_device = false} {
++  llvm.func @omp_target_region_() {
++    %0 = llvm.mlir.constant(20 : i32) : i32
++    %1 = llvm.mlir.constant(10 : i32) : i32
++    %2 = llvm.mlir.constant(1 : i64) : i64
++    %3 = llvm.alloca %2 x i32 {bindc_name = "a", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEa"} : (i64) -> !llvm.ptr
++    %4 = llvm.mlir.constant(1 : i64) : i64
++    %5 = llvm.alloca %4 x i32 {bindc_name = "b", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEb"} : (i64) -> !llvm.ptr
++    %6 = llvm.mlir.constant(1 : i64) : i64
++    %7 = llvm.alloca %6 x i32 {bindc_name = "c", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEc"} : (i64) -> !llvm.ptr
++    llvm.store %1, %3 : i32, !llvm.ptr
++    llvm.store %0, %5 : i32, !llvm.ptr
++    %map1 = omp.map.info var_ptr(%3 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++    %map2 = omp.map.info var_ptr(%5 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++    %map3 = omp.map.info var_ptr(%7 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++    omp.target map_entries(%map1 -> %arg0, %map2 -> %arg1, %map3 -> %arg2 : !llvm.ptr, !llvm.ptr, !llvm.ptr) {
++    ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr):
++      %8 = llvm.load %arg0 : !llvm.ptr -> i32
++      %9 = llvm.load %arg1 : !llvm.ptr -> i32
++      %10 = llvm.add %8, %9  : i32
++      llvm.store %10, %arg2 : i32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++
++  llvm.func @omp_target_no_map() {
++    omp.target {
++      omp.terminator
++    }
++    llvm.return
++  }
++}
++
++// CHECK: define void @omp_target_region_()
++// CHECK-NOT: call i32 @__tgt_target_kernel({{.*}})
++// CHECK: call void @__omp_offloading_[[DEV:.*]]_[[FIL:.*]]_omp_target_region__l[[LINE1:.*]](ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}})
++// CHECK-NEXT: ret void
++
++// CHECK: define void @omp_target_no_map()
++// CHECK-NOT: call i32 @__tgt_target_kernel({{.*}})
++// CHECK: call void @__omp_offloading_[[DEV]]_[[FIL]]_omp_target_no_map_l[[LINE2:.*]]()
++// CHECK-NEXT: ret void
++
++// CHECK: define internal void @__omp_offloading_[[DEV]]_[[FIL]]_omp_target_region__l[[LINE1]](ptr %[[ADDR_A:.*]], ptr %[[ADDR_B:.*]], ptr %[[ADDR_C:.*]])
++// CHECK: %[[VAL_A:.*]] = load i32, ptr %[[ADDR_A]], align 4
++// CHECK: %[[VAL_B:.*]] = load i32, ptr %[[ADDR_B]], align 4
++// CHECK: %[[SUM:.*]] = add i32 %[[VAL_A]], %[[VAL_B]]
++// CHECK: store i32 %[[SUM]], ptr %[[ADDR_C]], align 4
++
++// CHECK: define internal void @__omp_offloading_[[DEV]]_[[FIL]]_omp_target_no_map_l[[LINE2]]()
++// CHECK: ret void
+diff --git a/mlir/test/Target/LLVMIR/omptarget-region-llvm.mlir b/mlir/test/Target/LLVMIR/omptarget-region-llvm.mlir
+index a32ee3e184e26..3af960d6ffcd0 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-region-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-region-llvm.mlir
+@@ -1,6 +1,6 @@
+ // RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
+ 
+-module attributes {omp.is_target_device = false} {
++module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-amd-amdhsa"]} {
+   llvm.func @omp_target_region_() {
+     %0 = llvm.mlir.constant(20 : i32) : i32
+     %1 = llvm.mlir.constant(10 : i32) : i32

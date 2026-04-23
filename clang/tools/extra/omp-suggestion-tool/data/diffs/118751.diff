@@ -1,0 +1,583 @@
+diff --git a/flang/include/flang/Optimizer/Dialect/FIROps.td b/flang/include/flang/Optimizer/Dialect/FIROps.td
+index f9dc2e51a396c..cd5aa139b7391 100644
+--- a/flang/include/flang/Optimizer/Dialect/FIROps.td
++++ b/flang/include/flang/Optimizer/Dialect/FIROps.td
+@@ -305,7 +305,7 @@ def fir_LoadOp : fir_OneResultOp<"load", [FirAliasTagOpInterface,
+   }];
+ 
+   let arguments = (ins AnyReferenceLike:$memref,
+-                  OptionalAttr<LLVM_TBAATagArrayAttr>:$tbaa);
++      OptionalAttr<LLVM_TBAATagArrayAttr>:$tbaa, UnitAttr:$nontemporal);
+ 
+   let builders = [OpBuilder<(ins "mlir::Value":$refVal)>,
+                   OpBuilder<(ins "mlir::Type":$resTy, "mlir::Value":$refVal)>];
+@@ -337,9 +337,8 @@ def fir_StoreOp : fir_Op<"store", [FirAliasTagOpInterface,
+     `%p`, is undefined or null.
+   }];
+ 
+-  let arguments = (ins AnyType:$value,
+-                   AnyReferenceLike:$memref,
+-                   OptionalAttr<LLVM_TBAATagArrayAttr>:$tbaa);
++  let arguments = (ins AnyType:$value, AnyReferenceLike:$memref,
++      OptionalAttr<LLVM_TBAATagArrayAttr>:$tbaa, UnitAttr:$nontemporal);
+ 
+   let builders = [OpBuilder<(ins "mlir::Value":$value, "mlir::Value":$memref)>];
+ 
+diff --git a/flang/include/flang/Optimizer/OpenMP/Passes.td b/flang/include/flang/Optimizer/OpenMP/Passes.td
+index fcc7a4ca31fef..704faf0ccd856 100644
+--- a/flang/include/flang/Optimizer/OpenMP/Passes.td
++++ b/flang/include/flang/Optimizer/OpenMP/Passes.td
+@@ -81,6 +81,13 @@ def DoConcurrentConversionPass : Pass<"omp-do-concurrent-conversion", "mlir::fun
+   ];
+ }
+ 
++def LowerNontemporalPass : Pass<"lower-nontemporal", "mlir::func::FuncOp"> {
++  let summary =
++      "Adds nontemporal attribute to loads and stores performed on "
++      "the list items specified in the nontemporal clause of omp.simd.";
++  let dependentDialects = ["mlir::omp::OpenMPDialect"];
++}
++
+ // Needs to be scheduled on Module as we create functions in it
+ def LowerWorkshare : Pass<"lower-workshare", "::mlir::ModuleOp"> {
+   let summary = "Lower workshare construct";
+diff --git a/flang/lib/Optimizer/CodeGen/CodeGen.cpp b/flang/lib/Optimizer/CodeGen/CodeGen.cpp
+index 5c6ea7294682f..662ec8e30a56c 100644
+--- a/flang/lib/Optimizer/CodeGen/CodeGen.cpp
++++ b/flang/lib/Optimizer/CodeGen/CodeGen.cpp
+@@ -3569,8 +3569,13 @@ struct StoreOpConversion : public fir::FIROpConversion<fir::StoreOp> {
+     } else {
+       mlir::LLVM::StoreOp storeOp =
+           rewriter.create<mlir::LLVM::StoreOp>(loc, llvmValue, llvmMemref);
++
+       if (isVolatile)
+         storeOp.setVolatile_(true);
++
++      if (store.getNontemporal())
++        storeOp.setNontemporal(true);
++
+       newOp = storeOp;
+     }
+     if (std::optional<mlir::ArrayAttr> optionalTag = store.getTbaa())
+diff --git a/flang/lib/Optimizer/OpenMP/CMakeLists.txt b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+index 62a2fe377053b..e31543328a9f9 100644
+--- a/flang/lib/Optimizer/OpenMP/CMakeLists.txt
++++ b/flang/lib/Optimizer/OpenMP/CMakeLists.txt
+@@ -8,6 +8,7 @@ add_flang_library(FlangOpenMPTransforms
+   MapInfoFinalization.cpp
+   MarkDeclareTarget.cpp
+   LowerWorkshare.cpp
++  LowerNontemporal.cpp
+ 
+   DEPENDS
+   FIRDialect
+@@ -17,7 +18,7 @@ add_flang_library(FlangOpenMPTransforms
+   LINK_LIBS
+   FIRAnalysis
+   FIRBuilder
+-  FIRCodeGen
++  FIRCodeGenDialect
+   FIRDialect
+   FIRDialectSupport
+   FIRSupport
+diff --git a/flang/lib/Optimizer/OpenMP/LowerNontemporal.cpp b/flang/lib/Optimizer/OpenMP/LowerNontemporal.cpp
+new file mode 100644
+index 0000000000000..5aa1273a1be36
+--- /dev/null
++++ b/flang/lib/Optimizer/OpenMP/LowerNontemporal.cpp
+@@ -0,0 +1,84 @@
++//===- LowerNontemporal.cpp -------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Add nontemporal attributes to load and stores of variables marked as
++// nontemporal.
++//
++//===----------------------------------------------------------------------===//
++
++#include "flang/Optimizer/Dialect/FIRCG/CGOps.h"
++#include "flang/Optimizer/Dialect/FIROpsSupport.h"
++#include "flang/Optimizer/OpenMP/Passes.h"
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "llvm/ADT/TypeSwitch.h"
++
++using namespace mlir;
++
++namespace flangomp {
++#define GEN_PASS_DEF_LOWERNONTEMPORALPASS
++#include "flang/Optimizer/OpenMP/Passes.h.inc"
++} // namespace flangomp
++
++namespace {
++class LowerNontemporalPass
++    : public flangomp::impl::LowerNontemporalPassBase<LowerNontemporalPass> {
++  void addNonTemporalAttr(omp::SimdOp simdOp) {
++    if (simdOp.getNontemporalVars().empty())
++      return;
++
++    std::function<mlir::Value(mlir::Value)> getBaseOperand =
++        [&](mlir::Value operand) -> mlir::Value {
++      auto *defOp = operand.getDefiningOp();
++      while (defOp) {
++        llvm::TypeSwitch<Operation *>(defOp)
++            .Case<fir::ArrayCoorOp, fir::cg::XArrayCoorOp, fir::LoadOp>(
++                [&](auto op) {
++                  operand = op.getMemref();
++                  defOp = operand.getDefiningOp();
++                })
++            .Case<fir::BoxAddrOp>([&](auto op) {
++              operand = op.getVal();
++              defOp = operand.getDefiningOp();
++            })
++            .Default([&](auto op) { defOp = nullptr; });
++      }
++      return operand;
++    };
++
++    // walk through the operations and mark the load and store as nontemporal
++    simdOp->walk([&](Operation *op) {
++      mlir::Value operand = nullptr;
++
++      if (auto loadOp = llvm::dyn_cast<fir::LoadOp>(op))
++        operand = loadOp.getMemref();
++      else if (auto storeOp = llvm::dyn_cast<fir::StoreOp>(op))
++        operand = storeOp.getMemref();
++
++      // Skip load and store operations involving boxes (allocatable or pointer
++      // types).
++      if (operand && !(fir::isAllocatableType(operand.getType()) ||
++                       fir::isPointerType((operand.getType())))) {
++        operand = getBaseOperand(operand);
++
++        // TODO : Handling of nontemporal clause inside atomic construct
++        if (llvm::is_contained(simdOp.getNontemporalVars(), operand)) {
++          if (auto loadOp = llvm::dyn_cast<fir::LoadOp>(op))
++            loadOp.setNontemporal(true);
++          else if (auto storeOp = llvm::dyn_cast<fir::StoreOp>(op))
++            storeOp.setNontemporal(true);
++        }
++      }
++    });
++  }
++
++  void runOnOperation() override {
++    Operation *op = getOperation();
++    op->walk([&](omp::SimdOp simdOp) { addNonTemporalAttr(simdOp); });
++  }
++};
++} // namespace
+diff --git a/flang/lib/Optimizer/Passes/Pipelines.cpp b/flang/lib/Optimizer/Passes/Pipelines.cpp
+index 7a06a27748ebd..b04266ee94510 100644
+--- a/flang/lib/Optimizer/Passes/Pipelines.cpp
++++ b/flang/lib/Optimizer/Passes/Pipelines.cpp
+@@ -347,6 +347,11 @@ void createDefaultFIRCodeGenPassPipeline(mlir::PassManager &pm,
+        config.ApproxFuncFPMath, config.NoSignedZerosFPMath, config.UnsafeFPMath,
+        ""}));
+ 
++  if (config.EnableOpenMP) {
++    pm.addNestedPass<mlir::func::FuncOp>(
++        flangomp::createLowerNontemporalPass());
++  }
++
+   fir::addFIRToLLVMPass(pm, config);
+ }
+ 
+diff --git a/flang/test/Fir/basic-program.fir b/flang/test/Fir/basic-program.fir
+index ded42886aad44..5a02dd46c6031 100644
+--- a/flang/test/Fir/basic-program.fir
++++ b/flang/test/Fir/basic-program.fir
+@@ -149,6 +149,7 @@ func.func @_QQmain() {
+ // PASSES-NEXT: CompilerGeneratedNamesConversion
+ // PASSES-NEXT: 'func.func' Pipeline
+ // PASSES-NEXT:  FunctionAttr
++// PASSES-NEXT:  LowerNontemporalPass
+ // PASSES-NEXT: FIRToLLVMLowering
+ // PASSES-NEXT: ReconcileUnrealizedCasts
+ // PASSES-NEXT: LLVMIRLoweringPass
+diff --git a/flang/test/Fir/convert-nontemporal-to-llvm.fir b/flang/test/Fir/convert-nontemporal-to-llvm.fir
+new file mode 100644
+index 0000000000000..6200ef1c621d7
+--- /dev/null
++++ b/flang/test/Fir/convert-nontemporal-to-llvm.fir
+@@ -0,0 +1,111 @@
++// Test lower-nontemporal pass
++// RUN: fir-opt --fir-to-llvm-ir %s | FileCheck %s --check-prefixes=CHECK-LABEL,CHECK
++
++// CHECK-LABEL:  llvm.func @_QPtest() 
++// CHECK:    %[[CONST_VAL:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[VAL1:.*]] = llvm.alloca %[[CONST_VAL]] x i32 {bindc_name = "n"} : (i64) -> !llvm.ptr
++// CHECK:    %[[CONST_VAL1:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[VAL2:.*]] = llvm.alloca %[[CONST_VAL1]] x i32 {bindc_name = "i"} : (i64) -> !llvm.ptr
++// CHECK:    %[[CONST_VAL2:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[VAL3:.*]] = llvm.alloca %[[CONST_VAL2]] x i32 {bindc_name = "c"} : (i64) -> !llvm.ptr
++// CHECK:    %[[CONST_VAL3:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[VAL4:.*]] = llvm.alloca %[[CONST_VAL3]] x i32 {bindc_name = "b"} : (i64) -> !llvm.ptr
++// CHECK:    %[[CONST_VAL4:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[VAL5:.*]] = llvm.alloca %[[CONST_VAL4]] x i32 {bindc_name = "a"} : (i64) -> !llvm.ptr
++// CHECK:    %[[CONST_VAL5:.*]] = llvm.mlir.constant(1 : i32) : i32
++// CHECK:    %[[VAL6:.*]] = llvm.load %[[VAL1]] : !llvm.ptr -> i32
++// CHECK:    omp.simd nontemporal(%[[VAL5]], %[[VAL3]] : !llvm.ptr, !llvm.ptr) private(@_QFtestEi_private_i32 %[[VAL2]] -> %arg0 : !llvm.ptr) {
++// CHECK:      omp.loop_nest (%{{.*}}) : i32 = (%[[CONST_VAL5]]) to (%[[VAL6]]) inclusive step (%[[CONST_VAL5]]) {
++// CHECK:        llvm.store %{{.*}}, %{{.*}} : i32, !llvm.ptr
++// CHECK:        %[[VAL8:.*]] = llvm.load %[[VAL5]] {nontemporal} : !llvm.ptr -> i32
++// CHECK:        %[[VAL9:.*]] = llvm.load %[[VAL4]] : !llvm.ptr -> i32
++// CHECK:        %[[VAL10:.*]] = llvm.add %[[VAL8]], %[[VAL9]] : i32
++// CHECK:        llvm.store %[[VAL10]], %[[VAL3]] {nontemporal} : i32, !llvm.ptr
++// CHECK:        omp.yield
++// CHECK:      }
++// CHECK:    }
++
++ func.func @_QPtest() {
++    %c1_i32 = arith.constant 1 : i32
++    %0 = fir.alloca i32 {bindc_name = "a", uniq_name = "_QFtestEa"}
++    %1 = fir.alloca i32 {bindc_name = "b", uniq_name = "_QFtestEb"}
++    %2 = fir.alloca i32 {bindc_name = "c", uniq_name = "_QFtestEc"}
++    %3 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFtestEi"}
++    %4 = fir.alloca i32 {bindc_name = "n", uniq_name = "_QFtestEn"}
++    %5 = fir.load %4 : !fir.ref<i32>
++    omp.simd nontemporal(%0, %2 : !fir.ref<i32>, !fir.ref<i32>) private(@_QFtestEi_private_i32 %3 -> %arg0 : !fir.ref<i32>) {
++      omp.loop_nest (%arg1) : i32 = (%c1_i32) to (%5) inclusive step (%c1_i32) {
++        fir.store %arg1 to %arg0 : !fir.ref<i32>
++        %6 = fir.load %0 {nontemporal}: !fir.ref<i32>
++        %7 = fir.load %1 : !fir.ref<i32>
++        %8 = arith.addi %6, %7 : i32
++        fir.store %8 to %2 {nontemporal} : !fir.ref<i32>
++        omp.yield
++      }
++    }
++    return
++  }
++
++// CHECK-LABEL:  llvm.func @_QPsimd_nontemporal_allocatable
++// CHECK:    %[[CONST_VAL:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:    %[[ALLOCA2:.*]] = llvm.alloca %[[CONST_VAL]] x i32 {bindc_name = "i"} : (i64) -> !llvm.ptr
++// CHECK:    %[[IDX_VAL:.*]] = llvm.mlir.constant(1 : i32) : i32
++// CHECK:    %[[CONST_VAL1:.*]] = llvm.mlir.constant(0 : index) : i64
++// CHECK:    %[[END_IDX:.*]] = llvm.mlir.constant(100 : i32) : i32
++// CHECK:    omp.simd nontemporal(%[[ARG0:.*]] : !llvm.ptr) private(@_QFsimd_nontemporal_allocatableEi_private_i32 %[[ALLOCA2]] -> %[[ARG2:.*]] : !llvm.ptr) {
++// CHECK:      omp.loop_nest (%[[ARG3:.*]]) : i32 = (%[[IDX_VAL]]) to (%[[END_IDX]]) inclusive step (%[[IDX_VAL]]) {
++// CHECK:        llvm.store %[[ARG3]], %[[ARG2]] : i32, !llvm.ptr
++// CHECK:        %[[CONST_VAL2:.*]] = llvm.mlir.constant(48 : i32) : i32
++// CHECK:        "llvm.intr.memcpy"(%[[ALLOCA1:.*]], %[[ARG0]], %[[CONST_VAL2]]) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++// CHECK:        %[[VAL1:.*]] = llvm.load %[[ARG2]] : !llvm.ptr -> i32
++// CHECK:        %[[VAL2:.*]] = llvm.sext %[[VAL1]] : i32 to i64
++// CHECK:        %[[VAL3:.*]] = llvm.getelementptr %[[ALLOCA1]][0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++// CHECK:        %[[VAL4:.*]] = llvm.load %[[VAL3]] : !llvm.ptr -> !llvm.ptr
++// CHECK:        %[[VAL5:.*]] = llvm.getelementptr %[[ALLOCA1]][0, 7, %[[CONST_VAL1]], 0] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++// CHECK:        %[[VAL6:.*]] = llvm.load %[[VAL5]] : !llvm.ptr -> i64
++// CHECK:        %[[VAL7:.*]] = llvm.getelementptr %[[ALLOCA1]][0, 7, %[[CONST_VAL1]], 1] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++// CHECK:        %[[VAL8:.*]] = llvm.load %[[VAL7]] : !llvm.ptr -> i64
++// CHECK:        %[[VAL10:.*]] = llvm.mlir.constant(1 : i64) : i64
++// CHECK:        %[[VAL11:.*]] = llvm.mlir.constant(0 : i64) : i64
++// CHECK:        %[[VAL12:.*]] = llvm.sub %[[VAL2]], %[[VAL6]] overflow<nsw> : i64
++// CHECK:        %[[VAL13:.*]] = llvm.mul %[[VAL12]], %[[VAL10]] overflow<nsw> : i64
++// CHECK:        %[[VAL14:.*]] = llvm.mul %[[VAL13]], %[[VAL10]] overflow<nsw> : i64
++// CHECK:        %[[VAL15:.*]] = llvm.add %[[VAL14]], %[[VAL11]] overflow<nsw> : i64
++// CHECK:        %[[VAL16:.*]] = llvm.mul %[[VAL10]], %[[VAL8]] overflow<nsw> : i64
++// CHECK:        %[[VAL17:.*]] = llvm.getelementptr %[[VAL4]][%[[VAL15]]] : (!llvm.ptr, i64) -> !llvm.ptr, i32
++// CHECK:        %[[VAL18:.*]] = llvm.load %[[VAL17]] {nontemporal} : !llvm.ptr -> i32
++// CHECK:        %[[VAL19:.*]] = llvm.load %{{.*}} : !llvm.ptr -> i32
++// CHECK:        %[[VAL20:.*]] = llvm.add %[[VAL18]], %[[VAL19]] : i32
++// CHECK:        llvm.store %[[VAL20]], %[[VAL17]] {nontemporal} : i32, !llvm.ptr
++// CHECK:        omp.yield
++// CHECK:      }
++// CHECK:    }
++// CHECK:    llvm.return
++
++  func.func @_QPsimd_nontemporal_allocatable(%arg0: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {fir.bindc_name = "x"}, %arg1: !fir.ref<i32> {fir.bindc_name = "y"}) {
++   %c100 = arith.constant 100 : index
++   %c1_i32 = arith.constant 1 : i32
++    %c0 = arith.constant 0 : index
++    %c100_i32 = arith.constant 100 : i32
++    %0 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimd_nontemporal_allocatableEi"}
++    %1 = fir.allocmem !fir.array<?xi32>, %c100 {fir.must_be_heap = true, uniq_name = "_QFsimd_nontemporal_allocatableEx.alloc"}
++    %2 = fircg.ext_embox %1(%c100) : (!fir.heap<!fir.array<?xi32>>, index) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++    fir.store %2 to %arg0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    omp.simd nontemporal(%arg0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) private(@_QFsimd_nontemporal_allocatableEi_private_i32 %0 -> %arg2 : !fir.ref<i32>) {
++      omp.loop_nest (%arg3) : i32 = (%c1_i32) to (%c100_i32) inclusive step (%c1_i32) {
++        fir.store %arg3 to %arg2 : !fir.ref<i32>
++        %7 = fir.load %arg0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++        %8 = fir.load %arg2 : !fir.ref<i32>
++        %9 = fir.convert %8 : (i32) -> i64
++        %10 = fir.box_addr %7 : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++        %11:3 = fir.box_dims %7, %c0 : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
++        %12 = fircg.ext_array_coor %10(%11#1) origin %11#0<%9> : (!fir.heap<!fir.array<?xi32>>, index, index, i64) -> !fir.ref<i32>
++        %13 = fir.load %12 {nontemporal} : !fir.ref<i32> 
++        %14 = fir.load %arg1 : !fir.ref<i32>
++        %15 = arith.addi %13, %14 : i32
++        fir.store %15 to %12 {nontemporal} : !fir.ref<i32>
++        omp.yield
++      }
++    }
++    return
++  }
+diff --git a/flang/test/Fir/simd-nontemporal.fir b/flang/test/Fir/simd-nontemporal.fir
+new file mode 100644
+index 0000000000000..31051ff52f9bd
+--- /dev/null
++++ b/flang/test/Fir/simd-nontemporal.fir
+@@ -0,0 +1,103 @@
++// Test lower-nontemporal pass
++// RUN: fir-opt --lower-nontemporal %s | FileCheck %s
++
++// CHECK-LABEL: func @_QPsimd_with_nontemporal_clause
++func.func @_QPsimd_with_nontemporal_clause(%arg0: !fir.ref<i32> {fir.bindc_name = "n"}) {
++    %c1_i32 = arith.constant 1 : i32
++    %0 = fir.dummy_scope : !fir.dscope
++    %1 = fir.alloca i32 {bindc_name = "a", uniq_name = "_QFsimd_with_nontemporal_clauseEa"}
++    // CHECK: %[[A_DECL:.*]] = fir.declare %{{.*}} {uniq_name = "_QFsimd_with_nontemporal_clauseEa"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    // CHECK: %[[C_DECL:.*]] = fir.declare %{{.*}} {uniq_name = "_QFsimd_with_nontemporal_clauseEc"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    %2 = fir.declare %1 {uniq_name = "_QFsimd_with_nontemporal_clauseEa"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    %3 = fir.alloca i32 {bindc_name = "b", uniq_name = "_QFsimd_with_nontemporal_clauseEb"}
++    %4 = fir.declare %3 {uniq_name = "_QFsimd_with_nontemporal_clauseEb"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    %5 = fir.alloca i32 {bindc_name = "c", uniq_name = "_QFsimd_with_nontemporal_clauseEc"}
++    %6 = fir.declare %5 {uniq_name = "_QFsimd_with_nontemporal_clauseEc"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    %7 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimd_with_nontemporal_clauseEi"}
++    %8 = fir.declare %7 {uniq_name = "_QFsimd_with_nontemporal_clauseEi"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    %9 = fir.declare %arg0 dummy_scope %0 {uniq_name = "_QFsimd_with_nontemporal_clauseEn"} : (!fir.ref<i32>, !fir.dscope) -> !fir.ref<i32>
++    %10 = fir.load %9 : !fir.ref<i32>
++    // CHECK: omp.simd nontemporal(%[[A_DECL]], %[[C_DECL]] : !fir.ref<i32>, !fir.ref<i32>) private(@_QFsimd_with_nontemporal_clauseEi_private_i32 %8 -> %arg1 : !fir.ref<i32>) {
++    // CHECK-NEXT: omp.loop_nest (%{{.*}}) : i32 = (%{{.*}}) to (%{{.*}}) inclusive step (%{{.*}}) {
++    omp.simd nontemporal(%2, %6 : !fir.ref<i32>, !fir.ref<i32>) private(@_QFsimd_with_nontemporal_clauseEi_private_i32 %8 -> %arg1 : !fir.ref<i32>) {
++      omp.loop_nest (%arg2) : i32 = (%c1_i32) to (%10) inclusive step (%c1_i32) {
++        %11 = fir.declare %arg1 {uniq_name = "_QFsimd_with_nontemporal_clauseEi"} : (!fir.ref<i32>) -> !fir.ref<i32>
++        fir.store %arg2 to %11 : !fir.ref<i32>
++        // CHECK:  %[[LOAD:.*]] = fir.load %[[A_DECL]] {nontemporal} : !fir.ref<i32>
++        %12 = fir.load %2 : !fir.ref<i32>
++        // CHECK:  %[[LOAD1:.*]] = fir.load %{{.*}} : !fir.ref<i32>
++        %13 = fir.load %4 : !fir.ref<i32>
++        %14 = arith.addi %12, %13 : i32
++        // CHECK: %[[ADD_VAL:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
++        // CHECK: fir.store %[[ADD_VAL]] to %[[C_DECL]] {nontemporal} : !fir.ref<i32>
++        fir.store %14 to %6 : !fir.ref<i32>
++        omp.yield
++      }
++    }
++    return
++  }
++
++//  CHECK-LABEL:  func.func @_QPsimd_nontemporal_allocatable
++func.func @_QPsimd_nontemporal_allocatable(%arg0: !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {fir.bindc_name = "x"}, %arg1: !fir.ref<i32> {fir.bindc_name = "y"}) {
++    %c1_i32 = arith.constant 1 : i32
++    %c0 = arith.constant 0 : index
++    %c100_i32 = arith.constant 100 : i32
++    %0 = fir.dummy_scope : !fir.dscope
++    %1 = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFsimd_nontemporal_allocatableEi"}
++    %2 = fir.declare %1 {uniq_name = "_QFsimd_nontemporal_allocatableEi"} : (!fir.ref<i32>) -> !fir.ref<i32>
++    // CHECK:  %[[X_DECL:.*]] = fir.declare %{{.*}} dummy_scope %{{.*}} {fortran_attrs = #fir.var_attrs<allocatable>, 
++    // CHECK-SAME: uniq_name = "_QFsimd_nontemporal_allocatableEx"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.dscope) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    %3 = fir.declare %arg0 dummy_scope %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "_QFsimd_nontemporal_allocatableEx"} : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.dscope) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    %4 = fir.declare %arg1 dummy_scope %0 {uniq_name = "_QFsimd_nontemporal_allocatableEy"} : (!fir.ref<i32>, !fir.dscope) -> !fir.ref<i32>
++    %5 = fir.convert %c100_i32 : (i32) -> index
++    %6 = arith.cmpi sgt, %5, %c0 : index
++    %7 = arith.select %6, %5, %c0 : index
++    %8 = fir.allocmem !fir.array<?xi32>, %7 {fir.must_be_heap = true, uniq_name = "_QFsimd_nontemporal_allocatableEx.alloc"}
++    %9 = fir.shape %7 : (index) -> !fir.shape<1>
++    %10 = fir.embox %8(%9) : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++    fir.store %10 to %3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    // CHECK:  omp.simd nontemporal(%[[X_DECL]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) private(@_QFsimd_nontemporal_allocatableEi_private_i32 %2 -> %arg2 : !fir.ref<i32>) {
++    // CHECK:   omp.loop_nest (%{{.*}}) : i32 = (%{{.*}}) to (%{{.*}}) inclusive step (%{{.*}}) {
++    omp.simd nontemporal(%3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) private(@_QFsimd_nontemporal_allocatableEi_private_i32 %2 -> %arg2 : !fir.ref<i32>) {
++      omp.loop_nest (%arg3) : i32 = (%c1_i32) to (%c100_i32) inclusive step (%c1_i32) {
++        %16 = fir.declare %arg2 {uniq_name = "_QFsimd_nontemporal_allocatableEi"} : (!fir.ref<i32>) -> !fir.ref<i32>
++        fir.store %arg3 to %16 : !fir.ref<i32>
++        // CHECK:  %[[VAL1:.*]] = fir.load %[[X_DECL]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++        %17 = fir.load %3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++        // CHECK: %[[VAL2:.*]] = fir.load %{{.*}} : !fir.ref<i32>
++        %18 = fir.load %16 : !fir.ref<i32>
++        %19 = fir.convert %18 : (i32) -> i64
++        // CHECK:  %[[BOX_ADDR:.*]] = fir.box_addr %[[VAL1]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++        %20 = fir.box_addr %17 : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++        %c0_0 = arith.constant 0 : index
++        %21:3 = fir.box_dims %17, %c0_0 : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
++        %22 = fir.shape_shift %21#0, %21#1 : (index, index) -> !fir.shapeshift<1>
++        // CHECK:  %[[ARR_COOR:.*]] = fir.array_coor %[[BOX_ADDR]](%{{.*}}) %{{.*}} : (!fir.heap<!fir.array<?xi32>>, !fir.shapeshift<1>, i64) -> !fir.ref<i32>
++        %23 = fir.array_coor %20(%22) %19 : (!fir.heap<!fir.array<?xi32>>, !fir.shapeshift<1>, i64) -> !fir.ref<i32>
++        // CHECK:  %[[VAL3:.*]] = fir.load %[[ARR_COOR]] {nontemporal} : !fir.ref<i32>
++        %24 = fir.load %23 : !fir.ref<i32>
++        %25 = fir.load %4 : !fir.ref<i32>
++        %26 = arith.addi %24, %25 : i32
++        %27 = fir.load %3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++        %28 = fir.load %16 : !fir.ref<i32>
++        %29 = fir.convert %28 : (i32) -> i64
++        %30 = fir.box_addr %27 : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++        %c0_1 = arith.constant 0 : index
++        %31:3 = fir.box_dims %27, %c0_1 : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
++        %32 = fir.shape_shift %31#0, %31#1 : (index, index) -> !fir.shapeshift<1>
++        %33 = fir.array_coor %30(%32) %29 : (!fir.heap<!fir.array<?xi32>>, !fir.shapeshift<1>, i64) -> !fir.ref<i32>
++        // CHECK:  fir.store %{{.*}} to %{{.*}} {nontemporal} : !fir.ref<i32>
++        fir.store %26 to %33 : !fir.ref<i32>
++        omp.yield
++      }
++    }
++    %11 = fir.load %3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    %12 = fir.box_addr %11 : (!fir.box<!fir.heap<!fir.array<?xi32>>>) -> !fir.heap<!fir.array<?xi32>>
++    fir.freemem %12 : !fir.heap<!fir.array<?xi32>>
++    %13 = fir.zero_bits !fir.heap<!fir.array<?xi32>>
++    %14 = fir.shape %c0 : (index) -> !fir.shape<1>
++    %15 = fir.embox %13(%14) : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++    fir.store %15 to %3 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++    return
++  }
++
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 52aa1fbfab2c1..6cc19d215aca1 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -187,10 +187,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+     if (!op.getLinearVars().empty() || !op.getLinearStepVars().empty())
+       result = todo("linear");
+   };
+-  auto checkNontemporal = [&todo](auto op, LogicalResult &result) {
+-    if (!op.getNontemporalVars().empty())
+-      result = todo("nontemporal");
+-  };
+   auto checkNowait = [&todo](auto op, LogicalResult &result) {
+     if (op.getNowait())
+       result = todo("nowait");
+@@ -296,7 +292,6 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+       })
+       .Case([&](omp::SimdOp op) {
+         checkLinear(op, result);
+-        checkNontemporal(op, result);
+         checkReduction(op, result);
+       })
+       .Case<omp::AtomicReadOp, omp::AtomicWriteOp, omp::AtomicUpdateOp,
+@@ -2601,6 +2596,7 @@ convertOmpSimd(Operation &opInst, llvm::IRBuilderBase &builder,
+ 
+   llvm::MapVector<llvm::Value *, llvm::Value *> alignedVars;
+   llvm::omp::OrderKind order = convertOrderKind(simdOp.getOrder());
++
+   llvm::BasicBlock *sourceBlock = builder.GetInsertBlock();
+   std::optional<ArrayAttr> alignmentValues = simdOp.getAlignments();
+   mlir::OperandRange operands = simdOp.getAlignedVars();
+diff --git a/mlir/test/Target/LLVMIR/openmp-nontemporal.mlir b/mlir/test/Target/LLVMIR/openmp-nontemporal.mlir
+new file mode 100644
+index 0000000000000..974cf674d547d
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-nontemporal.mlir
+@@ -0,0 +1,96 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// -----
++// CHECK-LABEL: @simd_nontemporal
++llvm.func @simd_nontemporal() {
++  %0 = llvm.mlir.constant(10 : i64) : i64
++  %1 = llvm.mlir.constant(1 : i64) : i64
++  %2 = llvm.alloca %1 x i64 : (i64) -> !llvm.ptr
++  %3 = llvm.alloca %1 x i64 : (i64) -> !llvm.ptr
++  //CHECK: %[[A_ADDR:.*]] = alloca i64, i64 1, align 8
++  //CHECK: %[[B_ADDR:.*]] = alloca i64, i64 1, align 8
++  //CHECK: %[[B:.*]] = load i64, ptr %[[B_ADDR]], align 4, !nontemporal !1, !llvm.access.group !2
++  //CHECK: store i64 %[[B]], ptr %[[A_ADDR]], align 4, !nontemporal !1, !llvm.access.group !2
++  omp.simd nontemporal(%2, %3 : !llvm.ptr, !llvm.ptr) {
++    omp.loop_nest (%arg0) : i64 = (%1) to (%0) inclusive step (%1) {
++      %4 = llvm.load %3 {nontemporal}: !llvm.ptr -> i64
++      llvm.store %4, %2 {nontemporal} : i64, !llvm.ptr
++      omp.yield
++    }
++  }
++  llvm.return
++}
++
++// -----
++
++//CHECK-LABEL:  define void @_QPtest(ptr %0, ptr %1) {
++llvm.func @_QPtest(%arg0: !llvm.ptr {fir.bindc_name = "n"}, %arg1: !llvm.ptr {fir.bindc_name = "a"}) {
++    %0 = llvm.mlir.constant(1 : i32) : i32
++    %1 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++    %2 = llvm.alloca %0 x !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)> {alignment = 8 : i64} : (i32) -> !llvm.ptr
++    %3 = llvm.mlir.constant(1 : i64) : i64
++    %4 = llvm.alloca %3 x i32 {bindc_name = "i", pinned} : (i64) -> !llvm.ptr
++    %6 = llvm.load %arg0 : !llvm.ptr -> i32
++    // CHECK:  %[[A_VAL1:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, align 8
++    // CHECK:  %[[A_VAL2:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, align 8
++    omp.simd nontemporal(%arg1 : !llvm.ptr) {
++      omp.loop_nest (%arg2) : i32 = (%0) to (%6) inclusive step (%0) {
++        llvm.store %arg2, %4 : i32, !llvm.ptr
++        // CHECK:  call void @llvm.memcpy.p0.p0.i32(ptr %[[A_VAL2]], ptr %1, i32 48, i1 false)
++        %7 = llvm.mlir.constant(48 : i32) : i32
++        "llvm.intr.memcpy"(%2, %arg1, %7) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++        %8 = llvm.load %4 : !llvm.ptr -> i32
++        %9 = llvm.sext %8 : i32 to i64
++        %10 = llvm.getelementptr %2[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %11 = llvm.load %10 : !llvm.ptr -> !llvm.ptr
++        %12 = llvm.mlir.constant(0 : index) : i64
++        %13 = llvm.getelementptr %2[0, 7, %12, 0] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %14 = llvm.load %13 : !llvm.ptr -> i64
++        %15 = llvm.getelementptr %2[0, 7, %12, 1] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %16 = llvm.load %15 : !llvm.ptr -> i64
++        %17 = llvm.getelementptr %2[0, 7, %12, 2] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %18 = llvm.load %17 : !llvm.ptr -> i64
++        %19 = llvm.mlir.constant(0 : i64) : i64
++        %20 = llvm.sub %9, %14 overflow<nsw> : i64
++        %21 = llvm.mul %20, %3 overflow<nsw> : i64
++        %22 = llvm.mul %21, %3 overflow<nsw> : i64
++        %23 = llvm.add %22,%19 overflow<nsw> : i64
++        %24 = llvm.mul %3, %16 overflow<nsw> : i64
++        // CHECK:  %[[VAL1:.*]] = getelementptr float, ptr {{.*}}, i64 %{{.*}}
++        // CHECK:  %[[LOAD_A:.*]] = load float, ptr %[[VAL1]], align 4, !nontemporal 
++        // CHECK:  %[[RES:.*]] = fadd contract float %[[LOAD_A]], 2.000000e+01
++        %25 = llvm.getelementptr %11[%23] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++        %26 = llvm.load %25 {nontemporal} : !llvm.ptr -> f32
++        %27 = llvm.mlir.constant(2.000000e+01 : f32) : f32
++        %28 = llvm.fadd %26, %27 {fastmathFlags = #llvm.fastmath<contract>} : f32
++        // CHECK:  call void @llvm.memcpy.p0.p0.i32(ptr %[[A_VAL1]], ptr %1, i32 48, i1 false)
++        %29 = llvm.mlir.constant(48 : i32) : i32
++        "llvm.intr.memcpy"(%1, %arg1, %29) <{isVolatile = false}> : (!llvm.ptr, !llvm.ptr, i32) -> ()
++        %30 = llvm.load %4 : !llvm.ptr -> i32
++        %31 = llvm.sext %30 : i32 to i64
++        %32 = llvm.getelementptr %1[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %33 = llvm.load %32 : !llvm.ptr -> !llvm.ptr
++        %34 = llvm.mlir.constant(0 : index) : i64
++        %35 = llvm.getelementptr %1[0, 7, %34, 0] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %36 = llvm.load %35 : !llvm.ptr -> i64
++        %37 = llvm.getelementptr %1[0, 7, %34, 1] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %38 = llvm.load %37 : !llvm.ptr -> i64
++        %39 = llvm.getelementptr %1[0, 7, %34, 2] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8, array<1 x array<3 x i64>>)>
++        %40 = llvm.load %39 : !llvm.ptr -> i64
++        %41 = llvm.sub %31, %36 overflow<nsw> : i64
++        %42 = llvm.mul %41, %3 overflow<nsw> : i64
++        %43 = llvm.mul %42, %3 overflow<nsw> : i64
++        %44 = llvm.add %43,%19 overflow<nsw> : i64
++        %45 = llvm.mul %3, %38 overflow<nsw> : i64
++        // CHECK:  %[[VAL2:.*]] = getelementptr float, ptr %{{.*}}, i64 %{{.*}}
++        // CHECK:  store float %[[RES]], ptr %[[VAL2]], align 4, !nontemporal 
++        %46 = llvm.getelementptr %33[%44] : (!llvm.ptr, i64) -> !llvm.ptr, f32
++        llvm.store %28, %46 {nontemporal} : f32, !llvm.ptr
++        omp.yield
++      }
++    }
++    llvm.return
++  }
++
++// -----
++
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index 7eafe396082e4..4ba208103b227 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -169,19 +169,6 @@ llvm.func @simd_linear(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
+ 
+ // -----
+ 
+-llvm.func @simd_nontemporal(%lb : i32, %ub : i32, %step : i32, %x : !llvm.ptr) {
+-  // expected-error@below {{not yet implemented: Unhandled clause nontemporal in omp.simd operation}}
+-  // expected-error@below {{LLVM Translation failed for operation: omp.simd}}
+-  omp.simd nontemporal(%x : !llvm.ptr) {
+-    omp.loop_nest (%iv) : i32 = (%lb) to (%ub) step (%step) {
+-      omp.yield
+-    }
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ omp.declare_reduction @add_f32 : f32
+ init {
+ ^bb0(%arg: f32):

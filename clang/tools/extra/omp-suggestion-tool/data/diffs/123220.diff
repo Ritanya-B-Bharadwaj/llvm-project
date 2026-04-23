@@ -1,0 +1,139 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index d1f943f86f324..6db43cf6f04bd 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -3374,7 +3374,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Ordered &x) {
+ void OmpStructureChecker::Enter(const parser::OmpClause::Shared &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_shared);
+   CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "SHARED");
+-  CheckCrayPointee(x.v, "SHARED");
+ }
+ void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
+   SymbolSourceMap symbols;
+@@ -3382,7 +3381,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_private);
+   CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "PRIVATE");
+   CheckIntentInPointer(symbols, llvm::omp::Clause::OMPC_private);
+-  CheckCrayPointee(x.v, "PRIVATE");
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Nowait &x) {
+@@ -3462,7 +3460,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Firstprivate &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_firstprivate);
+ 
+   CheckIsVarPartOfAnotherVar(GetContext().clauseSource, x.v, "FIRSTPRIVATE");
+-  CheckCrayPointee(x.v, "FIRSTPRIVATE");
+   CheckIsLoopIvPartOfClause(llvmOmpClause::OMPC_firstprivate, x.v);
+ 
+   SymbolSourceMap currSymbols;
+@@ -4559,22 +4556,6 @@ void OmpStructureChecker::CheckProcedurePointer(
+   }
+ }
+ 
+-void OmpStructureChecker::CheckCrayPointee(
+-    const parser::OmpObjectList &objectList, llvm::StringRef clause) {
+-  SymbolSourceMap symbols;
+-  GetSymbolsInObjectList(objectList, symbols);
+-  for (auto it{symbols.begin()}; it != symbols.end(); ++it) {
+-    const auto *symbol{it->first};
+-    const auto source{it->second};
+-    if (symbol->test(Symbol::Flag::CrayPointee)) {
+-      context_.Say(source,
+-          "Cray Pointee '%s' may not appear in %s clause, use Cray Pointer '%s' instead"_err_en_US,
+-          symbol->name(), clause.str(),
+-          semantics::GetCrayPointer(*symbol).name());
+-    }
+-  }
+-}
+-
+ void OmpStructureChecker::GetSymbolsInObjectList(
+     const parser::OmpObjectList &objectList, SymbolSourceMap &symbols) {
+   for (const auto &ompObject : objectList.v) {
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 8952c4a85ccd4..dc360957c873b 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -197,8 +197,6 @@ class OmpStructureChecker
+       const parser::CharBlock &source, const parser::OmpObjectList &objList);
+   void CheckIntentInPointer(SymbolSourceMap &, const llvm::omp::Clause);
+   void CheckProcedurePointer(SymbolSourceMap &, const llvm::omp::Clause);
+-  void CheckCrayPointee(
+-      const parser::OmpObjectList &objectList, llvm::StringRef clause);
+   void GetSymbolsInObjectList(const parser::OmpObjectList &, SymbolSourceMap &);
+   void CheckDefinableObjects(SymbolSourceMap &, const llvm::omp::Clause);
+   void CheckCopyingPolymorphicAllocatable(
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 9cbc61391ba1f..39478b58a9070 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2115,12 +2115,8 @@ void OmpAttributeVisitor::Post(const parser::OpenMPAllocatorsConstruct &x) {
+ static bool IsPrivatizable(const Symbol *sym) {
+   auto *misc{sym->detailsIf<MiscDetails>()};
+   return IsVariableName(*sym) && !IsProcedure(*sym) && !IsNamedConstant(*sym) &&
+-      (!semantics::IsAssumedSizeArray(
+-           *sym) || /* OpenMP 5.2, 5.1.1: Assumed-size arrays are shared*/
+-          (sym->test(Symbol::Flag::CrayPointee) &&
+-              // If CrayPointer is among the DSA list then the
+-              // CrayPointee is Privatizable
+-              &semantics::GetCrayPointer(*sym))) &&
++      !semantics::IsAssumedSizeArray(
++          *sym) && /* OpenMP 5.2, 5.1.1: Assumed-size arrays are shared*/
+       !sym->owner().IsDerivedType() &&
+       sym->owner().kind() != Scope::Kind::ImpliedDos &&
+       !sym->detailsIf<semantics::AssocEntityDetails>() &&
+@@ -2286,18 +2282,10 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
+             // the scope of the parallel region, and not in this scope.
+             // TODO: check whether this should be caught in IsObjectWithDSA
+             !symbol->test(Symbol::Flag::OmpPrivate)) {
+-          if (symbol->test(Symbol::Flag::CrayPointee)) {
+-            std::string crayPtrName{
+-                semantics::GetCrayPointer(*symbol).name().ToString()};
+-            if (!IsObjectWithDSA(*currScope().FindSymbol(crayPtrName)))
+-              context_.Say(name.source,
+-                  "The DEFAULT(NONE) clause requires that the Cray Pointer '%s' must be listed in a data-sharing attribute clause"_err_en_US,
+-                  crayPtrName);
+-          } else {
+-            context_.Say(name.source,
+-                "The DEFAULT(NONE) clause requires that '%s' must be listed in a data-sharing attribute clause"_err_en_US,
+-                symbol->name());
+-          }
++          context_.Say(name.source,
++              "The DEFAULT(NONE) clause requires that '%s' must be listed in "
++              "a data-sharing attribute clause"_err_en_US,
++              symbol->name());
+         }
+       }
+     }
+diff --git a/flang/test/Semantics/OpenMP/cray-pointer-usage.f90 b/flang/test/Semantics/OpenMP/cray-pointer-usage.f90
+deleted file mode 100644
+index c7d03f0db9904..0000000000000
+--- a/flang/test/Semantics/OpenMP/cray-pointer-usage.f90
++++ /dev/null
+@@ -1,27 +0,0 @@
+-!RUN: %python %S/../test_errors.py %s %flang -fopenmp
+-subroutine test_cray_pointer_usage
+-  implicit none
+-  real(8) :: var(*), pointee(2)
+-  pointer(ivar, var)
+-
+-  pointee = 42.0
+-  ivar = loc(pointee)
+-
+-  !$omp parallel num_threads(2) default(none)
+-    ! ERROR: The DEFAULT(NONE) clause requires that the Cray Pointer 'ivar' must be listed in a data-sharing attribute clause
+-    print *, var(1)
+-  !$omp end parallel
+-
+-  ! ERROR: Cray Pointee 'var' may not appear in PRIVATE clause, use Cray Pointer 'ivar' instead
+-  !$omp parallel num_threads(2) default(none) private(var)
+-    print *, var(1)
+-  !$omp end parallel
+-
+-  !$omp parallel num_threads(2) default(none) firstprivate(ivar)
+-    print *, var(1)
+-  !$omp end parallel
+-
+-  !$omp parallel num_threads(2) default(private) shared(ivar)
+-    print *, var(1)
+-  !$omp end parallel
+-end subroutine test_cray_pointer_usage

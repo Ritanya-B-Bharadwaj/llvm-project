@@ -1,0 +1,528 @@
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 08ec57803aff8..a59677c02fc39 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -3116,6 +3116,174 @@ convertDeclareTargetAttr(Operation *op, mlir::omp::DeclareTargetAttr attribute,
+   return success();
+ }
+ 
++// Returns true if the operation is inside a TargetOp or
++// is part of a declare target function.
++static bool isTargetDeviceOp(Operation *op) {
++  // Assumes no reverse offloading
++  if (op->getParentOfType<omp::TargetOp>())
++    return true;
++
++  if (auto parentFn = op->getParentOfType<LLVM::LLVMFuncOp>())
++    if (auto declareTargetIface =
++            llvm::dyn_cast<mlir::omp::DeclareTargetInterface>(
++                parentFn.getOperation()))
++      if (declareTargetIface.isDeclareTarget() &&
++          declareTargetIface.getDeclareTargetDeviceType() !=
++              mlir::omp::DeclareTargetDeviceType::host)
++        return true;
++
++  return false;
++}
++
++/// Given an OpenMP MLIR operation, create the corresponding LLVM IR
++/// (including OpenMP runtime calls).
++static LogicalResult
++convertHostOrTargetOperation(Operation *op, llvm::IRBuilderBase &builder,
++                             LLVM::ModuleTranslation &moduleTranslation) {
++
++  llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
++
++  return llvm::TypeSwitch<Operation *, LogicalResult>(op)
++      .Case([&](omp::BarrierOp) {
++        ompBuilder->createBarrier(builder.saveIP(), llvm::omp::OMPD_barrier);
++        return success();
++      })
++      .Case([&](omp::TaskwaitOp) {
++        ompBuilder->createTaskwait(builder.saveIP());
++        return success();
++      })
++      .Case([&](omp::TaskyieldOp) {
++        ompBuilder->createTaskyield(builder.saveIP());
++        return success();
++      })
++      .Case([&](omp::FlushOp) {
++        // No support in Openmp runtime function (__kmpc_flush) to accept
++        // the argument list.
++        // OpenMP standard states the following:
++        //  "An implementation may implement a flush with a list by ignoring
++        //   the list, and treating it the same as a flush without a list."
++        //
++        // The argument list is discarded so that, flush with a list is treated
++        // same as a flush without a list.
++        ompBuilder->createFlush(builder.saveIP());
++        return success();
++      })
++      .Case([&](omp::ParallelOp op) {
++        return convertOmpParallel(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::ReductionOp reductionOp) {
++        return convertOmpReductionOp(reductionOp, builder, moduleTranslation);
++      })
++      .Case([&](omp::MasterOp) {
++        return convertOmpMaster(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::CriticalOp) {
++        return convertOmpCritical(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::OrderedRegionOp) {
++        return convertOmpOrderedRegion(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::OrderedOp) {
++        return convertOmpOrdered(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::WsloopOp) {
++        return convertOmpWsloop(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::SimdLoopOp) {
++        return convertOmpSimdLoop(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::AtomicReadOp) {
++        return convertOmpAtomicRead(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::AtomicWriteOp) {
++        return convertOmpAtomicWrite(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::AtomicUpdateOp op) {
++        return convertOmpAtomicUpdate(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::AtomicCaptureOp op) {
++        return convertOmpAtomicCapture(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::SectionsOp) {
++        return convertOmpSections(*op, builder, moduleTranslation);
++      })
++      .Case([&](omp::SingleOp op) {
++        return convertOmpSingle(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::TeamsOp op) {
++        return convertOmpTeams(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::TaskOp op) {
++        return convertOmpTaskOp(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::TaskgroupOp op) {
++        return convertOmpTaskgroupOp(op, builder, moduleTranslation);
++      })
++      .Case<omp::YieldOp, omp::TerminatorOp, omp::DeclareReductionOp,
++            omp::CriticalDeclareOp>([](auto op) {
++        // `yield` and `terminator` can be just omitted. The block structure
++        // was created in the region that handles their parent operation.
++        // `declare_reduction` will be used by reductions and is not
++        // converted directly, skip it.
++        // `critical.declare` is only used to declare names of critical
++        // sections which will be used by `critical` ops and hence can be
++        // ignored for lowering. The OpenMP IRBuilder will create unique
++        // name for critical section names.
++        return success();
++      })
++      .Case([&](omp::ThreadprivateOp) {
++        return convertOmpThreadprivate(*op, builder, moduleTranslation);
++      })
++      .Case<omp::TargetDataOp, omp::TargetEnterDataOp, omp::TargetExitDataOp,
++            omp::TargetUpdateOp>([&](auto op) {
++        return convertOmpTargetData(op, builder, moduleTranslation);
++      })
++      .Case([&](omp::TargetOp) {
++        return convertOmpTarget(*op, builder, moduleTranslation);
++      })
++      .Case<omp::MapInfoOp, omp::MapBoundsOp, omp::PrivateClauseOp>(
++          [&](auto op) {
++            // No-op, should be handled by relevant owning operations e.g.
++            // TargetOp, TargetEnterDataOp, TargetExitDataOp, TargetDataOp etc.
++            // and then discarded
++            return success();
++          })
++      .Default([&](Operation *inst) {
++        return inst->emitError("unsupported OpenMP operation: ")
++               << inst->getName();
++      });
++}
++
++static LogicalResult
++convertTargetDeviceOp(Operation *op, llvm::IRBuilderBase &builder,
++                      LLVM::ModuleTranslation &moduleTranslation) {
++  return convertHostOrTargetOperation(op, builder, moduleTranslation);
++}
++
++static LogicalResult
++convertTargetOpsInNest(Operation *op, llvm::IRBuilderBase &builder,
++                       LLVM::ModuleTranslation &moduleTranslation) {
++  if (isa<omp::TargetOp>(op))
++    return convertOmpTarget(*op, builder, moduleTranslation);
++  if (isa<omp::TargetDataOp>(op))
++    return convertOmpTargetData(op, builder, moduleTranslation);
++  bool interrupted =
++      op->walk<WalkOrder::PreOrder>([&](Operation *oper) {
++          if (isa<omp::TargetOp>(oper)) {
++            if (failed(convertOmpTarget(*oper, builder, moduleTranslation)))
++              return WalkResult::interrupt();
++            return WalkResult::skip();
++          }
++          if (isa<omp::TargetDataOp>(oper)) {
++            if (failed(convertOmpTargetData(oper, builder, moduleTranslation)))
++              return WalkResult::interrupt();
++            return WalkResult::skip();
++          }
++          return WalkResult::advance();
++        }).wasInterrupted();
++  return failure(interrupted);
++}
++
+ namespace {
+ 
+ /// Implementation of the dialect interface that converts operations belonging
+@@ -3131,8 +3299,8 @@ class OpenMPDialectLLVMIRTranslationInterface
+   convertOperation(Operation *op, llvm::IRBuilderBase &builder,
+                    LLVM::ModuleTranslation &moduleTranslation) const final;
+ 
+-  /// Given an OpenMP MLIR attribute, create the corresponding LLVM-IR, runtime
+-  /// calls, or operation amendments
++  /// Given an OpenMP MLIR attribute, create the corresponding LLVM-IR,
++  /// runtime calls, or operation amendments
+   LogicalResult
+   amendOperation(Operation *op, ArrayRef<llvm::Instruction *> instructions,
+                  NamedAttribute attribute,
+@@ -3237,116 +3405,15 @@ LogicalResult OpenMPDialectLLVMIRTranslationInterface::convertOperation(
+     LLVM::ModuleTranslation &moduleTranslation) const {
+ 
+   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
++  if (ompBuilder->Config.isTargetDevice()) {
++    if (isTargetDeviceOp(op)) {
++      return convertTargetDeviceOp(op, builder, moduleTranslation);
++    } else {
++      return convertTargetOpsInNest(op, builder, moduleTranslation);
++    }
++  }
+ 
+-  return llvm::TypeSwitch<Operation *, LogicalResult>(op)
+-      .Case([&](omp::BarrierOp) {
+-        ompBuilder->createBarrier(builder.saveIP(), llvm::omp::OMPD_barrier);
+-        return success();
+-      })
+-      .Case([&](omp::TaskwaitOp) {
+-        ompBuilder->createTaskwait(builder.saveIP());
+-        return success();
+-      })
+-      .Case([&](omp::TaskyieldOp) {
+-        ompBuilder->createTaskyield(builder.saveIP());
+-        return success();
+-      })
+-      .Case([&](omp::FlushOp) {
+-        // No support in Openmp runtime function (__kmpc_flush) to accept
+-        // the argument list.
+-        // OpenMP standard states the following:
+-        //  "An implementation may implement a flush with a list by ignoring
+-        //   the list, and treating it the same as a flush without a list."
+-        //
+-        // The argument list is discarded so that, flush with a list is treated
+-        // same as a flush without a list.
+-        ompBuilder->createFlush(builder.saveIP());
+-        return success();
+-      })
+-      .Case([&](omp::ParallelOp op) {
+-        return convertOmpParallel(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::ReductionOp reductionOp) {
+-        return convertOmpReductionOp(reductionOp, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::MasterOp) {
+-        return convertOmpMaster(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::CriticalOp) {
+-        return convertOmpCritical(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::OrderedRegionOp) {
+-        return convertOmpOrderedRegion(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::OrderedOp) {
+-        return convertOmpOrdered(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::WsloopOp) {
+-        return convertOmpWsloop(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::SimdLoopOp) {
+-        return convertOmpSimdLoop(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::AtomicReadOp) {
+-        return convertOmpAtomicRead(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::AtomicWriteOp) {
+-        return convertOmpAtomicWrite(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::AtomicUpdateOp op) {
+-        return convertOmpAtomicUpdate(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::AtomicCaptureOp op) {
+-        return convertOmpAtomicCapture(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::SectionsOp) {
+-        return convertOmpSections(*op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::SingleOp op) {
+-        return convertOmpSingle(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::TeamsOp op) {
+-        return convertOmpTeams(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::TaskOp op) {
+-        return convertOmpTaskOp(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::TaskgroupOp op) {
+-        return convertOmpTaskgroupOp(op, builder, moduleTranslation);
+-      })
+-      .Case<omp::YieldOp, omp::TerminatorOp, omp::DeclareReductionOp,
+-            omp::CriticalDeclareOp>([](auto op) {
+-        // `yield` and `terminator` can be just omitted. The block structure
+-        // was created in the region that handles their parent operation.
+-        // `declare_reduction` will be used by reductions and is not
+-        // converted directly, skip it.
+-        // `critical.declare` is only used to declare names of critical
+-        // sections which will be used by `critical` ops and hence can be
+-        // ignored for lowering. The OpenMP IRBuilder will create unique
+-        // name for critical section names.
+-        return success();
+-      })
+-      .Case([&](omp::ThreadprivateOp) {
+-        return convertOmpThreadprivate(*op, builder, moduleTranslation);
+-      })
+-      .Case<omp::TargetDataOp, omp::TargetEnterDataOp, omp::TargetExitDataOp,
+-            omp::TargetUpdateOp>([&](auto op) {
+-        return convertOmpTargetData(op, builder, moduleTranslation);
+-      })
+-      .Case([&](omp::TargetOp) {
+-        return convertOmpTarget(*op, builder, moduleTranslation);
+-      })
+-      .Case<omp::MapInfoOp, omp::MapBoundsOp, omp::PrivateClauseOp>(
+-          [&](auto op) {
+-            // No-op, should be handled by relevant owning operations e.g.
+-            // TargetOp, TargetEnterDataOp, TargetExitDataOp, TargetDataOp etc.
+-            // and then discarded
+-            return success();
+-          })
+-      .Default([&](Operation *inst) {
+-        return inst->emitError("unsupported OpenMP operation: ")
+-               << inst->getName();
+-      });
++  return convertHostOrTargetOperation(op, builder, moduleTranslation);
+ }
+ 
+ void mlir::registerOpenMPDialectTranslation(DialectRegistry &registry) {
+diff --git a/mlir/test/Target/LLVMIR/omptarget-parallel-wsloop.mlir b/mlir/test/Target/LLVMIR/omptarget-parallel-wsloop.mlir
+index 8ab50f05f0716..b0fe642238f14 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-parallel-wsloop.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-parallel-wsloop.mlir
+@@ -4,10 +4,10 @@
+ // for nested omp do loop inside omp target region
+ 
+ module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<"dlti.alloca_memory_space", 5 : ui32>>, llvm.data_layout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8", llvm.target_triple = "amdgcn-amd-amdhsa", omp.is_gpu = true, omp.is_target_device = true } {
+-  llvm.func @target_parallel_wsloop(%arg0: !llvm.ptr) attributes {
++  llvm.func @target_parallel_wsloop(%arg0: !llvm.ptr) attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>,
+     target_cpu = "gfx90a",
+-    target_features = #llvm.target_features<["+gfx9-insts", "+wavefrontsize64"]>
+-  } {
++    target_features = #llvm.target_features<["+gfx9-insts", "+wavefrontsize64"]>}
++   {
+     omp.parallel {
+       %loop_ub = llvm.mlir.constant(9 : i32) : i32
+       %loop_lb = llvm.mlir.constant(0 : i32) : i32
+diff --git a/mlir/test/Target/LLVMIR/omptarget-target-inside-task.mlir b/mlir/test/Target/LLVMIR/omptarget-target-inside-task.mlir
+new file mode 100644
+index 0000000000000..3d18e608d857e
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptarget-target-inside-task.mlir
+@@ -0,0 +1,41 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++module attributes {omp.is_target_device = true, omp.is_gpu = true} {
++  llvm.func @omp_target_region_() {
++    %0 = llvm.mlir.constant(20 : i32) : i32
++    %1 = llvm.mlir.constant(10 : i32) : i32
++    %2 = llvm.mlir.constant(1 : i64) : i64
++    %3 = llvm.alloca %2 x i32 {bindc_name = "a", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEa"} : (i64) -> !llvm.ptr
++    %4 = llvm.mlir.constant(1 : i64) : i64
++    %5 = llvm.alloca %4 x i32 {bindc_name = "b", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEb"} : (i64) -> !llvm.ptr
++    %6 = llvm.mlir.constant(1 : i64) : i64
++    %7 = llvm.alloca %6 x i32 {bindc_name = "c", in_type = i32, operandSegmentSizes = array<i32: 0, 0>, uniq_name = "_QFomp_target_regionEc"} : (i64) -> !llvm.ptr
++    llvm.store %1, %3 : i32, !llvm.ptr
++    llvm.store %0, %5 : i32, !llvm.ptr
++    omp.task {
++        %map1 = omp.map.info var_ptr(%3 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++        %map2 = omp.map.info var_ptr(%5 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++        %map3 = omp.map.info var_ptr(%7 : !llvm.ptr, i32)   map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++      omp.target map_entries(%map1 -> %arg0, %map2 -> %arg1, %map3 -> %arg2 : !llvm.ptr, !llvm.ptr, !llvm.ptr) {
++      ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: !llvm.ptr):
++        %8 = llvm.load %arg0 : !llvm.ptr -> i32
++        %9 = llvm.load %arg1 : !llvm.ptr -> i32
++        %10 = llvm.add %8, %9  : i32
++        llvm.store %10, %arg2 : i32, !llvm.ptr
++        omp.terminator
++      }
++      omp.terminator
++    }
++   llvm.return
++  }
++
++  llvm.func @omp_target_no_map() {
++    omp.target {
++      omp.terminator
++    }
++    llvm.return
++  }
++}
++
++// CHECK: define weak_odr protected void @__omp_offloading_{{.*}}_{{.*}}_omp_target_region__l19
++// CHECK: ret void
+diff --git a/mlir/test/Target/LLVMIR/omptarget-teams-llvm.mlir b/mlir/test/Target/LLVMIR/omptarget-teams-llvm.mlir
+index 96cced7a1d584..c5f89eb2c3274 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-teams-llvm.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-teams-llvm.mlir
+@@ -5,7 +5,7 @@
+ 
+ module attributes {omp.is_target_device = true} {
+   llvm.func @foo(i32)
+-  llvm.func @omp_target_teams_shared_simple(%arg0 : i32)  {
++  llvm.func @omp_target_teams_shared_simple(%arg0 : i32)  attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>} {
+     omp.teams {
+       llvm.call @foo(%arg0) : (i32) -> ()
+       omp.terminator
+diff --git a/mlir/test/Target/LLVMIR/omptarget-wsloop-collapsed.mlir b/mlir/test/Target/LLVMIR/omptarget-wsloop-collapsed.mlir
+index e246c551886cf..0d77423abcb4f 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-wsloop-collapsed.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-wsloop-collapsed.mlir
+@@ -4,7 +4,7 @@
+ // for nested omp do loop with collapse clause inside omp target region
+ 
+ module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<"dlti.alloca_memory_space", 5 : ui32>>, llvm.data_layout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8", llvm.target_triple = "amdgcn-amd-amdhsa", omp.is_gpu = true, omp.is_target_device = true } {
+-  llvm.func @target_collapsed_wsloop(%arg0: !llvm.ptr) {
++  llvm.func @target_collapsed_wsloop(%arg0: !llvm.ptr) attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>} {
+     %loop_ub = llvm.mlir.constant(99 : i32) : i32
+     %loop_lb = llvm.mlir.constant(0 : i32) : i32
+     %loop_step = llvm.mlir.constant(1 : index) : i32
+diff --git a/mlir/test/Target/LLVMIR/omptarget-wsloop.mlir b/mlir/test/Target/LLVMIR/omptarget-wsloop.mlir
+index 220eb85b3483e..0f3f503dfa537 100644
+--- a/mlir/test/Target/LLVMIR/omptarget-wsloop.mlir
++++ b/mlir/test/Target/LLVMIR/omptarget-wsloop.mlir
+@@ -4,7 +4,7 @@
+ // for nested omp do loop inside omp target region
+ 
+ module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<"dlti.alloca_memory_space", 5 : ui32>>, llvm.data_layout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8", llvm.target_triple = "amdgcn-amd-amdhsa", omp.is_gpu = true, omp.is_target_device = true } {
+-  llvm.func @target_wsloop(%arg0: !llvm.ptr ){
++  llvm.func @target_wsloop(%arg0: !llvm.ptr ) attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>} {
+       %loop_ub = llvm.mlir.constant(9 : i32) : i32
+       %loop_lb = llvm.mlir.constant(0 : i32) : i32
+       %loop_step = llvm.mlir.constant(1 : i32) : i32
+@@ -16,7 +16,7 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<#dlti.dl_entry<"dlti.alloca_memo
+     llvm.return
+   }
+ 
+-  llvm.func @target_empty_wsloop(){
++  llvm.func @target_empty_wsloop() attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (to)>} {
+       %loop_ub = llvm.mlir.constant(9 : i32) : i32
+       %loop_lb = llvm.mlir.constant(0 : i32) : i32
+       %loop_step = llvm.mlir.constant(1 : i32) : i32
+diff --git a/mlir/test/Target/LLVMIR/openmp-data-target-device.mlir b/mlir/test/Target/LLVMIR/openmp-data-target-device.mlir
+new file mode 100644
+index 0000000000000..d41429a6de066
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-data-target-device.mlir
+@@ -0,0 +1,61 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// This tests checks that a target op inside a data op
++// We are only interested in ensuring that the -mlir-to-llmvir pass doesn't crash.
++// CHECK: {{.*}} = add i32 {{.*}}, 1
++module attributes { } {
++  llvm.mlir.global weak_odr hidden local_unnamed_addr constant @__oclc_ABI_version(400 : i32) {addr_space = 4 : i32} : i32
++  llvm.func @_QQmain() attributes {fir.bindc_name = "main", omp.declare_target = #omp.declaretarget<device_type = (host), capture_clause = (to)>} {
++    %0 = llvm.mlir.constant(99 : index) : i64
++    %1 = llvm.mlir.constant(0 : index) : i64
++    %2 = llvm.mlir.constant(1 : index) : i64
++    %3 = llvm.mlir.constant(100 : index) : i64
++    %4 = llvm.mlir.constant(1 : i64) : i64
++    %5 = llvm.alloca %4 x i32 {bindc_name = "array_length"} : (i64) -> !llvm.ptr<5>
++    %6 = llvm.addrspacecast %5 : !llvm.ptr<5> to !llvm.ptr
++    %7 = llvm.mlir.constant(1 : i64) : i64
++    %8 = llvm.alloca %7 x i32 {bindc_name = "index_"} : (i64) -> !llvm.ptr<5>
++    %9 = llvm.addrspacecast %8 : !llvm.ptr<5> to !llvm.ptr
++    %10 = llvm.mlir.addressof @_QFEint_array : !llvm.ptr
++    %11 = omp.map.bounds lower_bound(%1 : i64) upper_bound(%0 : i64) extent(%3 : i64) stride(%2 : i64) start_idx(%2 : i64)
++    %12 = omp.map.info var_ptr(%10 : !llvm.ptr, !llvm.array<100 x i32>) map_clauses(from) capture(ByRef) bounds(%11) -> !llvm.ptr {name = "int_array"}
++    omp.target_data map_entries(%12 : !llvm.ptr) {
++      %13 = omp.map.info var_ptr(%10 : !llvm.ptr, !llvm.array<100 x i32>) map_clauses(from) capture(ByRef) bounds(%11) -> !llvm.ptr {name = "int_array"}
++      %14 = omp.map.info var_ptr(%9 : !llvm.ptr, i32) map_clauses(implicit, exit_release_or_enter_alloc) capture(ByCopy) -> !llvm.ptr {name = "index_"}
++      omp.target map_entries(%13 -> %arg0, %14 -> %arg1 : !llvm.ptr, !llvm.ptr) {
++      ^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++        %15 = llvm.mlir.constant(100 : i32) : i32
++        %16 = llvm.mlir.constant(1 : i32) : i32
++        %17 = llvm.mlir.constant(100 : index) : i64
++        omp.parallel {
++          %18 = llvm.mlir.constant(1 : i64) : i64
++          %19 = llvm.alloca %18 x i32 {pinned} : (i64) -> !llvm.ptr<5>
++          %20 = llvm.addrspacecast %19 : !llvm.ptr<5> to !llvm.ptr
++          omp.wsloop  for  (%arg2) : i32 = (%16) to (%15) inclusive step (%16) {
++            llvm.store %arg2, %20 : i32, !llvm.ptr
++            %21 = llvm.load %20 : !llvm.ptr -> i32
++            %22 = llvm.sext %21 : i32 to i64
++            %23 = llvm.mlir.constant(1 : i64) : i64
++            %24 = llvm.mlir.constant(0 : i64) : i64
++            %25 = llvm.sub %22, %23 overflow<nsw>  : i64
++            %26 = llvm.mul %25, %23 overflow<nsw>  : i64
++            %27 = llvm.mul %26, %23 overflow<nsw>  : i64
++            %28 = llvm.add %27, %24 overflow<nsw>  : i64
++            %29 = llvm.mul %23, %17 overflow<nsw>  : i64
++            %30 = llvm.getelementptr %arg0[%28] : (!llvm.ptr, i64) -> !llvm.ptr, i32
++            llvm.store %21, %30 : i32, !llvm.ptr
++            omp.yield
++          }
++          omp.terminator
++        }
++        omp.terminator
++      }
++      omp.terminator
++    }
++    llvm.return
++  }
++  llvm.mlir.global internal @_QFEint_array() {addr_space = 0 : i32} : !llvm.array<100 x i32> {
++    %0 = llvm.mlir.zero : !llvm.array<100 x i32>
++    llvm.return %0 : !llvm.array<100 x i32>
++  }
++}
+diff --git a/mlir/test/Target/LLVMIR/openmp-task-target-device.mlir b/mlir/test/Target/LLVMIR/openmp-task-target-device.mlir
+new file mode 100644
+index 0000000000000..b4c848beef690
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/openmp-task-target-device.mlir
+@@ -0,0 +1,27 @@
++// RUN: mlir-translate -mlir-to-llvmir %s | FileCheck %s
++
++// This tests the fix for https://github.com/llvm/llvm-project/issues/84606
++// We are only interested in ensuring that the -mlir-to-llmvir pass doesn't crash.
++// CHECK: {{.*}} = add i32 {{.*}}, 5
++module attributes {omp.is_target_device = true } {
++  llvm.func @_QQmain() attributes {fir.bindc_name = "main", omp.declare_target = #omp.declaretarget<device_type = (host), capture_clause = (to)>} {
++    %0 = llvm.mlir.constant(0 : i32) : i32
++    %1 = llvm.mlir.constant(1 : i64) : i64
++    %2 = llvm.alloca %1 x i32 {bindc_name = "a"} : (i64) -> !llvm.ptr<5>
++    %3 = llvm.addrspacecast %2 : !llvm.ptr<5> to !llvm.ptr
++    omp.task {
++      llvm.store %0, %3 : i32, !llvm.ptr
++      omp.terminator
++    }
++    %4 = omp.map.info var_ptr(%3 : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "a"}
++    omp.target map_entries(%4 -> %arg0 : !llvm.ptr) {
++    ^bb0(%arg0: !llvm.ptr):
++      %5 = llvm.mlir.constant(5 : i32) : i32
++      %6 = llvm.load %arg0  : !llvm.ptr -> i32
++      %7 = llvm.add %6, %5  : i32
++      llvm.store %7, %arg0  : i32, !llvm.ptr
++      omp.terminator
++    }
++    llvm.return
++  }
++}

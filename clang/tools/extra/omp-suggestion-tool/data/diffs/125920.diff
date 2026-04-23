@@ -1,0 +1,97 @@
+diff --git a/clang/include/clang/Basic/TargetInfo.h b/clang/include/clang/Basic/TargetInfo.h
+index b9e46a5e7d1ca..070cc792ca7db 100644
+--- a/clang/include/clang/Basic/TargetInfo.h
++++ b/clang/include/clang/Basic/TargetInfo.h
+@@ -1662,7 +1662,7 @@ class TargetInfo : public TransferrableTargetInfo,
+   // access target-specific GPU grid values that must be consistent between
+   // host RTL (plugin), deviceRTL and clang.
+   virtual const llvm::omp::GV &getGridValue() const {
+-    llvm_unreachable("getGridValue not implemented on this target");
++    return llvm::omp::SPIRVGridValues;
+   }
+ 
+   /// Retrieve the name of the platform as it is used in the
+diff --git a/clang/lib/CodeGen/CodeGenModule.cpp b/clang/lib/CodeGen/CodeGenModule.cpp
+index 02615bb13dfb8..846b00f089732 100644
+--- a/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -486,8 +486,10 @@ void CodeGenModule::createOpenMPRuntime() {
+   case llvm::Triple::nvptx:
+   case llvm::Triple::nvptx64:
+   case llvm::Triple::amdgcn:
+-    assert(getLangOpts().OpenMPIsTargetDevice &&
+-           "OpenMP AMDGPU/NVPTX is only prepared to deal with device code.");
++  case llvm::Triple::spirv64:
++    assert(
++        getLangOpts().OpenMPIsTargetDevice &&
++        "OpenMP AMDGPU/NVPTX/SPIRV is only prepared to deal with device code.");
+     OpenMPRuntime.reset(new CGOpenMPRuntimeGPU(*this));
+     break;
+   default:
+diff --git a/clang/test/OpenMP/spirv_target_codegen_basic.cpp b/clang/test/OpenMP/spirv_target_codegen_basic.cpp
+new file mode 100644
+index 0000000000000..fb2810e88c063
+--- /dev/null
++++ b/clang/test/OpenMP/spirv_target_codegen_basic.cpp
+@@ -0,0 +1,17 @@
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple x86_64-unknown-linux -fopenmp-targets=spirv64-intel -emit-llvm-bc %s -o %t-host.bc
++// RUN: %clang_cc1 -verify -fopenmp -x c++ -triple spirv64-intel -fopenmp-targets=spirv64-intel -emit-llvm %s -fopenmp-is-target-device -fopenmp-host-ir-file-path %t-host.bc -o - | FileCheck %s
++
++// expected-no-diagnostics
++
++// CHECK: @__omp_offloading_{{.*}}_dynamic_environment = weak_odr protected addrspace(1) global %struct.DynamicEnvironmentTy zeroinitializer
++// CHECK: @__omp_offloading_{{.*}}_kernel_environment = weak_odr protected addrspace(1) constant %struct.KernelEnvironmentTy
++
++// CHECK: define weak_odr protected spir_kernel void @__omp_offloading_{{.*}}
++
++int main() {
++  int ret = 0;
++  #pragma omp target
++  for(int i = 0; i < 5; i++)
++    ret++;
++  return ret;
++}
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPGridValues.h b/llvm/include/llvm/Frontend/OpenMP/OMPGridValues.h
+index bfac2d734b81d..788a3c8a56f38 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPGridValues.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPGridValues.h
+@@ -120,6 +120,17 @@ static constexpr GV NVPTXGridValues = {
+     128,       // GV_Default_WG_Size
+ };
+ 
++/// For generic SPIR-V GPUs
++static constexpr GV SPIRVGridValues = {
++    256,       // GV_Slot_Size
++    64,        // GV_Warp_Size
++    (1 << 16), // GV_Max_Teams
++    440,       // GV_Default_Num_Teams
++    896,       // GV_SimpleBufferSize
++    1024,      // GV_Max_WG_Size,
++    256,       // GV_Default_WG_Size
++};
++
+ } // namespace omp
+ } // namespace llvm
+ 
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 695b15ac31f38..26baf836e8714 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -159,6 +159,8 @@ static const omp::GV &getGridValue(const Triple &T, Function *Kernel) {
+   }
+   if (T.isNVPTX())
+     return omp::NVPTXGridValues;
++  if (T.isSPIRV())
++    return omp::SPIRVGridValues;
+   llvm_unreachable("No grid value available for this architecture!");
+ }
+ 
+@@ -6470,6 +6472,8 @@ void OpenMPIRBuilder::setOutlinedTargetRegionFunctionAttributes(
+       OutlinedFn->setCallingConv(CallingConv::AMDGPU_KERNEL);
+     else if (T.isNVPTX())
+       OutlinedFn->setCallingConv(CallingConv::PTX_Kernel);
++    else if (T.isSPIRV())
++      OutlinedFn->setCallingConv(CallingConv::SPIR_KERNEL);
+   }
+ }
+ 

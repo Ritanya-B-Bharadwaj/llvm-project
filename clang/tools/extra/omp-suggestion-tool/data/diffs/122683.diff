@@ -1,0 +1,104 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index cd4b25a17722c..ddbca3c7291ae 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1336,19 +1336,18 @@ static void genWorkshareClauses(lower::AbstractConverter &converter,
+   cp.processNowait(clauseOps);
+ }
+ 
+-static void genTeamsClauses(lower::AbstractConverter &converter,
+-                            semantics::SemanticsContext &semaCtx,
+-                            lower::StatementContext &stmtCtx,
+-                            const List<Clause> &clauses, mlir::Location loc,
+-                            mlir::omp::TeamsOperands &clauseOps) {
++static void genTeamsClauses(
++    lower::AbstractConverter &converter, semantics::SemanticsContext &semaCtx,
++    lower::StatementContext &stmtCtx, const List<Clause> &clauses,
++    mlir::Location loc, mlir::omp::TeamsOperands &clauseOps,
++    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSyms) {
+   ClauseProcessor cp(converter, semaCtx, clauses);
+   cp.processAllocate(clauseOps);
+   cp.processIf(llvm::omp::Directive::OMPD_teams, clauseOps);
+   cp.processNumTeams(stmtCtx, clauseOps);
+   cp.processThreadLimit(stmtCtx, clauseOps);
++  cp.processReduction(loc, clauseOps, reductionSyms);
+   // TODO Support delayed privatization.
+-
+-  cp.processTODO<clause::Reduction>(loc, llvm::omp::Directive::OMPD_teams);
+ }
+ 
+ static void genWsloopClauses(
+@@ -2015,13 +2014,29 @@ genTeamsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+            mlir::Location loc, const ConstructQueue &queue,
+            ConstructQueue::const_iterator item) {
+   lower::StatementContext stmtCtx;
++
+   mlir::omp::TeamsOperands clauseOps;
+-  genTeamsClauses(converter, semaCtx, stmtCtx, item->clauses, loc, clauseOps);
++  llvm::SmallVector<const semantics::Symbol *> reductionSyms;
++  genTeamsClauses(converter, semaCtx, stmtCtx, item->clauses, loc, clauseOps,
++                  reductionSyms);
++
++  EntryBlockArgs args;
++  // TODO: Add private syms and vars.
++  args.reduction.syms = reductionSyms;
++  args.reduction.vars = clauseOps.reductionVars;
++
++  auto genRegionEntryCB = [&](mlir::Operation *op) {
++    genEntryBlock(converter.getFirOpBuilder(), args, op->getRegion(0));
++    bindEntryBlockArgs(
++        converter, llvm::cast<mlir::omp::BlockArgOpenMPOpInterface>(op), args);
++    return llvm::to_vector(args.getSyms());
++  };
+ 
+   return genOpWithBody<mlir::omp::TeamsOp>(
+       OpWithBodyGenInfo(converter, symTable, semaCtx, loc, eval,
+                         llvm::omp::Directive::OMPD_teams)
+-          .setClauses(&item->clauses),
++          .setClauses(&item->clauses)
++          .setGenRegionEntryCb(genRegionEntryCB),
+       queue, item, clauseOps);
+ }
+ 
+diff --git a/flang/test/Lower/OpenMP/Todo/reduction-teams.f90 b/flang/test/Lower/OpenMP/Todo/reduction-teams.f90
+deleted file mode 100644
+index db4839593c7e7..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/reduction-teams.f90
++++ /dev/null
+@@ -1,12 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-! CHECK: not yet implemented: Unhandled clause REDUCTION in TEAMS construct
+-subroutine reduction_teams()
+-  integer :: i
+-  i = 0
+-
+-  !$omp teams reduction(+:i)
+-  i = i + 1
+-  !$omp end teams
+-end subroutine reduction_teams
+diff --git a/flang/test/Lower/OpenMP/reduction-teams.f90 b/flang/test/Lower/OpenMP/reduction-teams.f90
+new file mode 100644
+index 0000000000000..6997e774c2d42
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/reduction-teams.f90
+@@ -0,0 +1,18 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++! CHECK: omp.declare_reduction @[[RED:.*]] : i32 init {
++
++! CHECK: func.func @_QPreduction_teams() {
++subroutine reduction_teams()
++  integer :: i
++  i = 0
++
++  ! CHECK: omp.teams reduction(@[[RED]] %{{.*}}#0 -> %[[PRIV_I:.*]] : !fir.ref<i32>) {
++  !$omp teams reduction(+:i)
++    ! CHECK: %[[DECL_I:.*]]:2 = hlfir.declare %[[PRIV_I]]
++    ! CHECK: %{{.*}} = fir.load %[[DECL_I]]#0 : !fir.ref<i32>
++    ! CHECK: hlfir.assign %{{.*}} to %[[DECL_I]]#0 : i32, !fir.ref<i32>
++    i = i + 1
++  !$omp end teams
++end subroutine reduction_teams

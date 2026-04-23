@@ -1,0 +1,127 @@
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90 b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+index 833976ff284a8..5f09371bbaba2 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+@@ -57,6 +57,5 @@ end program compilation_to_obj
+ ! LLVM: @[[GLOB_VAR:[^[:space:]]+]]t = internal global
+ 
+ ! LLVM: define internal void @_QQmain..omp_par
+-! LLVM: %[[LOCAL_VAR:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, align 8
+-! LLVM-NEXT: %[[GLOB_VAL:.*]] = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @[[GLOB_VAR]]t, align 8
+-! LLVM-NEXT: store { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] } %[[GLOB_VAL]], ptr %[[LOCAL_VAR]], align 8
++! LLVM:      %[[GLOB_VAL:.*]] = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @[[GLOB_VAR]]t, align 8
++! LLVM-NEXT: store { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] } %[[GLOB_VAL]], ptr %{{.*}}, align 8
+diff --git a/llvm/include/llvm/Transforms/Utils/CodeExtractor.h b/llvm/include/llvm/Transforms/Utils/CodeExtractor.h
+index 68eb00a50fe03..826347e79f719 100644
+--- a/llvm/include/llvm/Transforms/Utils/CodeExtractor.h
++++ b/llvm/include/llvm/Transforms/Utils/CodeExtractor.h
+@@ -187,7 +187,8 @@ class CodeExtractorAnalysisCache {
+     /// sets, before extraction occurs. These modifications won't have any
+     /// significant impact on the cost however.
+     void findInputsOutputs(ValueSet &Inputs, ValueSet &Outputs,
+-                           const ValueSet &Allocas) const;
++                           const ValueSet &Allocas,
++                           bool CollectGlobalInputs = false) const;
+ 
+     /// Check if life time marker nodes can be hoisted/sunk into the outline
+     /// region.
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 70a6e74b94d55..532313a31fc13 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1548,7 +1548,16 @@ IRBuilder<>::InsertPoint OpenMPIRBuilder::createParallel(
+   BasicBlock *CommonExit = nullptr;
+   SetVector<Value *> Inputs, Outputs, SinkingCands, HoistingCands;
+   Extractor.findAllocas(CEAC, SinkingCands, HoistingCands, CommonExit);
+-  Extractor.findInputsOutputs(Inputs, Outputs, SinkingCands);
++
++  Extractor.findInputsOutputs(Inputs, Outputs, SinkingCands,
++                              /*CollectGlobalInputs=*/true);
++
++  Inputs.remove_if([&](Value *I) {
++    if (auto *GV = dyn_cast_if_present<GlobalVariable>(I))
++      return GV->getValueType() == OpenMPIRBuilder::Ident;
++
++    return false;
++  });
+ 
+   LLVM_DEBUG(dbgs() << "Before privatization: " << *OuterFn << "\n");
+ 
+diff --git a/llvm/lib/Transforms/Utils/CodeExtractor.cpp b/llvm/lib/Transforms/Utils/CodeExtractor.cpp
+index 81d3243c887fc..d378c6c3a4b01 100644
+--- a/llvm/lib/Transforms/Utils/CodeExtractor.cpp
++++ b/llvm/lib/Transforms/Utils/CodeExtractor.cpp
+@@ -632,14 +632,17 @@ bool CodeExtractor::isEligible() const {
+ }
+ 
+ void CodeExtractor::findInputsOutputs(ValueSet &Inputs, ValueSet &Outputs,
+-                                      const ValueSet &SinkCands) const {
++                                      const ValueSet &SinkCands,
++                                      bool CollectGlobalInputs) const {
+   for (BasicBlock *BB : Blocks) {
+     // If a used value is defined outside the region, it's an input.  If an
+     // instruction is used outside the region, it's an output.
+     for (Instruction &II : *BB) {
+       for (auto &OI : II.operands()) {
+         Value *V = OI;
+-        if (!SinkCands.count(V) && definedInCaller(Blocks, V))
++        if (!SinkCands.count(V) &&
++            (definedInCaller(Blocks, V) ||
++             (CollectGlobalInputs && llvm::isa<llvm::GlobalVariable>(V))))
+           Inputs.insert(V);
+       }
+ 
+diff --git a/mlir/test/Target/LLVMIR/openmp-firstprivate.mlir b/mlir/test/Target/LLVMIR/openmp-firstprivate.mlir
+index b06ad96f4592c..02ce6b5b19cea 100644
+--- a/mlir/test/Target/LLVMIR/openmp-firstprivate.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-firstprivate.mlir
+@@ -156,3 +156,49 @@ llvm.func @foo()
+ // CHECK:         %[[STR_LEN:.*]] = extractvalue { ptr, i64 } %{{.*}}, 1
+ // CHECK:         %{{.*}} = alloca i8, i64 %[[STR_LEN]], align 1
+ // CHECK:         call void @foo()
++
++// -----
++
++// Verifies fix for https://github.com/llvm/llvm-project/issues/102939.
++//
++// The issues occurs because the CodeExtractor component only collect inputs
++// (to the parallel regions) that are defined in the same function in which the
++// parallel regions is present. Howerver, this is problematic because if we are
++// privatizing a global value (e.g. a `target` variable which is emitted as a
++// global), then we miss finding that input and we do not privatize the
++// variable.
++
++omp.private {type = firstprivate} @global_privatizer : !llvm.ptr alloc {
++^bb0(%arg0: !llvm.ptr):
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x f32 {bindc_name = "global", pinned} : (i64) -> !llvm.ptr
++  omp.yield(%1 : !llvm.ptr)
++} copy {
++^bb0(%arg0: !llvm.ptr, %arg1: !llvm.ptr):
++  %0 = llvm.load %arg0 : !llvm.ptr -> f32
++  llvm.store %0, %arg1 : f32, !llvm.ptr
++  omp.yield(%arg1 : !llvm.ptr)
++}
++
++llvm.func @global_accessor() {
++  %global_addr = llvm.mlir.addressof @global : !llvm.ptr
++  omp.parallel private(@global_privatizer %global_addr -> %arg0 : !llvm.ptr) {
++    %1 = llvm.mlir.constant(3.140000e+00 : f32) : f32
++    llvm.store %1, %arg0 : f32, !llvm.ptr
++    omp.terminator
++  }
++  llvm.return
++}
++
++llvm.mlir.global internal @global() {addr_space = 0 : i32} : f32 {
++  %0 = llvm.mlir.zero : f32
++  llvm.return %0 : f32
++}
++
++// CHECK-LABEL: @global_accessor..omp_par({{.*}})
++// CHECK-NEXT:  omp.par.entry:
++// Verify that we found the privatizer by checking that we properly inlined the
++// bodies of the alloc and copy regions.
++// CHECK:         %[[PRIV_ALLOC:.*]] = alloca float, i64 1, align 4
++// CHECK:         %[[GLOB_VAL:.*]] = load float, ptr @global, align 4
++// CHECK:         store float %[[GLOB_VAL]], ptr %[[PRIV_ALLOC]], align 4

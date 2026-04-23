@@ -1,0 +1,209 @@
+diff --git a/openmp/libomptarget/include/OpenMP/Mapping.h b/openmp/libomptarget/include/OpenMP/Mapping.h
+index 4bd676fc658a7..b9f5c16582931 100644
+--- a/openmp/libomptarget/include/OpenMP/Mapping.h
++++ b/openmp/libomptarget/include/OpenMP/Mapping.h
+@@ -424,7 +424,8 @@ typedef int (*TargetDataFuncPtrTy)(ident_t *, DeviceTy &, int32_t, void **,
+                                    map_var_info_t *, void **, AsyncInfoTy &,
+                                    bool);
+ 
+-void dumpTargetPointerMappings(const ident_t *Loc, DeviceTy &Device);
++void dumpTargetPointerMappings(const ident_t *Loc, DeviceTy &Device,
++                               bool toStdOut = false);
+ 
+ int targetDataBegin(ident_t *Loc, DeviceTy &Device, int32_t ArgNum,
+                     void **ArgsBase, void **Args, int64_t *ArgSizes,
+diff --git a/openmp/libomptarget/include/Shared/Debug.h b/openmp/libomptarget/include/Shared/Debug.h
+index a39626d15386b..7c3db8dbf119f 100644
+--- a/openmp/libomptarget/include/Shared/Debug.h
++++ b/openmp/libomptarget/include/Shared/Debug.h
+@@ -136,10 +136,12 @@ inline uint32_t getDebugLevel() {
+   } while (0)
+ 
+ /// Print a generic information string used if LIBOMPTARGET_INFO=1
+-#define INFO_MESSAGE(_num, ...)                                                \
++#define INFO_MESSAGE(_num, ...) INFO_MESSAGE_TO(stderr, _num, __VA_ARGS__)
++
++#define INFO_MESSAGE_TO(_stdDst, _num, ...)                                    \
+   do {                                                                         \
+-    fprintf(stderr, GETNAME(TARGET_NAME) " device %d info: ", (int)_num);      \
+-    fprintf(stderr, __VA_ARGS__);                                              \
++    fprintf(_stdDst, GETNAME(TARGET_NAME) " device %d info: ", (int)_num);     \
++    fprintf(_stdDst, __VA_ARGS__);                                             \
+   } while (0)
+ 
+ // Debugging messages
+@@ -187,4 +189,13 @@ inline uint32_t getDebugLevel() {
+     }                                                                          \
+   } while (false)
+ 
++#define DUMP_INFO(toStdOut, _flags, _id, ...)                                  \
++  do {                                                                         \
++    if (toStdOut) {                                                            \
++      INFO_MESSAGE_TO(stdout, _id, __VA_ARGS__);                               \
++    } else {                                                                   \
++      INFO(_flags, _id, __VA_ARGS__);                                          \
++    }                                                                          \
++  } while (false)
++
+ #endif // OMPTARGET_SHARED_DEBUG_H
+diff --git a/openmp/libomptarget/include/omptarget.h b/openmp/libomptarget/include/omptarget.h
+index 8e0ccf191839d..323dee41630f2 100644
+--- a/openmp/libomptarget/include/omptarget.h
++++ b/openmp/libomptarget/include/omptarget.h
+@@ -273,6 +273,7 @@ struct __tgt_target_non_contig {
+ extern "C" {
+ #endif
+ 
++void ompx_dump_mapping_tables(void);
+ int omp_get_num_devices(void);
+ int omp_get_device_num(void);
+ int omp_get_initial_device(void);
+diff --git a/openmp/libomptarget/src/OpenMP/API.cpp b/openmp/libomptarget/src/OpenMP/API.cpp
+index 85fb08c00a9a7..c85f9868e37c2 100644
+--- a/openmp/libomptarget/src/OpenMP/API.cpp
++++ b/openmp/libomptarget/src/OpenMP/API.cpp
+@@ -16,6 +16,7 @@
+ #include "rtl.h"
+ 
+ #include "OpenMP/InternalTypes.h"
++#include "OpenMP/Mapping.h"
+ #include "OpenMP/OMPT/Interface.h"
+ #include "OpenMP/omp.h"
+ #include "Shared/Profile.h"
+@@ -27,6 +28,13 @@
+ #include <cstring>
+ #include <mutex>
+ 
++EXTERN void ompx_dump_mapping_tables() {
++  ident_t Loc = {0, 0, 0, 0, ";libomptarget;libomptarget;0;0;;"};
++  auto ExclusiveDevicesAccessor = PM->getExclusiveDevicesAccessor();
++  for (auto &Device : PM->devices(ExclusiveDevicesAccessor))
++    dumpTargetPointerMappings(&Loc, Device, true);
++}
++
+ #ifdef OMPT_SUPPORT
+ using namespace llvm::omp::target::ompt;
+ #endif
+diff --git a/openmp/libomptarget/src/OpenMP/Mapping.cpp b/openmp/libomptarget/src/OpenMP/Mapping.cpp
+index 9c0b219b6f15f..d8ad5d8cacc4b 100644
+--- a/openmp/libomptarget/src/OpenMP/Mapping.cpp
++++ b/openmp/libomptarget/src/OpenMP/Mapping.cpp
+@@ -16,28 +16,33 @@
+ #include "device.h"
+ 
+ /// Dump a table of all the host-target pointer pairs on failure
+-void dumpTargetPointerMappings(const ident_t *Loc, DeviceTy &Device) {
++void dumpTargetPointerMappings(const ident_t *Loc, DeviceTy &Device,
++                               bool toStdOut) {
+   MappingInfoTy::HDTTMapAccessorTy HDTTMap =
+       Device.getMappingInfo().HostDataToTargetMap.getExclusiveAccessor();
+-  if (HDTTMap->empty())
++  if (HDTTMap->empty()) {
++    DUMP_INFO(toStdOut, OMP_INFOTYPE_ALL, Device.DeviceID,
++              "OpenMP Host-Device pointer mappings table empty\n");
+     return;
++  }
+ 
+   SourceInfo Kernel(Loc);
+-  INFO(OMP_INFOTYPE_ALL, Device.DeviceID,
+-       "OpenMP Host-Device pointer mappings after block at %s:%d:%d:\n",
+-       Kernel.getFilename(), Kernel.getLine(), Kernel.getColumn());
+-  INFO(OMP_INFOTYPE_ALL, Device.DeviceID, "%-18s %-18s %s %s %s %s\n",
+-       "Host Ptr", "Target Ptr", "Size (B)", "DynRefCount", "HoldRefCount",
+-       "Declaration");
++  DUMP_INFO(toStdOut, OMP_INFOTYPE_ALL, Device.DeviceID,
++            "OpenMP Host-Device pointer mappings after block at %s:%d:%d:\n",
++            Kernel.getFilename(), Kernel.getLine(), Kernel.getColumn());
++  DUMP_INFO(toStdOut, OMP_INFOTYPE_ALL, Device.DeviceID,
++            "%-18s %-18s %s %s %s %s\n", "Host Ptr", "Target Ptr", "Size (B)",
++            "DynRefCount", "HoldRefCount", "Declaration");
+   for (const auto &It : *HDTTMap) {
+     HostDataToTargetTy &HDTT = *It.HDTT;
+     SourceInfo Info(HDTT.HstPtrName);
+-    INFO(OMP_INFOTYPE_ALL, Device.DeviceID,
+-         DPxMOD " " DPxMOD " %-8" PRIuPTR " %-11s %-12s %s at %s:%d:%d\n",
+-         DPxPTR(HDTT.HstPtrBegin), DPxPTR(HDTT.TgtPtrBegin),
+-         HDTT.HstPtrEnd - HDTT.HstPtrBegin, HDTT.dynRefCountToStr().c_str(),
+-         HDTT.holdRefCountToStr().c_str(), Info.getName(), Info.getFilename(),
+-         Info.getLine(), Info.getColumn());
++    DUMP_INFO(toStdOut, OMP_INFOTYPE_ALL, Device.DeviceID,
++              DPxMOD " " DPxMOD " %-8" PRIuPTR " %-11s %-12s %s at %s:%d:%d\n",
++              DPxPTR(HDTT.HstPtrBegin), DPxPTR(HDTT.TgtPtrBegin),
++              HDTT.HstPtrEnd - HDTT.HstPtrBegin,
++              HDTT.dynRefCountToStr().c_str(), HDTT.holdRefCountToStr().c_str(),
++              Info.getName(), Info.getFilename(), Info.getLine(),
++              Info.getColumn());
+   }
+ }
+ 
+diff --git a/openmp/libomptarget/src/exports b/openmp/libomptarget/src/exports
+index d5432a9eed380..f95544ec8329c 100644
+--- a/openmp/libomptarget/src/exports
++++ b/openmp/libomptarget/src/exports
+@@ -35,6 +35,7 @@ VERS1.0 {
+     __tgt_push_mapper_component;
+     __kmpc_push_target_tripcount;
+     __kmpc_push_target_tripcount_mapper;
++    ompx_dump_mapping_tables;
+     omp_get_mapped_ptr;
+     omp_get_num_devices;
+     omp_get_device_num;
+diff --git a/openmp/libomptarget/test/api/ompx_dump_mapping_tables.cpp b/openmp/libomptarget/test/api/ompx_dump_mapping_tables.cpp
+new file mode 100644
+index 0000000000000..a57d0c8a6d2bf
+--- /dev/null
++++ b/openmp/libomptarget/test/api/ompx_dump_mapping_tables.cpp
+@@ -0,0 +1,40 @@
++// RUN: %libomptarget-compilexx-run-and-check-generic
++
++#include <cstdio>
++#include <omp.h>
++
++#define N 10
++
++int main() {
++  int *a = new int[N]; // mapped and released from device 0
++  int *b = new int[N]; // mapped to device 2
++
++  // clang-format off
++  // CHECK: Mapping tables after target enter data:
++  // CHECK-NEXT: omptarget device 0 info: OpenMP Host-Device pointer mappings after block
++  // CHECK-NEXT: omptarget device 0 info: Host Ptr Target Ptr Size (B) DynRefCount HoldRefCount Declaration
++  // CHECK-NEXT: omptarget device 0 info: {{(0x[0-9a-f]{16})}} {{(0x[0-9a-f]{16})}}
++  // CHECK-NEXT: omptarget device 1 info: OpenMP Host-Device pointer mappings table empty
++  // CHECK-NEXT: omptarget device 2 info: OpenMP Host-Device pointer mappings after block
++  // CHECK-NEXT: omptarget device 2 info: Host Ptr Target Ptr Size (B) DynRefCount HoldRefCount Declaration
++  // CHECK-NEXT: omptarget device 2 info: {{(0x[0-9a-f]{16})}} {{(0x[0-9a-f]{16})}}
++  // clang-format on
++#pragma omp target enter data device(0) map(to : a[ : N])
++#pragma omp target enter data device(2) map(to : b[ : N])
++  printf("Mapping tables after target enter data:\n");
++  ompx_dump_mapping_tables();
++
++  // clang-format off
++  // CHECK: Mapping tables after target exit data for a:
++  // CHECK-NEXT: omptarget device 0 info: OpenMP Host-Device pointer mappings table empty
++  // CHECK-NEXT: omptarget device 1 info: OpenMP Host-Device pointer mappings table empty
++  // CHECK-NEXT: omptarget device 2 info: OpenMP Host-Device pointer mappings after block
++  // CHECK-NEXT: omptarget device 2 info: Host Ptr Target Ptr Size (B) DynRefCount HoldRefCount Declaration
++  // CHECK-NEXT: omptarget device 2 info: {{(0x[0-9a-f]{16})}} {{(0x[0-9a-f]{16})}}
++  // clang-format on
++#pragma omp target exit data device(0) map(release : a[ : N])
++  printf("\nMapping tables after target exit data for a:\n");
++  ompx_dump_mapping_tables();
++
++  return 0;
++}
+diff --git a/openmp/runtime/src/include/omp.h.var b/openmp/runtime/src/include/omp.h.var
+index a1488ae9d21c6..eb3ab7778606a 100644
+--- a/openmp/runtime/src/include/omp.h.var
++++ b/openmp/runtime/src/include/omp.h.var
+@@ -156,6 +156,8 @@
+     /* OpenMP 5.1 interop */
+     typedef intptr_t omp_intptr_t;
+ 
++    extern void __KAI_KMPC_CONVENTION ompx_dump_mapping_tables(void);
++
+     /* 0..omp_get_num_interop_properties()-1 are reserved for implementation-defined properties */
+     typedef enum omp_interop_property {
+         omp_ipr_fr_id = -1,

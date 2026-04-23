@@ -1,0 +1,952 @@
+diff --git a/flang/include/flang/Semantics/openmp-directive-sets.h b/flang/include/flang/Semantics/openmp-directive-sets.h
+index 5e51c5c7de0e8..7cdca1214e749 100644
+--- a/flang/include/flang/Semantics/openmp-directive-sets.h
++++ b/flang/include/flang/Semantics/openmp-directive-sets.h
+@@ -290,6 +290,12 @@ static const OmpDirectiveSet workShareSet{
+     } | allDoSet,
+ };
+ 
++//===----------------------------------------------------------------------===//
++// Directive sets for parent directives that do allow/not allow a construct
++//===----------------------------------------------------------------------===//
++
++static const OmpDirectiveSet scanParentAllowedSet{allDoSet | allSimdSet};
++
+ //===----------------------------------------------------------------------===//
+ // Directive sets for allowed/not allowed nested directives
+ //===----------------------------------------------------------------------===//
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index b9512f33eaacd..2f97efddf7f7b 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -755,7 +755,8 @@ class Symbol {
+       OmpDeclarativeAllocateDirective, OmpExecutableAllocateDirective,
+       OmpDeclareSimd, OmpDeclareTarget, OmpThreadprivate, OmpDeclareReduction,
+       OmpFlushed, OmpCriticalLock, OmpIfSpecified, OmpNone, OmpPreDetermined,
+-      OmpImplicit, OmpDependObject);
++      OmpImplicit, OmpDependObject, OmpInclusiveScan, OmpExclusiveScan,
++      OmpInScanReduction);
+   using Flags = common::EnumSet<Flag, Flag_enumSize>;
+ 
+   const Scope &owner() const { return *owner_; }
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 91f99ba4b0ca5..b651af3f2a6d9 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2520,6 +2520,9 @@ static void genOMPDispatch(lower::AbstractConverter &converter,
+   case llvm::omp::Directive::OMPD_parallel:
+     genStandaloneParallel(converter, symTable, semaCtx, eval, loc, queue, item);
+     break;
++  case llvm::omp::Directive::OMPD_scan:
++    TODO(loc, "Unhandled directive " + llvm::omp::getOpenMPDirectiveName(dir));
++    break;
+   case llvm::omp::Directive::OMPD_section:
+     llvm_unreachable("genOMPDispatch: OMPD_section");
+     // Lowered in the enclosing genSectionsOp.
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index a46b06dce001f..d5d870b9f6b75 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -559,6 +559,8 @@ TYPE_PARSER(
+         construct<OmpClause>(construct<OmpClause::DynamicAllocators>()) ||
+     "ENTER" >> construct<OmpClause>(construct<OmpClause::Enter>(
+                    parenthesized(Parser<OmpObjectList>{}))) ||
++    "EXCLUSIVE" >> construct<OmpClause>(construct<OmpClause::Exclusive>(
++                       parenthesized(Parser<OmpObjectList>{}))) ||
+     "FILTER" >> construct<OmpClause>(construct<OmpClause::Filter>(
+                     parenthesized(scalarIntExpr))) ||
+     "FINAL" >> construct<OmpClause>(construct<OmpClause::Final>(
+@@ -578,6 +580,8 @@ TYPE_PARSER(
+     "IF" >> construct<OmpClause>(construct<OmpClause::If>(
+                 parenthesized(Parser<OmpIfClause>{}))) ||
+     "INBRANCH" >> construct<OmpClause>(construct<OmpClause::Inbranch>()) ||
++    "INCLUSIVE" >> construct<OmpClause>(construct<OmpClause::Inclusive>(
++                       parenthesized(Parser<OmpObjectList>{}))) ||
+     "IS_DEVICE_PTR" >> construct<OmpClause>(construct<OmpClause::IsDevicePtr>(
+                            parenthesized(Parser<OmpObjectList>{}))) ||
+     "LASTPRIVATE" >> construct<OmpClause>(construct<OmpClause::Lastprivate>(
+@@ -790,6 +794,7 @@ TYPE_PARSER(sourced(construct<OpenMPFlushConstruct>(verbatim("FLUSH"_tok),
+ TYPE_PARSER(sourced(construct<OmpSimpleStandaloneDirective>(first(
+     "BARRIER" >> pure(llvm::omp::Directive::OMPD_barrier),
+     "ORDERED" >> pure(llvm::omp::Directive::OMPD_ordered),
++    "SCAN" >> pure(llvm::omp::Directive::OMPD_scan),
+     "TARGET ENTER DATA" >> pure(llvm::omp::Directive::OMPD_target_enter_data),
+     "TARGET EXIT DATA" >> pure(llvm::omp::Directive::OMPD_target_exit_data),
+     "TARGET UPDATE" >> pure(llvm::omp::Directive::OMPD_target_update),
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4b511da69832c..10089f8384ebd 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2393,6 +2393,9 @@ class UnparseVisitor {
+     case llvm::omp::Directive::OMPD_barrier:
+       Word("BARRIER ");
+       break;
++    case llvm::omp::Directive::OMPD_scan:
++      Word("SCAN ");
++      break;
+     case llvm::omp::Directive::OMPD_taskwait:
+       Word("TASKWAIT ");
+       break;
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index db7c15a0e0ec9..b9c06853cea67 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -12,6 +12,7 @@
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Semantics/expression.h"
+ #include "flang/Semantics/tools.h"
++#include <variant>
+ 
+ namespace Fortran::semantics {
+ 
+@@ -747,62 +748,69 @@ void OmpStructureChecker::CheckSIMDNest(const parser::OpenMPConstruct &c) {
+   // current context yet.
+   // TODO: Check for declare simd regions.
+   bool eligibleSIMD{false};
+-  common::visit(Fortran::common::visitors{
+-                    // Allow `!$OMP ORDERED SIMD`
+-                    [&](const parser::OpenMPBlockConstruct &c) {
+-                      const auto &beginBlockDir{
+-                          std::get<parser::OmpBeginBlockDirective>(c.t)};
+-                      const auto &beginDir{
+-                          std::get<parser::OmpBlockDirective>(beginBlockDir.t)};
+-                      if (beginDir.v == llvm::omp::Directive::OMPD_ordered) {
+-                        const auto &clauses{
+-                            std::get<parser::OmpClauseList>(beginBlockDir.t)};
+-                        for (const auto &clause : clauses.v) {
+-                          if (std::get_if<parser::OmpClause::Simd>(&clause.u)) {
+-                            eligibleSIMD = true;
+-                            break;
+-                          }
+-                        }
+-                      }
+-                    },
+-                    [&](const parser::OpenMPSimpleStandaloneConstruct &c) {
+-                      const auto &dir{
+-                          std::get<parser::OmpSimpleStandaloneDirective>(c.t)};
+-                      if (dir.v == llvm::omp::Directive::OMPD_ordered) {
+-                        const auto &clauses{
+-                            std::get<parser::OmpClauseList>(c.t)};
+-                        for (const auto &clause : clauses.v) {
+-                          if (std::get_if<parser::OmpClause::Simd>(&clause.u)) {
+-                            eligibleSIMD = true;
+-                            break;
+-                          }
+-                        }
+-                      }
+-                    },
+-                    // Allowing SIMD construct
+-                    [&](const parser::OpenMPLoopConstruct &c) {
+-                      const auto &beginLoopDir{
+-                          std::get<parser::OmpBeginLoopDirective>(c.t)};
+-                      const auto &beginDir{
+-                          std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
+-                      if ((beginDir.v == llvm::omp::Directive::OMPD_simd) ||
+-                          (beginDir.v == llvm::omp::Directive::OMPD_do_simd)) {
+-                        eligibleSIMD = true;
+-                      }
+-                    },
+-                    [&](const parser::OpenMPAtomicConstruct &c) {
+-                      // Allow `!$OMP ATOMIC`
+-                      eligibleSIMD = true;
+-                    },
+-                    [&](const auto &c) {},
+-                },
++  common::visit(
++      Fortran::common::visitors{
++          // Allow `!$OMP ORDERED SIMD`
++          [&](const parser::OpenMPBlockConstruct &c) {
++            const auto &beginBlockDir{
++                std::get<parser::OmpBeginBlockDirective>(c.t)};
++            const auto &beginDir{
++                std::get<parser::OmpBlockDirective>(beginBlockDir.t)};
++            if (beginDir.v == llvm::omp::Directive::OMPD_ordered) {
++              const auto &clauses{
++                  std::get<parser::OmpClauseList>(beginBlockDir.t)};
++              for (const auto &clause : clauses.v) {
++                if (std::get_if<parser::OmpClause::Simd>(&clause.u)) {
++                  eligibleSIMD = true;
++                  break;
++                }
++              }
++            }
++          },
++          [&](const parser::OpenMPStandaloneConstruct &c) {
++            if (const auto &simpleConstruct =
++                    std::get_if<parser::OpenMPSimpleStandaloneConstruct>(
++                        &c.u)) {
++              const auto &dir{std::get<parser::OmpSimpleStandaloneDirective>(
++                  simpleConstruct->t)};
++              if (dir.v == llvm::omp::Directive::OMPD_ordered) {
++                const auto &clauses{
++                    std::get<parser::OmpClauseList>(simpleConstruct->t)};
++                for (const auto &clause : clauses.v) {
++                  if (std::get_if<parser::OmpClause::Simd>(&clause.u)) {
++                    eligibleSIMD = true;
++                    break;
++                  }
++                }
++              } else if (dir.v == llvm::omp::Directive::OMPD_scan) {
++                eligibleSIMD = true;
++              }
++            }
++          },
++          // Allowing SIMD construct
++          [&](const parser::OpenMPLoopConstruct &c) {
++            const auto &beginLoopDir{
++                std::get<parser::OmpBeginLoopDirective>(c.t)};
++            const auto &beginDir{
++                std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
++            if ((beginDir.v == llvm::omp::Directive::OMPD_simd) ||
++                (beginDir.v == llvm::omp::Directive::OMPD_do_simd)) {
++              eligibleSIMD = true;
++            }
++          },
++          [&](const parser::OpenMPAtomicConstruct &c) {
++            // Allow `!$OMP ATOMIC`
++            eligibleSIMD = true;
++          },
++          [&](const auto &c) {},
++      },
+       c.u);
+   if (!eligibleSIMD) {
+     context_.Say(parser::FindSourceLocation(c),
+         "The only OpenMP constructs that can be encountered during execution "
+         "of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, "
+-        "the `SIMD` construct and the `ORDERED` construct with the `SIMD` "
+-        "clause."_err_en_US);
++        "the `SIMD` construct, the `SCAN` construct and the `ORDERED` "
++        "construct with the `SIMD` clause."_err_en_US);
+   }
+ }
+ 
+@@ -966,6 +974,49 @@ void OmpStructureChecker::CheckDistLinear(
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OpenMPLoopConstruct &x) {
++  const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
++  const auto &clauseList{std::get<parser::OmpClauseList>(beginLoopDir.t)};
++
++  // A few semantic checks for InScan reduction are performed below as SCAN
++  // constructs inside LOOP may add the relevant information. Scan reduction is
++  // supported only in loop constructs, so same checks are not applicable to
++  // other directives.
++  for (const auto &clause : clauseList.v) {
++    if (const auto *reductionClause{
++            std::get_if<parser::OmpClause::Reduction>(&clause.u)}) {
++      const auto &maybeModifier{
++          std::get<std::optional<ReductionModifier>>(reductionClause->v.t)};
++      if (maybeModifier && *maybeModifier == ReductionModifier::Inscan) {
++        const auto &objectList{
++            std::get<parser::OmpObjectList>(reductionClause->v.t)};
++        auto checkReductionSymbolInScan = [&](const parser::Name *name) {
++          if (auto &symbol = name->symbol) {
++            if (!symbol->test(Symbol::Flag::OmpInclusiveScan) &&
++                !symbol->test(Symbol::Flag::OmpExclusiveScan)) {
++              context_.Say(name->source,
++                  "List item %s must appear in EXCLUSIVE or "
++                  "INCLUSIVE clause of an "
++                  "enclosed SCAN directive"_err_en_US,
++                  name->ToString());
++            }
++          }
++        };
++        for (const auto &ompObj : objectList.v) {
++          common::visit(
++              common::visitors{
++                  [&](const parser::Designator &designator) {
++                    if (const auto *name{semantics::getDesignatorNameIfDataRef(
++                            designator)}) {
++                      checkReductionSymbolInScan(name);
++                    }
++                  },
++                  [&](const auto &name) { checkReductionSymbolInScan(&name); },
++              },
++              ompObj.u);
++        }
++      }
++    }
++  }
+   if (llvm::omp::allSimdSet.test(GetContext().directive)) {
+     ExitDirectiveNest(SIMDNest);
+   }
+@@ -1638,19 +1689,32 @@ void OmpStructureChecker::Leave(const parser::OpenMPAllocatorsConstruct &x) {
+   dirContext_.pop_back();
+ }
+ 
++void OmpStructureChecker::CheckScan(
++    const parser::OpenMPSimpleStandaloneConstruct &x) {
++  if (std::get<parser::OmpClauseList>(x.t).v.size() != 1) {
++    context_.Say(x.source,
++        "Exactly one of EXCLUSIVE or INCLUSIVE clause is expected"_err_en_US);
++  }
++  if (!CurrentDirectiveIsNested() ||
++      !llvm::omp::scanParentAllowedSet.test(GetContextParent().directive)) {
++    context_.Say(x.source,
++        "Orphaned SCAN directives are prohibited; perhaps you forgot "
++        "to enclose the directive in to a WORKSHARING LOOP, a WORKSHARING "
++        "LOOP SIMD or a SIMD directive."_err_en_US);
++  }
++}
++
+ void OmpStructureChecker::CheckBarrierNesting(
+     const parser::OpenMPSimpleStandaloneConstruct &x) {
+   // A barrier region may not be `closely nested` inside a worksharing, loop,
+   // task, taskloop, critical, ordered, atomic, or master region.
+   // TODO:  Expand the check to include `LOOP` construct as well when it is
+   // supported.
+-  if (GetContext().directive == llvm::omp::Directive::OMPD_barrier) {
+-    if (IsCloselyNestedRegion(llvm::omp::nestedBarrierErrSet)) {
+-      context_.Say(parser::FindSourceLocation(x),
+-          "`BARRIER` region may not be closely nested inside of `WORKSHARING`, "
+-          "`LOOP`, `TASK`, `TASKLOOP`,"
+-          "`CRITICAL`, `ORDERED`, `ATOMIC` or `MASTER` region."_err_en_US);
+-    }
++  if (IsCloselyNestedRegion(llvm::omp::nestedBarrierErrSet)) {
++    context_.Say(parser::FindSourceLocation(x),
++        "`BARRIER` region may not be closely nested inside of `WORKSHARING`, "
++        "`LOOP`, `TASK`, `TASKLOOP`,"
++        "`CRITICAL`, `ORDERED`, `ATOMIC` or `MASTER` region."_err_en_US);
+   }
+ }
+ 
+@@ -1834,7 +1898,16 @@ void OmpStructureChecker::Enter(
+     const parser::OpenMPSimpleStandaloneConstruct &x) {
+   const auto &dir{std::get<parser::OmpSimpleStandaloneDirective>(x.t)};
+   PushContextAndClauseSets(dir.source, dir.v);
+-  CheckBarrierNesting(x);
++  switch (dir.v) {
++  case llvm::omp::Directive::OMPD_barrier:
++    CheckBarrierNesting(x);
++    break;
++  case llvm::omp::Directive::OMPD_scan:
++    CheckScan(x);
++    break;
++  default:
++    break;
++  }
+ }
+ 
+ void OmpStructureChecker::Leave(
+@@ -2673,8 +2746,8 @@ CHECK_SIMPLE_CLAUSE(Full, OMPC_full)
+ CHECK_SIMPLE_CLAUSE(Grainsize, OMPC_grainsize)
+ CHECK_SIMPLE_CLAUSE(Hint, OMPC_hint)
+ CHECK_SIMPLE_CLAUSE(Holds, OMPC_holds)
+-CHECK_SIMPLE_CLAUSE(InReduction, OMPC_in_reduction)
+ CHECK_SIMPLE_CLAUSE(Inclusive, OMPC_inclusive)
++CHECK_SIMPLE_CLAUSE(InReduction, OMPC_in_reduction)
+ CHECK_SIMPLE_CLAUSE(Match, OMPC_match)
+ CHECK_SIMPLE_CLAUSE(Nontemporal, OMPC_nontemporal)
+ CHECK_SIMPLE_CLAUSE(NumTasks, OMPC_num_tasks)
+@@ -2767,7 +2840,11 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+   if (CheckReductionOperators(x)) {
+     CheckReductionTypeList(x);
+   }
+-  CheckReductionModifier(x);
++  if (const auto &maybeModifier{
++          std::get<std::optional<ReductionModifier>>(x.v.t)}) {
++    const ReductionModifier modifier{*maybeModifier};
++    CheckReductionModifier(modifier);
++  }
+ }
+ 
+ bool OmpStructureChecker::CheckReductionOperators(
+@@ -2810,6 +2887,7 @@ bool OmpStructureChecker::CheckReductionOperators(
+ 
+   return ok;
+ }
++
+ bool OmpStructureChecker::CheckIntrinsicOperator(
+     const parser::DefinedOperator::IntrinsicOperator &op) {
+ 
+@@ -2944,14 +3022,11 @@ void OmpStructureChecker::CheckReductionTypeList(
+ }
+ 
+ void OmpStructureChecker::CheckReductionModifier(
+-    const parser::OmpClause::Reduction &x) {
+-  using ReductionModifier = parser::OmpReductionClause::ReductionModifier;
+-  const auto &maybeModifier{std::get<std::optional<ReductionModifier>>(x.v.t)};
+-  if (!maybeModifier || *maybeModifier == ReductionModifier::Default) {
+-    // No modifier, or the default one is always ok.
++    const ReductionModifier &modifier) {
++  if (modifier == ReductionModifier::Default) {
++    // The default one is always ok.
+     return;
+   }
+-  ReductionModifier modifier{*maybeModifier};
+   const DirectiveContext &dirCtx{GetContext()};
+   if (dirCtx.directive == llvm::omp::Directive::OMPD_loop) {
+     // [5.2:257:33-34]
+@@ -2982,15 +3057,10 @@ void OmpStructureChecker::CheckReductionModifier(
+     // or "simd" directive.
+     // The worksharing-loop directives are OMPD_do and OMPD_for. Only the
+     // former is allowed in Fortran.
+-    switch (dirCtx.directive) {
+-    case llvm::omp::Directive::OMPD_do: // worksharing-loop
+-    case llvm::omp::Directive::OMPD_do_simd: // worksharing-loop simd
+-    case llvm::omp::Directive::OMPD_simd: // "simd"
+-      break;
+-    default:
++    if (!llvm::omp::scanParentAllowedSet.test(dirCtx.directive)) {
+       context_.Say(GetContext().clauseSource,
+           "Modifier 'INSCAN' on REDUCTION clause is only allowed with "
+-          "worksharing-loop, worksharing-loop simd, "
++          "WORKSHARING LOOP, WORKSHARING LOOP SIMD, "
+           "or SIMD directive"_err_en_US);
+     }
+   } else {
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 0c5f97f743e2e..e91d3ebcc5b09 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -70,6 +70,7 @@ class OmpStructureChecker
+         ) {
+   }
+   using llvmOmpClause = const llvm::omp::Clause;
++  using ReductionModifier = parser::OmpReductionClause::ReductionModifier;
+ 
+   void Enter(const parser::OpenMPConstruct &);
+   void Leave(const parser::OpenMPConstruct &);
+@@ -227,10 +228,11 @@ class OmpStructureChecker
+   bool CheckIntrinsicOperator(
+       const parser::DefinedOperator::IntrinsicOperator &);
+   void CheckReductionTypeList(const parser::OmpClause::Reduction &);
+-  void CheckReductionModifier(const parser::OmpClause::Reduction &);
++  void CheckReductionModifier(const ReductionModifier &);
+   void CheckMasterNesting(const parser::OpenMPBlockConstruct &x);
+   void ChecksOnOrderedAsBlock();
+   void CheckBarrierNesting(const parser::OpenMPSimpleStandaloneConstruct &x);
++  void CheckScan(const parser::OpenMPSimpleStandaloneConstruct &x);
+   void ChecksOnOrderedAsStandalone();
+   void CheckOrderedDependClause(std::optional<std::int64_t> orderedValue);
+   void CheckReductionArraySection(const parser::OmpObjectList &ompObjectList);
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 83d666283a48c..8e7763fbdd780 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -458,6 +458,14 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+   }
+ 
+   // 2.15.3 Data-Sharing Attribute Clauses
++  bool Pre(const parser::OmpClause::Inclusive &x) {
++    ResolveOmpObjectList(x.v, Symbol::Flag::OmpInclusiveScan);
++    return false;
++  }
++  bool Pre(const parser::OmpClause::Exclusive &x) {
++    ResolveOmpObjectList(x.v, Symbol::Flag::OmpExclusiveScan);
++    return false;
++  }
+   void Post(const parser::OmpDefaultClause &);
+   bool Pre(const parser::OmpClause::Shared &x) {
+     ResolveOmpObjectList(x.v, Symbol::Flag::OmpShared);
+@@ -538,6 +546,12 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+     }
+     const auto &objList{std::get<parser::OmpObjectList>(x.v.t)};
+     ResolveOmpObjectList(objList, Symbol::Flag::OmpReduction);
++    using ReductionModifier = parser::OmpReductionClause::ReductionModifier;
++    const auto &maybeModifier{
++        std::get<std::optional<ReductionModifier>>(x.v.t)};
++    if (maybeModifier && *maybeModifier == ReductionModifier::Inscan) {
++      ResolveOmpObjectList(objList, Symbol::Flag::OmpInScanReduction);
++    }
+     return false;
+   }
+ 
+@@ -692,8 +706,9 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+       Symbol::Flag::OmpUseDevicePtr, Symbol::Flag::OmpUseDeviceAddr,
+       Symbol::Flag::OmpIsDevicePtr, Symbol::Flag::OmpHasDeviceAddr};
+ 
+-  Symbol::Flags ompFlagsRequireMark{
+-      Symbol::Flag::OmpThreadprivate, Symbol::Flag::OmpDeclareTarget};
++  Symbol::Flags ompFlagsRequireMark{Symbol::Flag::OmpThreadprivate,
++      Symbol::Flag::OmpDeclareTarget, Symbol::Flag::OmpExclusiveScan,
++      Symbol::Flag::OmpInclusiveScan, Symbol::Flag::OmpInScanReduction};
+ 
+   Symbol::Flags dataCopyingAttributeFlags{
+       Symbol::Flag::OmpCopyIn, Symbol::Flag::OmpCopyPrivate};
+@@ -1626,6 +1641,7 @@ bool OmpAttributeVisitor::Pre(
+   switch (standaloneDir.v) {
+   case llvm::omp::Directive::OMPD_barrier:
+   case llvm::omp::Directive::OMPD_ordered:
++  case llvm::omp::Directive::OMPD_scan:
+   case llvm::omp::Directive::OMPD_target_enter_data:
+   case llvm::omp::Directive::OMPD_target_exit_data:
+   case llvm::omp::Directive::OMPD_target_update:
+@@ -2429,6 +2445,16 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                         name->ToString());
+                   }
+                 }
++                if (ompFlag == Symbol::Flag::OmpInclusiveScan ||
++                    ompFlag == Symbol::Flag::OmpExclusiveScan) {
++                  if (!symbol->test(Symbol::Flag::OmpInScanReduction)) {
++                    context_.Say(name->source,
++                        "List item %s must appear in REDUCTION clause "
++                        "with the INSCAN modifier of the parent "
++                        "directive"_err_en_US,
++                        name->ToString());
++                  }
++                }
+                 if (GetContext().directive ==
+                     llvm::omp::Directive::OMPD_target_data) {
+                   checkExclusivelists(symbol, Symbol::Flag::OmpUseDevicePtr,
+diff --git a/flang/test/Lower/OpenMP/Todo/reduction-inscan.f90 b/flang/test/Lower/OpenMP/Todo/reduction-inscan.f90
+index c5f196fe09693..152d91a16f80f 100644
+--- a/flang/test/Lower/OpenMP/Todo/reduction-inscan.f90
++++ b/flang/test/Lower/OpenMP/Todo/reduction-inscan.f90
+@@ -8,6 +8,7 @@ subroutine reduction_inscan()
+ 
+   !$omp do reduction(inscan, +:i)
+   do j=1,10
++     !$omp scan inclusive(i)
+      i = i + 1
+   end do
+   !$omp end do
+diff --git a/flang/test/Lower/OpenMP/Todo/reduction-modifiers.f90 b/flang/test/Lower/OpenMP/Todo/reduction-modifiers.f90
+index 5e566466492ce..82625ed8c5f31 100644
+--- a/flang/test/Lower/OpenMP/Todo/reduction-modifiers.f90
++++ b/flang/test/Lower/OpenMP/Todo/reduction-modifiers.f90
+@@ -8,6 +8,7 @@ subroutine foo()
+   j = 0
+   !$omp do reduction (inscan, *: j)
+   do i = 1, 10
++    !$omp scan inclusive(j)
+     j = j + 1
+   end do
+ end subroutine
+diff --git a/flang/test/Parser/OpenMP/scan.f90 b/flang/test/Parser/OpenMP/scan.f90
+new file mode 100644
+index 0000000000000..02fa09b6ef350
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/scan.f90
+@@ -0,0 +1,58 @@
++! RUN: %flang_fc1 -fdebug-unparse -fopenmp %s | FileCheck --ignore-case %s
++! RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++! Check for parsing scan directive
++subroutine test_scan(n, a, b)
++  implicit none
++  integer n
++  integer a(n), b(n)
++  integer x,y,k
++
++  ! a(k) is included in the computation of producing results in b(k)
++  !$omp parallel do simd reduction(inscan,+: x)
++  do k = 1, n
++    x = x + a(k)
++    !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++    !PARSE-TREE-NEXT: OmpSimpleStandaloneDirective -> llvm::omp::Directive = scan
++    !PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> Inclusive -> OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++    !CHECK: !$omp scan inclusive(x)
++    !$omp scan inclusive(x)
++      b(k) = x
++  end do
++
++  ! a(k) is not included in the computation of producing results in b(k)
++  !$omp parallel do simd reduction(inscan,+: x)
++  do k = 1, n
++    b(k) = x
++    !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++    !PARSE-TREE-NEXT: OmpSimpleStandaloneDirective -> llvm::omp::Directive = scan
++    !PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> Exclusive -> OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++    !CHECK: !$omp scan exclusive(x)
++    !$omp scan exclusive(x)
++    x = x + a(k)
++  end do
++
++  !$omp parallel do simd reduction(inscan,+: x, y)
++  do k = 1, n
++    x = x + a(k)
++    !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++    !PARSE-TREE-NEXT: OmpSimpleStandaloneDirective -> llvm::omp::Directive = scan
++    !PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> Inclusive -> OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++    !PARSE-TREE-NEXT: OmpObject -> Designator -> DataRef -> Name = 'y'
++    !CHECK: !$omp scan inclusive(x,y)
++    !$omp scan inclusive(x, y)
++      b(k) = x
++  end do
++
++  !$omp parallel do simd reduction(inscan,+: x, y)
++  do k = 1, n
++    x = x + a(k)
++    !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OpenMPSimpleStandaloneConstruct
++    !PARSE-TREE-NEXT: OmpSimpleStandaloneDirective -> llvm::omp::Directive = scan
++    !PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> Exclusive -> OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++    !PARSE-TREE-NEXT: OmpObject -> Designator -> DataRef -> Name = 'y'
++    !CHECK: !$omp scan exclusive(x,y)
++    !$omp scan exclusive(x, y)
++      b(k) = x
++  end do
++end subroutine
+diff --git a/flang/test/Semantics/OpenMP/do05.f90 b/flang/test/Semantics/OpenMP/do05.f90
+index c0f240db57b65..24844f9fe4f62 100644
+--- a/flang/test/Semantics/OpenMP/do05.f90
++++ b/flang/test/Semantics/OpenMP/do05.f90
+@@ -39,7 +39,7 @@ program omp_do
+     if( i == 5 ) then
+         cycle
+     end if
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+     !$omp single
+     do j=1,10
+@@ -70,7 +70,7 @@ program omp_do
+     if( i == 3 ) then
+         cycle
+     end if
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+     !$omp single
+     do j=1,10
+@@ -93,7 +93,7 @@ program omp_do
+ 
+   !$omp target parallel do simd
+   do i=1,10
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+     !$omp single
+     do j=1,10
+@@ -116,7 +116,7 @@ program omp_do
+ 
+   !$omp target teams distribute parallel do simd
+   do i=1,10
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+     !$omp single
+     do j=1,10
+diff --git a/flang/test/Semantics/OpenMP/nested-barrier.f90 b/flang/test/Semantics/OpenMP/nested-barrier.f90
+index 7c635d8e23cc0..5f51363d59e59 100644
+--- a/flang/test/Semantics/OpenMP/nested-barrier.f90
++++ b/flang/test/Semantics/OpenMP/nested-barrier.f90
+@@ -17,7 +17,7 @@ program omp_nest_barrier
+   !$omp do simd
+   do i = 1, 10
+     k = k + 1
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: `BARRIER` region may not be closely nested inside of `WORKSHARING`, `LOOP`, `TASK`, `TASKLOOP`,`CRITICAL`, `ORDERED`, `ATOMIC` or `MASTER` region.
+     !$omp barrier
+     j = j -1
+@@ -34,7 +34,7 @@ program omp_nest_barrier
+   !$omp parallel do simd
+   do i = 1, 10
+     k = k + 1
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: `BARRIER` region may not be closely nested inside of `WORKSHARING`, `LOOP`, `TASK`, `TASKLOOP`,`CRITICAL`, `ORDERED`, `ATOMIC` or `MASTER` region.
+     !$omp barrier
+     j = j -1
+diff --git a/flang/test/Semantics/OpenMP/nested-master.f90 b/flang/test/Semantics/OpenMP/nested-master.f90
+index b21ca5d141593..d51e366eb584b 100644
+--- a/flang/test/Semantics/OpenMP/nested-master.f90
++++ b/flang/test/Semantics/OpenMP/nested-master.f90
+@@ -64,7 +64,7 @@ program omp_nest_master
+   do i = 1, 10
+     k = k + 1
+     !WARNING: OpenMP directive MASTER has been deprecated, please use MASKED instead.
+-    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++    !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+     !ERROR: `MASTER` region may not be closely nested inside of `WORKSHARING`, `LOOP`, `TASK`, `TASKLOOP`, or `ATOMIC` region.
+     !$omp master
+     j = j -1
+diff --git a/flang/test/Semantics/OpenMP/nested-simd.f90 b/flang/test/Semantics/OpenMP/nested-simd.f90
+index 4149b6d97e9dc..c9fb90cdeceb2 100644
+--- a/flang/test/Semantics/OpenMP/nested-simd.f90
++++ b/flang/test/Semantics/OpenMP/nested-simd.f90
+@@ -40,7 +40,7 @@ SUBROUTINE NESTED_BAD(N)
+       !$OMP ORDERED SIMD
+       DO J = 1,N
+         print *, "Hi"
+-        !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++        !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+         !ERROR: TEAMS region can only be strictly nested within the implicit parallel region or TARGET region
+         !$omp teams 
+          DO K = 1,N
+@@ -58,25 +58,25 @@ SUBROUTINE NESTED_BAD(N)
+     !$OMP ATOMIC
+     K =  K + 1
+     IF (I <= 10) THEN
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp task 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end task
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp target 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end target
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP DO
+       DO J = 1,N
+         A(J) = J
+       END DO
+       !$OMP END DO
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP PARALLEL DO
+       DO J = 1,N
+         A(J) = J
+@@ -91,26 +91,26 @@ SUBROUTINE NESTED_BAD(N)
+     !$OMP ATOMIC
+     K =  K + 1
+     IF (I <= 10) THEN
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp task 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end task
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp target 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end target
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+       !$OMP DO
+       DO J = 1,N
+         A(J) = J
+       END DO
+       !$OMP END DO
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP PARALLEL DO
+       DO J = 1,N
+         A(J) = J
+@@ -125,26 +125,26 @@ SUBROUTINE NESTED_BAD(N)
+     !$OMP ATOMIC
+     K =  K + 1
+     IF (I <= 10) THEN
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp task 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end task
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp target 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end target
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !ERROR: A worksharing region may not be closely nested inside a worksharing, explicit task, taskloop, critical, ordered, atomic, or master region
+       !$OMP DO
+       DO J = 1,N
+         A(J) = J
+       END DO
+       !$OMP END DO
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP PARALLEL DO
+       DO J = 1,N
+         A(J) = J
+@@ -159,25 +159,25 @@ SUBROUTINE NESTED_BAD(N)
+     !$OMP ATOMIC
+     K =  K + 1
+     IF (I <= 10) THEN
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp task 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end task
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$omp target 
+       do J = 1, N
+         K = 2
+       end do
+       !$omp end target
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP DO
+       DO J = 1,N
+         A(J) = J
+       END DO
+       !$OMP END DO
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !$OMP PARALLEL DO
+       DO J = 1,N
+         A(J) = J
+diff --git a/flang/test/Semantics/OpenMP/ordered-simd.f90 b/flang/test/Semantics/OpenMP/ordered-simd.f90
+index 716dc42c28bb6..c90ffb3bd1c5f 100644
+--- a/flang/test/Semantics/OpenMP/ordered-simd.f90
++++ b/flang/test/Semantics/OpenMP/ordered-simd.f90
+@@ -25,7 +25,7 @@ SUBROUTINE ORDERED_BAD(N)
+   !$OMP DO SIMD
+   DO I = 1,N
+     IF (I <= 10) THEN
+-      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct and the `ORDERED` construct with the `SIMD` clause.
++      !ERROR: The only OpenMP constructs that can be encountered during execution of a 'SIMD' region are the `ATOMIC` construct, the `LOOP` construct, the `SIMD` construct, the `SCAN` construct and the `ORDERED` construct with the `SIMD` clause.
+       !ERROR: An ORDERED directive without the DEPEND clause must be closely nested in a worksharing-loop (or worksharing-loop SIMD) region with ORDERED clause without the parameter
+       !$OMP ORDERED 
+       CALL WORK(I)
+diff --git a/flang/test/Semantics/OpenMP/reduction-modifiers.f90 b/flang/test/Semantics/OpenMP/reduction-modifiers.f90
+index cf38200ba0a83..e6238bb8cb7ff 100644
+--- a/flang/test/Semantics/OpenMP/reduction-modifiers.f90
++++ b/flang/test/Semantics/OpenMP/reduction-modifiers.f90
+@@ -39,6 +39,7 @@ subroutine mod_inscan1(x)
+   !Correct: worksharing-loop directive
+   !$omp do reduction(inscan, +:x)
+   do i = 1, 100
++    !$omp scan inclusive(x)
+     x = foo(i)
+   enddo
+   !$omp end do
+@@ -50,6 +51,7 @@ subroutine mod_inscan2(x)
+   !Correct: worksharing-loop simd directive
+   !$omp do simd reduction(inscan, +:x)
+   do i = 1, 100
++    !$omp scan inclusive(x)
+     x = foo(i)
+   enddo
+   !$omp end do simd
+@@ -61,6 +63,7 @@ subroutine mod_inscan3(x)
+   !Correct: "simd" directive
+   !$omp simd reduction(inscan, +:x)
+   do i = 1, 100
++    !$omp scan inclusive(x)
+     x = foo(i)
+   enddo
+   !$omp end simd
+@@ -69,7 +72,7 @@ subroutine mod_inscan3(x)
+ subroutine mod_inscan4(x)
+   integer, intent(inout) :: x
+ 
+-  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with worksharing-loop, worksharing-loop simd, or SIMD directive
++  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with WORKSHARING LOOP, WORKSHARING LOOP SIMD, or SIMD directive
+   !$omp parallel reduction(inscan, +:x)
+   do i = 1, 100
+     x = foo(i)
+@@ -80,7 +83,7 @@ subroutine mod_inscan4(x)
+ subroutine mod_inscan5(x)
+   integer, intent(inout) :: x
+ 
+-  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with worksharing-loop, worksharing-loop simd, or SIMD directive
++  !ERROR: Modifier 'INSCAN' on REDUCTION clause is only allowed with WORKSHARING LOOP, WORKSHARING LOOP SIMD, or SIMD directive
+   !$omp sections reduction(inscan, +:x)
+   do i = 1, 100
+     x = foo(i)
+diff --git a/flang/test/Semantics/OpenMP/scan1.f90 b/flang/test/Semantics/OpenMP/scan1.f90
+new file mode 100644
+index 0000000000000..9e8fc9dec1c6b
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/scan1.f90
+@@ -0,0 +1,34 @@
++! RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp
++
++subroutine test_scan()
++ integer x, y, k, z
++ 
++ !ERROR: Orphaned SCAN directives are prohibited; perhaps you forgot to enclose the directive in to a WORKSHARING LOOP, a WORKSHARING LOOP SIMD or a SIMD directive.
++ !ERROR: List item x must appear in REDUCTION clause with the INSCAN modifier of the parent directive
++ !$omp scan inclusive(x)
++ !$omp parallel do simd
++ do k = 1, n
++ !ERROR: UNTIED clause is not allowed on the SCAN directive
++   !$omp scan untied
++ end do
++ 
++ !$omp parallel do simd
++ do k = 1, n
++ !ERROR: Exactly one of EXCLUSIVE or INCLUSIVE clause is expected
++   !$omp scan
++ end do
++
++!$omp parallel do simd reduction(inscan,+: x, y)
++ do k = 1, n
++ !ERROR: Exactly one of EXCLUSIVE or INCLUSIVE clause is expected
++   !$omp scan inclusive(x) exclusive(y)
++ end do
++
++!ERROR: List item y must appear in EXCLUSIVE or INCLUSIVE clause of an enclosed SCAN directive
++!$omp parallel do simd reduction(inscan,+: x, y)
++ do k = 1, n
++ !ERROR: Exactly one of EXCLUSIVE or INCLUSIVE clause is expected
++ !ERROR: List item z must appear in REDUCTION clause with the INSCAN modifier of the parent directive
++   !$omp scan inclusive(x) exclusive(z)
++ end do
++end subroutine
+diff --git a/flang/test/Semantics/OpenMP/scan2.f90 b/flang/test/Semantics/OpenMP/scan2.f90
+new file mode 100644
+index 0000000000000..5232e63aa6b4f
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/scan2.f90
+@@ -0,0 +1,27 @@
++! RUN: %flang_fc1 -fopenmp -fdebug-dump-symbols -o - %s 2>&1 | FileCheck %s
++! Check scan reduction
++
++! CHECK: MainProgram scope: omp_reduction
++program omp_reduction
++  ! CHECK: i size=4 offset=0: ObjectEntity type: INTEGER(4)
++  integer i
++  ! CHECK: k size=4 offset=4: ObjectEntity type: INTEGER(4) init:10_4
++  integer :: k = 10
++  ! CHECK: m size=4 offset=8: ObjectEntity type: INTEGER(4) init:12_4
++  integer :: m = 12
++
++  ! CHECK: OtherConstruct scope
++  ! CHECK: i (OmpPrivate, OmpPreDetermined): HostAssoc
++  ! CHECK: k (OmpReduction, OmpInclusiveScan, OmpInScanReduction): HostAssoc
++  !$omp parallel do  reduction(inscan, +:k)
++  do i=1,10
++   !$omp scan inclusive(k)
++  end do
++  !$omp end parallel do
++  ! CHECK: m (OmpReduction, OmpExclusiveScan, OmpInScanReduction): HostAssoc
++  !$omp parallel do  reduction(inscan, +:m)
++  do i=1,10
++   !$omp scan exclusive(m)
++  end do
++  !$omp end parallel do
++end program omp_reduction
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index fa96c3f367f0c..77f7e2355bb46 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -173,6 +173,7 @@ def OMPC_Enter : Clause<"enter"> {
+ }
+ def OMPC_Exclusive : Clause<"exclusive"> {
+   let clangClass = "OMPExclusiveClause";
++  let flangClass = "OmpObjectList";
+ }
+ def OMPC_Fail : Clause<"fail"> {
+   let clangClass = "OMPFailClause";
+@@ -230,6 +231,7 @@ def OMPC_Inbranch : Clause<"inbranch"> {
+ }
+ def OMPC_Inclusive : Clause<"inclusive"> {
+   let clangClass = "OMPInclusiveClause";
++  let flangClass = "OmpObjectList";
+ }
+ def OMPC_Indirect : Clause<"indirect"> {
+ }
+@@ -903,8 +905,8 @@ def OMP_Reverse : Directive<"reverse"> {
+ }
+ def OMP_Scan : Directive<"scan"> {
+   let allowedClauses = [
+-    VersionedClause<OMPC_Exclusive, 50>,
+-    VersionedClause<OMPC_Inclusive, 50>,
++    VersionedClause<OMPC_Exclusive>,
++    VersionedClause<OMPC_Inclusive>,
+   ];
+   let association = AS_Separating;
+   let category = CA_Subsidiary;

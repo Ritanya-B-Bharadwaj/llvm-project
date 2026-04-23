@@ -1,0 +1,429 @@
+diff --git a/offload/DeviceRTL/CMakeLists.txt b/offload/DeviceRTL/CMakeLists.txt
+index c76ad018ab4fe..3da83e5c30713 100644
+--- a/offload/DeviceRTL/CMakeLists.txt
++++ b/offload/DeviceRTL/CMakeLists.txt
+@@ -131,6 +131,7 @@ set(bc_flags -c -foffload-lto -std=c++17 -fvisibility=hidden
+              -DOMPTARGET_DEVICE_RUNTIME
+              -I${include_directory}
+              -I${devicertl_base_directory}/../include
++             -I${LLVM_MAIN_SRC_DIR}/../libc
+              ${LIBOMPTARGET_LLVM_INCLUDE_DIRS_DEVICERTL}
+ )
+ 
+@@ -275,6 +276,7 @@ function(compileDeviceRTLLibrary target_cpu target_name target_triple)
+     target_compile_definitions(${ide_target_name} PRIVATE SHARED_SCRATCHPAD_SIZE=512)
+     target_include_directories(${ide_target_name} PRIVATE
+       ${include_directory}
++      ${LLVM_MAIN_SRC_DIR}/../libc
+       ${devicertl_base_directory}/../include
+       ${LIBOMPTARGET_LLVM_INCLUDE_DIRS}
+     )
+diff --git a/offload/DeviceRTL/src/Misc.cpp b/offload/DeviceRTL/src/Misc.cpp
+index 8e690f6fd8e7c..c1df477365bcb 100644
+--- a/offload/DeviceRTL/src/Misc.cpp
++++ b/offload/DeviceRTL/src/Misc.cpp
+@@ -12,6 +12,8 @@
+ #include "Allocator.h"
+ #include "Configuration.h"
+ #include "DeviceTypes.h"
++#include "Shared/RPCOpcodes.h"
++#include "shared/rpc.h"
+ 
+ #include "Debug.h"
+ 
+@@ -110,6 +112,12 @@ void *indirectCallLookup(void *HstPtr) {
+   return HstPtr;
+ }
+ 
++/// The openmp client instance used to communicate with the server.
++/// FIXME: This is marked as 'retain' so that it is not removed via
++/// `-mlink-builtin-bitcode`
++[[gnu::visibility("protected"), gnu::weak,
++  gnu::retain]] rpc::Client Client asm("__llvm_rpc_client");
++
+ } // namespace impl
+ } // namespace ompx
+ 
+@@ -156,6 +164,20 @@ void omp_free(void *ptr, omp_allocator_handle_t allocator) {
+     return;
+   }
+ }
++
++unsigned long long __llvm_omp_host_call(void *fn, void *data, size_t size) {
++  rpc::Client::Port Port = ompx::impl::Client.open<OFFLOAD_HOST_CALL>();
++  Port.send_n(data, size);
++  Port.send([=](rpc::Buffer *buffer, uint32_t) {
++    buffer->data[0] = reinterpret_cast<uintptr_t>(fn);
++  });
++  unsigned long long Ret;
++  Port.recv([&](rpc::Buffer *Buffer, uint32_t) {
++    Ret = static_cast<unsigned long long>(Buffer->data[0]);
++  });
++  Port.close();
++  return Ret;
++}
+ }
+ 
+ ///}
+diff --git a/offload/DeviceRTL/src/exports b/offload/DeviceRTL/src/exports
+index 288ddf90b4a9f..01667e7aba827 100644
+--- a/offload/DeviceRTL/src/exports
++++ b/offload/DeviceRTL/src/exports
+@@ -15,4 +15,5 @@ malloc
+ free
+ memcmp
+ printf
++__llvm_rpc_client
+ __assert_fail
+diff --git a/offload/include/Shared/RPCOpcodes.h b/offload/include/Shared/RPCOpcodes.h
+new file mode 100644
+index 0000000000000..beee29df1f707
+--- /dev/null
++++ b/offload/include/Shared/RPCOpcodes.h
+@@ -0,0 +1,25 @@
++//===-- Shared/RPCOpcodes.h - Offload specific RPC opcodes ----- C++ ------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Defines RPC opcodes that are specifically used by the OpenMP device runtime.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef OMPTARGET_SHARED_RPC_OPCODES_H
++#define OMPTARGET_SHARED_RPC_OPCODES_H
++
++#define LLVM_OFFLOAD_RPC_BASE 'o'
++#define LLVM_OFFLOAD_OPCODE(n) (LLVM_OFFLOAD_RPC_BASE << 24 | n)
++
++typedef enum {
++  OFFLOAD_HOST_CALL = LLVM_OFFLOAD_OPCODE(0),
++} offload_opcode_t;
++
++#undef LLVM_OFFLOAD_OPCODE
++
++#endif // OMPTARGET_SHARED_RPC_OPCODES_H
+diff --git a/offload/plugins-nextgen/amdgpu/src/rtl.cpp b/offload/plugins-nextgen/amdgpu/src/rtl.cpp
+index 6356fa0554a9c..22c8079ab5812 100644
+--- a/offload/plugins-nextgen/amdgpu/src/rtl.cpp
++++ b/offload/plugins-nextgen/amdgpu/src/rtl.cpp
+@@ -2148,9 +2148,7 @@ struct AMDGPUDeviceTy : public GenericDeviceTy, AMDGenericDeviceTy {
+ 
+   /// We want to set up the RPC server for host services to the GPU if it is
+   /// availible.
+-  bool shouldSetupRPCServer() const override {
+-    return libomptargetSupportsRPC();
+-  }
++  bool shouldSetupRPCServer() const override { return true; }
+ 
+   /// The RPC interface should have enough space for all availible parallelism.
+   uint64_t requestedRPCPortCount() const override {
+diff --git a/offload/plugins-nextgen/common/CMakeLists.txt b/offload/plugins-nextgen/common/CMakeLists.txt
+index 3a861a47eedab..f9598a1718b3e 100644
+--- a/offload/plugins-nextgen/common/CMakeLists.txt
++++ b/offload/plugins-nextgen/common/CMakeLists.txt
+@@ -23,14 +23,15 @@ endif()
+ 
+ # Include the RPC server from the `libc` project if availible.
+ include(FindLibcCommonUtils)
++target_link_libraries(PluginCommon PRIVATE llvm-libc-common-utilities)
+ if(TARGET llvmlibc_rpc_server AND ${LIBOMPTARGET_GPU_LIBC_SUPPORT})
+-	target_link_libraries(PluginCommon PRIVATE llvmlibc_rpc_server llvm-libc-common-utilities)
++	target_link_libraries(PluginCommon PRIVATE llvmlibc_rpc_server)
+ 	target_compile_definitions(PluginCommon PRIVATE LIBOMPTARGET_RPC_SUPPORT)
+ elseif(${LIBOMPTARGET_GPU_LIBC_SUPPORT})
+   find_library(llvmlibc_rpc_server NAMES llvmlibc_rpc_server
+                PATHS ${LIBOMPTARGET_LLVM_LIBRARY_DIR} NO_DEFAULT_PATH)
+   if(llvmlibc_rpc_server)
+-    target_link_libraries(PluginCommon PRIVATE ${llvmlibc_rpc_server} llvm-libc-common-utilities)
++    target_link_libraries(PluginCommon PRIVATE ${llvmlibc_rpc_server})
+ 		target_compile_definitions(PluginCommon PRIVATE LIBOMPTARGET_RPC_SUPPORT)
+   endif()
+ endif()
+diff --git a/offload/plugins-nextgen/common/include/PluginInterface.h b/offload/plugins-nextgen/common/include/PluginInterface.h
+index 41cc0f286a581..97540d5a3e2b3 100644
+--- a/offload/plugins-nextgen/common/include/PluginInterface.h
++++ b/offload/plugins-nextgen/common/include/PluginInterface.h
+@@ -1580,9 +1580,6 @@ template <typename ResourceRef> class GenericDeviceResourceManagerTy {
+   std::deque<ResourceRef> ResourcePool;
+ };
+ 
+-/// A static check on whether or not we support RPC in libomptarget.
+-bool libomptargetSupportsRPC();
+-
+ } // namespace plugin
+ } // namespace target
+ } // namespace omp
+diff --git a/offload/plugins-nextgen/common/src/PluginInterface.cpp b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+index 25b815b7f9669..5cdf12176a0d6 100644
+--- a/offload/plugins-nextgen/common/src/PluginInterface.cpp
++++ b/offload/plugins-nextgen/common/src/PluginInterface.cpp
+@@ -2179,11 +2179,3 @@ int32_t GenericPluginTy::get_function(__tgt_device_binary Binary,
+   *KernelPtr = &Kernel;
+   return OFFLOAD_SUCCESS;
+ }
+-
+-bool llvm::omp::target::plugin::libomptargetSupportsRPC() {
+-#ifdef LIBOMPTARGET_RPC_SUPPORT
+-  return true;
+-#else
+-  return false;
+-#endif
+-}
+diff --git a/offload/plugins-nextgen/common/src/RPC.cpp b/offload/plugins-nextgen/common/src/RPC.cpp
+index c35431da69eb6..71a3a7690396e 100644
+--- a/offload/plugins-nextgen/common/src/RPC.cpp
++++ b/offload/plugins-nextgen/common/src/RPC.cpp
+@@ -9,19 +9,72 @@
+ #include "RPC.h"
+ 
+ #include "Shared/Debug.h"
++#include "Shared/RPCOpcodes.h"
+ 
+ #include "PluginInterface.h"
+ 
+-// TODO: This should be included unconditionally and cleaned up.
+-#if defined(LIBOMPTARGET_RPC_SUPPORT)
+ #include "shared/rpc.h"
+ #include "shared/rpc_opcodes.h"
+-#endif
+ 
+ using namespace llvm;
+ using namespace omp;
+ using namespace target;
+ 
++template <uint32_t NumLanes>
++rpc::Status handle_offload_opcodes(plugin::GenericDeviceTy &Device,
++                                   rpc::Server::Port &Port) {
++
++  switch (Port.get_opcode()) {
++  case RPC_MALLOC: {
++    Port.recv_and_send([&](rpc::Buffer *Buffer, uint32_t) {
++      Buffer->data[0] = reinterpret_cast<uintptr_t>(Device.allocate(
++          Buffer->data[0], nullptr, TARGET_ALLOC_DEVICE_NON_BLOCKING));
++    });
++    break;
++  }
++  case RPC_FREE: {
++    Port.recv([&](rpc::Buffer *Buffer, uint32_t) {
++      Device.free(reinterpret_cast<void *>(Buffer->data[0]),
++                  TARGET_ALLOC_DEVICE_NON_BLOCKING);
++    });
++    break;
++  }
++  case OFFLOAD_HOST_CALL: {
++    uint64_t Sizes[NumLanes] = {0};
++    unsigned long long Results[NumLanes] = {0};
++    void *Args[NumLanes] = {nullptr};
++    Port.recv_n(Args, Sizes, [&](uint64_t Size) { return new char[Size]; });
++    Port.recv([&](rpc::Buffer *buffer, uint32_t ID) {
++      using FuncPtrTy = unsigned long long (*)(void *);
++      auto Func = reinterpret_cast<FuncPtrTy>(buffer->data[0]);
++      Results[ID] = Func(Args[ID]);
++    });
++    Port.send([&](rpc::Buffer *Buffer, uint32_t ID) {
++      Buffer->data[0] = static_cast<uint64_t>(Results[ID]);
++      delete[] reinterpret_cast<char *>(Args[ID]);
++    });
++    break;
++  }
++  default:
++    return rpc::UNHANDLED_OPCODE;
++    break;
++  }
++  return rpc::SUCCESS;
++}
++
++static rpc::Status handle_offload_opcodes(plugin::GenericDeviceTy &Device,
++                                          rpc::Server::Port &Port,
++                                          uint32_t NumLanes) {
++  if (NumLanes == 1)
++    return handle_offload_opcodes<1>(Device, Port);
++  else if (NumLanes == 32)
++    return handle_offload_opcodes<32>(Device, Port);
++  else if (NumLanes == 64)
++    return handle_offload_opcodes<64>(Device, Port);
++  else
++    return rpc::ERROR;
++}
++
+ RPCServerTy::RPCServerTy(plugin::GenericPluginTy &Plugin)
+     : Buffers(Plugin.getNumDevices()) {}
+ 
+@@ -29,17 +82,12 @@ llvm::Expected<bool>
+ RPCServerTy::isDeviceUsingRPC(plugin::GenericDeviceTy &Device,
+                               plugin::GenericGlobalHandlerTy &Handler,
+                               plugin::DeviceImageTy &Image) {
+-#ifdef LIBOMPTARGET_RPC_SUPPORT
+   return Handler.isSymbolInImage(Device, Image, "__llvm_rpc_client");
+-#else
+-  return false;
+-#endif
+ }
+ 
+ Error RPCServerTy::initDevice(plugin::GenericDeviceTy &Device,
+                               plugin::GenericGlobalHandlerTy &Handler,
+                               plugin::DeviceImageTy &Image) {
+-#ifdef LIBOMPTARGET_RPC_SUPPORT
+   uint64_t NumPorts =
+       std::min(Device.requestedRPCPortCount(), rpc::MAX_PORT_COUNT);
+   void *RPCBuffer = Device.allocate(
+@@ -62,13 +110,9 @@ Error RPCServerTy::initDevice(plugin::GenericDeviceTy &Device,
+   Buffers[Device.getDeviceId()] = RPCBuffer;
+ 
+   return Error::success();
+-
+-#endif
+-  return Error::success();
+ }
+ 
+ Error RPCServerTy::runServer(plugin::GenericDeviceTy &Device) {
+-#ifdef LIBOMPTARGET_RPC_SUPPORT
+   uint64_t NumPorts =
+       std::min(Device.requestedRPCPortCount(), rpc::MAX_PORT_COUNT);
+   rpc::Server Server(NumPorts, Buffers[Device.getDeviceId()]);
+@@ -77,41 +121,22 @@ Error RPCServerTy::runServer(plugin::GenericDeviceTy &Device) {
+   if (!Port)
+     return Error::success();
+ 
+-  int Status = rpc::SUCCESS;
+-  switch (Port->get_opcode()) {
+-  case RPC_MALLOC: {
+-    Port->recv_and_send([&](rpc::Buffer *Buffer, uint32_t) {
+-      Buffer->data[0] = reinterpret_cast<uintptr_t>(Device.allocate(
+-          Buffer->data[0], nullptr, TARGET_ALLOC_DEVICE_NON_BLOCKING));
+-    });
+-    break;
+-  }
+-  case RPC_FREE: {
+-    Port->recv([&](rpc::Buffer *Buffer, uint32_t) {
+-      Device.free(reinterpret_cast<void *>(Buffer->data[0]),
+-                  TARGET_ALLOC_DEVICE_NON_BLOCKING);
+-    });
+-    break;
+-  }
+-  default:
+-    // Let the `libc` library handle any other unhandled opcodes.
++  int Status = handle_offload_opcodes(Device, *Port, Device.getWarpSize());
++
++  // Let the `libc` library handle any other unhandled opcodes.
++#ifdef LIBOMPTARGET_RPC_SUPPORT
++  if (Status == rpc::UNHANDLED_OPCODE)
+     Status = handle_libc_opcodes(*Port, Device.getWarpSize());
+-    break;
+-  }
+-  Port->close();
++#endif
+ 
++  Port->close();
+   if (Status != rpc::SUCCESS)
+     return createStringError("RPC server given invalid opcode!");
+ 
+-  return Error::success();
+-#endif
+   return Error::success();
+ }
+ 
+ Error RPCServerTy::deinitDevice(plugin::GenericDeviceTy &Device) {
+-#ifdef LIBOMPTARGET_RPC_SUPPORT
+   Device.free(Buffers[Device.getDeviceId()], TARGET_ALLOC_HOST);
+   return Error::success();
+-#endif
+-  return Error::success();
+ }
+diff --git a/offload/plugins-nextgen/cuda/src/rtl.cpp b/offload/plugins-nextgen/cuda/src/rtl.cpp
+index 015c7775ba351..9af71b06ce97d 100644
+--- a/offload/plugins-nextgen/cuda/src/rtl.cpp
++++ b/offload/plugins-nextgen/cuda/src/rtl.cpp
+@@ -496,9 +496,7 @@ struct CUDADeviceTy : public GenericDeviceTy {
+ 
+   /// We want to set up the RPC server for host services to the GPU if it is
+   /// availible.
+-  bool shouldSetupRPCServer() const override {
+-    return libomptargetSupportsRPC();
+-  }
++  bool shouldSetupRPCServer() const override { return true; }
+ 
+   /// The RPC interface should have enough space for all availible parallelism.
+   uint64_t requestedRPCPortCount() const override {
+diff --git a/offload/test/libc/host_call.c b/offload/test/api/omp_host_call.c
+similarity index 67%
+rename from offload/test/libc/host_call.c
+rename to offload/test/api/omp_host_call.c
+index 61c4e14d5b388..40d3dc7258291 100644
+--- a/offload/test/libc/host_call.c
++++ b/offload/test/api/omp_host_call.c
+@@ -1,20 +1,18 @@
+ // RUN: %libomptarget-compile-run-and-check-generic
+ 
+-// REQUIRES: libc
+-
+ #include <assert.h>
+ #include <omp.h>
+ #include <stdio.h>
+ 
+ #pragma omp begin declare variant match(device = {kind(gpu)})
+ // Extension provided by the 'libc' project.
+-unsigned long long rpc_host_call(void *fn, void *args, size_t size);
+-#pragma omp declare target to(rpc_host_call) device_type(nohost)
++unsigned long long __llvm_omp_host_call(void *fn, void *args, size_t size);
++#pragma omp declare target to(__llvm_omp_host_call) device_type(nohost)
+ #pragma omp end declare variant
+ 
+ #pragma omp begin declare variant match(device = {kind(cpu)})
+ // Dummy host implementation to make this work for all targets.
+-unsigned long long rpc_host_call(void *fn, void *args, size_t size) {
++unsigned long long __llvm_omp_host_call(void *fn, void *args, size_t size) {
+   return ((unsigned long long (*)(void *))fn)(args);
+ }
+ #pragma omp end declare variant
+@@ -25,22 +23,14 @@ typedef struct args_s {
+ } args_t;
+ 
+ // CHECK-DAG: Thread: 0, Block: 0
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 1, Block: 0
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 0, Block: 1
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 1, Block: 1
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 0, Block: 2
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 1, Block: 2
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 0, Block: 3
+-// CHECK-DAG: Result: 42
+ // CHECK-DAG: Thread: 1, Block: 3
+-// CHECK-DAG: Result: 42
+-long long foo(void *data) {
++unsigned long long foo(void *data) {
+   assert(omp_is_initial_device() && "Not executing on host?");
+   args_t *args = (args_t *)data;
+   printf("Thread: %d, Block: %d\n", args->thread_id, args->block_id);
+@@ -54,11 +44,19 @@ int main() {
+   fn_ptr = (void *)&foo;
+ #pragma omp target update to(fn_ptr)
+ 
+-#pragma omp target teams num_teams(4)
++  int failed = 0;
++#pragma omp target teams num_teams(4) map(tofrom : failed)
+ #pragma omp parallel num_threads(2)
+   {
+     args_t args = {omp_get_thread_num(), omp_get_team_num()};
+-    unsigned long long res = rpc_host_call(fn_ptr, &args, sizeof(args_t));
+-    printf("Result: %d\n", (int)res);
++    unsigned long long res =
++        __llvm_omp_host_call(fn_ptr, &args, sizeof(args_t));
++    if (res != 42)
++#pragma omp atomic write
++      failed = 1;
+   }
++
++  // CHECK: PASS
++  if (!failed)
++    printf("PASS\n");
+ }

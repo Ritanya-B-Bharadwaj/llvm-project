@@ -1,0 +1,294 @@
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index 3e9db06b61d50..79e5a04463e00 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -1317,7 +1317,8 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+                                      bool isUnordered) {
+     if (isUnordered || sym.has<Fortran::semantics::HostAssocDetails>() ||
+         sym.has<Fortran::semantics::UseDetails>()) {
+-      if (!shallowLookupSymbol(sym)) {
++      if (!shallowLookupSymbol(sym) &&
++          !sym.test(Fortran::semantics::Symbol::Flag::OmpShared)) {
+         // Do concurrent loop variables are not mapped yet since they are local
+         // to the Do concurrent scope (same for OpenMP loops).
+         mlir::OpBuilder::InsertPoint insPt = builder->saveInsertionPoint();
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 3b20d9e77e1cf..723596ad6ce45 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2121,11 +2121,14 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
+       }
+       return lastDeclSymbol;
+     };
+-    auto makeSharedSymbol = [&]() {
++    auto makeSharedSymbol = [&](std::optional<Symbol::Flag> flag = {}) {
+       const Symbol *hostSymbol =
+           lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
+-      MakeAssocSymbol(symbol->name(), *hostSymbol,
++      Symbol &assocSymbol = MakeAssocSymbol(symbol->name(), *hostSymbol,
+           context_.FindScope(dirContext.directiveSource));
++      if (flag) {
++        assocSymbol.set(*flag);
++      }
+     };
+     auto useLastDeclSymbol = [&]() {
+       if (lastDeclSymbol) {
+@@ -2140,8 +2143,9 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
+ 
+     if (dsa.has_value()) {
+       if (dsa.value() == Symbol::Flag::OmpShared &&
+-          (parallelDir || taskGenDir || teamsDir))
+-        makeSharedSymbol();
++          (parallelDir || taskGenDir || teamsDir)) {
++        makeSharedSymbol(Symbol::Flag::OmpShared);
++      }
+       // Private symbols will have been declared already.
+       prevDSA = dsa;
+       continue;
+@@ -2155,10 +2159,11 @@ void OmpAttributeVisitor::CreateImplicitSymbols(
+       if (!parallelDir && !taskGenDir && !teamsDir) {
+         return;
+       }
+-      if (dirContext.defaultDSA != Symbol::Flag::OmpShared)
++      if (dirContext.defaultDSA != Symbol::Flag::OmpShared) {
+         makePrivateSymbol(dirContext.defaultDSA);
+-      else
++      } else {
+         makeSharedSymbol();
++      }
+       dsa = dirContext.defaultDSA;
+     } else if (parallelDir) {
+       // 2) parallel -> shared
+diff --git a/flang/test/Lower/OpenMP/shared-loop.f90 b/flang/test/Lower/OpenMP/shared-loop.f90
+new file mode 100644
+index 0000000000000..191fa05be421a
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/shared-loop.f90
+@@ -0,0 +1,120 @@
++! RUN: bbc -emit-hlfir -fopenmp %s -o - | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++! --- Check that with shared(i) the variable outside the parallel section
++! --- is updated. 
++! CHECK-LABEL:  func.func @_QPomploop()
++! CHECK:    %[[ALLOC_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomploopEi"}
++! CHECK:    %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOC_I]] {uniq_name = "_QFomploopEi"} :
++! CHECK:    omp.parallel {
++! CHECK:      omp.sections {
++! CHECK:        omp.section {
++! CHECK:          %[[RES:.*]]:2 = fir.do_loop %[[ARG0:.*]] = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[ARG1:.*]] = 
++! CHECK:            fir.store %[[ARG1]] to %[[DECL_I]]#1
++! CHECK:            %[[UPDATE_ITER:.*]] = arith.addi %[[ARG0]], %{{.*}}
++! CHECK:            %[[LOAD_I:.*]] = fir.load %[[DECL_I]]#1
++! CHECK:            %[[RES_I:.*]] = arith.addi %[[LOAD_I]], %{{.*}}
++! CHECK:            fir.result %[[UPDATE_ITER]], %[[RES_I]]
++! CHECK:          }
++! CHECK:          fir.store %[[RES]]#1 to %[[DECL_I]]#1
++! CHECK:          omp.terminator
++! CHECK:        }
++! CHECK:        omp.terminator
++! CHECK:      }
++! CHECK:      return
++! CHECK:    }
++subroutine omploop
++  implicit none
++  integer :: i, j
++  i = 1
++  j = 0
++  !$omp parallel shared(i)
++    !$omp sections
++      do i=1,10
++         j = j + i
++      end do
++    !$omp end sections
++  !$omp end parallel
++end subroutine
++
++! --- Check that with default(shared) the variable outside the parallel section
++! --- is NOT updated (i is private to the omp.parallel code)
++! CHECK-LABEL:  func.func @_QPomploop2()
++! CHECK:    %[[ALLOC_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomploop2Ei"}
++! CHECK:    %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOC_I]] {uniq_name = "_QFomploop2Ei"} :
++! CHECK:    omp.parallel {
++! CHECK:      %[[ALLOC_PRIV_I:.*]] = fir.alloca i32 {bindc_name = "i", pinned}
++! CHECK:      %[[DECL_PRIV_I:.*]]:2 = hlfir.declare %[[ALLOC_PRIV_I]]
++! CHECK:      omp.sections {
++! CHECK:        omp.section {
++! CHECK:          %[[RES:.*]]:2 = fir.do_loop %[[ARG0:.*]] = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[ARG1:.*]] = 
++! CHECK-NOT:            fir.store %[[ARG1]] to %[[DECL_I]]#1
++! CHECK:            fir.store %[[ARG1]] to %[[DECL_PRIV_I]]#1
++! CHECK:            %[[UPDATE_ITER:.*]] = arith.addi %[[ARG0]], %{{.*}}
++! CHECK:            %[[LOAD_I:.*]] = fir.load %[[DECL_PRIV_I]]#1
++! CHECK:            %[[RES_I:.*]] = arith.addi %[[LOAD_I]], %{{.*}}
++! CHECK:            fir.result %[[UPDATE_ITER]], %[[RES_I]]
++! CHECK:          }
++! CHECK:          fir.store %[[RES]]#1 to %[[DECL_PRIV_I]]#1
++! CHECK:          omp.terminator
++! CHECK:        }
++! CHECK:        omp.terminator
++! CHECK:      }
++! CHECK:      return
++! CHECK:    }
++subroutine omploop2
++  implicit none
++  integer :: i, j
++  i = 1
++  j = 0
++  !$omp parallel default(shared)
++    !$omp sections
++      do i=1,10
++         j = j + i
++      end do
++    !$omp end sections
++  !$omp end parallel
++end subroutine
++
++
++! --- Check that with no data-sharing the variable outside the parallel section
++! --- is NOT updated (i is private to the omp.parallel code)
++! CHECK-LABEL:  func.func @_QPomploop3()
++! CHECK:    %[[ALLOC_I:.*]] = fir.alloca i32 {bindc_name = "i", uniq_name = "_QFomploop3Ei"}
++! CHECK:    %[[DECL_I:.*]]:2 = hlfir.declare %[[ALLOC_I]] {uniq_name = "_QFomploop3Ei"} :
++! CHECK:    omp.parallel {
++! CHECK:      %[[ALLOC_PRIV_I:.*]] = fir.alloca i32 {bindc_name = "i", pinned}
++! CHECK:      %[[DECL_PRIV_I:.*]]:2 = hlfir.declare %[[ALLOC_PRIV_I]]
++! CHECK:      omp.sections {
++! CHECK:        omp.section {
++! CHECK:          %[[RES:.*]]:2 = fir.do_loop %[[ARG0:.*]] = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[ARG1:.*]] = 
++! CHECK-NOT:            fir.store %[[ARG1]] to %[[DECL_I]]#1
++! CHECK:            fir.store %[[ARG1]] to %[[DECL_PRIV_I]]#1
++! CHECK:            %[[UPDATE_ITER:.*]] = arith.addi %[[ARG0]], %{{.*}}
++! CHECK:            %[[LOAD_I:.*]] = fir.load %[[DECL_PRIV_I]]#1
++! CHECK:            %[[RES_I:.*]] = arith.addi %[[LOAD_I]], %{{.*}}
++! CHECK:            fir.result %[[UPDATE_ITER]], %[[RES_I]]
++! CHECK:          }
++! CHECK:          fir.store %[[RES]]#1 to %[[DECL_PRIV_I]]#1
++! CHECK:          omp.terminator
++! CHECK:        }
++! CHECK:        omp.terminator
++! CHECK:      }
++! CHECK:      return
++! CHECK:    }
++subroutine omploop3
++  implicit none
++  integer :: i, j
++  i = 1
++  j = 0
++  !$omp parallel
++    !$omp sections
++      do i=1,10
++         j = j + i
++      end do
++    !$omp end sections
++  !$omp end parallel
++end subroutine
++
++
++ 
+diff --git a/flang/test/Semantics/OpenMP/do20.f90 b/flang/test/Semantics/OpenMP/do20.f90
+index 0cafae76b86b0..040a82079590f 100644
+--- a/flang/test/Semantics/OpenMP/do20.f90
++++ b/flang/test/Semantics/OpenMP/do20.f90
+@@ -10,7 +10,7 @@ subroutine shared_iv
+ 
+   !$omp parallel shared(i)
+     !$omp single
+-      !DEF: /shared_iv/OtherConstruct1/i HostAssoc INTEGER(4)
++      !DEF: /shared_iv/OtherConstruct1/i (OmpShared) HostAssoc INTEGER(4)
+       do i = 0, 1
+       end do
+     !$omp end single
+diff --git a/flang/test/Semantics/OpenMP/implicit-dsa.f90 b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+index 2abe3a0e16d62..a7ed834b0f1c6 100644
+--- a/flang/test/Semantics/OpenMP/implicit-dsa.f90
++++ b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+@@ -15,7 +15,7 @@ subroutine implicit_dsa_test1
+   !$omp task private(y) shared(z)
+     !DEF: /implicit_dsa_test1/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
+     !DEF: /implicit_dsa_test1/OtherConstruct1/y (OmpPrivate) HostAssoc INTEGER(4)
+-    !DEF: /implicit_dsa_test1/OtherConstruct1/z HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct1/z (OmpShared) HostAssoc INTEGER(4)
+     x = y + z
+   !$omp end task
+ 
+@@ -133,7 +133,7 @@ subroutine implicit_dsa_test6
+     !$omp end parallel
+ 
+     !$omp parallel default(firstprivate) shared(y)
+-      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/y HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/y (OmpShared) HostAssoc INTEGER(4)
+       !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate) HostAssocINTEGER(4)
+       !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/z (OmpFirstPrivate) HostAssocINTEGER(4)
+       y = x + z
+diff --git a/flang/test/Semantics/OpenMP/symbol01.f90 b/flang/test/Semantics/OpenMP/symbol01.f90
+index ecfb8622f8179..a40a8563fde1f 100644
+--- a/flang/test/Semantics/OpenMP/symbol01.f90
++++ b/flang/test/Semantics/OpenMP/symbol01.f90
+@@ -62,7 +62,7 @@ program mm
+   !REF: /mm/OtherConstruct1/i
+   !REF: /mm/OtherConstruct1/y
+   x = a+i+y
+-  !DEF: /mm/OtherConstruct1/c HostAssoc REAL(4)
++  !DEF: /mm/OtherConstruct1/c (OmpShared) HostAssoc REAL(4)
+   c = 3.0
+  end do
+ end program
+diff --git a/flang/test/Semantics/OpenMP/symbol02.f90 b/flang/test/Semantics/OpenMP/symbol02.f90
+index c199c526e1fa8..31d9cb2e46ba8 100644
+--- a/flang/test/Semantics/OpenMP/symbol02.f90
++++ b/flang/test/Semantics/OpenMP/symbol02.f90
+@@ -15,9 +15,9 @@
+   a = 3.
+   !DEF: /MainProgram1/OtherConstruct1/b (OmpPrivate) HostAssoc REAL(4)
+   b = 4
+-  !DEF: /MainProgram1/OtherConstruct1/c HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/c (OmpShared) HostAssoc REAL(4)
+   c = 5
+-  !DEF: /MainProgram1/OtherConstruct1/d HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/d (OmpShared) HostAssoc REAL(4)
+   d = 6
+   !$omp end parallel
+   !DEF: /MainProgram1/a (Implicit) ObjectEntity REAL(4)
+diff --git a/flang/test/Semantics/OpenMP/symbol03.f90 b/flang/test/Semantics/OpenMP/symbol03.f90
+index ba941b9c9e7c4..08defb40e56a7 100644
+--- a/flang/test/Semantics/OpenMP/symbol03.f90
++++ b/flang/test/Semantics/OpenMP/symbol03.f90
+@@ -9,10 +9,10 @@
+   !$omp parallel  private(a) shared(b)
+   !DEF: /MainProgram1/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
+   a = 3.
+-  !DEF: /MainProgram1/OtherConstruct1/b HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
+   b = 4
+   !$omp parallel  private(b) shared(a)
+-  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a HostAssoc REAL(4)
++  !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/a (OmpShared) HostAssoc REAL(4)
+   a = 5.
+   !DEF: /MainProgram1/OtherConstruct1/OtherConstruct1/b (OmpPrivate) HostAssoc REAL(4)
+   b = 6
+diff --git a/flang/test/Semantics/OpenMP/symbol07.f90 b/flang/test/Semantics/OpenMP/symbol07.f90
+index 8b4716999820b..a375942ebb1d9 100644
+--- a/flang/test/Semantics/OpenMP/symbol07.f90
++++ b/flang/test/Semantics/OpenMP/symbol07.f90
+@@ -23,7 +23,7 @@ subroutine function_call_in_region
+   !$omp parallel  default(none) private(a) shared(b)
+   !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
+   !REF: /function_call_in_region/foo
+-  !DEF: /function_call_in_region/OtherConstruct1/b HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
+   a = foo(b)
+   !$omp end parallel
+   !REF: /function_call_in_region/a
+diff --git a/flang/test/Semantics/OpenMP/symbol09.f90 b/flang/test/Semantics/OpenMP/symbol09.f90
+index 8b4716999820b..a375942ebb1d9 100644
+--- a/flang/test/Semantics/OpenMP/symbol09.f90
++++ b/flang/test/Semantics/OpenMP/symbol09.f90
+@@ -23,7 +23,7 @@ subroutine function_call_in_region
+   !$omp parallel  default(none) private(a) shared(b)
+   !DEF: /function_call_in_region/OtherConstruct1/a (OmpPrivate) HostAssoc REAL(4)
+   !REF: /function_call_in_region/foo
+-  !DEF: /function_call_in_region/OtherConstruct1/b HostAssoc REAL(4)
++  !DEF: /function_call_in_region/OtherConstruct1/b (OmpShared) HostAssoc REAL(4)
+   a = foo(b)
+   !$omp end parallel
+   !REF: /function_call_in_region/a

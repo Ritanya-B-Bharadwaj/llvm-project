@@ -1,0 +1,81 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index f336d213cc862..fa8a4309700f4 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1009,6 +1009,18 @@ bool ClauseProcessor::processMap(
+   return clauseFound;
+ }
+ 
++bool ClauseProcessor::processNontemporal(
++    mlir::omp::NontemporalClauseOps &result) const {
++  return findRepeatableClause<omp::clause::Nontemporal>(
++      [&](const omp::clause::Nontemporal &clause, const parser::CharBlock &) {
++        for (const Object &object : clause.v) {
++          semantics::Symbol *sym = object.sym();
++          mlir::Value symVal = converter.getSymbolAddress(*sym);
++          result.nontemporalVars.push_back(symVal);
++        }
++      });
++}
++
+ bool ClauseProcessor::processReduction(
+     mlir::Location currentLocation, mlir::omp::ReductionClauseOps &result,
+     llvm::SmallVectorImpl<mlir::Type> *outReductionTypes,
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index 8d02d368f4ee0..be1d8a66ddfcc 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -121,6 +121,7 @@ class ClauseProcessor {
+       llvm::SmallVectorImpl<const semantics::Symbol *> *mapSyms = nullptr,
+       llvm::SmallVectorImpl<mlir::Location> *mapSymLocs = nullptr,
+       llvm::SmallVectorImpl<mlir::Type> *mapSymTypes = nullptr) const;
++  bool processNontemporal(mlir::omp::NontemporalClauseOps &result) const;
+   bool processReduction(
+       mlir::Location currentLocation, mlir::omp::ReductionClauseOps &result,
+       llvm::SmallVectorImpl<mlir::Type> *reductionTypes = nullptr,
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 233aacb40354d..99114dc38a249 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -1123,13 +1123,13 @@ static void genSimdClauses(lower::AbstractConverter &converter,
+   ClauseProcessor cp(converter, semaCtx, clauses);
+   cp.processAligned(clauseOps);
+   cp.processIf(llvm::omp::Directive::OMPD_simd, clauseOps);
++  cp.processNontemporal(clauseOps);
+   cp.processOrder(clauseOps);
+   cp.processReduction(loc, clauseOps);
+   cp.processSafelen(clauseOps);
+   cp.processSimdlen(clauseOps);
+ 
+-  cp.processTODO<clause::Linear, clause::Nontemporal>(
+-      loc, llvm::omp::Directive::OMPD_simd);
++  cp.processTODO<clause::Linear>(loc, llvm::omp::Directive::OMPD_simd);
+ }
+ 
+ static void genSingleClauses(lower::AbstractConverter &converter,
+diff --git a/flang/test/Lower/OpenMP/simd.f90 b/flang/test/Lower/OpenMP/simd.f90
+index 2127451878849..bdc6a1eef0156 100644
+--- a/flang/test/Lower/OpenMP/simd.f90
++++ b/flang/test/Lower/OpenMP/simd.f90
+@@ -223,3 +223,21 @@ subroutine simdloop_aligned_allocatable()
+     A(i) = i
+   end do
+ end subroutine
++
++!CHECK-LABEL: func @_QPsimd_with_nontemporal_clause
++subroutine simd_with_nontemporal_clause(n)
++  !CHECK: %[[A_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_nontemporal_clauseEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  !CHECK: %[[C_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "_QFsimd_with_nontemporal_clauseEc"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer :: i, n
++  integer :: A, B, C
++  !CHECK: %[[LB:.*]] = arith.constant 1 : i32
++  !CHECK: %[[UB:.*]] = fir.load %{{.*}}#0 : !fir.ref<i32>
++  !CHECK: %[[STEP:.*]] = arith.constant 1 : i32
++  !CHECK: omp.simd nontemporal(%[[A_DECL]]#1, %[[C_DECL]]#1 : !fir.ref<i32>, !fir.ref<i32>) {
++  !CHECK-NEXT: omp.loop_nest (%[[I:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  !$OMP SIMD NONTEMPORAL(A, C)
++  do i = 1, n
++    C = A + B
++  end do
++  !$OMP END SIMD
++end subroutine

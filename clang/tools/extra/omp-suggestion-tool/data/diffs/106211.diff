@@ -1,0 +1,684 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 756e977d82906..2fd5d4b33074e 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2150,8 +2150,78 @@ static void genCompositeDistributeParallelDoSimd(
+     semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+     mlir::Location loc, const ConstructQueue &queue,
+     ConstructQueue::const_iterator item) {
++  lower::StatementContext stmtCtx;
++
+   assert(std::distance(item, queue.end()) == 4 && "Invalid leaf constructs");
+-  TODO(loc, "Composite DISTRIBUTE PARALLEL DO SIMD");
++  ConstructQueue::const_iterator distributeItem = item;
++  ConstructQueue::const_iterator parallelItem = std::next(distributeItem);
++  ConstructQueue::const_iterator doItem = std::next(parallelItem);
++  ConstructQueue::const_iterator simdItem = std::next(doItem);
++
++  // Create parent omp.parallel first.
++  mlir::omp::ParallelOperands parallelClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> parallelReductionSyms;
++  llvm::SmallVector<mlir::Type> parallelReductionTypes;
++  genParallelClauses(converter, semaCtx, stmtCtx, parallelItem->clauses, loc,
++                     parallelClauseOps, parallelReductionTypes,
++                     parallelReductionSyms);
++
++  DataSharingProcessor dsp(converter, semaCtx, simdItem->clauses, eval,
++                           /*shouldCollectPreDeterminedSymbols=*/true,
++                           /*useDelayedPrivatization=*/true, &symTable);
++  dsp.processStep1(&parallelClauseOps);
++
++  genParallelOp(converter, symTable, semaCtx, eval, loc, queue, parallelItem,
++                parallelClauseOps, parallelReductionSyms,
++                parallelReductionTypes, &dsp, /*isComposite=*/true);
++
++  // Clause processing.
++  mlir::omp::DistributeOperands distributeClauseOps;
++  genDistributeClauses(converter, semaCtx, stmtCtx, distributeItem->clauses,
++                       loc, distributeClauseOps);
++
++  mlir::omp::WsloopOperands wsloopClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> wsloopReductionSyms;
++  llvm::SmallVector<mlir::Type> wsloopReductionTypes;
++  genWsloopClauses(converter, semaCtx, stmtCtx, doItem->clauses, loc,
++                   wsloopClauseOps, wsloopReductionTypes, wsloopReductionSyms);
++
++  mlir::omp::SimdOperands simdClauseOps;
++  genSimdClauses(converter, semaCtx, simdItem->clauses, loc, simdClauseOps);
++
++  mlir::omp::LoopNestOperands loopNestClauseOps;
++  llvm::SmallVector<const semantics::Symbol *> iv;
++  genLoopNestClauses(converter, semaCtx, eval, simdItem->clauses, loc,
++                     loopNestClauseOps, iv);
++
++  // Operation creation.
++  // TODO: Populate entry block arguments with private variables.
++  auto distributeOp = genWrapperOp<mlir::omp::DistributeOp>(
++      converter, loc, distributeClauseOps, /*blockArgTypes=*/{});
++  distributeOp.setComposite(/*val=*/true);
++
++  // TODO: Add private variables to entry block arguments.
++  auto wsloopOp = genWrapperOp<mlir::omp::WsloopOp>(
++      converter, loc, wsloopClauseOps, wsloopReductionTypes);
++  wsloopOp.setComposite(/*val=*/true);
++
++  // TODO: Populate entry block arguments with reduction and private variables.
++  auto simdOp = genWrapperOp<mlir::omp::SimdOp>(converter, loc, simdClauseOps,
++                                                /*blockArgTypes=*/{});
++  simdOp.setComposite(/*val=*/true);
++
++  // Construct wrapper entry block list and associated symbols. It is important
++  // that the symbol order and the block argument order match, so that the
++  // symbol-value bindings created are correct.
++  auto &wrapperSyms = wsloopReductionSyms;
++
++  auto wrapperArgs = llvm::to_vector(llvm::concat<mlir::BlockArgument>(
++      distributeOp.getRegion().getArguments(),
++      wsloopOp.getRegion().getArguments(), simdOp.getRegion().getArguments()));
++
++  genLoopNestOp(converter, symTable, semaCtx, eval, loc, queue, simdItem,
++                loopNestClauseOps, iv, wrapperSyms, wrapperArgs,
++                llvm::omp::Directive::OMPD_distribute_parallel_do_simd, dsp);
+ }
+ 
+ static void genCompositeDistributeSimd(lower::AbstractConverter &converter,
+diff --git a/flang/test/Lower/OpenMP/distribute-parallel-do-simd.f90 b/flang/test/Lower/OpenMP/distribute-parallel-do-simd.f90
+new file mode 100644
+index 0000000000000..711d4dc4ba177
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/distribute-parallel-do-simd.f90
+@@ -0,0 +1,100 @@
++! This test checks lowering of OpenMP DISTRIBUTE PARALLEL DO SIMD composite
++! constructs.
++
++! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck %s
++! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - | FileCheck %s
++
++! CHECK-LABEL: func.func @_QPdistribute_parallel_do_simd_num_threads(
++subroutine distribute_parallel_do_simd_num_threads()
++  !$omp teams
++
++  ! CHECK:      omp.parallel num_threads({{.*}}) private({{.*}}) {
++  ! CHECK:      omp.distribute {
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd num_threads(10)
++  do index_ = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++end subroutine distribute_parallel_do_simd_num_threads
++
++! CHECK-LABEL: func.func @_QPdistribute_parallel_do_simd_dist_schedule(
++subroutine distribute_parallel_do_simd_dist_schedule()
++  !$omp teams
++
++  ! CHECK:      omp.parallel private({{.*}}) {
++  ! CHECK:      omp.distribute dist_schedule_static dist_schedule_chunk_size({{.*}}) {
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd dist_schedule(static, 4)
++  do index_ = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++end subroutine distribute_parallel_do_simd_dist_schedule
++
++! CHECK-LABEL: func.func @_QPdistribute_parallel_do_simd_schedule(
++subroutine distribute_parallel_do_simd_schedule()
++  !$omp teams
++
++  ! CHECK:      omp.parallel private({{.*}}) {
++  ! CHECK:      omp.distribute {
++  ! CHECK-NEXT: omp.wsloop schedule(static = {{.*}}) {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd schedule(static, 4)
++  do index_ = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++end subroutine distribute_parallel_do_simd_schedule
++
++! CHECK-LABEL: func.func @_QPdistribute_parallel_do_simd_simdlen(
++subroutine distribute_parallel_do_simd_simdlen()
++  !$omp teams
++
++  ! CHECK:      omp.parallel private({{.*}}) {
++  ! CHECK:      omp.distribute {
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.simd simdlen(4) {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd simdlen(4)
++  do index_ = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++end subroutine distribute_parallel_do_simd_simdlen
++
++! CHECK-LABEL: func.func @_QPdistribute_parallel_do_simd_private(
++subroutine distribute_parallel_do_simd_private()
++  ! CHECK: %[[INDEX_ALLOC:.*]] = fir.alloca i32
++  ! CHECK: %[[INDEX:.*]]:2 = hlfir.declare %[[INDEX_ALLOC]]
++  ! CHECK: %[[X_ALLOC:.*]] = fir.alloca i64
++  ! CHECK: %[[X:.*]]:2 = hlfir.declare %[[X_ALLOC]]
++  integer(8) :: x
++
++  ! CHECK: omp.teams {
++  !$omp teams
++
++  ! CHECK:      omp.parallel private(@{{.*}} %[[X]]#0 -> %[[X_ARG:.*]] : !fir.ref<i64>,
++  ! CHECK-SAME:                      @{{.*}} %[[INDEX]]#0 -> %[[INDEX_ARG:.*]] : !fir.ref<i32>) {
++  ! CHECK:      %[[X_PRIV:.*]]:2 = hlfir.declare %[[X_ARG]]
++  ! CHECK:      %[[INDEX_PRIV:.*]]:2 = hlfir.declare %[[INDEX_ARG]]
++  ! CHECK:      omp.distribute {
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.simd {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd private(x)
++  do index_ = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++end subroutine distribute_parallel_do_simd_private
+diff --git a/flang/test/Lower/OpenMP/if-clause.f90 b/flang/test/Lower/OpenMP/if-clause.f90
+index fce4efc7a5c2e..3ae9018ae4d5d 100644
+--- a/flang/test/Lower/OpenMP/if-clause.f90
++++ b/flang/test/Lower/OpenMP/if-clause.f90
+@@ -9,14 +9,11 @@ program main
+   integer :: i
+ 
+   ! TODO When they are supported, add tests for:
+-  ! - DISTRIBUTE PARALLEL DO SIMD
+   ! - PARALLEL SECTIONS
+   ! - PARALLEL WORKSHARE
+-  ! - TARGET TEAMS DISTRIBUTE PARALLEL DO SIMD
+   ! - TARGET UPDATE
+   ! - TASKLOOP
+   ! - TASKLOOP SIMD
+-  ! - TEAMS DISTRIBUTE PARALLEL DO SIMD
+ 
+   ! ----------------------------------------------------------------------------
+   ! DISTRIBUTE PARALLEL DO
+@@ -68,6 +65,97 @@ program main
+ 
+   !$omp end teams
+ 
++  ! ----------------------------------------------------------------------------
++  ! DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  !$omp teams
++
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd if(.true.)
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd if(parallel: .true.) if(simd: .false.)
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd if(parallel: .true.)
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd if(simd: .true.)
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++
+   ! ----------------------------------------------------------------------------
+   ! DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------
+@@ -828,6 +916,165 @@ program main
+   end do
+   !$omp end target teams distribute parallel do
+ 
++  ! ----------------------------------------------------------------------------
++  ! TARGET TEAMS DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  ! CHECK:      omp.target
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(.true.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(target: .true.) if(teams: .false.) if(parallel: .true.) if(simd: .false.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(target: .true.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(teams: .true.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(parallel: .true.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
++  ! CHECK:      omp.target
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd if(simd: .true.)
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
+   ! ----------------------------------------------------------------------------
+   ! TARGET TEAMS DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------
+@@ -1120,6 +1367,126 @@ program main
+   end do
+   !$omp end teams distribute parallel do
+ 
++  ! ----------------------------------------------------------------------------
++  ! TEAMS DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd if(.true.)
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd if(teams: .false.) if(parallel: .true.) if(simd: .false.)
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
++  ! CHECK:      omp.teams
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd if(teams: .true.)
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd if(parallel: .true.)
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
++  ! CHECK:      omp.teams
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.parallel
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK:      omp.distribute
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NOT:  if({{.*}})
++  ! CHECK-SAME: {
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-SAME: if({{.*}})
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd if(simd: .true.)
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
+   ! ----------------------------------------------------------------------------
+   ! TEAMS DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------
+diff --git a/flang/test/Lower/OpenMP/loop-compound.f90 b/flang/test/Lower/OpenMP/loop-compound.f90
+index fb61621e10f0a..e76edfe052f74 100644
+--- a/flang/test/Lower/OpenMP/loop-compound.f90
++++ b/flang/test/Lower/OpenMP/loop-compound.f90
+@@ -8,12 +8,7 @@ program main
+   integer :: i
+ 
+   ! TODO When composite constructs are supported add:
+-  ! - DISTRIBUTE PARALLEL DO SIMD
+-  ! - TARGET TEAMS DISTRIBUTE PARALLEL DO SIMD
+-  ! - TARGET TEAMS DISTRIBUTE PARALLEL DO
+   ! - TASKLOOP SIMD
+-  ! - TEAMS DISTRIBUTE PARALLEL DO SIMD
+-  ! - TEAMS DISTRIBUTE PARALLEL DO
+ 
+   ! ----------------------------------------------------------------------------
+   ! DISTRIBUTE PARALLEL DO
+@@ -31,6 +26,23 @@ program main
+ 
+   !$omp end teams
+ 
++  ! ----------------------------------------------------------------------------
++  ! DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  !$omp teams
++
++  ! CHECK: omp.parallel
++  ! CHECK: omp.distribute
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end distribute parallel do simd
++
++  !$omp end teams
++
+   ! ----------------------------------------------------------------------------
+   ! DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------
+@@ -142,6 +154,21 @@ program main
+   end do
+   !$omp end target teams distribute parallel do
+ 
++  ! ----------------------------------------------------------------------------
++  ! TARGET TEAMS DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  ! CHECK: omp.target
++  ! CHECK: omp.teams
++  ! CHECK: omp.parallel
++  ! CHECK: omp.distribute
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp target teams distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end target teams distribute parallel do simd
++
+   ! ----------------------------------------------------------------------------
+   ! TARGET TEAMS DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------
+@@ -179,6 +206,20 @@ program main
+   end do
+   !$omp end teams distribute parallel do
+ 
++  ! ----------------------------------------------------------------------------
++  ! TEAMS DISTRIBUTE PARALLEL DO SIMD
++  ! ----------------------------------------------------------------------------
++  ! CHECK: omp.teams
++  ! CHECK: omp.parallel
++  ! CHECK: omp.distribute
++  ! CHECK-NEXT: omp.wsloop
++  ! CHECK-NEXT: omp.simd
++  ! CHECK-NEXT: omp.loop_nest
++  !$omp teams distribute parallel do simd
++  do i = 1, 10
++  end do
++  !$omp end teams distribute parallel do simd
++
+   ! ----------------------------------------------------------------------------
+   ! TEAMS DISTRIBUTE SIMD
+   ! ----------------------------------------------------------------------------

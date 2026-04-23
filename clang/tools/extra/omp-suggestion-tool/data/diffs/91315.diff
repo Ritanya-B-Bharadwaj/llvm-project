@@ -1,0 +1,145 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 70863c5f20e89..2493eb3ed3676 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -84,52 +84,69 @@ class OmpWorkshareBlockChecker {
+   parser::CharBlock source_;
+ };
+ 
+-class OmpCycleChecker {
++class OmpCycleAndExitChecker {
+ public:
+-  OmpCycleChecker(SemanticsContext &context, std::int64_t cycleLevel)
+-      : context_{context}, cycleLevel_{cycleLevel} {}
++  OmpCycleAndExitChecker(SemanticsContext &context, std::int64_t level)
++      : context_{context}, level_{level} {}
+ 
+   template <typename T> bool Pre(const T &) { return true; }
+   template <typename T> void Post(const T &) {}
+ 
+   bool Pre(const parser::DoConstruct &dc) {
+-    cycleLevel_--;
++    level_--;
+     const auto &constructName{std::get<0>(std::get<0>(dc.t).statement.t)};
+     if (constructName) {
+       constructNamesAndLevels_.emplace(
+-          constructName.value().ToString(), cycleLevel_);
++          constructName.value().ToString(), level_);
+     }
+     return true;
+   }
+ 
++  void Post(const parser::DoConstruct &dc) { level_++; }
++
+   bool Pre(const parser::CycleStmt &cyclestmt) {
+     std::map<std::string, std::int64_t>::iterator it;
+     bool err{false};
+     if (cyclestmt.v) {
+       it = constructNamesAndLevels_.find(cyclestmt.v->source.ToString());
+       err = (it != constructNamesAndLevels_.end() && it->second > 0);
+-    } else {
+-      // If there is no label then the cycle statement is associated with the
+-      // closest enclosing DO. Use its level for the checks.
+-      err = cycleLevel_ > 0;
++    } else { // If there is no label then use the level of the last enclosing DO
++      err = level_ > 0;
+     }
+     if (err) {
+-      context_.Say(*cycleSource_,
++      context_.Say(*source_,
+           "CYCLE statement to non-innermost associated loop of an OpenMP DO "
+           "construct"_err_en_US);
+     }
+     return true;
+   }
+ 
++  bool Pre(const parser::ExitStmt &exitStmt) {
++    std::map<std::string, std::int64_t>::iterator it;
++    bool err{false};
++    if (exitStmt.v) {
++      it = constructNamesAndLevels_.find(exitStmt.v->source.ToString());
++      err = (it != constructNamesAndLevels_.end() && it->second >= 0);
++    } else { // If there is no label then use the level of the last enclosing DO
++      err = level_ >= 0;
++    }
++    if (err) {
++      context_.Say(*source_,
++          "EXIT statement terminates associated loop of an OpenMP DO "
++          "construct"_err_en_US);
++    }
++    return true;
++  }
++
+   bool Pre(const parser::Statement<parser::ActionStmt> &actionstmt) {
+-    cycleSource_ = &actionstmt.source;
++    source_ = &actionstmt.source;
+     return true;
+   }
+ 
+ private:
+   SemanticsContext &context_;
+-  const parser::CharBlock *cycleSource_;
+-  std::int64_t cycleLevel_;
++  const parser::CharBlock *source_;
++  std::int64_t level_;
+   std::map<std::string, std::int64_t> constructNamesAndLevels_;
+ };
+ 
+@@ -657,8 +674,8 @@ std::int64_t OmpStructureChecker::GetOrdCollapseLevel(
+ void OmpStructureChecker::CheckCycleConstraints(
+     const parser::OpenMPLoopConstruct &x) {
+   std::int64_t ordCollapseLevel{GetOrdCollapseLevel(x)};
+-  OmpCycleChecker ompCycleChecker{context_, ordCollapseLevel};
+-  parser::Walk(x, ompCycleChecker);
++  OmpCycleAndExitChecker checker{context_, ordCollapseLevel};
++  parser::Walk(x, checker);
+ }
+ 
+ void OmpStructureChecker::CheckDistLinear(
+diff --git a/flang/test/Semantics/OpenMP/do08.f90 b/flang/test/Semantics/OpenMP/do08.f90
+index 3ba63072a80bd..5143dff0dd315 100644
+--- a/flang/test/Semantics/OpenMP/do08.f90
++++ b/flang/test/Semantics/OpenMP/do08.f90
+@@ -4,6 +4,8 @@
+ 
+ program omp
+   integer i, j, k
++  logical cond(10,10,10)
++  cond = .false.
+ 
+   !ERROR: The value of the parameter in the COLLAPSE or ORDERED clause must not be larger than the number of nested loops following the construct.
+   !$omp do  collapse(3)
+@@ -135,4 +137,33 @@ program omp
+   end do foo
+   !$omp end do
+ 
++  !$omp do collapse(3)
++  loopk: do k=1,10
++    loopj: do j=1,10
++      loopi: do i=1,10
++        ifi : if (.true.) then
++          !ERROR: EXIT statement terminates associated loop of an OpenMP DO construct
++          if (cond(i,j,k)) exit
++          if (cond(i,j,k)) exit ifi
++          !ERROR: EXIT statement terminates associated loop of an OpenMP DO construct
++          if (cond(i,j,k)) exit loopi
++          !ERROR: EXIT statement terminates associated loop of an OpenMP DO construct
++          if (cond(i,j,k)) exit loopj
++        end if ifi
++      end do loopi
++    end do loopj
++  end do loopk
++  !$omp end do
++
++  !$omp do collapse(2)
++  loopk: do k=1,10
++    loopj: do j=1,10
++      do i=1,10
++      end do
++      !ERROR: EXIT statement terminates associated loop of an OpenMP DO construct
++      if (cond(i,j,k)) exit
++    end do loopj
++  end do loopk
++  !$omp end do
++
+ end program omp

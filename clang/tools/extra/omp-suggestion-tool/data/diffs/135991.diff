@@ -1,0 +1,176 @@
+diff --git a/flang/lib/Semantics/check-directive-structure.h b/flang/lib/Semantics/check-directive-structure.h
+index 91ffda6404c23..4a4893fe805a2 100644
+--- a/flang/lib/Semantics/check-directive-structure.h
++++ b/flang/lib/Semantics/check-directive-structure.h
+@@ -202,6 +202,7 @@ class DirectiveStructureChecker : public virtual BaseChecker {
+     const PC *clause{nullptr};
+     ClauseMapTy clauseInfo;
+     std::list<C> actualClauses;
++    std::list<C> endDirectiveClauses;
+     std::list<C> crtGroup;
+     Symbol *loopIV{nullptr};
+   };
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 717982f66027c..bc4651584b9a8 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -15,6 +15,7 @@
+ #include "flang/Semantics/expression.h"
+ #include "flang/Semantics/openmp-modifiers.h"
+ #include "flang/Semantics/tools.h"
++#include "llvm/ADT/STLExtras.h"
+ #include <variant>
+ 
+ namespace Fortran::semantics {
+@@ -682,11 +683,20 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclarativeConstruct &x) {
+   ExitDirectiveNest(DeclarativeNest);
+ }
+ 
++void OmpStructureChecker::AddEndDirectiveClauses(
++    const parser::OmpClauseList &clauses) {
++  for (const parser::OmpClause &clause : clauses.v) {
++    GetContext().endDirectiveClauses.push_back(clause.Id());
++  }
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
+   loopStack_.push_back(&x);
+   const auto &beginLoopDir{std::get<parser::OmpBeginLoopDirective>(x.t)};
+   const auto &beginDir{std::get<parser::OmpLoopDirective>(beginLoopDir.t)};
+ 
++  PushContextAndClauseSets(beginDir.source, beginDir.v);
++
+   // check matching, End directive is optional
+   if (const auto &endLoopDir{
+           std::get<std::optional<parser::OmpEndLoopDirective>>(x.t)}) {
+@@ -694,9 +704,10 @@ void OmpStructureChecker::Enter(const parser::OpenMPLoopConstruct &x) {
+         std::get<parser::OmpLoopDirective>(endLoopDir.value().t)};
+ 
+     CheckMatching<parser::OmpLoopDirective>(beginDir, endDir);
++
++    AddEndDirectiveClauses(std::get<parser::OmpClauseList>(endLoopDir->t));
+   }
+ 
+-  PushContextAndClauseSets(beginDir.source, beginDir.v);
+   if (llvm::omp::allSimdSet.test(GetContext().directive)) {
+     EnterDirectiveNest(SIMDNest);
+   }
+@@ -1429,6 +1440,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPSectionsConstruct &x) {
+   CheckMatching<parser::OmpSectionsDirective>(beginDir, endDir);
+ 
+   PushContextAndClauseSets(beginDir.source, beginDir.v);
++  AddEndDirectiveClauses(std::get<parser::OmpClauseList>(endSectionsDir.t));
++
+   const auto &sectionBlocks{std::get<parser::OmpSectionBlocks>(x.t)};
+   for (const parser::OpenMPConstruct &block : sectionBlocks.v) {
+     CheckNoBranching(std::get<parser::OpenMPSectionConstruct>(block.u).v,
+@@ -2288,6 +2301,37 @@ void OmpStructureChecker::Enter(const parser::OpenMPCancelConstruct &x) {
+   if (auto maybeConstruct{GetCancelType(
+           llvm::omp::Directive::OMPD_cancel, x.source, maybeClauses)}) {
+     CheckCancellationNest(dirName.source, *maybeConstruct);
++
++    if (CurrentDirectiveIsNested()) {
++      // nowait can be put on the end directive rather than the start directive
++      // so we need to check both
++      auto getParentClauses{[&]() {
++        const DirectiveContext &parent{GetContextParent()};
++        return llvm::concat<const llvm::omp::Clause>(
++            parent.actualClauses, parent.endDirectiveClauses);
++      }};
++
++      if (llvm::omp::nestedCancelDoAllowedSet.test(*maybeConstruct)) {
++        for (llvm::omp::Clause clause : getParentClauses()) {
++          if (clause == llvm::omp::Clause::OMPC_nowait) {
++            context_.Say(dirName.source,
++                "The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause"_err_en_US);
++          }
++          if (clause == llvm::omp::Clause::OMPC_ordered) {
++            context_.Say(dirName.source,
++                "The CANCEL construct cannot be nested inside of a worksharing construct with the ORDERED clause"_err_en_US);
++          }
++        }
++      } else if (llvm::omp::nestedCancelSectionsAllowedSet.test(
++                     *maybeConstruct)) {
++        for (llvm::omp::Clause clause : getParentClauses()) {
++          if (clause == llvm::omp::Clause::OMPC_nowait) {
++            context_.Say(dirName.source,
++                "The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause"_err_en_US);
++          }
++        }
++      }
++    }
+   }
+ }
+ 
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index a8869561cf5ea..5af3b505937c1 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -318,6 +318,8 @@ class OmpStructureChecker
+ 
+   void CheckAlignValue(const parser::OmpClause &);
+ 
++  void AddEndDirectiveClauses(const parser::OmpClauseList &clauses);
++
+   void EnterDirectiveNest(const int index) { directiveNest_[index]++; }
+   void ExitDirectiveNest(const int index) { directiveNest_[index]--; }
+   int GetDirectiveNest(const int index) { return directiveNest_[index]; }
+diff --git a/flang/test/Semantics/OpenMP/cancel.f90 b/flang/test/Semantics/OpenMP/cancel.f90
+index 581c4bdb97646..6f3a255312ccf 100644
+--- a/flang/test/Semantics/OpenMP/cancel.f90
++++ b/flang/test/Semantics/OpenMP/cancel.f90
+@@ -27,3 +27,54 @@ subroutine f03
+ !$omp cancellation point parallel parallel
+ !$omp end parallel
+ end
++
++subroutine do_nowait1
++!$omp parallel
++!$omp do nowait
++  do i=1,2
++!ERROR: The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause
++    !$omp cancel do
++  enddo
++!$omp end do
++!$omp end parallel
++end subroutine
++
++subroutine do_nowait2
++!$omp parallel
++!$omp do
++  do i=1,2
++!ERROR: The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause
++    !$omp cancel do
++  enddo
++!$omp end do nowait
++!$omp end parallel
++end subroutine
++
++subroutine do_ordered
++!$omp parallel do ordered
++  do i=1,2
++!ERROR: The CANCEL construct cannot be nested inside of a worksharing construct with the ORDERED clause
++    !$omp cancel do
++  enddo
++!$omp end parallel do
++end subroutine
++
++subroutine sections_nowait1
++!$omp parallel
++!$omp sections nowait
++  !$omp section
++!ERROR: The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause
++    !$omp cancel sections
++!$omp end sections
++!$omp end parallel
++end subroutine
++
++subroutine sections_nowait2
++!$omp parallel
++!$omp sections
++  !$omp section
++!ERROR: The CANCEL construct cannot be nested inside of a worksharing construct with the NOWAIT clause
++    !$omp cancel sections
++!$omp end sections nowait
++!$omp end parallel
++end subroutine
