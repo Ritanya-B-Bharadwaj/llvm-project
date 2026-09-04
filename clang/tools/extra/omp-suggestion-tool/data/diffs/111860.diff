@@ -1,0 +1,752 @@
+diff --git a/flang/examples/FeatureList/FeatureList.cpp b/flang/examples/FeatureList/FeatureList.cpp
+index 8fd0236608a66..06ca12a492d29 100644
+--- a/flang/examples/FeatureList/FeatureList.cpp
++++ b/flang/examples/FeatureList/FeatureList.cpp
+@@ -492,9 +492,8 @@ struct NodeVisitor {
+   READ_FEATURE(OmpLinearModifier::Type)
+   READ_FEATURE(OmpLoopDirective)
+   READ_FEATURE(OmpMapClause)
+-  READ_FEATURE(OmpMapType)
+-  READ_FEATURE(OmpMapType::Always)
+-  READ_FEATURE(OmpMapType::Type)
++  READ_FEATURE(OmpMapClause::TypeModifier)
++  READ_FEATURE(OmpMapClause::Type)
+   READ_FEATURE(OmpObject)
+   READ_FEATURE(OmpObjectList)
+   READ_FEATURE(OmpOrderClause)
+diff --git a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+index 00acb14ca8bbd..5d3c5cd72eef0 100644
+--- a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
++++ b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+@@ -226,8 +226,8 @@ void OpenMPCounterVisitor::Post(const OmpDependenceType::Type &c) {
+   clauseDetails +=
+       "type=" + std::string{OmpDependenceType::EnumToString(c)} + ";";
+ }
+-void OpenMPCounterVisitor::Post(const OmpMapType::Type &c) {
+-  clauseDetails += "type=" + std::string{OmpMapType::EnumToString(c)} + ";";
++void OpenMPCounterVisitor::Post(const OmpMapClause::Type &c) {
++  clauseDetails += "type=" + std::string{OmpMapClause::EnumToString(c)} + ";";
+ }
+ void OpenMPCounterVisitor::Post(const OmpScheduleClause::ScheduleType &c) {
+   clauseDetails +=
+diff --git a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.h b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.h
+index e1882f7b43635..380534ebbfd70 100644
+--- a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.h
++++ b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.h
+@@ -74,7 +74,7 @@ struct OpenMPCounterVisitor {
+   void Post(const OmpScheduleModifierType::ModType &c);
+   void Post(const OmpLinearModifier::Type &c);
+   void Post(const OmpDependenceType::Type &c);
+-  void Post(const OmpMapType::Type &c);
++  void Post(const OmpMapClause::Type &c);
+   void Post(const OmpScheduleClause::ScheduleType &c);
+   void Post(const OmpIfClause::DirectiveNameModifier &c);
+   void Post(const OmpCancelType::Type &c);
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index bf00e6b43d066..5d243b4e5d3e9 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -531,9 +531,8 @@ class ParseTreeDumper {
+   NODE_ENUM(OmpLinearModifier, Type)
+   NODE(parser, OmpLoopDirective)
+   NODE(parser, OmpMapClause)
+-  NODE(parser, OmpMapType)
+-  NODE(OmpMapType, Always)
+-  NODE_ENUM(OmpMapType, Type)
++  NODE_ENUM(OmpMapClause, TypeModifier)
++  NODE_ENUM(OmpMapClause, Type)
+   static std::string GetNodeName(const llvm::omp::Clause &x) {
+     return llvm::Twine(
+         "llvm::omp::Clause = ", llvm::omp::getOpenMPClauseName(x))
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 7057ac2267aa1..21b4a344dbc43 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3448,18 +3448,18 @@ struct OmpObject {
+ 
+ WRAPPER_CLASS(OmpObjectList, std::list<OmpObject>);
+ 
+-// 2.15.5.1 map-type -> TO | FROM | TOFROM | ALLOC | RELEASE | DELETE
+-struct OmpMapType {
+-  TUPLE_CLASS_BOILERPLATE(OmpMapType);
+-  EMPTY_CLASS(Always);
+-  ENUM_CLASS(Type, To, From, Tofrom, Alloc, Release, Delete)
+-  std::tuple<std::optional<Always>, Type> t;
+-};
+-
+-// 2.15.5.1 map -> MAP ([ [ALWAYS[,]] map-type : ] variable-name-list)
++// 2.15.5.1 map ->
++//    MAP ([ [map-type-modifiers [,] ] map-type : ] variable-name-list)
++// map-type-modifiers -> map-type-modifier [,] [...]
++// map-type-modifier -> ALWAYS | CLOSE | PRESENT | OMPX_HOLD
++// map-type -> TO | FROM | TOFROM | ALLOC | RELEASE | DELETE
+ struct OmpMapClause {
++  ENUM_CLASS(TypeModifier, Always, Close, Present, OmpxHold);
++  ENUM_CLASS(Type, To, From, Tofrom, Alloc, Release, Delete)
+   TUPLE_CLASS_BOILERPLATE(OmpMapClause);
+-  std::tuple<std::optional<OmpMapType>, OmpObjectList> t;
++  std::tuple<std::optional<std::list<TypeModifier>>, std::optional<Type>,
++      OmpObjectList>
++      t;
+ };
+ 
+ // 2.15.5.2 defaultmap -> DEFAULTMAP (implicit-behavior[:variable-category])
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index cf91b2638aecc..88c443b4198ab 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -945,40 +945,42 @@ bool ClauseProcessor::processMap(
+             llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE;
+         // If the map type is specified, then process it else Tofrom is the
+         // default.
+-        if (mapType) {
+-          switch (*mapType) {
+-          case Map::MapType::To:
+-            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
+-            break;
+-          case Map::MapType::From:
+-            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+-            break;
+-          case Map::MapType::Tofrom:
+-            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+-                           llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+-            break;
+-          case Map::MapType::Alloc:
+-          case Map::MapType::Release:
+-            // alloc and release is the default map_type for the Target Data
+-            // Ops, i.e. if no bits for map_type is supplied then alloc/release
+-            // is implicitly assumed based on the target directive. Default
+-            // value for Target Data and Enter Data is alloc and for Exit Data
+-            // it is release.
+-            break;
+-          case Map::MapType::Delete:
+-            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DELETE;
+-          }
+-
+-          auto &modTypeMods =
+-              std::get<std::optional<Map::MapTypeModifiers>>(clause.t);
+-          if (modTypeMods) {
+-            if (llvm::is_contained(*modTypeMods, Map::MapTypeModifier::Always))
+-              mapTypeBits |=
+-                  llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
+-          }
+-        } else {
++        Map::MapType type = mapType.value_or(Map::MapType::Tofrom);
++        switch (type) {
++        case Map::MapType::To:
++          mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
++          break;
++        case Map::MapType::From:
++          mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
++          break;
++        case Map::MapType::Tofrom:
+           mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+                          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
++          break;
++        case Map::MapType::Alloc:
++        case Map::MapType::Release:
++          // alloc and release is the default map_type for the Target Data
++          // Ops, i.e. if no bits for map_type is supplied then alloc/release
++          // is implicitly assumed based on the target directive. Default
++          // value for Target Data and Enter Data is alloc and for Exit Data
++          // it is release.
++          break;
++        case Map::MapType::Delete:
++          mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DELETE;
++        }
++
++        auto &modTypeMods =
++            std::get<std::optional<Map::MapTypeModifiers>>(clause.t);
++        if (modTypeMods) {
++          if (llvm::is_contained(*modTypeMods, Map::MapTypeModifier::Always))
++            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
++          // Diagnose unimplemented map-type-modifiers.
++          if (llvm::any_of(*modTypeMods, [](Map::MapTypeModifier m) {
++                return m != Map::MapTypeModifier::Always;
++              })) {
++            TODO(currentLocation, "Map type modifiers (other than 'ALWAYS')"
++                                  " are not implemented yet");
++          }
+         }
+         processMapObjects(stmtCtx, clauseLocation,
+                           std::get<omp::ObjectList>(clause.t), mapTypeBits,
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 91c1b08dd8c2f..812551de68574 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -846,41 +846,49 @@ Link make(const parser::OmpClause::Link &inp,
+ Map make(const parser::OmpClause::Map &inp,
+          semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpMapClause
++  using wrapped = parser::OmpMapClause;
+ 
+   CLAUSET_ENUM_CONVERT( //
+-      convert1, parser::OmpMapType::Type, Map::MapType,
++      convert1, parser::OmpMapClause::Type, Map::MapType,
+       // clang-format off
+-      MS(To,       To)
+-      MS(From,     From)
+-      MS(Tofrom,   Tofrom)
+       MS(Alloc,    Alloc)
+-      MS(Release,  Release)
+       MS(Delete,   Delete)
++      MS(From,     From)
++      MS(Release,  Release)
++      MS(To,       To)
++      MS(Tofrom,   Tofrom)
+       // clang-format on
+   );
+ 
+-  // No convert2: MapTypeModifier is not an enum in parser.
+-
+-  auto &t0 = std::get<std::optional<parser::OmpMapType>>(inp.v.t);
+-  auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
++  CLAUSET_ENUM_CONVERT( //
++      convert2, parser::OmpMapClause::TypeModifier, Map::MapTypeModifier,
++      // clang-format off
++      MS(Always,   Always)
++      MS(Close,    Close)
++      MS(OmpxHold, OmpxHold)
++      MS(Present,  Present)
++      // clang-format on
++  );
+ 
+-  if (!t0) {
+-    return Map{{/*MapType=*/std::nullopt, /*MapTypeModifiers=*/std::nullopt,
+-                /*Mapper=*/std::nullopt, /*Iterator=*/std::nullopt,
+-                /*LocatorList=*/makeObjects(t1, semaCtx)}};
+-  }
++  auto &t0 = std::get<std::optional<std::list<wrapped::TypeModifier>>>(inp.v.t);
++  auto &t1 = std::get<std::optional<wrapped::Type>>(inp.v.t);
++  auto &t2 = std::get<parser::OmpObjectList>(inp.v.t);
+ 
+-  auto &s0 = std::get<std::optional<parser::OmpMapType::Always>>(t0->t);
+-  auto &s1 = std::get<parser::OmpMapType::Type>(t0->t);
++  std::optional<Map::MapType> maybeType = maybeApply(convert1, t1);
+ 
+-  std::optional<Map::MapTypeModifiers> maybeList;
+-  if (s0)
+-    maybeList = Map::MapTypeModifiers{Map::MapTypeModifier::Always};
++  std::optional<Map::MapTypeModifiers> maybeTypeMods = maybeApply(
++      [&](const std::list<wrapped::TypeModifier> &typeMods) {
++        Map::MapTypeModifiers mods;
++        for (wrapped::TypeModifier mod : typeMods)
++          mods.push_back(convert2(mod));
++        return mods;
++      },
++      t0);
+ 
+-  return Map{{/*MapType=*/convert1(s1),
+-              /*MapTypeModifiers=*/maybeList,
++  return Map{{/*MapType=*/maybeType,
++              /*MapTypeModifiers=*/maybeTypeMods,
+               /*Mapper=*/std::nullopt, /*Iterator=*/std::nullopt,
+-              /*LocatorList=*/makeObjects(t1, semaCtx)}};
++              /*LocatorList=*/makeObjects(t2, semaCtx)}};
+ }
+ 
+ // Match: incomplete
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 214d6b4a91087..8634c522cf343 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -23,6 +23,70 @@ namespace Fortran::parser {
+ constexpr auto startOmpLine = skipStuffBeforeStatement >> "!$OMP "_sptok;
+ constexpr auto endOmpLine = space >> endOfLine;
+ 
++// Map modifiers come from two categories: map-type-modifier and map-type.
++// There can be zero or more map-type-modifiers, and zero or one map-type.
++// Syntax-wise they look like a single list, where the last element could
++// be a map-type, and all elements in that list are comma-separated[1].
++// Only if there was at least one modifier (of any kind) specified, the
++// list must end with ":".
++// [1] Any of the commas are optional, but that syntax has been deprecated,
++// and the parsing code is intended to identify that. There are complications
++// coming from the fact that the comma separating the two kinds of modifiers
++// is only allowed if there is at least one modifier of each kind.
++// The MapModifiers parser parses the modifier list as a whole, and returns
++// a tuple with the (optional) map-type-modifier list, and the (optional)
++// type modifier as its members.
++// The list is then parsed, first with a mandatory separator, and if that
++// fails, with an optional one. If the latter succeeds, a deprecation
++// message is printed.
++template <typename Separator> struct MapModifiers {
++  constexpr MapModifiers(
++      Separator sep, std::optional<MessageFixedText> msg = std::nullopt)
++      : sep_(sep), msg_(msg) {}
++  constexpr MapModifiers(const MapModifiers &) = default;
++  constexpr MapModifiers(MapModifiers &&) = default;
++
++  using resultType =
++      std::tuple<std::optional<std::list<OmpMapClause::TypeModifier>>,
++          std::optional<OmpMapClause::Type>>;
++
++  std::optional<resultType> Parse(ParseState &state) const {
++    auto pmod{Parser<OmpMapClause::TypeModifier>{}};
++    auto ptype{Parser<OmpMapClause::Type>{}};
++    auto startLoc{state.GetLocation()};
++
++    auto &&[mods, type] = [&]() -> resultType {
++      // The 'maybe' will return optional<optional<list>>, and the outer
++      // optional will never be nullopt.
++      if (auto mods{
++              *maybe(attempt(nonemptySeparated(pmod, sep_))).Parse(state)}) {
++        // mods = optional<list>, and the list is nonempty.
++        return attempt(sep_).Parse(state)
++            ? resultType(mods, *maybe(attempt(ptype)).Parse(state))
++            : resultType(mods, std::nullopt);
++      }
++      return {std::nullopt, *maybe(attempt(ptype)).Parse(state)};
++    }();
++    auto endLoc{state.GetLocation()};
++
++    // The above always "succeeds", i.e. even if the input is junk, it will
++    // return a tuple with two nullopts. If any of the components is not a
++    // nullopt, expect a ":".
++    if ((mods.has_value() || type.has_value()) &&
++        !attempt(":"_tok).Parse(state)) {
++      return std::nullopt;
++    }
++    if (msg_) {
++      state.Say(CharBlock{startLoc, endLoc}, *msg_);
++    }
++    return resultType(mods, type);
++  }
++
++private:
++  const Separator sep_;
++  std::optional<MessageFixedText> msg_;
++};
++
+ // OpenMP Clauses
+ // 2.15.3.1 DEFAULT (PRIVATE | FIRSTPRIVATE | SHARED | NONE)
+ TYPE_PARSER(construct<OmpDefaultClause>(
+@@ -38,20 +102,39 @@ TYPE_PARSER(construct<OmpProcBindClause>(
+     "PRIMARY" >> pure(OmpProcBindClause::Type::Primary) ||
+     "SPREAD" >> pure(OmpProcBindClause::Type::Spread)))
+ 
+-// 2.15.5.1 MAP ([ [ALWAYS[,]] map-type : ] variable-name-list)
+-//          map-type -> TO | FROM | TOFROM | ALLOC | RELEASE | DELETE
+-TYPE_PARSER(construct<OmpMapType>(
+-    maybe("ALWAYS" >> construct<OmpMapType::Always>() / maybe(","_tok)),
+-    ("TO"_id >> pure(OmpMapType::Type::To) ||
+-        "FROM" >> pure(OmpMapType::Type::From) ||
+-        "TOFROM" >> pure(OmpMapType::Type::Tofrom) ||
+-        "ALLOC" >> pure(OmpMapType::Type::Alloc) ||
+-        "RELEASE" >> pure(OmpMapType::Type::Release) ||
+-        "DELETE" >> pure(OmpMapType::Type::Delete)) /
+-        ":"))
+-
+-TYPE_PARSER(construct<OmpMapClause>(
+-    maybe(Parser<OmpMapType>{}), Parser<OmpObjectList>{}))
++// 2.15.5.1 map ->
++//    MAP ([ [map-type-modifiers [,] ] map-type : ] variable-name-list)
++// map-type-modifiers -> map-type-modifier [,] [...]
++// map-type-modifier -> ALWAYS | CLOSE | OMPX_HOLD | PRESENT
++// map-type -> ALLOC | DELETE | FROM | RELEASE | TO | TOFROM
++TYPE_PARSER(construct<OmpMapClause::TypeModifier>(
++    "ALWAYS" >> pure(OmpMapClause::TypeModifier::Always) ||
++    "CLOSE" >> pure(OmpMapClause::TypeModifier::Close) ||
++    "OMPX_HOLD" >> pure(OmpMapClause::TypeModifier::OmpxHold) ||
++    "PRESENT" >> pure(OmpMapClause::TypeModifier::Present)))
++
++TYPE_PARSER(
++    construct<OmpMapClause::Type>("ALLOC" >> pure(OmpMapClause::Type::Alloc) ||
++        "DELETE" >> pure(OmpMapClause::Type::Delete) ||
++        "FROM" >> pure(OmpMapClause::Type::From) ||
++        "RELEASE" >> pure(OmpMapClause::Type::Release) ||
++        "TO"_id >> pure(OmpMapClause::Type::To) ||
++        "TOFROM" >> pure(OmpMapClause::Type::Tofrom)))
++
++static inline OmpMapClause makeMapClause(
++    std::tuple<std::optional<std::list<OmpMapClause::TypeModifier>>,
++        std::optional<OmpMapClause::Type>> &&mod,
++    OmpObjectList &&obj) {
++  return OmpMapClause{
++      std::move(std::get<0>(mod)), std::move(std::get<1>(mod)), std::move(obj)};
++}
++
++TYPE_PARSER(construct<OmpMapClause>(applyFunction<OmpMapClause>(makeMapClause,
++    (MapModifiers(","_tok) ||
++        MapModifiers(maybe(","_tok),
++            "the specification of modifiers without comma separators for the "
++            "'MAP' clause has been deprecated"_port_en_US)),
++    Parser<OmpObjectList>{})))
+ 
+ // [OpenMP 5.0]
+ // 2.19.7.2 defaultmap(implicit-behavior[:variable-category])
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index ab01d82537c03..d1011fe58a026 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2073,11 +2073,27 @@ class UnparseVisitor {
+         ":");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
+-  void Unparse(const OmpMapType::Always &) { Word("ALWAYS,"); }
+   void Unparse(const OmpMapClause &x) {
+-    Walk(std::get<std::optional<OmpMapType>>(x.t), ":");
++    auto &typeMod =
++        std::get<std::optional<std::list<OmpMapClause::TypeModifier>>>(x.t);
++    auto &type = std::get<std::optional<OmpMapClause::Type>>(x.t);
++    Walk(typeMod);
++    if (typeMod.has_value() && type.has_value()) {
++      Put(", ");
++    }
++    Walk(type);
++    if (typeMod.has_value() || type.has_value()) {
++      Put(": ");
++    }
+     Walk(std::get<OmpObjectList>(x.t));
+   }
++  void Unparse(const OmpMapClause::TypeModifier &x) {
++    if (x == OmpMapClause::TypeModifier::OmpxHold) {
++      Word("OMPX_HOLD");
++    } else {
++      Word(OmpMapClause::EnumToString(x));
++    }
++  }
+   void Unparse(const OmpScheduleModifier &x) {
+     Walk(std::get<OmpScheduleModifier::Modifier1>(x.t));
+     Walk(",", std::get<std::optional<OmpScheduleModifier::Modifier2>>(x.t));
+@@ -2775,7 +2791,6 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(OmpScheduleModifierType, ModType) // OMP schedule-modifier
+   WALK_NESTED_ENUM(OmpLinearModifier, Type) // OMP linear-modifier
+   WALK_NESTED_ENUM(OmpDependenceType, Type) // OMP dependence-type
+-  WALK_NESTED_ENUM(OmpMapType, Type) // OMP map-type
+   WALK_NESTED_ENUM(OmpScheduleClause, ScheduleType) // OMP schedule-type
+   WALK_NESTED_ENUM(OmpDeviceClause, DeviceModifier) // OMP device modifier
+   WALK_NESTED_ENUM(OmpDeviceTypeClause, Type) // OMP DEVICE_TYPE
+@@ -2785,6 +2800,7 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(OmpCancelType, Type) // OMP cancel-type
+   WALK_NESTED_ENUM(OmpOrderClause, Type) // OMP order-type
+   WALK_NESTED_ENUM(OmpOrderModifier, Kind) // OMP order-modifier
++  WALK_NESTED_ENUM(OmpMapClause, Type) // OMP map-type
+ #undef WALK_NESTED_ENUM
+   void Unparse(const ReductionOperator::Operator x) {
+     switch (x) {
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index a54fa14730321..bdb8a7249f1a3 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -3029,15 +3029,15 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Linear &x) {
+ }
+ 
+ void OmpStructureChecker::CheckAllowedMapTypes(
+-    const parser::OmpMapType::Type &type,
+-    const std::list<parser::OmpMapType::Type> &allowedMapTypeList) {
++    const parser::OmpMapClause::Type &type,
++    const std::list<parser::OmpMapClause::Type> &allowedMapTypeList) {
+   if (!llvm::is_contained(allowedMapTypeList, type)) {
+     std::string commaSeparatedMapTypes;
+     llvm::interleave(
+         allowedMapTypeList.begin(), allowedMapTypeList.end(),
+-        [&](const parser::OmpMapType::Type &mapType) {
++        [&](const parser::OmpMapClause::Type &mapType) {
+           commaSeparatedMapTypes.append(parser::ToUpperCaseLetters(
+-              parser::OmpMapType::EnumToString(mapType)));
++              parser::OmpMapClause::EnumToString(mapType)));
+         },
+         [&] { commaSeparatedMapTypes.append(", "); });
+     context_.Say(GetContext().clauseSource,
+@@ -3049,10 +3049,9 @@ void OmpStructureChecker::CheckAllowedMapTypes(
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Map &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_map);
++  using Type = parser::OmpMapClause::Type;
+ 
+-  if (const auto &maptype{std::get<std::optional<parser::OmpMapType>>(x.v.t)}) {
+-    using Type = parser::OmpMapType::Type;
+-    const Type &type{std::get<Type>(maptype->t)};
++  if (const auto &mapType{std::get<std::optional<Type>>(x.v.t)}) {
+     switch (GetContext().directive) {
+     case llvm::omp::Directive::OMPD_target:
+     case llvm::omp::Directive::OMPD_target_teams:
+@@ -3062,13 +3061,13 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Map &x) {
+     case llvm::omp::Directive::OMPD_target_teams_distribute_parallel_do_simd:
+     case llvm::omp::Directive::OMPD_target_data:
+       CheckAllowedMapTypes(
+-          type, {Type::To, Type::From, Type::Tofrom, Type::Alloc});
++          *mapType, {Type::To, Type::From, Type::Tofrom, Type::Alloc});
+       break;
+     case llvm::omp::Directive::OMPD_target_enter_data:
+-      CheckAllowedMapTypes(type, {Type::To, Type::Alloc});
++      CheckAllowedMapTypes(*mapType, {Type::To, Type::Alloc});
+       break;
+     case llvm::omp::Directive::OMPD_target_exit_data:
+-      CheckAllowedMapTypes(type, {Type::From, Type::Release, Type::Delete});
++      CheckAllowedMapTypes(*mapType, {Type::From, Type::Release, Type::Delete});
+       break;
+     default:
+       break;
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index a8e60b411e184..cce9fa4e3016e 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -158,8 +158,8 @@ class OmpStructureChecker
+   // specific clause related
+   bool ScheduleModifierHasType(const parser::OmpScheduleClause &,
+       const parser::OmpScheduleModifierType::ModType &);
+-  void CheckAllowedMapTypes(const parser::OmpMapType::Type &,
+-      const std::list<parser::OmpMapType::Type> &);
++  void CheckAllowedMapTypes(const parser::OmpMapClause::Type &,
++      const std::list<parser::OmpMapClause::Type> &);
+   llvm::StringRef getClauseName(llvm::omp::Clause clause) override;
+   llvm::StringRef getDirectiveName(llvm::omp::Directive directive) override;
+ 
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 3d3630e8f388c..8eb40058b437b 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -591,26 +591,25 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+ 
+   void Post(const parser::OmpMapClause &x) {
+     Symbol::Flag ompFlag = Symbol::Flag::OmpMapToFrom;
+-    if (const auto &maptype{std::get<std::optional<parser::OmpMapType>>(x.t)}) {
+-      using Type = parser::OmpMapType::Type;
+-      const Type &type{std::get<Type>(maptype->t)};
+-      switch (type) {
+-      case Type::To:
++    if (const auto &mapType{
++            std::get<std::optional<parser::OmpMapClause::Type>>(x.t)}) {
++      switch (*mapType) {
++      case parser::OmpMapClause::Type::To:
+         ompFlag = Symbol::Flag::OmpMapTo;
+         break;
+-      case Type::From:
++      case parser::OmpMapClause::Type::From:
+         ompFlag = Symbol::Flag::OmpMapFrom;
+         break;
+-      case Type::Tofrom:
++      case parser::OmpMapClause::Type::Tofrom:
+         ompFlag = Symbol::Flag::OmpMapToFrom;
+         break;
+-      case Type::Alloc:
++      case parser::OmpMapClause::Type::Alloc:
+         ompFlag = Symbol::Flag::OmpMapAlloc;
+         break;
+-      case Type::Release:
++      case parser::OmpMapClause::Type::Release:
+         ompFlag = Symbol::Flag::OmpMapRelease;
+         break;
+-      case Type::Delete:
++      case parser::OmpMapClause::Type::Delete:
+         ompFlag = Symbol::Flag::OmpMapDelete;
+         break;
+       }
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90
+new file mode 100644
+index 0000000000000..c30f45d83864b
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90
+@@ -0,0 +1,10 @@
++! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
++subroutine f00()
++  integer :: x
++  !$omp target map(close: x)
++  x = x + 1
++  !$omp end target
++end
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90
+new file mode 100644
+index 0000000000000..0b5f2f5ca5e24
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90
+@@ -0,0 +1,11 @@
++! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
++subroutine f01()
++  integer :: x
++  !$omp target map(ompx_hold: x)
++  x = x + 1
++  !$omp end target
++end
++
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90
+new file mode 100644
+index 0000000000000..836b3a0a84bec
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90
+@@ -0,0 +1,11 @@
++! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
++subroutine f02()
++  integer :: x
++  !$omp target map(present: x)
++  x = x + 1
++  !$omp end target
++end
++
+diff --git a/flang/test/Parser/OpenMP/map-modifiers.f90 b/flang/test/Parser/OpenMP/map-modifiers.f90
+new file mode 100644
+index 0000000000000..4c6dcde5a20c5
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/map-modifiers.f90
+@@ -0,0 +1,136 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x
++  !$omp target map(ompx_hold, always, present, close, to: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(OMPX_HOLD, ALWAYS, PRESENT, CLOSE, TO: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | TypeModifier = OmpxHold
++!PARSE-TREE: | | TypeModifier = Always
++!PARSE-TREE: | | TypeModifier = Present
++!PARSE-TREE: | | TypeModifier = Close
++!PARSE-TREE: | | Type = To
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f01(x)
++  integer :: x
++  !$omp target map(ompx_hold, always, present, close: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(OMPX_HOLD, ALWAYS, PRESENT, CLOSE: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | TypeModifier = OmpxHold
++!PARSE-TREE: | | TypeModifier = Always
++!PARSE-TREE: | | TypeModifier = Present
++!PARSE-TREE: | | TypeModifier = Close
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f02(x)
++  integer :: x
++  !$omp target map(from: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f02 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(FROM: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | Type = From
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f03(x)
++  integer :: x
++  !$omp target map(x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f03 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f10(x)
++  integer :: x
++  !$omp target map(ompx_hold always, present, close, to: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f10 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(OMPX_HOLD, ALWAYS, PRESENT, CLOSE, TO: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | TypeModifier = OmpxHold
++!PARSE-TREE: | | TypeModifier = Always
++!PARSE-TREE: | | TypeModifier = Present
++!PARSE-TREE: | | TypeModifier = Close
++!PARSE-TREE: | | Type = To
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
++subroutine f11(x)
++  integer :: x
++  !$omp target map(ompx_hold, always, present, close: x)
++  x = x + 1
++  !$omp end target
++end
++
++!UNPARSE: SUBROUTINE f11 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET  MAP(OMPX_HOLD, ALWAYS, PRESENT, CLOSE: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TARGET
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = target
++!PARSE-TREE: | OmpClauseList -> OmpClause -> Map -> OmpMapClause
++!PARSE-TREE: | | TypeModifier = OmpxHold
++!PARSE-TREE: | | TypeModifier = Always
++!PARSE-TREE: | | TypeModifier = Present
++!PARSE-TREE: | | TypeModifier = Close
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++
+diff --git a/flang/test/Semantics/OpenMP/map-modifiers.f90 b/flang/test/Semantics/OpenMP/map-modifiers.f90
+new file mode 100644
+index 0000000000000..355df6e083aa5
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/map-modifiers.f90
+@@ -0,0 +1,18 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -Werror
++
++subroutine f10(x)
++  integer :: x
++!PORTABILITY: the specification of modifiers without comma separators for the 'MAP' clause has been deprecated
++  !$omp target map(always, present close, to: x)
++  x = x + 1
++  !$omp end target
++end
++
++subroutine f11(x)
++  integer :: x
++!PORTABILITY: the specification of modifiers without comma separators for the 'MAP' clause has been deprecated
++  !$omp target map(always, present, close to: x)
++  x = x + 1
++  !$omp end target
++end
++

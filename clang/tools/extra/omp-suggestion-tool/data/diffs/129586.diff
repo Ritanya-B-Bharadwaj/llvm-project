@@ -1,0 +1,543 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 98a2bb7583d98..2da0338200a3a 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1029,15 +1029,15 @@ bool ClauseProcessor::processMap(
+     }
+ 
+     if (typeMods) {
++      // TODO: Still requires "self" modifier, an OpenMP 6.0+ feature
+       if (llvm::is_contained(*typeMods, Map::MapTypeModifier::Always))
+         mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
+-      // Diagnose unimplemented map-type-modifiers.
+-      if (llvm::any_of(*typeMods, [](Map::MapTypeModifier m) {
+-            return m != Map::MapTypeModifier::Always;
+-          })) {
+-        TODO(currentLocation, "Map type modifiers (other than 'ALWAYS')"
+-                              " are not implemented yet");
+-      }
++      if (llvm::is_contained(*typeMods, Map::MapTypeModifier::Present))
++        mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_PRESENT;
++      if (llvm::is_contained(*typeMods, Map::MapTypeModifier::Close))
++        mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_CLOSE;
++      if (llvm::is_contained(*typeMods, Map::MapTypeModifier::OmpxHold))
++        mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_OMPX_HOLD;
+     }
+ 
+     if (iterator) {
+@@ -1073,19 +1073,20 @@ bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
+   auto callbackFn = [&](const auto &clause, const parser::CharBlock &source) {
+     mlir::Location clauseLocation = converter.genLocation(source);
+     const auto &[expectation, mapper, iterator, objects] = clause.t;
+-    // TODO Support motion modifiers: present, mapper, iterator.
+-    if (expectation) {
+-      TODO(clauseLocation, "PRESENT modifier is not supported yet");
+-    } else if (mapper) {
++
++    // TODO Support motion modifiers: mapper, iterator.
++    if (mapper) {
+       TODO(clauseLocation, "Mapper modifier is not supported yet");
+     } else if (iterator) {
+       TODO(clauseLocation, "Iterator modifier is not supported yet");
+     }
+-    constexpr llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
++
++    llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+         std::is_same_v<llvm::remove_cvref_t<decltype(clause)>, omp::clause::To>
+             ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
+             : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+-
++    if (expectation && *expectation == omp::clause::To::Expectation::Present)
++      mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_PRESENT;
+     processMapObjects(stmtCtx, clauseLocation, objects, mapTypeBits,
+                       parentMemberIndices, result.mapVars, mapSymbols);
+   };
+diff --git a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+index ab4dc582d5804..9ee066631d663 100644
+--- a/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/OpenMP/MapInfoFinalization.cpp
+@@ -243,20 +243,15 @@ class MapInfoFinalizationPass
+   /// where necessary, although it does not seem strictly required.
+   unsigned long getDescriptorMapType(unsigned long mapTypeFlag,
+                                      mlir::Operation *target) {
++    using mapFlags = llvm::omp::OpenMPOffloadMappingFlags;
+     if (llvm::isa_and_nonnull<mlir::omp::TargetExitDataOp,
+                               mlir::omp::TargetUpdateOp>(target))
+       return mapTypeFlag;
+ 
+-    bool hasImplicitMap =
+-        (llvm::omp::OpenMPOffloadMappingFlags(mapTypeFlag) &
+-         llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT) ==
+-        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT;
+-
+-    return llvm::to_underlying(
+-        hasImplicitMap
+-            ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+-                  llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT
+-            : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO);
++    mapFlags flags = mapFlags::OMP_MAP_TO |
++                     (mapFlags(mapTypeFlag) &
++                      (mapFlags::OMP_MAP_IMPLICIT | mapFlags::OMP_MAP_CLOSE));
++    return llvm::to_underlying(flags);
+   }
+ 
+   mlir::omp::MapInfoOp genDescriptorMemberMaps(mlir::omp::MapInfoOp op,
+diff --git a/flang/test/Integration/OpenMP/map-types-and-sizes.f90 b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+index 70ae353ced214..35eec823e30de 100644
+--- a/flang/test/Integration/OpenMP/map-types-and-sizes.f90
++++ b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+@@ -6,7 +6,7 @@
+ ! added to this directory and sub-directories.
+ !===----------------------------------------------------------------------===!
+ 
+-!RUN: %flang_fc1 -emit-llvm -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa -flang-deprecated-no-hlfir %s -o - | FileCheck %s
++!RUN: %flang_fc1 -emit-llvm -fopenmp -fopenmp-version=51 -fopenmp-targets=amdgcn-amd-amdhsa -flang-deprecated-no-hlfir %s -o - | FileCheck %s
+ 
+ !===============================================================================
+ ! Check MapTypes for target implicit captures
+@@ -39,6 +39,37 @@ subroutine mapType_ptr
+   !$omp end target
+ end subroutine mapType_ptr
+ 
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4097]
++subroutine map_present_target_data
++  integer :: x
++!$omp target data map(present, to: x)
++!$omp end target data
++end subroutine
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4097]
++subroutine map_present_update
++  integer :: x
++!$omp target update to(present: x)
++end subroutine
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 1027]
++subroutine map_close
++  integer :: x
++!$omp target data map(close, tofrom: x)
++!$omp end target data
++end subroutine
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 8195]
++subroutine map_ompx_hold
++  integer :: x
++!$omp target data map(ompx_hold, tofrom: x)
++!$omp end target data
++end subroutine
++
+ !CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [4 x i64] [i64 0, i64 24, i64 8, i64 0]
+ !CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [4 x i64] [i64 32, i64 281474976711169, i64 281474976711171, i64 281474976711187]
+ subroutine mapType_allocatable
+diff --git a/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90 b/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90
+deleted file mode 100644
+index 7be70ba9102e1..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90
++++ /dev/null
+@@ -1,8 +0,0 @@
+-!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
+-!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
+-
+-!CHECK: not yet implemented: PRESENT modifier is not supported yet
+-subroutine f00(x)
+-  integer :: x
+-  !$omp target update from(present: x)
+-end
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90
+deleted file mode 100644
+index c30f45d83864b..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/map-modifiers-close.f90
++++ /dev/null
+@@ -1,10 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
+-subroutine f00()
+-  integer :: x
+-  !$omp target map(close: x)
+-  x = x + 1
+-  !$omp end target
+-end
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90
+deleted file mode 100644
+index 0b5f2f5ca5e24..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/map-modifiers-ompxhold.f90
++++ /dev/null
+@@ -1,11 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
+-subroutine f01()
+-  integer :: x
+-  !$omp target map(ompx_hold: x)
+-  x = x + 1
+-  !$omp end target
+-end
+-
+diff --git a/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90 b/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90
+deleted file mode 100644
+index 836b3a0a84bec..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/map-modifiers-present.f90
++++ /dev/null
+@@ -1,11 +0,0 @@
+-! RUN: %not_todo_cmd bbc -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -o - %s 2>&1 | FileCheck %s
+-
+-!CHECK: Map type modifiers (other than 'ALWAYS') are not implemented yet
+-subroutine f02()
+-  integer :: x
+-  !$omp target map(present: x)
+-  x = x + 1
+-  !$omp end target
+-end
+-
+diff --git a/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90 b/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90
+deleted file mode 100644
+index f29fb8fffb1eb..0000000000000
+--- a/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90
++++ /dev/null
+@@ -1,8 +0,0 @@
+-!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
+-!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
+-
+-!CHECK: not yet implemented: PRESENT modifier is not supported yet
+-subroutine f00(x)
+-  integer :: x
+-  !$omp target update to(present: x)
+-end
+diff --git a/flang/test/Lower/OpenMP/map-modifiers.f90 b/flang/test/Lower/OpenMP/map-modifiers.f90
+new file mode 100644
+index 0000000000000..64d7869cbb836
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/map-modifiers.f90
+@@ -0,0 +1,32 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=51 %s -o - | FileCheck %s
++
++subroutine map_present_target_data
++    integer :: x
++!CHECK: %[[MAP:.*]] = omp.map.info {{.*}} map_clauses(present, to) {{.*}} {name = "x"}
++!CHECK: omp.target_data map_entries(%[[MAP]] : {{.*}}) {
++!$omp target data map(present, to: x)
++!$omp end target data
++end subroutine
++
++subroutine map_present_update
++    integer :: x
++!CHECK: %[[MAP:.*]] = omp.map.info {{.*}} map_clauses(present, to) {{.*}} {name = "x"}
++!CHECK: omp.target_update map_entries(%[[MAP]] : {{.*}})
++!$omp target update to(present: x)
++end subroutine
++
++subroutine map_close
++    integer :: x
++!CHECK: %[[MAP:.*]] = omp.map.info {{.*}} map_clauses(close, tofrom) {{.*}} {name = "x"}
++!CHECK: omp.target_data map_entries(%[[MAP]] : {{.*}}) {
++!$omp target data map(close, tofrom: x)
++!$omp end target data
++end subroutine
++
++subroutine map_ompx_hold
++    integer :: x
++!CHECK: %[[MAP:.*]] = omp.map.info {{.*}} map_clauses(ompx_hold, tofrom) {{.*}} {name = "x"}
++!CHECK: omp.target_data map_entries(%[[MAP]] : {{.*}}) {
++!$omp target data map(ompx_hold, tofrom: x)
++!$omp end target data
++end subroutine
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 23ddc2fd53347..077fd0d1e2f53 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1458,8 +1458,8 @@ uint64_t mapTypeToBitFlag(uint64_t value,
+ /// Parses a map_entries map type from a string format back into its numeric
+ /// value.
+ ///
+-/// map-clause = `map_clauses (  ( `(` `always, `? `close, `? `present, `? (
+-/// `to` | `from` | `delete` `)` )+ `)` )
++/// map-clause = `map_clauses (  ( `(` `always, `? `implicit, `? `ompx_hold, `?
++/// `close, `? `present, `? ( `to` | `from` | `delete` `)` )+ `)` )
+ static ParseResult parseMapClause(OpAsmParser &parser, IntegerAttr &mapType) {
+   llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+       llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE;
+@@ -1477,6 +1477,9 @@ static ParseResult parseMapClause(OpAsmParser &parser, IntegerAttr &mapType) {
+     if (mapTypeMod == "implicit")
+       mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT;
+ 
++    if (mapTypeMod == "ompx_hold")
++      mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_OMPX_HOLD;
++
+     if (mapTypeMod == "close")
+       mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_CLOSE;
+ 
+@@ -1526,6 +1529,9 @@ static void printMapClause(OpAsmPrinter &p, Operation *op,
+   if (mapTypeToBitFlag(mapTypeBits,
+                        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT))
+     mapTypeStrs.push_back("implicit");
++  if (mapTypeToBitFlag(mapTypeBits,
++                       llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_OMPX_HOLD))
++    mapTypeStrs.push_back("ompx_hold");
+   if (mapTypeToBitFlag(mapTypeBits,
+                        llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_CLOSE))
+     mapTypeStrs.push_back("close");
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index 72bb1db72377b..f7356f7271af4 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -825,6 +825,12 @@ func.func @omp_target_data (%if_cond : i1, %device : si32, %device_ptr: memref<i
+     %mapv6 = omp.map.info var_ptr(%map2 : memref<?xi32>, tensor<?xi32>)   map_clauses(exit_release_or_enter_alloc) capture(ByRef) -> memref<?xi32> {name = ""}
+     omp.target_exit_data if(%if_cond) device(%device : si32) nowait map_entries(%mapv6 : memref<?xi32>)
+ 
++    // CHECK: %[[MAP_A:.*]] = omp.map.info var_ptr(%[[VAL_2:.*]] : memref<?xi32>, tensor<?xi32>)   map_clauses(ompx_hold, to) capture(ByRef) -> memref<?xi32> {name = ""}
++    // CHECK: omp.target_data map_entries(%[[MAP_A]] : memref<?xi32>)
++    %mapv7 = omp.map.info var_ptr(%map1 : memref<?xi32>, tensor<?xi32>)   map_clauses(ompx_hold, to) capture(ByRef) -> memref<?xi32> {name = ""}
++    omp.target_data map_entries(%mapv7 : memref<?xi32>) {
++      omp.terminator
++    }
+     return
+ }
+ 
+diff --git a/offload/test/Inputs/target-use-dev-ptr.c b/offload/test/Inputs/target-use-dev-ptr.c
+index e1430a93fbc7d..71e37eee1b1ae 100644
+--- a/offload/test/Inputs/target-use-dev-ptr.c
++++ b/offload/test/Inputs/target-use-dev-ptr.c
+@@ -21,3 +21,7 @@ int check_result(int *host_ptr, int *dev_ptr) {
+     return 0;
+   }
+ }
++
++int check_equality(void *host_ptr, void *dev_ptr) {
++  return dev_ptr == host_ptr;
++}
+diff --git a/offload/test/offloading/fortran/target-use-dev-ptr.f90 b/offload/test/offloading/fortran/target-use-dev-ptr.f90
+index 4476f45699d6e..069d4a717ff5e 100644
+--- a/offload/test/offloading/fortran/target-use-dev-ptr.f90
++++ b/offload/test/offloading/fortran/target-use-dev-ptr.f90
+@@ -18,7 +18,7 @@ end function get_ptr
+       integer(c_int) function check_result(host, dev) BIND(C)
+          USE, intrinsic :: iso_c_binding
+          implicit none
+-         type(c_ptr), intent(in) :: host, dev
++         type(c_ptr), value, intent(in) :: host, dev
+       end function check_result
+    end interface
+ 
+diff --git a/offload/test/offloading/fortran/target_map_ompx_hold.f90 b/offload/test/offloading/fortran/target_map_ompx_hold.f90
+new file mode 100644
+index 0000000000000..2a1e9b1423edd
+--- /dev/null
++++ b/offload/test/offloading/fortran/target_map_ompx_hold.f90
+@@ -0,0 +1,29 @@
++! Basic test that checks that when ompx_hold is in use we cannot delete the data
++! until the ompx_hold falls out of scope, and verifies this via the utilisation of
++! present.
++! REQUIRES: flang, amdgpu
++! RUN: %libomptarget-compile-fortran-generic
++! RUN: %libomptarget-run-fail-generic 2>&1 \
++! RUN: | %fcheck-generic
++
++program ompx_hold
++    implicit none
++    integer :: presence_check
++
++!CHECK-NOT: omptarget message: device mapping required by 'present' map type modifier does not exist for host address{{.*}}
++!$omp target data map(ompx_hold, tofrom: presence_check)
++!$omp target exit data map(delete: presence_check)
++!$omp target map(present, tofrom: presence_check)
++    presence_check = 10
++!$omp end target
++!$omp end target data
++
++!CHECK: omptarget message: device mapping required by 'present' map type modifier does not exist for host address{{.*}}
++!$omp target data map(tofrom: presence_check)
++!$omp target exit data map(delete: presence_check)
++!$omp target map(present, tofrom: presence_check)
++presence_check = 20
++!$omp end target
++!$omp end target data
++
++end program
+diff --git a/offload/test/offloading/fortran/target_map_present_fail.f90 b/offload/test/offloading/fortran/target_map_present_fail.f90
+new file mode 100644
+index 0000000000000..2845bf1e064fb
+--- /dev/null
++++ b/offload/test/offloading/fortran/target_map_present_fail.f90
+@@ -0,0 +1,36 @@
++! This checks that the basic functionality of map type present functions as
++! expected, emitting an omptarget error when the data is not present.
++! REQUIRES: flang, amdgpu
++! RUN: %libomptarget-compile-fortran-generic
++! RUN: %libomptarget-run-fail-generic 2>&1 \
++! RUN: | %fcheck-generic
++
++! NOTE: This should intentionally fatal error in omptarget as it's not
++! present, as is intended.
++ subroutine target_data_not_present()
++    double precision, dimension(:), allocatable :: arr
++    integer, parameter :: N = 16
++    integer :: i
++
++    allocate(arr(N))
++
++!$omp target data map(present,alloc:arr)
++
++!$omp target
++    do i = 1,N
++        arr(i) = 42.0d0
++    end do
++!$omp end target
++
++!$omp end target data
++
++    deallocate(arr)
++    return
++end subroutine
++
++program map_present
++    implicit none
++    call target_data_not_present()
++end program
++
++!CHECK: omptarget message: device mapping required by 'present' map type modifier does not exist for host address{{.*}}
+diff --git a/offload/test/offloading/fortran/target_map_present_success.f90 b/offload/test/offloading/fortran/target_map_present_success.f90
+new file mode 100644
+index 0000000000000..63d5e80500249
+--- /dev/null
++++ b/offload/test/offloading/fortran/target_map_present_success.f90
+@@ -0,0 +1,41 @@
++! This checks that the basic functionality of map type present functions as
++! expected, no-op'ng when present
++! REQUIRES: flang, amdgpu
++! RUN: %libomptarget-compile-fortran-run-and-check-generic
++
++ subroutine target_data_present()
++    double precision, dimension(:), allocatable :: arr
++    integer, parameter :: N = 16
++    integer :: i
++
++    allocate(arr(N))
++
++    arr(:) = 10.0d0
++
++!$omp target data map(tofrom:arr)
++
++!$omp target data map(present,alloc:arr)
++
++!$omp target
++    do i = 1,N
++        arr(i) = 42.0d0
++    end do
++!$omp end target
++
++!$omp end target data
++
++!$omp end target data
++
++    print *, arr
++
++    deallocate(arr)
++
++    return
++end subroutine
++
++program map_present
++    implicit none
++   call target_data_present()
++end program
++
++!CHECK: 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42. 42.
+diff --git a/offload/test/offloading/fortran/usm_map_close.f90 b/offload/test/offloading/fortran/usm_map_close.f90
+new file mode 100644
+index 0000000000000..61d096ef94f1b
+--- /dev/null
++++ b/offload/test/offloading/fortran/usm_map_close.f90
+@@ -0,0 +1,85 @@
++! Test for map type close, verifying it appropriately places memory
++! near/on device when utilised in USM mode.
++! REQUIRES: clang, flang, amdgpu
++
++! RUN: %clang -c -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa \
++! RUN:   %S/../../Inputs/target-use-dev-ptr.c -o target-use-dev-ptr_c.o
++! RUN: %libomptarget-compile-fortran-generic target-use-dev-ptr_c.o
++! RUN: env HSA_XNACK=1 \
++! RUN: %libomptarget-run-generic | %fcheck-generic
++
++program use_device_test
++    use iso_c_binding
++    implicit none
++    interface
++       type(c_ptr) function get_ptr() BIND(C)
++          USE, intrinsic :: iso_c_binding
++          implicit none
++       end function get_ptr
++ 
++       integer(c_int) function check_equality(host, dev) BIND(C)
++          USE, intrinsic :: iso_c_binding
++          implicit none
++          type(c_ptr), value, intent(in) :: host, dev
++       end function check_equality
++    end interface
++    type(c_ptr) :: host_alloc, device_alloc
++    integer, pointer :: a
++  !$omp requires unified_shared_memory
++
++    allocate(a)
++    host_alloc = C_LOC(a)
++
++! map + target no close
++device_alloc = c_null_ptr
++!$omp target data map(tofrom: a, device_alloc)
++!$omp target map(tofrom: device_alloc)
++    device_alloc = C_LOC(a)
++!$omp end target
++!$omp end target data
++
++! CHECK: a used from unified memory
++if (check_equality(host_alloc, device_alloc) == 1) then
++    print*, "a used from unified memory"
++end if
++
++! map + target with close
++device_alloc = c_null_ptr
++!$omp target data map(close, tofrom: a) map(tofrom: device_alloc)
++!$omp target map(tofrom: device_alloc)
++    device_alloc = C_LOC(a)
++!$omp end target
++!$omp end target data
++
++! CHECK: a copied to device
++if (check_equality(host_alloc, device_alloc) == 0) then
++    print *, "a copied to device"
++end if
++
++! map + use_device_ptr no close
++device_alloc = c_null_ptr
++!$omp target data map(tofrom: a) use_device_ptr(a)
++    device_alloc = C_LOC(a)
++!$omp end target data
++
++! CHECK: a used from unified memory with use_device_ptr
++if (check_equality(host_alloc, device_alloc) == 1) then
++    print *, "a used from unified memory with use_device_ptr"
++end if
++
++! map enter/exit + close
++device_alloc = c_null_ptr
++!$omp target enter data map(close, to: a)
++
++!$omp target map(from: device_alloc)
++    device_alloc = C_LOC(a)
++!$omp end target
++
++!$omp target exit data map(from: a)
++
++! CHECK: a has been mapped to the device
++if (check_equality(host_alloc, device_alloc) == 0) then
++    print *, "a has been mapped to the device"
++end if
++
++end program use_device_test

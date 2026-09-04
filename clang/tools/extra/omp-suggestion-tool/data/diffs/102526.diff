@@ -1,0 +1,144 @@
+diff --git a/offload/DeviceRTL/include/Allocator.h b/offload/DeviceRTL/include/Allocator.h
+index a28eb0fb2977e..23e0106c80a2c 100644
+--- a/offload/DeviceRTL/include/Allocator.h
++++ b/offload/DeviceRTL/include/Allocator.h
+@@ -39,6 +39,11 @@ void free(void *Ptr);
+ 
+ } // namespace ompx
+ 
++extern "C" {
++[[gnu::weak]] void *malloc(size_t Size);
++[[gnu::weak]] void free(void *Ptr);
++}
++
+ #pragma omp end declare target
+ 
+ #endif
+diff --git a/offload/DeviceRTL/include/Types.h b/offload/DeviceRTL/include/Types.h
+index 2e12d9da0353b..cd8f925a392a8 100644
+--- a/offload/DeviceRTL/include/Types.h
++++ b/offload/DeviceRTL/include/Types.h
+@@ -188,7 +188,7 @@ typedef enum omp_allocator_handle_t {
+   omp_cgroup_mem_alloc = 6,
+   omp_pteam_mem_alloc = 7,
+   omp_thread_mem_alloc = 8,
+-  KMP_ALLOCATOR_MAX_HANDLE = ~(0U)
++  KMP_ALLOCATOR_MAX_HANDLE = ~(0LU)
+ } omp_allocator_handle_t;
+ 
+ #define __PRAGMA(STR) _Pragma(#STR)
+diff --git a/offload/DeviceRTL/src/Misc.cpp b/offload/DeviceRTL/src/Misc.cpp
+index c24af9442d16e..ce4a221bdb37d 100644
+--- a/offload/DeviceRTL/src/Misc.cpp
++++ b/offload/DeviceRTL/src/Misc.cpp
+@@ -9,6 +9,7 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "Allocator.h"
+ #include "Configuration.h"
+ #include "Types.h"
+ 
+@@ -128,6 +129,33 @@ double omp_get_wtime(void) { return ompx::impl::getWTime(); }
+ void *__llvm_omp_indirect_call_lookup(void *HstPtr) {
+   return ompx::impl::indirectCallLookup(HstPtr);
+ }
++
++void *omp_alloc(size_t size, omp_allocator_handle_t allocator) {
++  switch (allocator) {
++  case omp_default_mem_alloc:
++  case omp_large_cap_mem_alloc:
++  case omp_const_mem_alloc:
++  case omp_high_bw_mem_alloc:
++  case omp_low_lat_mem_alloc:
++    return malloc(size);
++  default:
++    return nullptr;
++  }
++}
++
++void omp_free(void *ptr, omp_allocator_handle_t allocator) {
++  switch (allocator) {
++  case omp_default_mem_alloc:
++  case omp_large_cap_mem_alloc:
++  case omp_const_mem_alloc:
++  case omp_high_bw_mem_alloc:
++  case omp_low_lat_mem_alloc:
++    free(ptr);
++  case omp_null_allocator:
++  default:
++    return;
++  }
++}
+ }
+ 
+ ///}
+diff --git a/offload/DeviceRTL/src/State.cpp b/offload/DeviceRTL/src/State.cpp
+index a1e4fa2449d9a..f43f2cedb431d 100644
+--- a/offload/DeviceRTL/src/State.cpp
++++ b/offload/DeviceRTL/src/State.cpp
+@@ -53,12 +53,12 @@ namespace {
+ extern "C" {
+ #ifdef __AMDGPU__
+ 
+-[[gnu::weak]] void *malloc(uint64_t Size) { return allocator::alloc(Size); }
++[[gnu::weak]] void *malloc(size_t Size) { return allocator::alloc(Size); }
+ [[gnu::weak]] void free(void *Ptr) { allocator::free(Ptr); }
+ 
+ #else
+ 
+-[[gnu::weak, gnu::leaf]] void *malloc(uint64_t Size);
++[[gnu::weak, gnu::leaf]] void *malloc(size_t Size);
+ [[gnu::weak, gnu::leaf]] void free(void *Ptr);
+ 
+ #endif
+diff --git a/offload/test/api/omp_device_alloc.c b/offload/test/api/omp_device_alloc.c
+new file mode 100644
+index 0000000000000..46153a30e2e30
+--- /dev/null
++++ b/offload/test/api/omp_device_alloc.c
+@@ -0,0 +1,25 @@
++// RUN: %libomptarget-compile-run-and-check-generic
++
++#include <assert.h>
++#include <omp.h>
++#include <stdio.h>
++
++int main() {
++#pragma omp target teams num_teams(4)
++#pragma omp parallel
++  {
++    int *ptr = (int *)omp_alloc(sizeof(int), omp_default_mem_alloc);
++    assert(ptr && "Ptr is (null)!");
++    *ptr = 1;
++    assert(*ptr == 1 && "Ptr is not 1");
++    omp_free(ptr, omp_default_mem_alloc);
++  }
++
++#pragma omp target
++  {
++    assert(!omp_alloc(sizeof(int), omp_null_allocator) && "Ptr is not (null)!");
++  }
++
++  // CHECK: PASS
++  printf("PASS\n");
++}
+diff --git a/openmp/docs/design/Runtimes.rst b/openmp/docs/design/Runtimes.rst
+index ed002c8cf0f80..951c651f42f29 100644
+--- a/openmp/docs/design/Runtimes.rst
++++ b/openmp/docs/design/Runtimes.rst
+@@ -1496,6 +1496,14 @@ clause. Examples for both are given below.
+     $ clang++ -fopenmp --offload-arch=gfx90a -O3 shared.c
+     $ env ./shared
+ 
++.. _libomptarget_device_allocator:
++
++Device Allocation
++^^^^^^^^^^^^^^^^^
++
++The device runtime supports basic runtime allocation via the ``omp_alloc`` 
++function. Currently, this allocates global memory for all default traits. Access 
++modifiers are currently not supported and return a null pointer.
+ 
+ .. _libomptarget_device_debugging:
+ 

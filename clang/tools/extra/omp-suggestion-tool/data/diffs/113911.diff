@@ -1,0 +1,247 @@
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 0fc0f066c2c43..d1cc753b7daf0 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -71,10 +71,21 @@ def OMPC_AtomicDefaultMemOrder : Clause<"atomic_default_mem_order"> {
+   let clangClass = "OMPAtomicDefaultMemOrderClause";
+   let flangClass = "OmpAtomicDefaultMemOrderClause";
+ }
++
++def OMP_BIND_parallel : ClauseVal<"parallel",1,1> {}
++def OMP_BIND_teams : ClauseVal<"teams",2,1> {}
++def OMP_BIND_thread : ClauseVal<"thread",3,1> { let isDefault = true; }
+ def OMPC_Bind : Clause<"bind"> {
+   let clangClass = "OMPBindClause";
+   let flangClass = "OmpBindClause";
++  let enumClauseValue = "BindKind";
++  let allowedClauseValues = [
++    OMP_BIND_parallel,
++    OMP_BIND_teams,
++    OMP_BIND_thread
++  ];
+ }
++
+ def OMP_CANCELLATION_CONSTRUCT_Parallel : ClauseVal<"parallel", 1, 1> {}
+ def OMP_CANCELLATION_CONSTRUCT_Loop : ClauseVal<"loop", 2, 1> {}
+ def OMP_CANCELLATION_CONSTRUCT_Sections : ClauseVal<"sections", 3, 1> {}
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
+index 886554f66afff..855deab94b2f1 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauses.td
+@@ -107,6 +107,31 @@ class OpenMP_CancelDirectiveNameClauseSkip<
+ 
+ def OpenMP_CancelDirectiveNameClause : OpenMP_CancelDirectiveNameClauseSkip<>;
+ 
++//===----------------------------------------------------------------------===//
++// V5.2: [11.7.1] `bind` clause
++//===----------------------------------------------------------------------===//
++
++class OpenMP_BindClauseSkip<
++    bit traits = false, bit arguments = false, bit assemblyFormat = false,
++    bit description = false, bit extraClassDeclaration = false
++  > : OpenMP_Clause<traits, arguments, assemblyFormat, description,
++                    extraClassDeclaration> {
++  let arguments = (ins
++    OptionalAttr<BindKindAttr>:$bind_kind
++  );
++
++  let optAssemblyFormat = [{
++    `bind` `(` custom<ClauseAttr>($bind_kind) `)`
++  }];
++
++  let description = [{
++    The `bind` clause specifies the binding region of the construct on which it
++    appears.
++  }];
++}
++
++def OpenMP_BindClause : OpenMP_BindClauseSkip<>;
++
+ //===----------------------------------------------------------------------===//
+ // V5.2: [5.7.2] `copyprivate` clause
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 5fd8184fe0e0f..a0da3db124d1f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -382,6 +382,50 @@ def LoopNestOp : OpenMP_Op<"loop_nest", traits = [
+ // 2.9.2 Workshare Loop Construct
+ //===----------------------------------------------------------------------===//
+ 
++def LoopOp : OpenMP_Op<"loop", traits = [
++    AttrSizedOperandSegments, DeclareOpInterfaceMethods<LoopWrapperInterface>,
++    NoTerminator, SingleBlock
++  ], clauses = [
++    OpenMP_BindClause, OpenMP_PrivateClause, OpenMP_OrderClause,
++    OpenMP_ReductionClause
++  ], singleRegion = true> {
++  let summary = "loop construct";
++  let description = [{
++    A loop construct specifies that the logical iterations of the associated loops
++    may execute concurrently and permits the encountering threads to execute the
++    loop accordingly. A loop construct can have 3 different types of binding:
++      1. teams: in which case the binding region is the innermost enclosing `teams`
++         region.
++      2. parallel: in which case the binding region is the innermost enclosing `parallel`
++         region.
++      3. thread: in which case the binding region is not defined.
++
++    The body region can only contain a single block which must contain a single
++    operation, this operation must be an `omp.loop_nest`.
++
++    ```
++    omp.loop <clauses> {
++      omp.loop_nest (%i1, %i2) : index = (%c0, %c0) to (%c10, %c10) step (%c1, %c1) {
++        %a = load %arrA[%i1, %i2] : memref<?x?xf32>
++        %b = load %arrB[%i1, %i2] : memref<?x?xf32>
++        %sum = arith.addf %a, %b : f32
++        store %sum, %arrC[%i1, %i2] : memref<?x?xf32>
++        omp.yield
++      }
++    }
++    ```
++  }] # clausesDescription;
++
++  let assemblyFormat = clausesAssemblyFormat # [{
++    custom<PrivateReductionRegion>($region, $private_vars, type($private_vars),
++        $private_syms, $reduction_vars, type($reduction_vars), $reduction_byref,
++        $reduction_syms) attr-dict
++  }];
++
++  let hasVerifier = 1;
++  let hasRegionVerifier = 1;
++}
++
+ def WsloopOp : OpenMP_Op<"wsloop", traits = [
+     AttrSizedOperandSegments, DeclareOpInterfaceMethods<ComposableOpInterface>,
+     DeclareOpInterfaceMethods<LoopWrapperInterface>, NoTerminator,
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 4a27a5ed8eb74..228c2d034ad4a 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -1948,6 +1948,23 @@ LogicalResult LoopWrapperInterface::verifyImpl() {
+   return success();
+ }
+ 
++//===----------------------------------------------------------------------===//
++// LoopOp
++//===----------------------------------------------------------------------===//
++
++LogicalResult LoopOp::verify() {
++  return verifyReductionVarList(*this, getReductionSyms(), getReductionVars(),
++                                getReductionByref());
++}
++
++LogicalResult LoopOp::verifyRegions() {
++  if (llvm::isa_and_nonnull<LoopWrapperInterface>((*this)->getParentOp()) ||
++      getNestedWrapper())
++    return emitError() << "`omp.loop` expected to be a standalone loop wrapper";
++
++  return success();
++}
++
+ //===----------------------------------------------------------------------===//
+ // WsloopOp
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index db941d401d52d..aa41eea44f3ef 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -2577,3 +2577,49 @@ func.func @omp_taskloop_invalid_composite(%lb: index, %ub: index, %step: index)
+   } {omp.composite}
+   return
+ }
++
++// -----
++
++func.func @omp_loop_invalid_nesting(%lb : index, %ub : index, %step : index) {
++
++  // expected-error @below {{`omp.loop` expected to be a standalone loop wrapper}}
++  omp.loop {
++    omp.simd {
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++    } {omp.composite}
++  }
++
++  return
++}
++
++// -----
++
++func.func @omp_loop_invalid_nesting2(%lb : index, %ub : index, %step : index) {
++
++  omp.simd {
++    // expected-error @below {{`omp.loop` expected to be a standalone loop wrapper}}
++    omp.loop {
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++    } {omp.composite}
++  }
++
++  return
++}
++
++// -----
++
++func.func @omp_loop_invalid_binding(%lb : index, %ub : index, %step : index) {
++
++  // expected-error @below {{custom op 'omp.loop' invalid clause value: 'dummy_value'}}
++  omp.loop bind(dummy_value) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++
++  return
++}
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index b606f9eb708cf..4f5cc696cada8 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -2749,3 +2749,43 @@ func.func @omp_target_private(%map1: memref<?xi32>, %map2: memref<?xi32>, %priv_
+ 
+   return
+ }
++
++// CHECK-LABEL: omp_loop
++func.func @omp_loop(%lb : index, %ub : index, %step : index) {
++  // CHECK: omp.loop {
++  omp.loop {
++    // CHECK: omp.loop_nest {{.*}} {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      // CHECK: omp.yield
++      omp.yield
++    }
++    // CHECK: }
++  }
++  // CHECK: }
++
++  // CHECK: omp.loop bind(teams) {
++  omp.loop bind(teams) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  // CHECK: }
++
++  // CHECK: omp.loop bind(parallel) {
++  omp.loop bind(parallel) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  // CHECK: }
++
++  // CHECK: omp.loop bind(thread) {
++  omp.loop bind(thread) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  // CHECK: }
++
++  return
++}

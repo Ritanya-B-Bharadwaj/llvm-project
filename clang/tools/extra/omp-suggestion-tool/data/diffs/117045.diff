@@ -1,0 +1,147 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 983627027ac9c..e1eef30c0dd06 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -653,7 +653,7 @@ def DistributeOp : OpenMP_Op<"distribute", traits = [
+     will be executed in parallel by threads in the current context. These
+     iterations are spread across threads that already exist in the enclosing
+     region.
+-    
++
+     The body region can only contain a single block which must contain a single
+     operation. This operation must be another compatible loop wrapper or an
+     `omp.loop_nest`.
+@@ -1749,6 +1749,62 @@ def ScanOp : OpenMP_Op<"scan", [
+   let hasVerifier = 1;
+ }
+ 
++//===----------------------------------------------------------------------===//
++// 2.19.7.3 Declare Mapper Directive
++//===----------------------------------------------------------------------===//
++def DeclareMapperOp : OpenMP_Op<"declare_mapper", [
++    IsolatedFromAbove,
++    RecipeInterface,
++    SingleBlock,
++    Symbol
++  ]> {
++  let summary = "declare mapper directive";
++  let description = [{
++    The declare mapper directive declares a user-defined mapper for a given
++    type, and defines a mapper-identifier that can be used in a map clause.
++  }] # clausesDescription;
++
++  let arguments = (ins  SymbolNameAttr:$sym_name,
++                        TypeAttr:$type);
++
++  let regions = (region AnyRegion:$body);
++
++  let assemblyFormat = "$sym_name `:` $type $body attr-dict";
++
++  let extraClassDeclaration = [{
++    /// Get DeclareMapperInfoOp.
++    DeclareMapperInfoOp getDeclareMapperInfo(){
++      return cast<DeclareMapperInfoOp>(getRegion().getBlocks().front().getTerminator());
++    }
++
++    /// Get SymVal block argument
++    BlockArgument getSymVal(){
++      return getRegion().getArgument(0);
++    }
++  }];
++
++  let hasRegionVerifier = 1;
++}
++
++def DeclareMapperInfoOp : OpenMP_Op<"declare_mapper.info", [
++    HasParent<"DeclareMapperOp">,
++    Terminator
++  ], clauses = [
++    OpenMP_MapClause
++  ]> {
++  let summary = "declare mapper info";
++  let description = [{
++    This Op is used to capture the map information related to it's
++    parent DeclareMapperOp.
++  }] # clausesDescription;
++
++  let builders = [
++    OpBuilder<(ins CArg<"const DeclareMapperInfoOperands &">:$clauses)>
++  ];
++
++  let hasVerifier = 1;
++}
++
+ //===----------------------------------------------------------------------===//
+ // 2.19.5.7 declare reduction Directive
+ //===----------------------------------------------------------------------===//
+@@ -1861,7 +1917,7 @@ def MaskedOp : OpenMP_Op<"masked", clauses = [
+   ], singleRegion = 1> {
+   let summary = "masked construct";
+   let description = [{
+-    Masked construct allows to specify a structured block to be executed by a subset of 
++    Masked construct allows to specify a structured block to be executed by a subset of
+     threads of the current team.
+   }] # clausesDescription;
+ 
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 5ec840e7fef81..c067c2d0a0255 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2432,6 +2432,22 @@ LogicalResult DistributeOp::verifyRegions() {
+   return success();
+ }
+ 
++//===----------------------------------------------------------------------===//
++// DeclareMapperOp / DeclareMapperInfoOp
++//===----------------------------------------------------------------------===//
++
++LogicalResult DeclareMapperInfoOp::verify() {
++  return verifyMapClause(*this, getMapVars());
++}
++
++LogicalResult DeclareMapperOp::verifyRegions() {
++  if (!llvm::isa_and_present<DeclareMapperInfoOp>(
++          getRegion().getBlocks().front().getTerminator()))
++    return emitOpError() << "expected terminator to be a DeclareMapperInfoOp";
++
++  return success();
++}
++
+ //===----------------------------------------------------------------------===//
+ // DeclareReductionOp
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index 02b0af17564d4..a2d34a88d2ebe 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -2842,3 +2842,10 @@ func.func @missing_workshare(%idx : index) {
+   }
+   return
+ }
++
++// -----
++  // expected-error @below {{op expected terminator to be a DeclareMapperInfoOp}}
++  omp.declare_mapper @missing_declareMapperInfo : !llvm.struct<"mytype", (array<1024 x i32>)> {
++  ^bb0(%arg0: !llvm.ptr):
++    omp.terminator
++  }
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index aca63600876aa..f00d3d3426631 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -879,6 +879,15 @@ cleanup {
+   omp.yield
+ }
+ 
++// CHECK: omp.declare_mapper @my_mapper : !llvm.struct<"my_type", (i32)>
++omp.declare_mapper @my_mapper : !llvm.struct<"my_type", (i32)> {
++^bb0(%arg: !llvm.ptr):
++  // CHECK: %[[DECL_MAP_INFO:.*]] = omp.map.info var_ptr(%{{.*}} : !llvm.ptr, !llvm.struct<"my_type", (i32)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++  %decl_map_info = omp.map.info var_ptr(%arg : !llvm.ptr, !llvm.struct<"my_type", (i32)>) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
++  // CHECK: omp.declare_mapper.info map_entries(%[[DECL_MAP_INFO]] : !llvm.ptr)
++  omp.declare_mapper.info map_entries(%decl_map_info : !llvm.ptr)
++}
++
+ // CHECK-LABEL: func @wsloop_reduction
+ func.func @wsloop_reduction(%lb : index, %ub : index, %step : index) {
+   %c1 = arith.constant 1 : i32

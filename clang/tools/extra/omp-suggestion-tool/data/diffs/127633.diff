@@ -1,0 +1,576 @@
+diff --git a/flang/docs/DoConcurrentConversionToOpenMP.md b/flang/docs/DoConcurrentConversionToOpenMP.md
+index 7b49af742f242..19611615ee9d6 100644
+--- a/flang/docs/DoConcurrentConversionToOpenMP.md
++++ b/flang/docs/DoConcurrentConversionToOpenMP.md
+@@ -126,6 +126,53 @@ see the "Data environment" section below.
+ See `flang/test/Transforms/DoConcurrent/loop_nest_test.f90` for more examples
+ of what is and is not detected as a perfect loop nest.
+ 
++### Single-range loops
++
++Given the following loop:
++```fortran
++  do concurrent(i=1:n)
++    a(i) = i * i
++  end do
++```
++
++#### Mapping to `host`
++
++Mapping this loop to the `host`, generates MLIR operations of the following
++structure:
++
++```
++%4 = fir.address_of(@_QFEa) ...
++%6:2 = hlfir.declare %4 ...
++
++omp.parallel {
++  // Allocate private copy for `i`.
++  // TODO Use delayed privatization.
++  %19 = fir.alloca i32 {bindc_name = "i"}
++  %20:2 = hlfir.declare %19 {uniq_name = "_QFEi"} ...
++
++  omp.wsloop {
++    omp.loop_nest (%arg0) : index = (%21) to (%22) inclusive step (%c1_2) {
++      %23 = fir.convert %arg0 : (index) -> i32
++      // Use the privatized version of `i`.
++      fir.store %23 to %20#1 : !fir.ref<i32>
++      ...
++
++      // Use "shared" SSA value of `a`.
++      %42 = hlfir.designate %6#0
++      hlfir.assign %35 to %42
++      ...
++      omp.yield
++    }
++    omp.terminator
++  }
++  omp.terminator
++}
++```
++
++#### Mapping to `device`
++
++<!-- TODO -->
++
+ <!--
+ More details about current status will be added along with relevant parts of the
+ implementation in later upstreaming patches.
+diff --git a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+index ad88b42ac6d7a..bb535cf8aba03 100644
+--- a/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
++++ b/flang/lib/Optimizer/OpenMP/DoConcurrentConversion.cpp
+@@ -11,6 +11,7 @@
+ #include "flang/Optimizer/OpenMP/Utils.h"
+ #include "mlir/Analysis/SliceAnalysis.h"
+ #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/IR/IRMapping.h"
+ #include "mlir/Transforms/DialectConversion.h"
+ #include "mlir/Transforms/RegionUtils.h"
+ 
+@@ -24,7 +25,67 @@ namespace flangomp {
+ 
+ namespace {
+ namespace looputils {
+-using LoopNest = llvm::SetVector<fir::DoLoopOp>;
++/// Stores info needed about the induction/iteration variable for each `do
++/// concurrent` in a loop nest.
++struct InductionVariableInfo {
++  /// The operation allocating memory for iteration variable.
++  mlir::Operation *iterVarMemDef;
++};
++
++using LoopNestToIndVarMap =
++    llvm::MapVector<fir::DoLoopOp, InductionVariableInfo>;
++
++/// For the \p doLoop parameter, find the operation that declares its iteration
++/// variable or allocates memory for it.
++///
++/// For example, give the following loop:
++/// ```
++///   ...
++///   %i:2 = hlfir.declare %0 {uniq_name = "_QFEi"} : ...
++///   ...
++///   fir.do_loop %ind_var = %lb to %ub step %s unordered {
++///     %ind_var_conv = fir.convert %ind_var : (index) -> i32
++///     fir.store %ind_var_conv to %i#1 : !fir.ref<i32>
++///     ...
++///   }
++/// ```
++///
++/// This function returns the `hlfir.declare` op for `%i`.
++///
++/// Note: The current implementation is dependent on how flang emits loop
++/// bodies; which is sufficient for the current simple test/use cases. If this
++/// proves to be insufficient, this should be made more generic.
++mlir::Operation *findLoopIterationVarMemDecl(fir::DoLoopOp doLoop) {
++  mlir::Value result = nullptr;
++
++  // Checks if a StoreOp is updating the memref of the loop's iteration
++  // variable.
++  auto isStoringIV = [&](fir::StoreOp storeOp) {
++    // Direct store into the IV memref.
++    if (storeOp.getValue() == doLoop.getInductionVar())
++      return true;
++
++    // Indirect store into the IV memref.
++    if (auto convertOp = mlir::dyn_cast<fir::ConvertOp>(
++            storeOp.getValue().getDefiningOp())) {
++      if (convertOp.getOperand() == doLoop.getInductionVar())
++        return true;
++    }
++
++    return false;
++  };
++
++  for (mlir::Operation &op : doLoop) {
++    if (auto storeOp = mlir::dyn_cast<fir::StoreOp>(op))
++      if (isStoringIV(storeOp)) {
++        result = storeOp.getMemref();
++        break;
++      }
++  }
++
++  assert(result != nullptr && result.getDefiningOp() != nullptr);
++  return result.getDefiningOp();
++}
+ 
+ /// Loop \p innerLoop is considered perfectly-nested inside \p outerLoop iff
+ /// there are no operations in \p outerloop's body other than:
+@@ -116,11 +177,14 @@ bool isPerfectlyNested(fir::DoLoopOp outerLoop, fir::DoLoopOp innerLoop) {
+ /// fails to recognize a certain nested loop as part of the nest it just returns
+ /// the parent loops it discovered before.
+ mlir::LogicalResult collectLoopNest(fir::DoLoopOp currentLoop,
+-                                    LoopNest &loopNest) {
++                                    LoopNestToIndVarMap &loopNest) {
+   assert(currentLoop.getUnordered());
+ 
+   while (true) {
+-    loopNest.insert(currentLoop);
++    loopNest.insert(
++        {currentLoop,
++         InductionVariableInfo{findLoopIterationVarMemDecl(currentLoop)}});
++
+     llvm::SmallVector<fir::DoLoopOp> unorderedLoops;
+ 
+     for (auto nestedLoop : currentLoop.getRegion().getOps<fir::DoLoopOp>())
+@@ -152,13 +216,19 @@ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+ public:
+   using mlir::OpConversionPattern<fir::DoLoopOp>::OpConversionPattern;
+ 
+-  DoConcurrentConversion(mlir::MLIRContext *context, bool mapToDevice)
+-      : OpConversionPattern(context), mapToDevice(mapToDevice) {}
++  DoConcurrentConversion(mlir::MLIRContext *context, bool mapToDevice,
++                         llvm::DenseSet<fir::DoLoopOp> &concurrentLoopsToSkip)
++      : OpConversionPattern(context), mapToDevice(mapToDevice),
++        concurrentLoopsToSkip(concurrentLoopsToSkip) {}
+ 
+   mlir::LogicalResult
+   matchAndRewrite(fir::DoLoopOp doLoop, OpAdaptor adaptor,
+                   mlir::ConversionPatternRewriter &rewriter) const override {
+-    looputils::LoopNest loopNest;
++    if (mapToDevice)
++      return doLoop.emitError(
++          "not yet implemented: Mapping `do concurrent` loops to device");
++
++    looputils::LoopNestToIndVarMap loopNest;
+     bool hasRemainingNestedLoops =
+         failed(looputils::collectLoopNest(doLoop, loopNest));
+     if (hasRemainingNestedLoops)
+@@ -166,12 +236,120 @@ class DoConcurrentConversion : public mlir::OpConversionPattern<fir::DoLoopOp> {
+                         "Some `do concurent` loops are not perfectly-nested. "
+                         "These will be serialized.");
+ 
+-    // TODO This will be filled in with the next PRs that upstreams the rest of
+-    // the ROCm implementaion.
++    mlir::IRMapping mapper;
++    genParallelOp(doLoop.getLoc(), rewriter, loopNest, mapper);
++    mlir::omp::LoopNestOperands loopNestClauseOps;
++    genLoopNestClauseOps(doLoop.getLoc(), rewriter, loopNest, mapper,
++                         loopNestClauseOps);
++
++    mlir::omp::LoopNestOp ompLoopNest =
++        genWsLoopOp(rewriter, loopNest.back().first, mapper, loopNestClauseOps,
++                    /*isComposite=*/mapToDevice);
++
++    rewriter.eraseOp(doLoop);
++
++    // Mark `unordered` loops that are not perfectly nested to be skipped from
++    // the legality check of the `ConversionTarget` since we are not interested
++    // in mapping them to OpenMP.
++    ompLoopNest->walk([&](fir::DoLoopOp doLoop) {
++      if (doLoop.getUnordered()) {
++        concurrentLoopsToSkip.insert(doLoop);
++      }
++    });
++
+     return mlir::success();
+   }
+ 
++private:
++  mlir::omp::ParallelOp genParallelOp(mlir::Location loc,
++                                      mlir::ConversionPatternRewriter &rewriter,
++                                      looputils::LoopNestToIndVarMap &loopNest,
++                                      mlir::IRMapping &mapper) const {
++    auto parallelOp = rewriter.create<mlir::omp::ParallelOp>(loc);
++    rewriter.createBlock(&parallelOp.getRegion());
++    rewriter.setInsertionPoint(rewriter.create<mlir::omp::TerminatorOp>(loc));
++
++    genLoopNestIndVarAllocs(rewriter, loopNest, mapper);
++    return parallelOp;
++  }
++
++  void genLoopNestIndVarAllocs(mlir::ConversionPatternRewriter &rewriter,
++                               looputils::LoopNestToIndVarMap &loopNest,
++                               mlir::IRMapping &mapper) const {
++
++    for (auto &[_, indVarInfo] : loopNest)
++      genInductionVariableAlloc(rewriter, indVarInfo.iterVarMemDef, mapper);
++  }
++
++  mlir::Operation *
++  genInductionVariableAlloc(mlir::ConversionPatternRewriter &rewriter,
++                            mlir::Operation *indVarMemDef,
++                            mlir::IRMapping &mapper) const {
++    assert(
++        indVarMemDef != nullptr &&
++        "Induction variable memdef is expected to have a defining operation.");
++
++    llvm::SmallSetVector<mlir::Operation *, 2> indVarDeclareAndAlloc;
++    for (auto operand : indVarMemDef->getOperands())
++      indVarDeclareAndAlloc.insert(operand.getDefiningOp());
++    indVarDeclareAndAlloc.insert(indVarMemDef);
++
++    mlir::Operation *result;
++    for (mlir::Operation *opToClone : indVarDeclareAndAlloc)
++      result = rewriter.clone(*opToClone, mapper);
++
++    return result;
++  }
++
++  void genLoopNestClauseOps(
++      mlir::Location loc, mlir::ConversionPatternRewriter &rewriter,
++      looputils::LoopNestToIndVarMap &loopNest, mlir::IRMapping &mapper,
++      mlir::omp::LoopNestOperands &loopNestClauseOps) const {
++    assert(loopNestClauseOps.loopLowerBounds.empty() &&
++           "Loop nest bounds were already emitted!");
++
++    auto populateBounds = [](mlir::Value var,
++                             llvm::SmallVectorImpl<mlir::Value> &bounds) {
++      bounds.push_back(var.getDefiningOp()->getResult(0));
++    };
++
++    for (auto &[doLoop, _] : loopNest) {
++      populateBounds(doLoop.getLowerBound(), loopNestClauseOps.loopLowerBounds);
++      populateBounds(doLoop.getUpperBound(), loopNestClauseOps.loopUpperBounds);
++      populateBounds(doLoop.getStep(), loopNestClauseOps.loopSteps);
++    }
++
++    loopNestClauseOps.loopInclusive = rewriter.getUnitAttr();
++  }
++
++  mlir::omp::LoopNestOp
++  genWsLoopOp(mlir::ConversionPatternRewriter &rewriter, fir::DoLoopOp doLoop,
++              mlir::IRMapping &mapper,
++              const mlir::omp::LoopNestOperands &clauseOps,
++              bool isComposite) const {
++
++    auto wsloopOp = rewriter.create<mlir::omp::WsloopOp>(doLoop.getLoc());
++    wsloopOp.setComposite(isComposite);
++    rewriter.createBlock(&wsloopOp.getRegion());
++
++    auto loopNestOp =
++        rewriter.create<mlir::omp::LoopNestOp>(doLoop.getLoc(), clauseOps);
++
++    // Clone the loop's body inside the loop nest construct using the
++    // mapped values.
++    rewriter.cloneRegionBefore(doLoop.getRegion(), loopNestOp.getRegion(),
++                               loopNestOp.getRegion().begin(), mapper);
++
++    mlir::Operation *terminator = loopNestOp.getRegion().back().getTerminator();
++    rewriter.setInsertionPointToEnd(&loopNestOp.getRegion().back());
++    rewriter.create<mlir::omp::YieldOp>(terminator->getLoc());
++    rewriter.eraseOp(terminator);
++
++    return loopNestOp;
++  }
++
+   bool mapToDevice;
++  llvm::DenseSet<fir::DoLoopOp> &concurrentLoopsToSkip;
+ };
+ 
+ class DoConcurrentConversionPass
+@@ -200,24 +378,24 @@ class DoConcurrentConversionPass
+       return;
+     }
+ 
++    llvm::DenseSet<fir::DoLoopOp> concurrentLoopsToSkip;
+     mlir::RewritePatternSet patterns(context);
+     patterns.insert<DoConcurrentConversion>(
+-        context, mapTo == flangomp::DoConcurrentMappingKind::DCMK_Device);
++        context, mapTo == flangomp::DoConcurrentMappingKind::DCMK_Device,
++        concurrentLoopsToSkip);
+     mlir::ConversionTarget target(*context);
+     target.addDynamicallyLegalOp<fir::DoLoopOp>([&](fir::DoLoopOp op) {
+       // The goal is to handle constructs that eventually get lowered to
+       // `fir.do_loop` with the `unordered` attribute (e.g. array expressions).
+       // Currently, this is only enabled for the `do concurrent` construct since
+       // the pass runs early in the pipeline.
+-      return !op.getUnordered();
++      return !op.getUnordered() || concurrentLoopsToSkip.contains(op);
+     });
+     target.markUnknownOpDynamicallyLegal(
+         [](mlir::Operation *) { return true; });
+ 
+     if (mlir::failed(mlir::applyFullConversion(getOperation(), target,
+                                                std::move(patterns)))) {
+-      mlir::emitError(mlir::UnknownLoc::get(context),
+-                      "error in converting do-concurrent op");
+       signalPassFailure();
+     }
+   }
+diff --git a/flang/test/Transforms/DoConcurrent/basic_device.mlir b/flang/test/Transforms/DoConcurrent/basic_device.mlir
+new file mode 100644
+index 0000000000000..d7fcc40e4a7f9
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/basic_device.mlir
+@@ -0,0 +1,29 @@
++// RUN: fir-opt --omp-do-concurrent-conversion="map-to=device" -verify-diagnostics %s
++
++func.func @do_concurrent_basic() attributes {fir.bindc_name = "do_concurrent_basic"} {
++    %0 = fir.alloca i32 {bindc_name = "i"}
++    %1:2 = hlfir.declare %0 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++    %2 = fir.address_of(@_QFEa) : !fir.ref<!fir.array<10xi32>>
++    %c10 = arith.constant 10 : index
++    %3 = fir.shape %c10 : (index) -> !fir.shape<1>
++    %4:2 = hlfir.declare %2(%3) {uniq_name = "_QFEa"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++    %c1_i32 = arith.constant 1 : i32
++    %7 = fir.convert %c1_i32 : (i32) -> index
++    %c10_i32 = arith.constant 10 : i32
++    %8 = fir.convert %c10_i32 : (i32) -> index
++    %c1 = arith.constant 1 : index
++
++    // expected-error@+2 {{not yet implemented: Mapping `do concurrent` loops to device}}
++    // expected-error@below {{failed to legalize operation 'fir.do_loop'}}
++    fir.do_loop %arg0 = %7 to %8 step %c1 unordered {
++      %13 = fir.convert %arg0 : (index) -> i32
++      fir.store %13 to %1#1 : !fir.ref<i32>
++      %14 = fir.load %1#0 : !fir.ref<i32>
++      %15 = fir.load %1#0 : !fir.ref<i32>
++      %16 = fir.convert %15 : (i32) -> i64
++      %17 = hlfir.designate %4#0 (%16)  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++      hlfir.assign %14 to %17 : i32, !fir.ref<i32>
++    }
++
++    return
++  }
+diff --git a/flang/test/Transforms/DoConcurrent/basic_host.f90 b/flang/test/Transforms/DoConcurrent/basic_host.f90
+index b569668ab0f0e..12f63031cbaee 100644
+--- a/flang/test/Transforms/DoConcurrent/basic_host.f90
++++ b/flang/test/Transforms/DoConcurrent/basic_host.f90
+@@ -1,7 +1,3 @@
+-! Mark as xfail for now until we upstream the relevant part. This is just for
+-! demo purposes at this point. Upstreaming this is the next step.
+-! XFAIL: *
+-
+ ! Tests mapping of a basic `do concurrent` loop to `!$omp parallel do`.
+ 
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
+@@ -19,21 +15,21 @@ program do_concurrent_basic
+ 
+     ! CHECK-NOT: fir.do_loop
+ 
+-    ! CHECK: omp.parallel {
+-
+-    ! CHECK-NEXT: %[[ITER_VAR:.*]] = fir.alloca i32 {bindc_name = "i"}
+-    ! CHECK-NEXT: %[[BINDING:.*]]:2 = hlfir.declare %[[ITER_VAR]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+-
+     ! CHECK: %[[C1:.*]] = arith.constant 1 : i32
+     ! CHECK: %[[LB:.*]] = fir.convert %[[C1]] : (i32) -> index
+     ! CHECK: %[[C10:.*]] = arith.constant 10 : i32
+     ! CHECK: %[[UB:.*]] = fir.convert %[[C10]] : (i32) -> index
+     ! CHECK: %[[STEP:.*]] = arith.constant 1 : index
+ 
++    ! CHECK: omp.parallel {
++
++    ! CHECK-NEXT: %[[ITER_VAR:.*]] = fir.alloca i32 {bindc_name = "i"}
++    ! CHECK-NEXT: %[[BINDING:.*]]:2 = hlfir.declare %[[ITER_VAR]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
+     ! CHECK: omp.wsloop {
+     ! CHECK-NEXT: omp.loop_nest (%[[ARG0:.*]]) : index = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+     ! CHECK-NEXT: %[[IV_IDX:.*]] = fir.convert %[[ARG0]] : (index) -> i32
+-    ! CHECK-NEXT: fir.store %[[IV_IDX]] to %[[BINDING]]#1 : !fir.ref<i32>
++    ! CHECK-NEXT: fir.store %[[IV_IDX]] to %[[BINDING]]#0 : !fir.ref<i32>
+     ! CHECK-NEXT: %[[IV_VAL1:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
+     ! CHECK-NEXT: %[[IV_VAL2:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
+     ! CHECK-NEXT: %[[IV_VAL_I64:.*]] = fir.convert %[[IV_VAL2]] : (i32) -> i64
+diff --git a/flang/test/Transforms/DoConcurrent/basic_host.mlir b/flang/test/Transforms/DoConcurrent/basic_host.mlir
+new file mode 100644
+index 0000000000000..b53ecd687c039
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/basic_host.mlir
+@@ -0,0 +1,62 @@
++// Tests mapping of a basic `do concurrent` loop to `!$omp parallel do`.
++
++// RUN: fir-opt --omp-do-concurrent-conversion="map-to=host" %s | FileCheck %s
++
++// CHECK-LABEL: func.func @do_concurrent_basic
++func.func @do_concurrent_basic() attributes {fir.bindc_name = "do_concurrent_basic"} {
++    // CHECK: %[[ARR:.*]]:2 = hlfir.declare %{{.*}}(%{{.*}}) {uniq_name = "_QFEa"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++
++    %0 = fir.alloca i32 {bindc_name = "i"}
++    %1:2 = hlfir.declare %0 {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++    %2 = fir.address_of(@_QFEa) : !fir.ref<!fir.array<10xi32>>
++    %c10 = arith.constant 10 : index
++    %3 = fir.shape %c10 : (index) -> !fir.shape<1>
++    %4:2 = hlfir.declare %2(%3) {uniq_name = "_QFEa"} : (!fir.ref<!fir.array<10xi32>>, !fir.shape<1>) -> (!fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.array<10xi32>>)
++    %c1_i32 = arith.constant 1 : i32
++    %7 = fir.convert %c1_i32 : (i32) -> index
++    %c10_i32 = arith.constant 10 : i32
++    %8 = fir.convert %c10_i32 : (i32) -> index
++    %c1 = arith.constant 1 : index
++
++    // CHECK-NOT: fir.do_loop
++
++    // CHECK: %[[C1:.*]] = arith.constant 1 : i32
++    // CHECK: %[[LB:.*]] = fir.convert %[[C1]] : (i32) -> index
++    // CHECK: %[[C10:.*]] = arith.constant 10 : i32
++    // CHECK: %[[UB:.*]] = fir.convert %[[C10]] : (i32) -> index
++    // CHECK: %[[STEP:.*]] = arith.constant 1 : index
++
++    // CHECK: omp.parallel {
++
++    // CHECK-NEXT: %[[ITER_VAR:.*]] = fir.alloca i32 {bindc_name = "i"}
++    // CHECK-NEXT: %[[BINDING:.*]]:2 = hlfir.declare %[[ITER_VAR]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++    // CHECK: omp.wsloop {
++    // CHECK-NEXT: omp.loop_nest (%[[ARG0:.*]]) : index = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++    // CHECK-NEXT: %[[IV_IDX:.*]] = fir.convert %[[ARG0]] : (index) -> i32
++    // CHECK-NEXT: fir.store %[[IV_IDX]] to %[[BINDING]]#1 : !fir.ref<i32>
++    // CHECK-NEXT: %[[IV_VAL1:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
++    // CHECK-NEXT: %[[IV_VAL2:.*]] = fir.load %[[BINDING]]#0 : !fir.ref<i32>
++    // CHECK-NEXT: %[[IV_VAL_I64:.*]] = fir.convert %[[IV_VAL2]] : (i32) -> i64
++    // CHECK-NEXT: %[[ARR_ACCESS:.*]] = hlfir.designate %[[ARR]]#0 (%[[IV_VAL_I64]])  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++    // CHECK-NEXT: hlfir.assign %[[IV_VAL1]] to %[[ARR_ACCESS]] : i32, !fir.ref<i32>
++    // CHECK-NEXT: omp.yield
++    // CHECK-NEXT: }
++    // CHECK-NEXT: }
++
++    // CHECK-NEXT: omp.terminator
++    // CHECK-NEXT: }
++    fir.do_loop %arg0 = %7 to %8 step %c1 unordered {
++      %13 = fir.convert %arg0 : (index) -> i32
++      fir.store %13 to %1#1 : !fir.ref<i32>
++      %14 = fir.load %1#0 : !fir.ref<i32>
++      %15 = fir.load %1#0 : !fir.ref<i32>
++      %16 = fir.convert %15 : (i32) -> i64
++      %17 = hlfir.designate %4#0 (%16)  : (!fir.ref<!fir.array<10xi32>>, i64) -> !fir.ref<i32>
++      hlfir.assign %14 to %17 : i32, !fir.ref<i32>
++    }
++
++    // CHECK-NOT: fir.do_loop
++
++    return
++  }
+diff --git a/flang/test/Transforms/DoConcurrent/non_const_bounds.f90 b/flang/test/Transforms/DoConcurrent/non_const_bounds.f90
+new file mode 100644
+index 0000000000000..cd1bd4f98a3f5
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/non_const_bounds.f90
+@@ -0,0 +1,45 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
++! RUN:   | FileCheck %s
++
++program main
++    implicit none
++
++    call foo(10)
++
++    contains
++        subroutine foo(n)
++            implicit none
++            integer :: n
++            integer :: i
++            integer, dimension(n) :: a
++
++            do concurrent(i=1:n)
++                a(i) = i
++            end do
++        end subroutine
++
++end program main
++
++! CHECK: %[[N_DECL:.*]]:2 = hlfir.declare %{{.*}} dummy_scope %{{.*}} {uniq_name = "_QFFfooEn"}
++
++! CHECK: fir.load
++
++! CHECK: %[[LB:.*]] = fir.convert %{{c1_.*}} : (i32) -> index
++! CHECK: %[[N_VAL:.*]] = fir.load %[[N_DECL]]#0 : !fir.ref<i32>
++! CHECK: %[[UB:.*]] = fir.convert %[[N_VAL]] : (i32) -> index
++! CHECK: %[[C1:.*]] = arith.constant 1 : index
++
++! CHECK: omp.parallel {
++
++
++! Verify that we resort to using the outside value for the upper bound since it
++! is not originally a constant.
++
++! CHECK:   omp.wsloop {
++! CHECK:     omp.loop_nest (%{{.*}}) : index = (%[[LB]]) to (%[[UB]]) inclusive step (%{{.*}}) {
++! CHECK:       omp.yield
++! CHECK:     }
++! CHECK:   }
++! CHECK:   omp.terminator
++! CHECK: }
++
+diff --git a/flang/test/Transforms/DoConcurrent/not_perfectly_nested.f90 b/flang/test/Transforms/DoConcurrent/not_perfectly_nested.f90
+new file mode 100644
+index 0000000000000..184fdfe00d397
+--- /dev/null
++++ b/flang/test/Transforms/DoConcurrent/not_perfectly_nested.f90
+@@ -0,0 +1,45 @@
++! Tests that if `do concurrent` is not perfectly nested in its parent loop, that
++! we skip converting the not-perfectly nested `do concurrent` loop.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fdo-concurrent-to-openmp=host %s -o - \
++! RUN:   | FileCheck %s
++
++program main
++   integer, parameter :: n = 10
++   integer, parameter :: m = 20
++   integer, parameter :: l = 30
++   integer x;
++   integer :: a(n, m, l)
++
++   do concurrent(i=1:n)
++     x = 10
++     do concurrent(j=1:m, k=1:l)
++       a(i,j,k) = i * j + k
++     end do
++   end do
++end
++
++! CHECK: %[[ORIG_K_ALLOC:.*]] = fir.alloca i32 {bindc_name = "k"}
++! CHECK: %[[ORIG_K_DECL:.*]]:2 = hlfir.declare %[[ORIG_K_ALLOC]]
++
++! CHECK: %[[ORIG_J_ALLOC:.*]] = fir.alloca i32 {bindc_name = "j"}
++! CHECK: %[[ORIG_J_DECL:.*]]:2 = hlfir.declare %[[ORIG_J_ALLOC]]
++
++! CHECK: omp.parallel {
++
++! CHECK: omp.wsloop {
++! CHECK: omp.loop_nest ({{[^[:space:]]+}}) {{.*}} {
++! CHECK:   fir.do_loop %[[J_IV:.*]] = {{.*}} {
++! CHECK:     %[[J_IV_CONV:.*]] = fir.convert %[[J_IV]] : (index) -> i32
++! CHECK:       fir.store %[[J_IV_CONV]] to %[[ORIG_J_DECL]]#0
++
++! CHECK:     fir.do_loop %[[K_IV:.*]] = {{.*}} {
++! CHECK:       %[[K_IV_CONV:.*]] = fir.convert %[[K_IV]] : (index) -> i32
++! CHECK:         fir.store %[[K_IV_CONV]] to %[[ORIG_K_DECL]]#0
++! CHECK:     }
++! CHECK:   }
++! CHECK: omp.yield
++! CHECK: }
++! CHECK: }
++! CHECK: omp.terminator
++! CHECK: }

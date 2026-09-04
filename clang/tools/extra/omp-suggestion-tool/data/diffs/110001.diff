@@ -1,0 +1,1179 @@
+diff --git a/clang/lib/CodeGen/CGOpenMPRuntime.cpp b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+index 6a5860242035b..e4f11088f899e 100644
+--- a/clang/lib/CodeGen/CGOpenMPRuntime.cpp
++++ b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+@@ -9042,337 +9042,69 @@ void CGOpenMPRuntime::emitUserDefinedMapper(const OMPDeclareMapperDecl *D,
+     return;
+   ASTContext &C = CGM.getContext();
+   QualType Ty = D->getType();
+-  QualType PtrTy = C.getPointerType(Ty).withRestrict();
+-  QualType Int64Ty = C.getIntTypeForBitwidth(/*DestWidth=*/64, /*Signed=*/true);
+   auto *MapperVarDecl =
+       cast<VarDecl>(cast<DeclRefExpr>(D->getMapperVarRef())->getDecl());
+-  SourceLocation Loc = D->getLocation();
+   CharUnits ElementSize = C.getTypeSizeInChars(Ty);
+   llvm::Type *ElemTy = CGM.getTypes().ConvertTypeForMem(Ty);
+ 
+-  // Prepare mapper function arguments and attributes.
+-  ImplicitParamDecl HandleArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr,
+-                              C.VoidPtrTy, ImplicitParamKind::Other);
+-  ImplicitParamDecl BaseArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr, C.VoidPtrTy,
+-                            ImplicitParamKind::Other);
+-  ImplicitParamDecl BeginArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr,
+-                             C.VoidPtrTy, ImplicitParamKind::Other);
+-  ImplicitParamDecl SizeArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr, Int64Ty,
+-                            ImplicitParamKind::Other);
+-  ImplicitParamDecl TypeArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr, Int64Ty,
+-                            ImplicitParamKind::Other);
+-  ImplicitParamDecl NameArg(C, /*DC=*/nullptr, Loc, /*Id=*/nullptr, C.VoidPtrTy,
+-                            ImplicitParamKind::Other);
+-  FunctionArgList Args;
+-  Args.push_back(&HandleArg);
+-  Args.push_back(&BaseArg);
+-  Args.push_back(&BeginArg);
+-  Args.push_back(&SizeArg);
+-  Args.push_back(&TypeArg);
+-  Args.push_back(&NameArg);
+-  const CGFunctionInfo &FnInfo =
+-      CGM.getTypes().arrangeBuiltinFunctionDeclaration(C.VoidTy, Args);
+-  llvm::FunctionType *FnTy = CGM.getTypes().GetFunctionType(FnInfo);
++  CodeGenFunction MapperCGF(CGM);
++  MappableExprsHandler::MapCombinedInfoTy CombinedInfo;
++  auto PrivatizeAndGenMapInfoCB =
++      [&](llvm::OpenMPIRBuilder::InsertPointTy CodeGenIP, llvm::Value *PtrPHI,
++          llvm::Value *BeginArg) -> llvm::OpenMPIRBuilder::MapInfosTy & {
++    MapperCGF.Builder.restoreIP(CodeGenIP);
++
++    // Privatize the declared variable of mapper to be the current array
++    // element.
++    Address PtrCurrent(
++        PtrPHI, ElemTy,
++        Address(BeginArg, MapperCGF.VoidPtrTy, CGM.getPointerAlign())
++            .getAlignment()
++            .alignmentOfArrayElement(ElementSize));
++    CodeGenFunction::OMPPrivateScope Scope(MapperCGF);
++    Scope.addPrivate(MapperVarDecl, PtrCurrent);
++    (void)Scope.Privatize();
++
++    // Get map clause information.
++    MappableExprsHandler MEHandler(*D, MapperCGF);
++    MEHandler.generateAllInfoForMapper(CombinedInfo, OMPBuilder);
++
++    auto FillInfoMap = [&](MappableExprsHandler::MappingExprInfo &MapExpr) {
++      return emitMappingInformation(MapperCGF, OMPBuilder, MapExpr);
++    };
++    if (CGM.getCodeGenOpts().getDebugInfo() !=
++        llvm::codegenoptions::NoDebugInfo) {
++      CombinedInfo.Names.resize(CombinedInfo.Exprs.size());
++      llvm::transform(CombinedInfo.Exprs, CombinedInfo.Names.begin(),
++                      FillInfoMap);
++    }
++
++    return CombinedInfo;
++  };
++
++  auto CustomMapperCB = [&](unsigned I, llvm::Function **MapperFunc) {
++    if (CombinedInfo.Mappers[I]) {
++      // Call the corresponding mapper function.
++      *MapperFunc = getOrCreateUserDefinedMapperFunc(
++          cast<OMPDeclareMapperDecl>(CombinedInfo.Mappers[I]));
++      assert(*MapperFunc && "Expect a valid mapper function is available.");
++      return true;
++    }
++    return false;
++  };
++
+   SmallString<64> TyStr;
+   llvm::raw_svector_ostream Out(TyStr);
+   CGM.getCXXABI().getMangleContext().mangleCanonicalTypeName(Ty, Out);
+   std::string Name = getName({"omp_mapper", TyStr, D->getName()});
+-  auto *Fn = llvm::Function::Create(FnTy, llvm::GlobalValue::InternalLinkage,
+-                                    Name, &CGM.getModule());
+-  CGM.SetInternalFunctionAttributes(GlobalDecl(), Fn, FnInfo);
+-  Fn->removeFnAttr(llvm::Attribute::OptimizeNone);
+-  // Start the mapper function code generation.
+-  CodeGenFunction MapperCGF(CGM);
+-  MapperCGF.StartFunction(GlobalDecl(), C.VoidTy, Fn, FnInfo, Args, Loc, Loc);
+-  // Compute the starting and end addresses of array elements.
+-  llvm::Value *Size = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&SizeArg), /*Volatile=*/false,
+-      C.getPointerType(Int64Ty), Loc);
+-  // Prepare common arguments for array initiation and deletion.
+-  llvm::Value *Handle = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&HandleArg),
+-      /*Volatile=*/false, C.getPointerType(C.VoidPtrTy), Loc);
+-  llvm::Value *BaseIn = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&BaseArg),
+-      /*Volatile=*/false, C.getPointerType(C.VoidPtrTy), Loc);
+-  llvm::Value *BeginIn = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&BeginArg),
+-      /*Volatile=*/false, C.getPointerType(C.VoidPtrTy), Loc);
+-  // Convert the size in bytes into the number of array elements.
+-  Size = MapperCGF.Builder.CreateExactUDiv(
+-      Size, MapperCGF.Builder.getInt64(ElementSize.getQuantity()));
+-  llvm::Value *PtrBegin = MapperCGF.Builder.CreateBitCast(
+-      BeginIn, CGM.getTypes().ConvertTypeForMem(PtrTy));
+-  llvm::Value *PtrEnd = MapperCGF.Builder.CreateGEP(ElemTy, PtrBegin, Size);
+-  llvm::Value *MapType = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&TypeArg), /*Volatile=*/false,
+-      C.getPointerType(Int64Ty), Loc);
+-  llvm::Value *MapName = MapperCGF.EmitLoadOfScalar(
+-      MapperCGF.GetAddrOfLocalVar(&NameArg),
+-      /*Volatile=*/false, C.getPointerType(C.VoidPtrTy), Loc);
+-
+-  // Emit array initiation if this is an array section and \p MapType indicates
+-  // that memory allocation is required.
+-  llvm::BasicBlock *HeadBB = MapperCGF.createBasicBlock("omp.arraymap.head");
+-  emitUDMapperArrayInitOrDel(MapperCGF, Handle, BaseIn, BeginIn, Size, MapType,
+-                             MapName, ElementSize, HeadBB, /*IsInit=*/true);
+-
+-  // Emit a for loop to iterate through SizeArg of elements and map all of them.
+-
+-  // Emit the loop header block.
+-  MapperCGF.EmitBlock(HeadBB);
+-  llvm::BasicBlock *BodyBB = MapperCGF.createBasicBlock("omp.arraymap.body");
+-  llvm::BasicBlock *DoneBB = MapperCGF.createBasicBlock("omp.done");
+-  // Evaluate whether the initial condition is satisfied.
+-  llvm::Value *IsEmpty =
+-      MapperCGF.Builder.CreateICmpEQ(PtrBegin, PtrEnd, "omp.arraymap.isempty");
+-  MapperCGF.Builder.CreateCondBr(IsEmpty, DoneBB, BodyBB);
+-  llvm::BasicBlock *EntryBB = MapperCGF.Builder.GetInsertBlock();
+-
+-  // Emit the loop body block.
+-  MapperCGF.EmitBlock(BodyBB);
+-  llvm::BasicBlock *LastBB = BodyBB;
+-  llvm::PHINode *PtrPHI = MapperCGF.Builder.CreatePHI(
+-      PtrBegin->getType(), 2, "omp.arraymap.ptrcurrent");
+-  PtrPHI->addIncoming(PtrBegin, EntryBB);
+-  Address PtrCurrent(PtrPHI, ElemTy,
+-                     MapperCGF.GetAddrOfLocalVar(&BeginArg)
+-                         .getAlignment()
+-                         .alignmentOfArrayElement(ElementSize));
+-  // Privatize the declared variable of mapper to be the current array element.
+-  CodeGenFunction::OMPPrivateScope Scope(MapperCGF);
+-  Scope.addPrivate(MapperVarDecl, PtrCurrent);
+-  (void)Scope.Privatize();
+ 
+-  // Get map clause information. Fill up the arrays with all mapped variables.
+-  MappableExprsHandler::MapCombinedInfoTy Info;
+-  MappableExprsHandler MEHandler(*D, MapperCGF);
+-  MEHandler.generateAllInfoForMapper(Info, OMPBuilder);
+-
+-  // Call the runtime API __tgt_mapper_num_components to get the number of
+-  // pre-existing components.
+-  llvm::Value *OffloadingArgs[] = {Handle};
+-  llvm::Value *PreviousSize = MapperCGF.EmitRuntimeCall(
+-      OMPBuilder.getOrCreateRuntimeFunction(CGM.getModule(),
+-                                            OMPRTL___tgt_mapper_num_components),
+-      OffloadingArgs);
+-  llvm::Value *ShiftedPreviousSize = MapperCGF.Builder.CreateShl(
+-      PreviousSize,
+-      MapperCGF.Builder.getInt64(MappableExprsHandler::getFlagMemberOffset()));
+-
+-  // Fill up the runtime mapper handle for all components.
+-  for (unsigned I = 0; I < Info.BasePointers.size(); ++I) {
+-    llvm::Value *CurBaseArg = MapperCGF.Builder.CreateBitCast(
+-        Info.BasePointers[I], CGM.getTypes().ConvertTypeForMem(C.VoidPtrTy));
+-    llvm::Value *CurBeginArg = MapperCGF.Builder.CreateBitCast(
+-        Info.Pointers[I], CGM.getTypes().ConvertTypeForMem(C.VoidPtrTy));
+-    llvm::Value *CurSizeArg = Info.Sizes[I];
+-    llvm::Value *CurNameArg =
+-        (CGM.getCodeGenOpts().getDebugInfo() ==
+-         llvm::codegenoptions::NoDebugInfo)
+-            ? llvm::ConstantPointerNull::get(CGM.VoidPtrTy)
+-            : emitMappingInformation(MapperCGF, OMPBuilder, Info.Exprs[I]);
+-
+-    // Extract the MEMBER_OF field from the map type.
+-    llvm::Value *OriMapType = MapperCGF.Builder.getInt64(
+-        static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-            Info.Types[I]));
+-    llvm::Value *MemberMapType =
+-        MapperCGF.Builder.CreateNUWAdd(OriMapType, ShiftedPreviousSize);
+-
+-    // Combine the map type inherited from user-defined mapper with that
+-    // specified in the program. According to the OMP_MAP_TO and OMP_MAP_FROM
+-    // bits of the \a MapType, which is the input argument of the mapper
+-    // function, the following code will set the OMP_MAP_TO and OMP_MAP_FROM
+-    // bits of MemberMapType.
+-    // [OpenMP 5.0], 1.2.6. map-type decay.
+-    //        | alloc |  to   | from  | tofrom | release | delete
+-    // ----------------------------------------------------------
+-    // alloc  | alloc | alloc | alloc | alloc  | release | delete
+-    // to     | alloc |  to   | alloc |   to   | release | delete
+-    // from   | alloc | alloc | from  |  from  | release | delete
+-    // tofrom | alloc |  to   | from  | tofrom | release | delete
+-    llvm::Value *LeftToFrom = MapperCGF.Builder.CreateAnd(
+-        MapType,
+-        MapperCGF.Builder.getInt64(
+-            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_TO |
+-                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
+-    llvm::BasicBlock *AllocBB = MapperCGF.createBasicBlock("omp.type.alloc");
+-    llvm::BasicBlock *AllocElseBB =
+-        MapperCGF.createBasicBlock("omp.type.alloc.else");
+-    llvm::BasicBlock *ToBB = MapperCGF.createBasicBlock("omp.type.to");
+-    llvm::BasicBlock *ToElseBB = MapperCGF.createBasicBlock("omp.type.to.else");
+-    llvm::BasicBlock *FromBB = MapperCGF.createBasicBlock("omp.type.from");
+-    llvm::BasicBlock *EndBB = MapperCGF.createBasicBlock("omp.type.end");
+-    llvm::Value *IsAlloc = MapperCGF.Builder.CreateIsNull(LeftToFrom);
+-    MapperCGF.Builder.CreateCondBr(IsAlloc, AllocBB, AllocElseBB);
+-    // In case of alloc, clear OMP_MAP_TO and OMP_MAP_FROM.
+-    MapperCGF.EmitBlock(AllocBB);
+-    llvm::Value *AllocMapType = MapperCGF.Builder.CreateAnd(
+-        MemberMapType,
+-        MapperCGF.Builder.getInt64(
+-            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_TO |
+-                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
+-    MapperCGF.Builder.CreateBr(EndBB);
+-    MapperCGF.EmitBlock(AllocElseBB);
+-    llvm::Value *IsTo = MapperCGF.Builder.CreateICmpEQ(
+-        LeftToFrom,
+-        MapperCGF.Builder.getInt64(
+-            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_TO)));
+-    MapperCGF.Builder.CreateCondBr(IsTo, ToBB, ToElseBB);
+-    // In case of to, clear OMP_MAP_FROM.
+-    MapperCGF.EmitBlock(ToBB);
+-    llvm::Value *ToMapType = MapperCGF.Builder.CreateAnd(
+-        MemberMapType,
+-        MapperCGF.Builder.getInt64(
+-            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
+-    MapperCGF.Builder.CreateBr(EndBB);
+-    MapperCGF.EmitBlock(ToElseBB);
+-    llvm::Value *IsFrom = MapperCGF.Builder.CreateICmpEQ(
+-        LeftToFrom,
+-        MapperCGF.Builder.getInt64(
+-            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
+-    MapperCGF.Builder.CreateCondBr(IsFrom, FromBB, EndBB);
+-    // In case of from, clear OMP_MAP_TO.
+-    MapperCGF.EmitBlock(FromBB);
+-    llvm::Value *FromMapType = MapperCGF.Builder.CreateAnd(
+-        MemberMapType,
+-        MapperCGF.Builder.getInt64(
+-            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_TO)));
+-    // In case of tofrom, do nothing.
+-    MapperCGF.EmitBlock(EndBB);
+-    LastBB = EndBB;
+-    llvm::PHINode *CurMapType =
+-        MapperCGF.Builder.CreatePHI(CGM.Int64Ty, 4, "omp.maptype");
+-    CurMapType->addIncoming(AllocMapType, AllocBB);
+-    CurMapType->addIncoming(ToMapType, ToBB);
+-    CurMapType->addIncoming(FromMapType, FromBB);
+-    CurMapType->addIncoming(MemberMapType, ToElseBB);
+-
+-    llvm::Value *OffloadingArgs[] = {Handle,     CurBaseArg, CurBeginArg,
+-                                     CurSizeArg, CurMapType, CurNameArg};
+-    if (Info.Mappers[I]) {
+-      // Call the corresponding mapper function.
+-      llvm::Function *MapperFunc = getOrCreateUserDefinedMapperFunc(
+-          cast<OMPDeclareMapperDecl>(Info.Mappers[I]));
+-      assert(MapperFunc && "Expect a valid mapper function is available.");
+-      MapperCGF.EmitNounwindRuntimeCall(MapperFunc, OffloadingArgs);
+-    } else {
+-      // Call the runtime API __tgt_push_mapper_component to fill up the runtime
+-      // data structure.
+-      MapperCGF.EmitRuntimeCall(
+-          OMPBuilder.getOrCreateRuntimeFunction(
+-              CGM.getModule(), OMPRTL___tgt_push_mapper_component),
+-          OffloadingArgs);
+-    }
+-  }
+-
+-  // Update the pointer to point to the next element that needs to be mapped,
+-  // and check whether we have mapped all elements.
+-  llvm::Value *PtrNext = MapperCGF.Builder.CreateConstGEP1_32(
+-      ElemTy, PtrPHI, /*Idx0=*/1, "omp.arraymap.next");
+-  PtrPHI->addIncoming(PtrNext, LastBB);
+-  llvm::Value *IsDone =
+-      MapperCGF.Builder.CreateICmpEQ(PtrNext, PtrEnd, "omp.arraymap.isdone");
+-  llvm::BasicBlock *ExitBB = MapperCGF.createBasicBlock("omp.arraymap.exit");
+-  MapperCGF.Builder.CreateCondBr(IsDone, ExitBB, BodyBB);
+-
+-  MapperCGF.EmitBlock(ExitBB);
+-  // Emit array deletion if this is an array section and \p MapType indicates
+-  // that deletion is required.
+-  emitUDMapperArrayInitOrDel(MapperCGF, Handle, BaseIn, BeginIn, Size, MapType,
+-                             MapName, ElementSize, DoneBB, /*IsInit=*/false);
+-
+-  // Emit the function exit block.
+-  MapperCGF.EmitBlock(DoneBB, /*IsFinished=*/true);
+-  MapperCGF.FinishFunction();
+-  UDMMap.try_emplace(D, Fn);
++  auto *NewFn = OMPBuilder.emitUserDefinedMapper(PrivatizeAndGenMapInfoCB,
++                                                 ElemTy, Name, CustomMapperCB);
++  UDMMap.try_emplace(D, NewFn);
+   if (CGF)
+     FunctionUDMMap[CGF->CurFn].push_back(D);
+ }
+ 
+-/// Emit the array initialization or deletion portion for user-defined mapper
+-/// code generation. First, it evaluates whether an array section is mapped and
+-/// whether the \a MapType instructs to delete this section. If \a IsInit is
+-/// true, and \a MapType indicates to not delete this array, array
+-/// initialization code is generated. If \a IsInit is false, and \a MapType
+-/// indicates to not this array, array deletion code is generated.
+-void CGOpenMPRuntime::emitUDMapperArrayInitOrDel(
+-    CodeGenFunction &MapperCGF, llvm::Value *Handle, llvm::Value *Base,
+-    llvm::Value *Begin, llvm::Value *Size, llvm::Value *MapType,
+-    llvm::Value *MapName, CharUnits ElementSize, llvm::BasicBlock *ExitBB,
+-    bool IsInit) {
+-  StringRef Prefix = IsInit ? ".init" : ".del";
+-
+-  // Evaluate if this is an array section.
+-  llvm::BasicBlock *BodyBB =
+-      MapperCGF.createBasicBlock(getName({"omp.array", Prefix}));
+-  llvm::Value *IsArray = MapperCGF.Builder.CreateICmpSGT(
+-      Size, MapperCGF.Builder.getInt64(1), "omp.arrayinit.isarray");
+-  llvm::Value *DeleteBit = MapperCGF.Builder.CreateAnd(
+-      MapType,
+-      MapperCGF.Builder.getInt64(
+-          static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-              OpenMPOffloadMappingFlags::OMP_MAP_DELETE)));
+-  llvm::Value *DeleteCond;
+-  llvm::Value *Cond;
+-  if (IsInit) {
+-    // base != begin?
+-    llvm::Value *BaseIsBegin = MapperCGF.Builder.CreateICmpNE(Base, Begin);
+-    // IsPtrAndObj?
+-    llvm::Value *PtrAndObjBit = MapperCGF.Builder.CreateAnd(
+-        MapType,
+-        MapperCGF.Builder.getInt64(
+-            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-                OpenMPOffloadMappingFlags::OMP_MAP_PTR_AND_OBJ)));
+-    PtrAndObjBit = MapperCGF.Builder.CreateIsNotNull(PtrAndObjBit);
+-    BaseIsBegin = MapperCGF.Builder.CreateAnd(BaseIsBegin, PtrAndObjBit);
+-    Cond = MapperCGF.Builder.CreateOr(IsArray, BaseIsBegin);
+-    DeleteCond = MapperCGF.Builder.CreateIsNull(
+-        DeleteBit, getName({"omp.array", Prefix, ".delete"}));
+-  } else {
+-    Cond = IsArray;
+-    DeleteCond = MapperCGF.Builder.CreateIsNotNull(
+-        DeleteBit, getName({"omp.array", Prefix, ".delete"}));
+-  }
+-  Cond = MapperCGF.Builder.CreateAnd(Cond, DeleteCond);
+-  MapperCGF.Builder.CreateCondBr(Cond, BodyBB, ExitBB);
+-
+-  MapperCGF.EmitBlock(BodyBB);
+-  // Get the array size by multiplying element size and element number (i.e., \p
+-  // Size).
+-  llvm::Value *ArraySize = MapperCGF.Builder.CreateNUWMul(
+-      Size, MapperCGF.Builder.getInt64(ElementSize.getQuantity()));
+-  // Remove OMP_MAP_TO and OMP_MAP_FROM from the map type, so that it achieves
+-  // memory allocation/deletion purpose only.
+-  llvm::Value *MapTypeArg = MapperCGF.Builder.CreateAnd(
+-      MapType,
+-      MapperCGF.Builder.getInt64(
+-          ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-              OpenMPOffloadMappingFlags::OMP_MAP_TO |
+-              OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
+-  MapTypeArg = MapperCGF.Builder.CreateOr(
+-      MapTypeArg,
+-      MapperCGF.Builder.getInt64(
+-          static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
+-              OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT)));
+-
+-  // Call the runtime API __tgt_push_mapper_component to fill up the runtime
+-  // data structure.
+-  llvm::Value *OffloadingArgs[] = {Handle,    Base,       Begin,
+-                                   ArraySize, MapTypeArg, MapName};
+-  MapperCGF.EmitRuntimeCall(
+-      OMPBuilder.getOrCreateRuntimeFunction(CGM.getModule(),
+-                                            OMPRTL___tgt_push_mapper_component),
+-      OffloadingArgs);
+-}
+-
+ llvm::Function *CGOpenMPRuntime::getOrCreateUserDefinedMapperFunc(
+     const OMPDeclareMapperDecl *D) {
+   auto I = UDMMap.find(D);
+diff --git a/clang/lib/CodeGen/CGOpenMPRuntime.h b/clang/lib/CodeGen/CGOpenMPRuntime.h
+index 56d502d92806e..8ab5ee70a19fa 100644
+--- a/clang/lib/CodeGen/CGOpenMPRuntime.h
++++ b/clang/lib/CodeGen/CGOpenMPRuntime.h
+@@ -559,15 +559,6 @@ class CGOpenMPRuntime {
+                                 llvm::Value *Ctor, llvm::Value *CopyCtor,
+                                 llvm::Value *Dtor, SourceLocation Loc);
+ 
+-  /// Emit the array initialization or deletion portion for user-defined mapper
+-  /// code generation.
+-  void emitUDMapperArrayInitOrDel(CodeGenFunction &MapperCGF,
+-                                  llvm::Value *Handle, llvm::Value *BasePtr,
+-                                  llvm::Value *Ptr, llvm::Value *Size,
+-                                  llvm::Value *MapType, llvm::Value *MapName,
+-                                  CharUnits ElementSize,
+-                                  llvm::BasicBlock *ExitBB, bool IsInit);
+-
+   struct TaskResultTy {
+     llvm::Value *NewTask = nullptr;
+     llvm::Function *TaskEntry = nullptr;
+diff --git a/clang/test/OpenMP/declare_mapper_codegen.cpp b/clang/test/OpenMP/declare_mapper_codegen.cpp
+index d2954b7a74821..f9da3d97766d9 100644
+--- a/clang/test/OpenMP/declare_mapper_codegen.cpp
++++ b/clang/test/OpenMP/declare_mapper_codegen.cpp
+@@ -86,19 +86,9 @@ class C {
+ 
+ #pragma omp declare mapper(id: C s) map(s.a, s.b[0:2])
+ 
+-// CK0: define {{.*}}void [[MPRFUNC:@[.]omp_mapper[.].*C[.]id]](ptr{{.*}}, ptr{{.*}}, ptr{{.*}}, i64{{.*}}, i64{{.*}}, ptr{{.*}})
+-// CK0: store ptr %{{[^,]+}}, ptr [[HANDLEADDR:%[^,]+]]
+-// CK0: store ptr %{{[^,]+}}, ptr [[BPTRADDR:%[^,]+]]
+-// CK0: store ptr %{{[^,]+}}, ptr [[VPTRADDR:%[^,]+]]
+-// CK0: store i64 %{{[^,]+}}, ptr [[SIZEADDR:%[^,]+]]
+-// CK0: store i64 %{{[^,]+}}, ptr [[TYPEADDR:%[^,]+]]
+-// CK0-DAG: [[BYTESIZE:%.+]] = load i64, ptr [[SIZEADDR]]
++// CK0: define {{.*}}void [[MPRFUNC:@[.]omp_mapper[.].*C[.]id]](ptr noundef [[HANDLE:%.+]], ptr noundef [[BPTR:%.+]], ptr noundef [[BEGIN:%.+]], i64 noundef [[BYTESIZE:%.+]], i64 noundef [[TYPE:%.+]], ptr{{.*}})
+ // CK0-64-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 16
+ // CK0-32-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 8
+-// CK0-DAG: [[TYPE:%.+]] = load i64, ptr [[TYPEADDR]]
+-// CK0-DAG: [[HANDLE:%.+]] = load ptr, ptr [[HANDLEADDR]]
+-// CK0-DAG: [[BPTR:%.+]] = load ptr, ptr [[BPTRADDR]]
+-// CK0-DAG: [[BEGIN:%.+]] = load ptr, ptr [[VPTRADDR]]
+ // CK0-DAG: [[ISARRAY:%.+]] = icmp sgt i64 [[SIZE]], 1
+ // CK0-DAG: [[PTREND:%.+]] = getelementptr %class.C, ptr [[BEGIN]], i64 [[SIZE]]
+ // CK0-DAG: [[PTRSNE:%.+]] = icmp ne ptr [[BPTR]], [[BEGIN]]
+@@ -597,18 +587,8 @@ class C {
+ 
+ #pragma omp declare mapper(id: C<int> s) map(s.a)
+ 
+-// CK1-LABEL: define {{.*}}void @.omp_mapper.{{.*}}C{{.*}}.id{{.*}}(ptr{{.*}}, ptr{{.*}}, ptr{{.*}}, i64{{.*}}, i64{{.*}}, ptr{{.*}})
+-// CK1: store ptr %{{[^,]+}}, ptr [[HANDLEADDR:%[^,]+]]
+-// CK1: store ptr %{{[^,]+}}, ptr [[BPTRADDR:%[^,]+]]
+-// CK1: store ptr %{{[^,]+}}, ptr [[VPTRADDR:%[^,]+]]
+-// CK1: store i64 %{{[^,]+}}, ptr [[SIZEADDR:%[^,]+]]
+-// CK1: store i64 %{{[^,]+}}, ptr [[TYPEADDR:%[^,]+]]
+-// CK1-DAG: [[BYTESIZE:%.+]] = load i64, ptr [[SIZEADDR]]
++// CK1:     define {{.*}}void @.omp_mapper.{{.*}}C{{.*}}.id{{.*}}(ptr noundef [[HANDLE:%.+]], ptr noundef [[BPTR:%.+]], ptr noundef [[BEGIN:%.+]], i64 noundef [[BYTESIZE:%.+]], i64 noundef [[TYPE:%.+]], ptr{{.*}})
+ // CK1-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 4
+-// CK1-DAG: [[TYPE:%.+]] = load i64, ptr [[TYPEADDR]]
+-// CK1-DAG: [[HANDLE:%.+]] = load ptr, ptr [[HANDLEADDR]]
+-// CK1-DAG: [[BPTR:%.+]] = load ptr, ptr [[BPTRADDR]]
+-// CK1-DAG: [[BEGIN:%.+]] = load ptr, ptr [[VPTRADDR]]
+ // CK1-DAG: [[PTREND:%.+]] = getelementptr %class.C, ptr [[BEGIN]], i64 [[SIZE]]
+ // CK1-DAG: [[ISARRAY:%.+]] = icmp sgt i64 [[SIZE]], 1
+ // CK1-DAG: [[PTRSNE:%.+]] = icmp ne ptr [[BPTR]], [[BEGIN]]
+@@ -717,18 +697,8 @@ class C {
+ 
+ // CK2: define {{.*}}void [[BMPRFUNC:@[.]omp_mapper[.].*B[.]default]](ptr{{.*}}, ptr{{.*}}, ptr{{.*}}, i64{{.*}}, i64{{.*}}, ptr{{.*}})
+ 
+-// CK2-LABEL: define {{.*}}void @.omp_mapper.{{.*}}C{{.*}}.id(ptr{{.*}}, ptr{{.*}}, ptr{{.*}}, i64{{.*}}, i64{{.*}}, ptr{{.*}})
+-// CK2: store ptr %{{[^,]+}}, ptr [[HANDLEADDR:%[^,]+]]
+-// CK2: store ptr %{{[^,]+}}, ptr [[BPTRADDR:%[^,]+]]
+-// CK2: store ptr %{{[^,]+}}, ptr [[VPTRADDR:%[^,]+]]
+-// CK2: store i64 %{{[^,]+}}, ptr [[SIZEADDR:%[^,]+]]
+-// CK2: store i64 %{{[^,]+}}, ptr [[TYPEADDR:%[^,]+]]
+-// CK2-DAG: [[BYTESIZE:%.+]] = load i64, ptr [[SIZEADDR]]
++// CK2:     define {{.*}}void @.omp_mapper.{{.*}}C{{.*}}.id(ptr noundef [[HANDLE:%.+]], ptr noundef [[BPTR:%.+]], ptr noundef [[BEGIN:%.+]], i64 noundef [[BYTESIZE:%.+]], i64 noundef [[TYPE:%.+]], ptr{{.*}})
+ // CK2-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 16
+-// CK2-DAG: [[TYPE:%.+]] = load i64, ptr [[TYPEADDR]]
+-// CK2-DAG: [[HANDLE:%.+]] = load ptr, ptr [[HANDLEADDR]]
+-// CK2-DAG: [[BPTR:%.+]] = load ptr, ptr [[BPTRADDR]]
+-// CK2-DAG: [[BEGIN:%.+]] = load ptr, ptr [[VPTRADDR]]
+ // CK2-DAG: [[PTREND:%.+]] = getelementptr %class.C, ptr [[BEGIN]], i64 [[SIZE]]
+ // CK2-DAG: [[ISARRAY:%.+]] = icmp sgt i64 [[SIZE]], 1
+ // CK2-DAG: [[PTRSNE:%.+]] = icmp ne ptr [[BPTR]], [[BEGIN]]
+@@ -921,19 +891,9 @@ class C {
+ 
+ #pragma omp declare mapper(id: C s) map(s.a, s.b[0:2])
+ 
+-// CK4: define {{.*}}void [[MPRFUNC:@[.]omp_mapper[.].*C[.]id]](ptr{{.*}}, ptr{{.*}}, ptr{{.*}}, i64{{.*}}, i64{{.*}}, ptr{{.*}})
+-// CK4: store ptr %{{[^,]+}}, ptr [[HANDLEADDR:%[^,]+]]
+-// CK4: store ptr %{{[^,]+}}, ptr [[BPTRADDR:%[^,]+]]
+-// CK4: store ptr %{{[^,]+}}, ptr [[VPTRADDR:%[^,]+]]
+-// CK4: store i64 %{{[^,]+}}, ptr [[SIZEADDR:%[^,]+]]
+-// CK4: store i64 %{{[^,]+}}, ptr [[TYPEADDR:%[^,]+]]
+-// CK4-DAG: [[BYTESIZE:%.+]] = load i64, ptr [[SIZEADDR]]
++// CK4: define {{.*}}void [[MPRFUNC:@[.]omp_mapper[.].*C[.]id]](ptr noundef [[HANDLE:%.+]], ptr noundef [[BPTR:%.+]], ptr noundef [[BEGIN:%.+]], i64 noundef [[BYTESIZE:%.+]], i64 noundef [[TYPE:%.+]], ptr{{.*}})
+ // CK4-64-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 16
+ // CK4-32-DAG: [[SIZE:%.+]] = udiv exact i64 [[BYTESIZE]], 8
+-// CK4-DAG: [[TYPE:%.+]] = load i64, ptr [[TYPEADDR]]
+-// CK4-DAG: [[HANDLE:%.+]] = load ptr, ptr [[HANDLEADDR]]
+-// CK4-DAG: [[BPTR:%.+]] = load ptr, ptr [[BPTRADDR]]
+-// CK4-DAG: [[BEGIN:%.+]] = load ptr, ptr [[VPTRADDR]]
+ // CK4-DAG: [[PTREND:%.+]] = getelementptr %class.C, ptr [[BEGIN]], i64 [[SIZE]]
+ // CK4-DAG: [[ISARRAY:%.+]] = icmp sgt i64 [[SIZE]], 1
+ // CK4-DAG: [[PTRSNE:%.+]] = icmp ne ptr [[BPTR]], [[BEGIN]]
+diff --git a/clang/test/OpenMP/target_map_names.cpp b/clang/test/OpenMP/target_map_names.cpp
+index c1c2015609fb7..3ee28d3ce5ce9 100644
+--- a/clang/test/OpenMP/target_map_names.cpp
++++ b/clang/test/OpenMP/target_map_names.cpp
+@@ -201,9 +201,7 @@ void secondMapNameInClause() {
+ // DEBUG: store ptr @[[NAME:.offload_mapnames.[0-9]+]], ptr %[[ARG:.+]]
+ // CHECK-NOT: store ptr @[[NAME:.offload_mapnames.[0-9]+]], ptr %[[ARG:.+]]
+ 
+-// DEBUG: void @.omp_mapper._ZTS2S3.id(ptr {{.*}}, ptr {{.*}}, ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr noundef [[NAME_ARG:%.+]])
+-// DEBUG: store ptr [[NAME_ARG]], ptr [[NAME_STACK:%.+]]
+-// DEBUG: [[MAPPER_NAME:%.+]] = load ptr, ptr [[NAME_STACK]]
++// DEBUG: void @.omp_mapper._ZTS2S3.id(ptr {{.*}}, ptr {{.*}}, ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr noundef [[MAPPER_NAME:%.+]])
+ // DEBUG: call void @__tgt_push_mapper_component(ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}}, i64 %{{.*}}, i64 %{{.*}}, ptr [[MAPPER_NAME]])
+ 
+ #endif
+diff --git a/clang/test/OpenMP/target_map_names_attr.cpp b/clang/test/OpenMP/target_map_names_attr.cpp
+index cb108474b3561..e6b0e1beb5bd5 100644
+--- a/clang/test/OpenMP/target_map_names_attr.cpp
++++ b/clang/test/OpenMP/target_map_names_attr.cpp
+@@ -186,9 +186,7 @@ void secondMapNameInClause() {
+ // DEBUG: store ptr @[[NAME:.offload_mapnames.[0-9]+]], ptr %[[ARG:.+]]
+ // CHECK-NOT: store ptr @[[NAME:.offload_mapnames.[0-9]+]], ptr %[[ARG:.+]]
+ 
+-// DEBUG: void @.omp_mapper._ZTS2S3.id(ptr {{.*}}, ptr {{.*}}, ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr noundef [[NAME_ARG:%.+]])
+-// DEBUG: store ptr [[NAME_ARG]], ptr [[NAME_STACK:%.+]]
+-// DEBUG: [[MAPPER_NAME:%.+]] = load ptr, ptr [[NAME_STACK]]
++// DEBUG: void @.omp_mapper._ZTS2S3.id(ptr {{.*}}, ptr {{.*}}, ptr {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr noundef [[MAPPER_NAME:%.+]])
+ // DEBUG: call void @__tgt_push_mapper_component(ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}}, i64 %{{.*}}, i64 %{{.*}}, ptr [[MAPPER_NAME]])
+ 
+ #endif
+diff --git a/clang/test/OpenMP/target_map_nest_defalut_mapper_codegen.cpp b/clang/test/OpenMP/target_map_nest_defalut_mapper_codegen.cpp
+index 775f0b296b1b6..0fc6de0e4279a 100644
+--- a/clang/test/OpenMP/target_map_nest_defalut_mapper_codegen.cpp
++++ b/clang/test/OpenMP/target_map_nest_defalut_mapper_codegen.cpp
+@@ -109,30 +109,12 @@ void foo() {
+ // CHECK-LABEL: define {{[^@]+}}@.omp_mapper._ZTS1D.default
+ // CHECK-SAME: (ptr noundef [[TMP0:%.*]], ptr noundef [[TMP1:%.*]], ptr noundef [[TMP2:%.*]], i64 noundef [[TMP3:%.*]], i64 noundef [[TMP4:%.*]], ptr noundef [[TMP5:%.*]]) #[[ATTR2:[0-9]+]] {
+ // CHECK-NEXT:  entry:
+-// CHECK-NEXT:    [[DOTADDR:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR1:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR2:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR3:%.*]] = alloca i64, align 8
+-// CHECK-NEXT:    [[DOTADDR4:%.*]] = alloca i64, align 8
+-// CHECK-NEXT:    [[DOTADDR5:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    store ptr [[TMP0]], ptr [[DOTADDR]], align 8
+-// CHECK-NEXT:    store ptr [[TMP1]], ptr [[DOTADDR1]], align 8
+-// CHECK-NEXT:    store ptr [[TMP2]], ptr [[DOTADDR2]], align 8
+-// CHECK-NEXT:    store i64 [[TMP3]], ptr [[DOTADDR3]], align 8
+-// CHECK-NEXT:    store i64 [[TMP4]], ptr [[DOTADDR4]], align 8
+-// CHECK-NEXT:    store ptr [[TMP5]], ptr [[DOTADDR5]], align 8
+-// CHECK-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTADDR3]], align 8
+-// CHECK-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[DOTADDR]], align 8
+-// CHECK-NEXT:    [[TMP8:%.*]] = load ptr, ptr [[DOTADDR1]], align 8
+-// CHECK-NEXT:    [[TMP9:%.*]] = load ptr, ptr [[DOTADDR2]], align 8
+-// CHECK-NEXT:    [[TMP10:%.*]] = udiv exact i64 [[TMP6]], 12
+-// CHECK-NEXT:    [[TMP11:%.*]] = getelementptr [[STRUCT_D:%.*]], ptr [[TMP9]], i64 [[TMP10]]
+-// CHECK-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTADDR4]], align 8
+-// CHECK-NEXT:    [[TMP13:%.*]] = load ptr, ptr [[DOTADDR5]], align 8
++// CHECK-NEXT:    [[TMP10:%.*]] = udiv exact i64 [[TMP3]], 12
++// CHECK-NEXT:    [[TMP11:%.*]] = getelementptr [[STRUCT_D:%.*]], ptr [[TMP2]], i64 [[TMP10]]
+ // CHECK-NEXT:    [[OMP_ARRAYINIT_ISARRAY:%.*]] = icmp sgt i64 [[TMP10]], 1
+-// CHECK-NEXT:    [[TMP14:%.*]] = and i64 [[TMP12]], 8
+-// CHECK-NEXT:    [[TMP15:%.*]] = icmp ne ptr [[TMP8]], [[TMP9]]
+-// CHECK-NEXT:    [[TMP16:%.*]] = and i64 [[TMP12]], 16
++// CHECK-NEXT:    [[TMP14:%.*]] = and i64 [[TMP4]], 8
++// CHECK-NEXT:    [[TMP15:%.*]] = icmp ne ptr [[TMP1]], [[TMP2]]
++// CHECK-NEXT:    [[TMP16:%.*]] = and i64 [[TMP4]], 16
+ // CHECK-NEXT:    [[TMP17:%.*]] = icmp ne i64 [[TMP16]], 0
+ // CHECK-NEXT:    [[TMP18:%.*]] = and i1 [[TMP15]], [[TMP17]]
+ // CHECK-NEXT:    [[TMP19:%.*]] = or i1 [[OMP_ARRAYINIT_ISARRAY]], [[TMP18]]
+@@ -141,15 +123,15 @@ void foo() {
+ // CHECK-NEXT:    br i1 [[TMP20]], label [[DOTOMP_ARRAY__INIT:%.*]], label [[OMP_ARRAYMAP_HEAD:%.*]]
+ // CHECK:       .omp.array..init:
+ // CHECK-NEXT:    [[TMP21:%.*]] = mul nuw i64 [[TMP10]], 12
+-// CHECK-NEXT:    [[TMP22:%.*]] = and i64 [[TMP12]], -4
++// CHECK-NEXT:    [[TMP22:%.*]] = and i64 [[TMP4]], -4
+ // CHECK-NEXT:    [[TMP23:%.*]] = or i64 [[TMP22]], 512
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[TMP8]], ptr [[TMP9]], i64 [[TMP21]], i64 [[TMP23]], ptr [[TMP13]])
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[TMP1]], ptr [[TMP2]], i64 [[TMP21]], i64 [[TMP23]], ptr [[TMP5]])
+ // CHECK-NEXT:    br label [[OMP_ARRAYMAP_HEAD]]
+ // CHECK:       omp.arraymap.head:
+-// CHECK-NEXT:    [[OMP_ARRAYMAP_ISEMPTY:%.*]] = icmp eq ptr [[TMP9]], [[TMP11]]
++// CHECK-NEXT:    [[OMP_ARRAYMAP_ISEMPTY:%.*]] = icmp eq ptr [[TMP2]], [[TMP11]]
+ // CHECK-NEXT:    br i1 [[OMP_ARRAYMAP_ISEMPTY]], label [[OMP_DONE:%.*]], label [[OMP_ARRAYMAP_BODY:%.*]]
+ // CHECK:       omp.arraymap.body:
+-// CHECK-NEXT:    [[OMP_ARRAYMAP_PTRCURRENT:%.*]] = phi ptr [ [[TMP9]], [[OMP_ARRAYMAP_HEAD]] ], [ [[OMP_ARRAYMAP_NEXT:%.*]], [[OMP_TYPE_END25:%.*]] ]
++// CHECK-NEXT:    [[OMP_ARRAYMAP_PTRCURRENT:%.*]] = phi ptr [ [[TMP2]], [[OMP_ARRAYMAP_HEAD]] ], [ [[OMP_ARRAYMAP_NEXT:%.*]], [[OMP_TYPE_END25:%.*]] ]
+ // CHECK-NEXT:    [[E:%.*]] = getelementptr inbounds nuw [[STRUCT_D]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 0, i32 0
+ // CHECK-NEXT:    [[F:%.*]] = getelementptr inbounds nuw [[STRUCT_D]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 0, i32 1
+ // CHECK-NEXT:    [[H:%.*]] = getelementptr inbounds nuw [[STRUCT_D]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 0, i32 2
+@@ -158,10 +140,10 @@ void foo() {
+ // CHECK-NEXT:    [[TMP26:%.*]] = ptrtoint ptr [[E]] to i64
+ // CHECK-NEXT:    [[TMP27:%.*]] = sub i64 [[TMP25]], [[TMP26]]
+ // CHECK-NEXT:    [[TMP28:%.*]] = sdiv exact i64 [[TMP27]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
+-// CHECK-NEXT:    [[TMP29:%.*]] = call i64 @__tgt_mapper_num_components(ptr [[TMP7]])
++// CHECK-NEXT:    [[TMP29:%.*]] = call i64 @__tgt_mapper_num_components(ptr [[TMP0]])
+ // CHECK-NEXT:    [[TMP30:%.*]] = shl i64 [[TMP29]], 48
+ // CHECK-NEXT:    [[TMP31:%.*]] = add nuw i64 0, [[TMP30]]
+-// CHECK-NEXT:    [[TMP32:%.*]] = and i64 [[TMP12]], 3
++// CHECK-NEXT:    [[TMP32:%.*]] = and i64 [[TMP4]], 3
+ // CHECK-NEXT:    [[TMP33:%.*]] = icmp eq i64 [[TMP32]], 0
+ // CHECK-NEXT:    br i1 [[TMP33]], label [[OMP_TYPE_ALLOC:%.*]], label [[OMP_TYPE_ALLOC_ELSE:%.*]]
+ // CHECK:       omp.type.alloc:
+@@ -181,87 +163,87 @@ void foo() {
+ // CHECK-NEXT:    br label [[OMP_TYPE_END]]
+ // CHECK:       omp.type.end:
+ // CHECK-NEXT:    [[OMP_MAPTYPE:%.*]] = phi i64 [ [[TMP34]], [[OMP_TYPE_ALLOC]] ], [ [[TMP36]], [[OMP_TYPE_TO]] ], [ [[TMP38]], [[OMP_TYPE_FROM]] ], [ [[TMP31]], [[OMP_TYPE_TO_ELSE]] ]
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[E]], i64 [[TMP28]], i64 [[OMP_MAPTYPE]], ptr null)
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[E]], i64 [[TMP28]], i64 [[OMP_MAPTYPE]], ptr null)
+ // CHECK-NEXT:    [[TMP39:%.*]] = add nuw i64 281474976711171, [[TMP30]]
+-// CHECK-NEXT:    [[TMP40:%.*]] = and i64 [[TMP12]], 3
++// CHECK-NEXT:    [[TMP40:%.*]] = and i64 [[TMP4]], 3
+ // CHECK-NEXT:    [[TMP41:%.*]] = icmp eq i64 [[TMP40]], 0
+ // CHECK-NEXT:    br i1 [[TMP41]], label [[OMP_TYPE_ALLOC6:%.*]], label [[OMP_TYPE_ALLOC_ELSE7:%.*]]
+-// CHECK:       omp.type.alloc6:
++// CHECK:       omp.type.alloc1:
+ // CHECK-NEXT:    [[TMP42:%.*]] = and i64 [[TMP39]], -4
+ // CHECK-NEXT:    br label [[OMP_TYPE_END11:%.*]]
+-// CHECK:       omp.type.alloc.else7:
++// CHECK:       omp.type.alloc.else2:
+ // CHECK-NEXT:    [[TMP43:%.*]] = icmp eq i64 [[TMP40]], 1
+ // CHECK-NEXT:    br i1 [[TMP43]], label [[OMP_TYPE_TO8:%.*]], label [[OMP_TYPE_TO_ELSE9:%.*]]
+-// CHECK:       omp.type.to8:
++// CHECK:       omp.type.to3:
+ // CHECK-NEXT:    [[TMP44:%.*]] = and i64 [[TMP39]], -3
+ // CHECK-NEXT:    br label [[OMP_TYPE_END11]]
+-// CHECK:       omp.type.to.else9:
++// CHECK:       omp.type.to.else4:
+ // CHECK-NEXT:    [[TMP45:%.*]] = icmp eq i64 [[TMP40]], 2
+ // CHECK-NEXT:    br i1 [[TMP45]], label [[OMP_TYPE_FROM10:%.*]], label [[OMP_TYPE_END11]]
+-// CHECK:       omp.type.from10:
++// CHECK:       omp.type.from5:
+ // CHECK-NEXT:    [[TMP46:%.*]] = and i64 [[TMP39]], -2
+ // CHECK-NEXT:    br label [[OMP_TYPE_END11]]
+-// CHECK:       omp.type.end11:
++// CHECK:       omp.type.end6:
+ // CHECK-NEXT:    [[OMP_MAPTYPE12:%.*]] = phi i64 [ [[TMP42]], [[OMP_TYPE_ALLOC6]] ], [ [[TMP44]], [[OMP_TYPE_TO8]] ], [ [[TMP46]], [[OMP_TYPE_FROM10]] ], [ [[TMP39]], [[OMP_TYPE_TO_ELSE9]] ]
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[E]], i64 4, i64 [[OMP_MAPTYPE12]], ptr null)
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[E]], i64 4, i64 [[OMP_MAPTYPE12]], ptr null)
+ // CHECK-NEXT:    [[TMP47:%.*]] = add nuw i64 281474976711171, [[TMP30]]
+-// CHECK-NEXT:    [[TMP48:%.*]] = and i64 [[TMP12]], 3
++// CHECK-NEXT:    [[TMP48:%.*]] = and i64 [[TMP4]], 3
+ // CHECK-NEXT:    [[TMP49:%.*]] = icmp eq i64 [[TMP48]], 0
+ // CHECK-NEXT:    br i1 [[TMP49]], label [[OMP_TYPE_ALLOC13:%.*]], label [[OMP_TYPE_ALLOC_ELSE14:%.*]]
+-// CHECK:       omp.type.alloc13:
++// CHECK:       omp.type.alloc8:
+ // CHECK-NEXT:    [[TMP50:%.*]] = and i64 [[TMP47]], -4
+ // CHECK-NEXT:    br label [[OMP_TYPE_END18:%.*]]
+-// CHECK:       omp.type.alloc.else14:
++// CHECK:       omp.type.alloc.else9:
+ // CHECK-NEXT:    [[TMP51:%.*]] = icmp eq i64 [[TMP48]], 1
+ // CHECK-NEXT:    br i1 [[TMP51]], label [[OMP_TYPE_TO15:%.*]], label [[OMP_TYPE_TO_ELSE16:%.*]]
+-// CHECK:       omp.type.to15:
++// CHECK:       omp.type.to10:
+ // CHECK-NEXT:    [[TMP52:%.*]] = and i64 [[TMP47]], -3
+ // CHECK-NEXT:    br label [[OMP_TYPE_END18]]
+-// CHECK:       omp.type.to.else16:
++// CHECK:       omp.type.to.else11:
+ // CHECK-NEXT:    [[TMP53:%.*]] = icmp eq i64 [[TMP48]], 2
+ // CHECK-NEXT:    br i1 [[TMP53]], label [[OMP_TYPE_FROM17:%.*]], label [[OMP_TYPE_END18]]
+-// CHECK:       omp.type.from17:
++// CHECK:       omp.type.from12:
+ // CHECK-NEXT:    [[TMP54:%.*]] = and i64 [[TMP47]], -2
+ // CHECK-NEXT:    br label [[OMP_TYPE_END18]]
+-// CHECK:       omp.type.end18:
++// CHECK:       omp.type.end13:
+ // CHECK-NEXT:    [[OMP_MAPTYPE19:%.*]] = phi i64 [ [[TMP50]], [[OMP_TYPE_ALLOC13]] ], [ [[TMP52]], [[OMP_TYPE_TO15]] ], [ [[TMP54]], [[OMP_TYPE_FROM17]] ], [ [[TMP47]], [[OMP_TYPE_TO_ELSE16]] ]
+-// CHECK-NEXT:    call void @.omp_mapper._ZTS1C.default(ptr [[TMP7]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[F]], i64 4, i64 [[OMP_MAPTYPE19]], ptr null) #[[ATTR3]]
++// CHECK-NEXT:    call void @.omp_mapper._ZTS1C.default(ptr [[TMP0]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[F]], i64 4, i64 [[OMP_MAPTYPE19]], ptr null) #[[ATTR3]]
+ // CHECK-NEXT:    [[TMP55:%.*]] = add nuw i64 281474976711171, [[TMP30]]
+-// CHECK-NEXT:    [[TMP56:%.*]] = and i64 [[TMP12]], 3
++// CHECK-NEXT:    [[TMP56:%.*]] = and i64 [[TMP4]], 3
+ // CHECK-NEXT:    [[TMP57:%.*]] = icmp eq i64 [[TMP56]], 0
+ // CHECK-NEXT:    br i1 [[TMP57]], label [[OMP_TYPE_ALLOC20:%.*]], label [[OMP_TYPE_ALLOC_ELSE21:%.*]]
+-// CHECK:       omp.type.alloc20:
++// CHECK:       omp.type.alloc15:
+ // CHECK-NEXT:    [[TMP58:%.*]] = and i64 [[TMP55]], -4
+ // CHECK-NEXT:    br label [[OMP_TYPE_END25]]
+-// CHECK:       omp.type.alloc.else21:
++// CHECK:       omp.type.alloc.else16:
+ // CHECK-NEXT:    [[TMP59:%.*]] = icmp eq i64 [[TMP56]], 1
+ // CHECK-NEXT:    br i1 [[TMP59]], label [[OMP_TYPE_TO22:%.*]], label [[OMP_TYPE_TO_ELSE23:%.*]]
+-// CHECK:       omp.type.to22:
++// CHECK:       omp.type.to17:
+ // CHECK-NEXT:    [[TMP60:%.*]] = and i64 [[TMP55]], -3
+ // CHECK-NEXT:    br label [[OMP_TYPE_END25]]
+-// CHECK:       omp.type.to.else23:
++// CHECK:       omp.type.to.else18:
+ // CHECK-NEXT:    [[TMP61:%.*]] = icmp eq i64 [[TMP56]], 2
+ // CHECK-NEXT:    br i1 [[TMP61]], label [[OMP_TYPE_FROM24:%.*]], label [[OMP_TYPE_END25]]
+-// CHECK:       omp.type.from24:
++// CHECK:       omp.type.from19:
+ // CHECK-NEXT:    [[TMP62:%.*]] = and i64 [[TMP55]], -2
+ // CHECK-NEXT:    br label [[OMP_TYPE_END25]]
+-// CHECK:       omp.type.end25:
++// CHECK:       omp.type.end20:
+ // CHECK-NEXT:    [[OMP_MAPTYPE26:%.*]] = phi i64 [ [[TMP58]], [[OMP_TYPE_ALLOC20]] ], [ [[TMP60]], [[OMP_TYPE_TO22]] ], [ [[TMP62]], [[OMP_TYPE_FROM24]] ], [ [[TMP55]], [[OMP_TYPE_TO_ELSE23]] ]
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[H]], i64 4, i64 [[OMP_MAPTYPE26]], ptr null)
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[H]], i64 4, i64 [[OMP_MAPTYPE26]], ptr null)
+ // CHECK-NEXT:    [[OMP_ARRAYMAP_NEXT]] = getelementptr [[STRUCT_D]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 1
+ // CHECK-NEXT:    [[OMP_ARRAYMAP_ISDONE:%.*]] = icmp eq ptr [[OMP_ARRAYMAP_NEXT]], [[TMP11]]
+ // CHECK-NEXT:    br i1 [[OMP_ARRAYMAP_ISDONE]], label [[OMP_ARRAYMAP_EXIT:%.*]], label [[OMP_ARRAYMAP_BODY]]
+ // CHECK:       omp.arraymap.exit:
+ // CHECK-NEXT:    [[OMP_ARRAYINIT_ISARRAY27:%.*]] = icmp sgt i64 [[TMP10]], 1
+-// CHECK-NEXT:    [[TMP63:%.*]] = and i64 [[TMP12]], 8
++// CHECK-NEXT:    [[TMP63:%.*]] = and i64 [[TMP4]], 8
+ // CHECK-NEXT:    [[DOTOMP_ARRAY__DEL__DELETE:%.*]] = icmp ne i64 [[TMP63]], 0
+ // CHECK-NEXT:    [[TMP64:%.*]] = and i1 [[OMP_ARRAYINIT_ISARRAY27]], [[DOTOMP_ARRAY__DEL__DELETE]]
+ // CHECK-NEXT:    br i1 [[TMP64]], label [[DOTOMP_ARRAY__DEL:%.*]], label [[OMP_DONE]]
+ // CHECK:       .omp.array..del:
+ // CHECK-NEXT:    [[TMP65:%.*]] = mul nuw i64 [[TMP10]], 12
+-// CHECK-NEXT:    [[TMP66:%.*]] = and i64 [[TMP12]], -4
++// CHECK-NEXT:    [[TMP66:%.*]] = and i64 [[TMP4]], -4
+ // CHECK-NEXT:    [[TMP67:%.*]] = or i64 [[TMP66]], 512
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[TMP8]], ptr [[TMP9]], i64 [[TMP65]], i64 [[TMP67]], ptr [[TMP13]])
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[TMP1]], ptr [[TMP2]], i64 [[TMP65]], i64 [[TMP67]], ptr [[TMP5]])
+ // CHECK-NEXT:    br label [[OMP_DONE]]
+ // CHECK:       omp.done:
+ // CHECK-NEXT:    ret void
+@@ -270,30 +252,12 @@ void foo() {
+ // CHECK-LABEL: define {{[^@]+}}@.omp_mapper._ZTS1C.default
+ // CHECK-SAME: (ptr noundef [[TMP0:%.*]], ptr noundef [[TMP1:%.*]], ptr noundef [[TMP2:%.*]], i64 noundef [[TMP3:%.*]], i64 noundef [[TMP4:%.*]], ptr noundef [[TMP5:%.*]]) #[[ATTR2]] {
+ // CHECK-NEXT:  entry:
+-// CHECK-NEXT:    [[DOTADDR:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR1:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR2:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    [[DOTADDR3:%.*]] = alloca i64, align 8
+-// CHECK-NEXT:    [[DOTADDR4:%.*]] = alloca i64, align 8
+-// CHECK-NEXT:    [[DOTADDR5:%.*]] = alloca ptr, align 8
+-// CHECK-NEXT:    store ptr [[TMP0]], ptr [[DOTADDR]], align 8
+-// CHECK-NEXT:    store ptr [[TMP1]], ptr [[DOTADDR1]], align 8
+-// CHECK-NEXT:    store ptr [[TMP2]], ptr [[DOTADDR2]], align 8
+-// CHECK-NEXT:    store i64 [[TMP3]], ptr [[DOTADDR3]], align 8
+-// CHECK-NEXT:    store i64 [[TMP4]], ptr [[DOTADDR4]], align 8
+-// CHECK-NEXT:    store ptr [[TMP5]], ptr [[DOTADDR5]], align 8
+-// CHECK-NEXT:    [[TMP6:%.*]] = load i64, ptr [[DOTADDR3]], align 8
+-// CHECK-NEXT:    [[TMP7:%.*]] = load ptr, ptr [[DOTADDR]], align 8
+-// CHECK-NEXT:    [[TMP8:%.*]] = load ptr, ptr [[DOTADDR1]], align 8
+-// CHECK-NEXT:    [[TMP9:%.*]] = load ptr, ptr [[DOTADDR2]], align 8
+-// CHECK-NEXT:    [[TMP10:%.*]] = udiv exact i64 [[TMP6]], 4
+-// CHECK-NEXT:    [[TMP11:%.*]] = getelementptr [[STRUCT_C:%.*]], ptr [[TMP9]], i64 [[TMP10]]
+-// CHECK-NEXT:    [[TMP12:%.*]] = load i64, ptr [[DOTADDR4]], align 8
+-// CHECK-NEXT:    [[TMP13:%.*]] = load ptr, ptr [[DOTADDR5]], align 8
++// CHECK-NEXT:    [[TMP10:%.*]] = udiv exact i64 [[TMP3]], 4
++// CHECK-NEXT:    [[TMP11:%.*]] = getelementptr [[STRUCT_C:%.*]], ptr [[TMP2]], i64 [[TMP10]]
+ // CHECK-NEXT:    [[OMP_ARRAYINIT_ISARRAY:%.*]] = icmp sgt i64 [[TMP10]], 1
+-// CHECK-NEXT:    [[TMP14:%.*]] = and i64 [[TMP12]], 8
+-// CHECK-NEXT:    [[TMP15:%.*]] = icmp ne ptr [[TMP8]], [[TMP9]]
+-// CHECK-NEXT:    [[TMP16:%.*]] = and i64 [[TMP12]], 16
++// CHECK-NEXT:    [[TMP14:%.*]] = and i64 [[TMP4]], 8
++// CHECK-NEXT:    [[TMP15:%.*]] = icmp ne ptr [[TMP1]], [[TMP2]]
++// CHECK-NEXT:    [[TMP16:%.*]] = and i64 [[TMP4]], 16
+ // CHECK-NEXT:    [[TMP17:%.*]] = icmp ne i64 [[TMP16]], 0
+ // CHECK-NEXT:    [[TMP18:%.*]] = and i1 [[TMP15]], [[TMP17]]
+ // CHECK-NEXT:    [[TMP19:%.*]] = or i1 [[OMP_ARRAYINIT_ISARRAY]], [[TMP18]]
+@@ -302,20 +266,20 @@ void foo() {
+ // CHECK-NEXT:    br i1 [[TMP20]], label [[DOTOMP_ARRAY__INIT:%.*]], label [[OMP_ARRAYMAP_HEAD:%.*]]
+ // CHECK:       .omp.array..init:
+ // CHECK-NEXT:    [[TMP21:%.*]] = mul nuw i64 [[TMP10]], 4
+-// CHECK-NEXT:    [[TMP22:%.*]] = and i64 [[TMP12]], -4
++// CHECK-NEXT:    [[TMP22:%.*]] = and i64 [[TMP4]], -4
+ // CHECK-NEXT:    [[TMP23:%.*]] = or i64 [[TMP22]], 512
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[TMP8]], ptr [[TMP9]], i64 [[TMP21]], i64 [[TMP23]], ptr [[TMP13]])
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[TMP1]], ptr [[TMP2]], i64 [[TMP21]], i64 [[TMP23]], ptr [[TMP5]])
+ // CHECK-NEXT:    br label [[OMP_ARRAYMAP_HEAD]]
+ // CHECK:       omp.arraymap.head:
+-// CHECK-NEXT:    [[OMP_ARRAYMAP_ISEMPTY:%.*]] = icmp eq ptr [[TMP9]], [[TMP11]]
++// CHECK-NEXT:    [[OMP_ARRAYMAP_ISEMPTY:%.*]] = icmp eq ptr [[TMP2]], [[TMP11]]
+ // CHECK-NEXT:    br i1 [[OMP_ARRAYMAP_ISEMPTY]], label [[OMP_DONE:%.*]], label [[OMP_ARRAYMAP_BODY:%.*]]
+ // CHECK:       omp.arraymap.body:
+-// CHECK-NEXT:    [[OMP_ARRAYMAP_PTRCURRENT:%.*]] = phi ptr [ [[TMP9]], [[OMP_ARRAYMAP_HEAD]] ], [ [[OMP_ARRAYMAP_NEXT:%.*]], [[OMP_TYPE_END:%.*]] ]
++// CHECK-NEXT:    [[OMP_ARRAYMAP_PTRCURRENT:%.*]] = phi ptr [ [[TMP2]], [[OMP_ARRAYMAP_HEAD]] ], [ [[OMP_ARRAYMAP_NEXT:%.*]], [[OMP_TYPE_END:%.*]] ]
+ // CHECK-NEXT:    [[A:%.*]] = getelementptr inbounds nuw [[STRUCT_C]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 0, i32 0
+-// CHECK-NEXT:    [[TMP24:%.*]] = call i64 @__tgt_mapper_num_components(ptr [[TMP7]])
++// CHECK-NEXT:    [[TMP24:%.*]] = call i64 @__tgt_mapper_num_components(ptr [[TMP0]])
+ // CHECK-NEXT:    [[TMP25:%.*]] = shl i64 [[TMP24]], 48
+ // CHECK-NEXT:    [[TMP26:%.*]] = add nuw i64 1, [[TMP25]]
+-// CHECK-NEXT:    [[TMP27:%.*]] = and i64 [[TMP12]], 3
++// CHECK-NEXT:    [[TMP27:%.*]] = and i64 [[TMP4]], 3
+ // CHECK-NEXT:    [[TMP28:%.*]] = icmp eq i64 [[TMP27]], 0
+ // CHECK-NEXT:    br i1 [[TMP28]], label [[OMP_TYPE_ALLOC:%.*]], label [[OMP_TYPE_ALLOC_ELSE:%.*]]
+ // CHECK:       omp.type.alloc:
+@@ -335,21 +299,21 @@ void foo() {
+ // CHECK-NEXT:    br label [[OMP_TYPE_END]]
+ // CHECK:       omp.type.end:
+ // CHECK-NEXT:    [[OMP_MAPTYPE:%.*]] = phi i64 [ [[TMP29]], [[OMP_TYPE_ALLOC]] ], [ [[TMP31]], [[OMP_TYPE_TO]] ], [ [[TMP33]], [[OMP_TYPE_FROM]] ], [ [[TMP26]], [[OMP_TYPE_TO_ELSE]] ]
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[A]], i64 4, i64 [[OMP_MAPTYPE]], ptr null)
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], ptr [[A]], i64 4, i64 [[OMP_MAPTYPE]], ptr null)
+ // CHECK-NEXT:    [[OMP_ARRAYMAP_NEXT]] = getelementptr [[STRUCT_C]], ptr [[OMP_ARRAYMAP_PTRCURRENT]], i32 1
+ // CHECK-NEXT:    [[OMP_ARRAYMAP_ISDONE:%.*]] = icmp eq ptr [[OMP_ARRAYMAP_NEXT]], [[TMP11]]
+ // CHECK-NEXT:    br i1 [[OMP_ARRAYMAP_ISDONE]], label [[OMP_ARRAYMAP_EXIT:%.*]], label [[OMP_ARRAYMAP_BODY]]
+ // CHECK:       omp.arraymap.exit:
+ // CHECK-NEXT:    [[OMP_ARRAYINIT_ISARRAY6:%.*]] = icmp sgt i64 [[TMP10]], 1
+-// CHECK-NEXT:    [[TMP34:%.*]] = and i64 [[TMP12]], 8
++// CHECK-NEXT:    [[TMP34:%.*]] = and i64 [[TMP4]], 8
+ // CHECK-NEXT:    [[DOTOMP_ARRAY__DEL__DELETE:%.*]] = icmp ne i64 [[TMP34]], 0
+ // CHECK-NEXT:    [[TMP35:%.*]] = and i1 [[OMP_ARRAYINIT_ISARRAY6]], [[DOTOMP_ARRAY__DEL__DELETE]]
+ // CHECK-NEXT:    br i1 [[TMP35]], label [[DOTOMP_ARRAY__DEL:%.*]], label [[OMP_DONE]]
+ // CHECK:       .omp.array..del:
+ // CHECK-NEXT:    [[TMP36:%.*]] = mul nuw i64 [[TMP10]], 4
+-// CHECK-NEXT:    [[TMP37:%.*]] = and i64 [[TMP12]], -4
++// CHECK-NEXT:    [[TMP37:%.*]] = and i64 [[TMP4]], -4
+ // CHECK-NEXT:    [[TMP38:%.*]] = or i64 [[TMP37]], 512
+-// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP7]], ptr [[TMP8]], ptr [[TMP9]], i64 [[TMP36]], i64 [[TMP38]], ptr [[TMP13]])
++// CHECK-NEXT:    call void @__tgt_push_mapper_component(ptr [[TMP0]], ptr [[TMP1]], ptr [[TMP2]], i64 [[TMP36]], i64 [[TMP38]], ptr [[TMP5]])
+ // CHECK-NEXT:    br label [[OMP_DONE]]
+ // CHECK:       omp.done:
+ // CHECK-NEXT:    ret void
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index a97deafa3683c..48941500b403e 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -2855,6 +2855,67 @@ class OpenMPIRBuilder {
+   using GenMapInfoCallbackTy =
+       function_ref<MapInfosTy &(InsertPointTy CodeGenIP)>;
+ 
++private:
++  /// Emit the array initialization or deletion portion for user-defined mapper
++  /// code generation. First, it evaluates whether an array section is mapped
++  /// and whether the \a MapType instructs to delete this section. If \a IsInit
++  /// is true, and \a MapType indicates to not delete this array, array
++  /// initialization code is generated. If \a IsInit is false, and \a MapType
++  /// indicates to delete this array, array deletion code is generated.
++  void emitUDMapperArrayInitOrDel(Function *MapperFn, llvm::Value *MapperHandle,
++                                  llvm::Value *Base, llvm::Value *Begin,
++                                  llvm::Value *Size, llvm::Value *MapType,
++                                  llvm::Value *MapName, TypeSize ElementSize,
++                                  llvm::BasicBlock *ExitBB, bool IsInit);
++
++public:
++  /// Emit the user-defined mapper function. The code generation follows the
++  /// pattern in the example below.
++  /// \code
++  /// void .omp_mapper.<type_name>.<mapper_id>.(void *rt_mapper_handle,
++  ///                                           void *base, void *begin,
++  ///                                           int64_t size, int64_t type,
++  ///                                           void *name = nullptr) {
++  ///   // Allocate space for an array section first or add a base/begin for
++  ///   // pointer dereference.
++  ///   if ((size > 1 || (base != begin && maptype.IsPtrAndObj)) &&
++  ///       !maptype.IsDelete)
++  ///     __tgt_push_mapper_component(rt_mapper_handle, base, begin,
++  ///                                 size*sizeof(Ty), clearToFromMember(type));
++  ///   // Map members.
++  ///   for (unsigned i = 0; i < size; i++) {
++  ///     // For each component specified by this mapper:
++  ///     for (auto c : begin[i]->all_components) {
++  ///       if (c.hasMapper())
++  ///         (*c.Mapper())(rt_mapper_handle, c.arg_base, c.arg_begin,
++  ///         c.arg_size,
++  ///                       c.arg_type, c.arg_name);
++  ///       else
++  ///         __tgt_push_mapper_component(rt_mapper_handle, c.arg_base,
++  ///                                     c.arg_begin, c.arg_size, c.arg_type,
++  ///                                     c.arg_name);
++  ///     }
++  ///   }
++  ///   // Delete the array section.
++  ///   if (size > 1 && maptype.IsDelete)
++  ///     __tgt_push_mapper_component(rt_mapper_handle, base, begin,
++  ///                                 size*sizeof(Ty), clearToFromMember(type));
++  /// }
++  /// \endcode
++  ///
++  /// \param PrivAndGenMapInfoCB Callback that privatizes code and populates the
++  /// MapInfos and returns.
++  /// \param ElemTy DeclareMapper element type.
++  /// \param FuncName Optional param to specify mapper function name.
++  /// \param CustomMapperCB Optional callback to generate code related to
++  /// custom mappers.
++  Function *emitUserDefinedMapper(
++      function_ref<MapInfosTy &(InsertPointTy CodeGenIP, llvm::Value *PtrPHI,
++                                llvm::Value *BeginArg)>
++          PrivAndGenMapInfoCB,
++      llvm::Type *ElemTy, StringRef FuncName = {},
++      function_ref<bool(unsigned int, Function **)> CustomMapperCB = nullptr);
++
+   /// Generator for '#omp target data'
+   ///
+   /// \param Loc The location where the target data construct was encountered.
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 1fae138b449ed..662b46bf8f8e9 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -7705,6 +7705,297 @@ void OpenMPIRBuilder::emitNonContiguousDescriptor(InsertPointTy AllocaIP,
+   }
+ }
+ 
++void OpenMPIRBuilder::emitUDMapperArrayInitOrDel(
++    Function *MapperFn, Value *MapperHandle, Value *Base, Value *Begin,
++    Value *Size, Value *MapType, Value *MapName, TypeSize ElementSize,
++    BasicBlock *ExitBB, bool IsInit) {
++  StringRef Prefix = IsInit ? ".init" : ".del";
++
++  // Evaluate if this is an array section.
++  BasicBlock *BodyBB = BasicBlock::Create(
++      M.getContext(), createPlatformSpecificName({"omp.array", Prefix}));
++  Value *IsArray =
++      Builder.CreateICmpSGT(Size, Builder.getInt64(1), "omp.arrayinit.isarray");
++  Value *DeleteBit = Builder.CreateAnd(
++      MapType,
++      Builder.getInt64(
++          static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++              OpenMPOffloadMappingFlags::OMP_MAP_DELETE)));
++  Value *DeleteCond;
++  Value *Cond;
++  if (IsInit) {
++    // base != begin?
++    Value *BaseIsBegin = Builder.CreateICmpNE(Base, Begin);
++    // IsPtrAndObj?
++    Value *PtrAndObjBit = Builder.CreateAnd(
++        MapType,
++        Builder.getInt64(
++            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_PTR_AND_OBJ)));
++    PtrAndObjBit = Builder.CreateIsNotNull(PtrAndObjBit);
++    BaseIsBegin = Builder.CreateAnd(BaseIsBegin, PtrAndObjBit);
++    Cond = Builder.CreateOr(IsArray, BaseIsBegin);
++    DeleteCond = Builder.CreateIsNull(
++        DeleteBit,
++        createPlatformSpecificName({"omp.array", Prefix, ".delete"}));
++  } else {
++    Cond = IsArray;
++    DeleteCond = Builder.CreateIsNotNull(
++        DeleteBit,
++        createPlatformSpecificName({"omp.array", Prefix, ".delete"}));
++  }
++  Cond = Builder.CreateAnd(Cond, DeleteCond);
++  Builder.CreateCondBr(Cond, BodyBB, ExitBB);
++
++  emitBlock(BodyBB, MapperFn);
++  // Get the array size by multiplying element size and element number (i.e., \p
++  // Size).
++  Value *ArraySize = Builder.CreateNUWMul(Size, Builder.getInt64(ElementSize));
++  // Remove OMP_MAP_TO and OMP_MAP_FROM from the map type, so that it achieves
++  // memory allocation/deletion purpose only.
++  Value *MapTypeArg = Builder.CreateAnd(
++      MapType,
++      Builder.getInt64(
++          ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++              OpenMPOffloadMappingFlags::OMP_MAP_TO |
++              OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
++  MapTypeArg = Builder.CreateOr(
++      MapTypeArg,
++      Builder.getInt64(
++          static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++              OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT)));
++
++  // Call the runtime API __tgt_push_mapper_component to fill up the runtime
++  // data structure.
++  Value *OffloadingArgs[] = {MapperHandle, Base,       Begin,
++                             ArraySize,    MapTypeArg, MapName};
++  Builder.CreateCall(
++      getOrCreateRuntimeFunction(M, OMPRTL___tgt_push_mapper_component),
++      OffloadingArgs);
++}
++
++Function *OpenMPIRBuilder::emitUserDefinedMapper(
++    function_ref<MapInfosTy &(InsertPointTy CodeGenIP, llvm::Value *PtrPHI,
++                              llvm::Value *BeginArg)>
++        GenMapInfoCB,
++    Type *ElemTy, StringRef FuncName,
++    function_ref<bool(unsigned int, Function **)> CustomMapperCB) {
++  SmallVector<Type *> Params;
++  Params.emplace_back(Builder.getPtrTy());
++  Params.emplace_back(Builder.getPtrTy());
++  Params.emplace_back(Builder.getPtrTy());
++  Params.emplace_back(Builder.getInt64Ty());
++  Params.emplace_back(Builder.getInt64Ty());
++  Params.emplace_back(Builder.getPtrTy());
++
++  auto *FnTy =
++      FunctionType::get(Builder.getVoidTy(), Params, /* IsVarArg */ false);
++
++  SmallString<64> TyStr;
++  raw_svector_ostream Out(TyStr);
++  if (FuncName == "")
++    FuncName = StringRef{createPlatformSpecificName({"omp_mapper"})};
++  Function *MapperFn =
++      Function::Create(FnTy, GlobalValue::InternalLinkage, FuncName, M);
++  MapperFn->addFnAttr(Attribute::NoInline);
++  MapperFn->addFnAttr(Attribute::NoUnwind);
++  MapperFn->addParamAttr(0, Attribute::NoUndef);
++  MapperFn->addParamAttr(1, Attribute::NoUndef);
++  MapperFn->addParamAttr(2, Attribute::NoUndef);
++  MapperFn->addParamAttr(3, Attribute::NoUndef);
++  MapperFn->addParamAttr(4, Attribute::NoUndef);
++  MapperFn->addParamAttr(5, Attribute::NoUndef);
++
++  // Start the mapper function code generation.
++  BasicBlock *EntryBB = BasicBlock::Create(M.getContext(), "entry", MapperFn);
++  auto SavedIP = Builder.saveIP();
++  Builder.SetInsertPoint(EntryBB);
++
++  Value *MapperHandle = MapperFn->getArg(0);
++  Value *BaseIn = MapperFn->getArg(1);
++  Value *BeginIn = MapperFn->getArg(2);
++  Value *Size = MapperFn->getArg(3);
++  Value *MapType = MapperFn->getArg(4);
++  Value *MapName = MapperFn->getArg(5);
++
++  // Compute the starting and end addresses of array elements.
++  // Prepare common arguments for array initiation and deletion.
++  // Convert the size in bytes into the number of array elements.
++  TypeSize ElementSize = M.getDataLayout().getTypeStoreSize(ElemTy);
++  Size = Builder.CreateExactUDiv(Size, Builder.getInt64(ElementSize));
++  Value *PtrBegin = Builder.CreateBitCast(BeginIn, Builder.getPtrTy());
++  Value *PtrEnd = Builder.CreateGEP(ElemTy, PtrBegin, Size);
++
++  // Emit array initiation if this is an array section and \p MapType indicates
++  // that memory allocation is required.
++  BasicBlock *HeadBB = BasicBlock::Create(M.getContext(), "omp.arraymap.head");
++  emitUDMapperArrayInitOrDel(MapperFn, MapperHandle, BaseIn, BeginIn, Size,
++                             MapType, MapName, ElementSize, HeadBB,
++                             /*IsInit=*/true);
++
++  // Emit a for loop to iterate through SizeArg of elements and map all of them.
++
++  // Emit the loop header block.
++  emitBlock(HeadBB, MapperFn);
++  BasicBlock *BodyBB = BasicBlock::Create(M.getContext(), "omp.arraymap.body");
++  BasicBlock *DoneBB = BasicBlock::Create(M.getContext(), "omp.done");
++  // Evaluate whether the initial condition is satisfied.
++  Value *IsEmpty =
++      Builder.CreateICmpEQ(PtrBegin, PtrEnd, "omp.arraymap.isempty");
++  Builder.CreateCondBr(IsEmpty, DoneBB, BodyBB);
++
++  // Emit the loop body block.
++  emitBlock(BodyBB, MapperFn);
++  BasicBlock *LastBB = BodyBB;
++  PHINode *PtrPHI =
++      Builder.CreatePHI(PtrBegin->getType(), 2, "omp.arraymap.ptrcurrent");
++  PtrPHI->addIncoming(PtrBegin, HeadBB);
++
++  // Get map clause information. Fill up the arrays with all mapped variables.
++  MapInfosTy &Info = GenMapInfoCB(Builder.saveIP(), PtrPHI, BeginIn);
++
++  // Call the runtime API __tgt_mapper_num_components to get the number of
++  // pre-existing components.
++  Value *OffloadingArgs[] = {MapperHandle};
++  Value *PreviousSize = Builder.CreateCall(
++      getOrCreateRuntimeFunction(M, OMPRTL___tgt_mapper_num_components),
++      OffloadingArgs);
++  Value *ShiftedPreviousSize =
++      Builder.CreateShl(PreviousSize, Builder.getInt64(getFlagMemberOffset()));
++
++  // Fill up the runtime mapper handle for all components.
++  for (unsigned I = 0; I < Info.BasePointers.size(); ++I) {
++    Value *CurBaseArg =
++        Builder.CreateBitCast(Info.BasePointers[I], Builder.getPtrTy());
++    Value *CurBeginArg =
++        Builder.CreateBitCast(Info.Pointers[I], Builder.getPtrTy());
++    Value *CurSizeArg = Info.Sizes[I];
++    Value *CurNameArg = Info.Names.size()
++                            ? Info.Names[I]
++                            : Constant::getNullValue(Builder.getPtrTy());
++
++    // Extract the MEMBER_OF field from the map type.
++    Value *OriMapType = Builder.getInt64(
++        static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++            Info.Types[I]));
++    Value *MemberMapType =
++        Builder.CreateNUWAdd(OriMapType, ShiftedPreviousSize);
++
++    // Combine the map type inherited from user-defined mapper with that
++    // specified in the program. According to the OMP_MAP_TO and OMP_MAP_FROM
++    // bits of the \a MapType, which is the input argument of the mapper
++    // function, the following code will set the OMP_MAP_TO and OMP_MAP_FROM
++    // bits of MemberMapType.
++    // [OpenMP 5.0], 1.2.6. map-type decay.
++    //        | alloc |  to   | from  | tofrom | release | delete
++    // ----------------------------------------------------------
++    // alloc  | alloc | alloc | alloc | alloc  | release | delete
++    // to     | alloc |  to   | alloc |   to   | release | delete
++    // from   | alloc | alloc | from  |  from  | release | delete
++    // tofrom | alloc |  to   | from  | tofrom | release | delete
++    Value *LeftToFrom = Builder.CreateAnd(
++        MapType,
++        Builder.getInt64(
++            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_TO |
++                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
++    BasicBlock *AllocBB = BasicBlock::Create(M.getContext(), "omp.type.alloc");
++    BasicBlock *AllocElseBB =
++        BasicBlock::Create(M.getContext(), "omp.type.alloc.else");
++    BasicBlock *ToBB = BasicBlock::Create(M.getContext(), "omp.type.to");
++    BasicBlock *ToElseBB =
++        BasicBlock::Create(M.getContext(), "omp.type.to.else");
++    BasicBlock *FromBB = BasicBlock::Create(M.getContext(), "omp.type.from");
++    BasicBlock *EndBB = BasicBlock::Create(M.getContext(), "omp.type.end");
++    Value *IsAlloc = Builder.CreateIsNull(LeftToFrom);
++    Builder.CreateCondBr(IsAlloc, AllocBB, AllocElseBB);
++    // In case of alloc, clear OMP_MAP_TO and OMP_MAP_FROM.
++    emitBlock(AllocBB, MapperFn);
++    Value *AllocMapType = Builder.CreateAnd(
++        MemberMapType,
++        Builder.getInt64(
++            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_TO |
++                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
++    Builder.CreateBr(EndBB);
++    emitBlock(AllocElseBB, MapperFn);
++    Value *IsTo = Builder.CreateICmpEQ(
++        LeftToFrom,
++        Builder.getInt64(
++            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_TO)));
++    Builder.CreateCondBr(IsTo, ToBB, ToElseBB);
++    // In case of to, clear OMP_MAP_FROM.
++    emitBlock(ToBB, MapperFn);
++    Value *ToMapType = Builder.CreateAnd(
++        MemberMapType,
++        Builder.getInt64(
++            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
++    Builder.CreateBr(EndBB);
++    emitBlock(ToElseBB, MapperFn);
++    Value *IsFrom = Builder.CreateICmpEQ(
++        LeftToFrom,
++        Builder.getInt64(
++            static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_FROM)));
++    Builder.CreateCondBr(IsFrom, FromBB, EndBB);
++    // In case of from, clear OMP_MAP_TO.
++    emitBlock(FromBB, MapperFn);
++    Value *FromMapType = Builder.CreateAnd(
++        MemberMapType,
++        Builder.getInt64(
++            ~static_cast<std::underlying_type_t<OpenMPOffloadMappingFlags>>(
++                OpenMPOffloadMappingFlags::OMP_MAP_TO)));
++    // In case of tofrom, do nothing.
++    emitBlock(EndBB, MapperFn);
++    LastBB = EndBB;
++    PHINode *CurMapType =
++        Builder.CreatePHI(Builder.getInt64Ty(), 4, "omp.maptype");
++    CurMapType->addIncoming(AllocMapType, AllocBB);
++    CurMapType->addIncoming(ToMapType, ToBB);
++    CurMapType->addIncoming(FromMapType, FromBB);
++    CurMapType->addIncoming(MemberMapType, ToElseBB);
++
++    Value *OffloadingArgs[] = {MapperHandle, CurBaseArg, CurBeginArg,
++                               CurSizeArg,   CurMapType, CurNameArg};
++    Function *ChildMapperFn = nullptr;
++    if (CustomMapperCB && CustomMapperCB(I, &ChildMapperFn)) {
++      // Call the corresponding mapper function.
++      Builder.CreateCall(ChildMapperFn, OffloadingArgs)->setDoesNotThrow();
++    } else {
++      // Call the runtime API __tgt_push_mapper_component to fill up the runtime
++      // data structure.
++      Builder.CreateCall(
++          getOrCreateRuntimeFunction(M, OMPRTL___tgt_push_mapper_component),
++          OffloadingArgs);
++    }
++  }
++
++  // Update the pointer to point to the next element that needs to be mapped,
++  // and check whether we have mapped all elements.
++  Value *PtrNext = Builder.CreateConstGEP1_32(ElemTy, PtrPHI, /*Idx0=*/1,
++                                              "omp.arraymap.next");
++  PtrPHI->addIncoming(PtrNext, LastBB);
++  Value *IsDone = Builder.CreateICmpEQ(PtrNext, PtrEnd, "omp.arraymap.isdone");
++  BasicBlock *ExitBB = BasicBlock::Create(M.getContext(), "omp.arraymap.exit");
++  Builder.CreateCondBr(IsDone, ExitBB, BodyBB);
++
++  emitBlock(ExitBB, MapperFn);
++  // Emit array deletion if this is an array section and \p MapType indicates
++  // that deletion is required.
++  emitUDMapperArrayInitOrDel(MapperFn, MapperHandle, BaseIn, BeginIn, Size,
++                             MapType, MapName, ElementSize, DoneBB,
++                             /*IsInit=*/false);
++
++  // Emit the function exit block.
++  emitBlock(DoneBB, MapperFn, /*IsFinished=*/true);
++
++  Builder.CreateRetVoid();
++  Builder.restoreIP(SavedIP);
++  return MapperFn;
++}
++
+ void OpenMPIRBuilder::emitOffloadingArrays(
+     InsertPointTy AllocaIP, InsertPointTy CodeGenIP, MapInfosTy &CombinedInfo,
+     TargetDataInfo &Info, bool IsNonContiguous,

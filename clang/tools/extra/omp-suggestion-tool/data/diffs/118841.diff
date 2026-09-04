@@ -1,0 +1,916 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index c6f35a07d81ea..b87bc5b60cafe 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -592,7 +592,10 @@ class ParseTreeDumper {
+   NODE(parser, OmpReductionClause)
+   NODE(OmpReductionClause, Modifier)
+   NODE(parser, OmpInReductionClause)
++  NODE(OmpInReductionClause, Modifier)
+   NODE(parser, OmpReductionCombiner)
++  NODE(parser, OmpTaskReductionClause)
++  NODE(OmpTaskReductionClause, Modifier)
+   NODE(OmpReductionCombiner, FunctionCombiner)
+   NODE(parser, OmpReductionInitializerClause)
+   NODE(parser, OmpReductionIdentifier)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 8160b095f06dd..e2530cea3652a 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3951,11 +3951,14 @@ struct OmpIfClause {
+   std::tuple<MODIFIERS(), ScalarLogicalExpr> t;
+ };
+ 
+-// OMP 5.0 2.19.5.6 in_reduction-clause -> IN_REDUCTION (reduction-identifier:
+-//                                         variable-name-list)
++// Ref: [5.0:170-176], [5.1:197-205], [5.2:138-139]
++//
++// in-reduction-clause ->
++//    IN_REDUCTION(reduction-identifier: list)      // since 5.0
+ struct OmpInReductionClause {
+   TUPLE_CLASS_BOILERPLATE(OmpInReductionClause);
+-  std::tuple<OmpReductionIdentifier, OmpObjectList> t;
++  MODIFIER_BOILERPLATE(OmpReductionIdentifier);
++  std::tuple<MODIFIERS(), OmpObjectList> t;
+ };
+ 
+ // Ref: [4.5:199-201], [5.0:288-290], [5.1:321-322], [5.2:115-117]
+@@ -4070,6 +4073,16 @@ struct OmpScheduleClause {
+   std::tuple<MODIFIERS(), Kind, std::optional<ScalarIntExpr>> t;
+ };
+ 
++// Ref: [5.0:232-234], [5.1:264-266], [5.2:137]
++//
++// task-reduction-clause ->
++//    TASK_REDUCTION(reduction-identifier: list)    // since 5.0
++struct OmpTaskReductionClause {
++  TUPLE_CLASS_BOILERPLATE(OmpTaskReductionClause);
++  MODIFIER_BOILERPLATE(OmpReductionIdentifier);
++  std::tuple<MODIFIERS(), OmpObjectList> t;
++};
++
+ // Ref: [4.5:107-109], [5.0:176-180], [5.1:205-210], [5.2:167-168]
+ //
+ // to-clause (in DECLARE TARGET) ->
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 10c31963ec493..a0dc1be0afc5c 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -859,10 +859,14 @@ Init make(const parser::OmpClause::Init &inp,
+ InReduction make(const parser::OmpClause::InReduction &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpInReductionClause
+-  auto &t0 = std::get<parser::OmpReductionIdentifier>(inp.v.t);
++  auto &mods = semantics::OmpGetModifiers(inp.v);
++  auto *m0 =
++      semantics::OmpGetUniqueModifier<parser::OmpReductionIdentifier>(mods);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
++  assert(m0 && "OmpReductionIdentifier is required");
++
+   return InReduction{
+-      {/*ReductionIdentifiers=*/{makeReductionOperator(t0, semaCtx)},
++      {/*ReductionIdentifiers=*/{makeReductionOperator(*m0, semaCtx)},
+        /*List=*/makeObjects(t1, semaCtx)}};
+ }
+ 
+@@ -1155,17 +1159,17 @@ Reduction make(const parser::OmpClause::Reduction &inp,
+   );
+ 
+   auto &mods = semantics::OmpGetModifiers(inp.v);
+-  auto *t0 =
++  auto *m0 =
+       semantics::OmpGetUniqueModifier<parser::OmpReductionModifier>(mods);
+-  auto *t1 =
++  auto *m1 =
+       semantics::OmpGetUniqueModifier<parser::OmpReductionIdentifier>(mods);
+-  auto &t2 = std::get<parser::OmpObjectList>(inp.v.t);
+-  assert(t1 && "OmpReductionIdentifier is required");
++  auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
++  assert(m1 && "OmpReductionIdentifier is required");
+ 
+   return Reduction{
+-      {/*ReductionModifier=*/maybeApplyToV(convert, t0),
+-       /*ReductionIdentifiers=*/{makeReductionOperator(*t1, semaCtx)},
+-       /*List=*/makeObjects(t2, semaCtx)}};
++      {/*ReductionModifier=*/maybeApplyToV(convert, m0),
++       /*ReductionIdentifiers=*/{makeReductionOperator(*m1, semaCtx)},
++       /*List=*/makeObjects(t1, semaCtx)}};
+ }
+ 
+ // Relaxed: empty
+@@ -1259,13 +1263,13 @@ TaskReduction make(const parser::OmpClause::TaskReduction &inp,
+                    semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpReductionClause
+   auto &mods = semantics::OmpGetModifiers(inp.v);
+-  auto *t0 =
++  auto *m0 =
+       semantics::OmpGetUniqueModifier<parser::OmpReductionIdentifier>(mods);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+-  assert(t0 && "OmpReductionIdentifier is required");
++  assert(m0 && "OmpReductionIdentifier is required");
+ 
+   return TaskReduction{
+-      {/*ReductionIdentifiers=*/{makeReductionOperator(*t0, semaCtx)},
++      {/*ReductionIdentifiers=*/{makeReductionOperator(*m0, semaCtx)},
+        /*List=*/makeObjects(t1, semaCtx)}};
+ }
+ 
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 86d475c1a1542..cff372658a996 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -282,6 +282,9 @@ TYPE_PARSER(sourced(
+ 
+ TYPE_PARSER(sourced(construct<OmpIfClause::Modifier>(OmpDirectiveNameParser{})))
+ 
++TYPE_PARSER(sourced(construct<OmpInReductionClause::Modifier>(
++    Parser<OmpReductionIdentifier>{})))
++
+ TYPE_PARSER(sourced(construct<OmpLastprivateClause::Modifier>(
+     Parser<OmpLastprivateModifier>{})))
+ 
+@@ -306,6 +309,9 @@ TYPE_PARSER(sourced(construct<OmpScheduleClause::Modifier>(sourced(
+     construct<OmpScheduleClause::Modifier>(Parser<OmpChunkModifier>{}) ||
+     construct<OmpScheduleClause::Modifier>(Parser<OmpOrderingModifier>{})))))
+ 
++TYPE_PARSER(sourced(construct<OmpTaskReductionClause::Modifier>(
++    Parser<OmpReductionIdentifier>{})))
++
+ TYPE_PARSER(sourced(construct<OmpToClause::Modifier>(
+     sourced(construct<OmpToClause::Modifier>(Parser<OmpExpectation>{}) ||
+         construct<OmpToClause::Modifier>(Parser<OmpMapper>{}) ||
+@@ -407,7 +413,12 @@ TYPE_PARSER(construct<OmpReductionClause>(
+ 
+ // OMP 5.0 2.19.5.6 IN_REDUCTION (reduction-identifier: variable-name-list)
+ TYPE_PARSER(construct<OmpInReductionClause>(
+-    Parser<OmpReductionIdentifier>{} / ":", Parser<OmpObjectList>{}))
++    maybe(nonemptyList(Parser<OmpInReductionClause::Modifier>{}) / ":"),
++    Parser<OmpObjectList>{}))
++
++TYPE_PARSER(construct<OmpTaskReductionClause>(
++    maybe(nonemptyList(Parser<OmpTaskReductionClause::Modifier>{}) / ":"),
++    Parser<OmpObjectList>{}))
+ 
+ // OMP 5.0 2.11.4 allocate-clause -> ALLOCATE ([allocator:] variable-name-list)
+ // OMP 5.2 2.13.4 allocate-clause -> ALLOCATE ([allocate-modifier
+@@ -609,15 +620,15 @@ TYPE_PARSER(
+                      parenthesized(Parser<OmpObjectList>{}))) ||
+     "PROC_BIND" >> construct<OmpClause>(construct<OmpClause::ProcBind>(
+                        parenthesized(Parser<OmpProcBindClause>{}))) ||
+-    "REDUCTION" >> construct<OmpClause>(construct<OmpClause::Reduction>(
+-                       parenthesized(Parser<OmpReductionClause>{}))) ||
++    "REDUCTION"_id >> construct<OmpClause>(construct<OmpClause::Reduction>(
++                          parenthesized(Parser<OmpReductionClause>{}))) ||
+     "IN_REDUCTION" >> construct<OmpClause>(construct<OmpClause::InReduction>(
+                           parenthesized(Parser<OmpInReductionClause>{}))) ||
+     "DETACH" >> construct<OmpClause>(construct<OmpClause::Detach>(
+                     parenthesized(Parser<OmpDetachClause>{}))) ||
+     "TASK_REDUCTION" >>
+         construct<OmpClause>(construct<OmpClause::TaskReduction>(
+-            parenthesized(Parser<OmpReductionClause>{}))) ||
++            parenthesized(Parser<OmpTaskReductionClause>{}))) ||
+     "RELAXED" >> construct<OmpClause>(construct<OmpClause::Relaxed>()) ||
+     "RELEASE" >> construct<OmpClause>(construct<OmpClause::Release>()) ||
+     "REVERSE_OFFLOAD" >>
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4782cc1f2d7d7..f8c4069e65f30 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2143,13 +2143,18 @@ class UnparseVisitor {
+   }
+   void Unparse(const OmpReductionClause &x) {
+     using Modifier = OmpReductionClause::Modifier;
+-    Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ":");
++    Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ": ");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
+   void Unparse(const OmpDetachClause &x) { Walk(x.v); }
+   void Unparse(const OmpInReductionClause &x) {
+-    Walk(std::get<OmpReductionIdentifier>(x.t));
+-    Put(":");
++    using Modifier = OmpInReductionClause::Modifier;
++    Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ": ");
++    Walk(std::get<OmpObjectList>(x.t));
++  }
++  void Unparse(const OmpTaskReductionClause &x) {
++    using Modifier = OmpTaskReductionClause::Modifier;
++    Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ": ");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
+   void Unparse(const OmpAllocateClause &x) {
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 1f0e9ca8df6c9..597bd040a0662 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2821,7 +2821,6 @@ CHECK_SIMPLE_CLAUSE(Grainsize, OMPC_grainsize)
+ CHECK_SIMPLE_CLAUSE(Hint, OMPC_hint)
+ CHECK_SIMPLE_CLAUSE(Holds, OMPC_holds)
+ CHECK_SIMPLE_CLAUSE(Inclusive, OMPC_inclusive)
+-CHECK_SIMPLE_CLAUSE(InReduction, OMPC_in_reduction)
+ CHECK_SIMPLE_CLAUSE(Match, OMPC_match)
+ CHECK_SIMPLE_CLAUSE(Nontemporal, OMPC_nontemporal)
+ CHECK_SIMPLE_CLAUSE(NumTasks, OMPC_num_tasks)
+@@ -2846,7 +2845,6 @@ CHECK_SIMPLE_CLAUSE(SeqCst, OMPC_seq_cst)
+ CHECK_SIMPLE_CLAUSE(Simd, OMPC_simd)
+ CHECK_SIMPLE_CLAUSE(Sizes, OMPC_sizes)
+ CHECK_SIMPLE_CLAUSE(Permutation, OMPC_permutation)
+-CHECK_SIMPLE_CLAUSE(TaskReduction, OMPC_task_reduction)
+ CHECK_SIMPLE_CLAUSE(Uniform, OMPC_uniform)
+ CHECK_SIMPLE_CLAUSE(Unknown, OMPC_unknown)
+ CHECK_SIMPLE_CLAUSE(Untied, OMPC_untied)
+@@ -2915,14 +2913,17 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+ 
+   if (OmpVerifyModifiers(x.v, llvm::omp::OMPC_reduction,
+           GetContext().clauseSource, context_)) {
+-    if (CheckReductionOperators(x)) {
+-      CheckReductionTypeList(x);
+-    }
+     auto &modifiers{OmpGetModifiers(x.v)};
++    const auto *ident{
++        OmpGetUniqueModifier<parser::OmpReductionIdentifier>(modifiers)};
++    assert(ident && "reduction-identifier is a required modifier");
++    if (CheckReductionOperator(*ident, OmpGetModifierSource(modifiers, ident),
++            llvm::omp::OMPC_reduction)) {
++      CheckReductionObjectTypes(objects, *ident);
++    }
+     using ReductionModifier = parser::OmpReductionModifier;
+-    if (auto *maybeModifier{
+-            OmpGetUniqueModifier<ReductionModifier>(modifiers)}) {
+-      CheckReductionModifier(*maybeModifier);
++    if (auto *modifier{OmpGetUniqueModifier<ReductionModifier>(modifiers)}) {
++      CheckReductionModifier(*modifier);
+     }
+   }
+   CheckReductionObjects(objects, llvm::omp::Clause::OMPC_reduction);
+@@ -2934,70 +2935,88 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Reduction &x) {
+   }
+ }
+ 
+-bool OmpStructureChecker::CheckReductionOperators(
+-    const parser::OmpClause::Reduction &x) {
+-  bool ok = false;
+-  auto &modifiers{OmpGetModifiers(x.v)};
+-  if (const auto *ident{
+-          OmpGetUniqueModifier<parser::OmpReductionIdentifier>(modifiers)}) {
+-
+-    auto visitOperator{[&](const parser::DefinedOperator &dOpr) {
+-      if (const auto *intrinsicOp{
+-              std::get_if<parser::DefinedOperator::IntrinsicOperator>(
+-                  &dOpr.u)}) {
+-        ok = CheckIntrinsicOperator(*intrinsicOp);
+-      } else {
+-        context_.Say(GetContext().clauseSource,
+-            "Invalid reduction operator in REDUCTION clause."_err_en_US,
+-            ContextDirectiveAsFortran());
+-      }
+-    }};
++void OmpStructureChecker::Enter(const parser::OmpClause::InReduction &x) {
++  CheckAllowedClause(llvm::omp::Clause::OMPC_in_reduction);
++  auto &objects{std::get<parser::OmpObjectList>(x.v.t)};
+ 
+-    auto visitDesignator{[&](const parser::ProcedureDesignator &procD) {
+-      const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
+-      if (name && name->symbol) {
+-        const SourceName &realName{name->symbol->GetUltimate().name()};
+-        if (realName == "max" || realName == "min" || realName == "iand" ||
+-            realName == "ior" || realName == "ieor") {
+-          ok = true;
+-        }
+-      }
+-      if (!ok) {
++  if (OmpVerifyModifiers(x.v, llvm::omp::OMPC_in_reduction,
++          GetContext().clauseSource, context_)) {
++    auto &modifiers{OmpGetModifiers(x.v)};
++    const auto *ident{
++        OmpGetUniqueModifier<parser::OmpReductionIdentifier>(modifiers)};
++    assert(ident && "reduction-identifier is a required modifier");
++    if (CheckReductionOperator(*ident, OmpGetModifierSource(modifiers, ident),
++            llvm::omp::OMPC_in_reduction)) {
++      CheckReductionObjectTypes(objects, *ident);
++    }
++  }
++  CheckReductionObjects(objects, llvm::omp::Clause::OMPC_in_reduction);
++}
++
++void OmpStructureChecker::Enter(const parser::OmpClause::TaskReduction &x) {
++  CheckAllowedClause(llvm::omp::Clause::OMPC_task_reduction);
++  auto &objects{std::get<parser::OmpObjectList>(x.v.t)};
++
++  if (OmpVerifyModifiers(x.v, llvm::omp::OMPC_task_reduction,
++          GetContext().clauseSource, context_)) {
++    auto &modifiers{OmpGetModifiers(x.v)};
++    const auto *ident{
++        OmpGetUniqueModifier<parser::OmpReductionIdentifier>(modifiers)};
++    assert(ident && "reduction-identifier is a required modifier");
++    if (CheckReductionOperator(*ident, OmpGetModifierSource(modifiers, ident),
++            llvm::omp::OMPC_task_reduction)) {
++      CheckReductionObjectTypes(objects, *ident);
++    }
++  }
++  CheckReductionObjects(objects, llvm::omp::Clause::OMPC_task_reduction);
++}
++
++bool OmpStructureChecker::CheckReductionOperator(
++    const parser::OmpReductionIdentifier &ident, parser::CharBlock source,
++    llvm::omp::Clause clauseId) {
++  auto visitOperator{[&](const parser::DefinedOperator &dOpr) {
++    if (const auto *intrinsicOp{
++            std::get_if<parser::DefinedOperator::IntrinsicOperator>(&dOpr.u)}) {
++      switch (*intrinsicOp) {
++      case parser::DefinedOperator::IntrinsicOperator::Add:
++      case parser::DefinedOperator::IntrinsicOperator::Multiply:
++      case parser::DefinedOperator::IntrinsicOperator::AND:
++      case parser::DefinedOperator::IntrinsicOperator::OR:
++      case parser::DefinedOperator::IntrinsicOperator::EQV:
++      case parser::DefinedOperator::IntrinsicOperator::NEQV:
++        return true;
++      case parser::DefinedOperator::IntrinsicOperator::Subtract:
+         context_.Say(GetContext().clauseSource,
+-            "Invalid reduction identifier in REDUCTION "
+-            "clause."_err_en_US,
++            "The minus reduction operator is deprecated since OpenMP 5.2 and is not supported in the REDUCTION clause."_err_en_US,
+             ContextDirectiveAsFortran());
++        return false;
++      default:
++        break;
+       }
+-    }};
+-    common::visit(common::visitors{visitOperator, visitDesignator}, ident->u);
+-  }
+-
+-  return ok;
+-}
++    }
++    context_.Say(source, "Invalid reduction operator in %s clause."_err_en_US,
++        parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++    return false;
++  }};
+ 
+-bool OmpStructureChecker::CheckIntrinsicOperator(
+-    const parser::DefinedOperator::IntrinsicOperator &op) {
++  auto visitDesignator{[&](const parser::ProcedureDesignator &procD) {
++    const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
++    bool valid{false};
++    if (name && name->symbol) {
++      const SourceName &realName{name->symbol->GetUltimate().name()};
++      valid =
++          llvm::is_contained({"max", "min", "iand", "ior", "ieor"}, realName);
++    }
++    if (!valid) {
++      context_.Say(source,
++          "Invalid reduction identifier in %s clause."_err_en_US,
++          parser::ToUpperCaseLetters(getClauseName(clauseId).str()));
++    }
++    return valid;
++  }};
+ 
+-  switch (op) {
+-  case parser::DefinedOperator::IntrinsicOperator::Add:
+-  case parser::DefinedOperator::IntrinsicOperator::Multiply:
+-  case parser::DefinedOperator::IntrinsicOperator::AND:
+-  case parser::DefinedOperator::IntrinsicOperator::OR:
+-  case parser::DefinedOperator::IntrinsicOperator::EQV:
+-  case parser::DefinedOperator::IntrinsicOperator::NEQV:
+-    return true;
+-  case parser::DefinedOperator::IntrinsicOperator::Subtract:
+-    context_.Say(GetContext().clauseSource,
+-        "The minus reduction operator is deprecated since OpenMP 5.2 and is "
+-        "not supported in the REDUCTION clause."_err_en_US,
+-        ContextDirectiveAsFortran());
+-    break;
+-  default:
+-    context_.Say(GetContext().clauseSource,
+-        "Invalid reduction operator in REDUCTION clause."_err_en_US,
+-        ContextDirectiveAsFortran());
+-  }
+-  return false;
++  return common::visit(
++      common::visitors{visitOperator, visitDesignator}, ident.u);
+ }
+ 
+ /// Check restrictions on objects that are common to all reduction clauses.
+@@ -3011,7 +3030,7 @@ void OmpStructureChecker::CheckReductionObjects(
+   for (const parser::OmpObject &object : objects.v) {
+     CheckIfContiguous(object);
+   }
+-  CheckReductionArraySection(objects);
++  CheckReductionArraySection(objects, clauseId);
+   // An object must be definable.
+   CheckDefinableObjects(symbols, clauseId);
+   // Procedure pointers are not allowed.
+@@ -3064,100 +3083,82 @@ void OmpStructureChecker::CheckReductionObjects(
+ }
+ 
+ static bool IsReductionAllowedForType(
+-    const parser::OmpClause::Reduction &x, const DeclTypeSpec &type) {
+-  auto &modifiers{OmpGetModifiers(x.v)};
+-  const auto *definedOp{
+-      OmpGetUniqueModifier<parser::OmpReductionIdentifier>(modifiers)};
+-  if (!definedOp) {
+-    return false;
+-  }
+-  // TODO: user defined reduction operators. Just allow everything for now.
+-  bool ok{true};
+-
+-  auto IsLogical{[](const DeclTypeSpec &type) -> bool {
++    const parser::OmpReductionIdentifier &ident, const DeclTypeSpec &type) {
++  auto isLogical{[](const DeclTypeSpec &type) -> bool {
+     return type.category() == DeclTypeSpec::Logical;
+   }};
+-  auto IsCharacter{[](const DeclTypeSpec &type) -> bool {
++  auto isCharacter{[](const DeclTypeSpec &type) -> bool {
+     return type.category() == DeclTypeSpec::Character;
+   }};
+ 
+-  common::visit(
+-      common::visitors{
+-          [&](const parser::DefinedOperator &dOpr) {
+-            if (const auto *intrinsicOp{
+-                    std::get_if<parser::DefinedOperator::IntrinsicOperator>(
+-                        &dOpr.u)}) {
+-              // OMP5.2: The type [...] of a list item that appears in a
+-              // reduction clause must be valid for the combiner expression
+-              // See F2023: Table 10.2
+-              // .LT., .LE., .GT., .GE. are handled as procedure designators
+-              // below.
+-              switch (*intrinsicOp) {
+-              case parser::DefinedOperator::IntrinsicOperator::Multiply:
+-                [[fallthrough]];
+-              case parser::DefinedOperator::IntrinsicOperator::Add:
+-                [[fallthrough]];
+-              case parser::DefinedOperator::IntrinsicOperator::Subtract:
+-                ok = type.IsNumeric(TypeCategory::Integer) ||
+-                    type.IsNumeric(TypeCategory::Real) ||
+-                    type.IsNumeric(TypeCategory::Complex);
+-                break;
+-
+-              case parser::DefinedOperator::IntrinsicOperator::AND:
+-                [[fallthrough]];
+-              case parser::DefinedOperator::IntrinsicOperator::OR:
+-                [[fallthrough]];
+-              case parser::DefinedOperator::IntrinsicOperator::EQV:
+-                [[fallthrough]];
+-              case parser::DefinedOperator::IntrinsicOperator::NEQV:
+-                ok = IsLogical(type);
+-                break;
++  auto checkOperator{[&](const parser::DefinedOperator &dOpr) {
++    if (const auto *intrinsicOp{
++            std::get_if<parser::DefinedOperator::IntrinsicOperator>(&dOpr.u)}) {
++      // OMP5.2: The type [...] of a list item that appears in a
++      // reduction clause must be valid for the combiner expression
++      // See F2023: Table 10.2
++      // .LT., .LE., .GT., .GE. are handled as procedure designators
++      // below.
++      switch (*intrinsicOp) {
++      case parser::DefinedOperator::IntrinsicOperator::Multiply:
++      case parser::DefinedOperator::IntrinsicOperator::Add:
++      case parser::DefinedOperator::IntrinsicOperator::Subtract:
++        return type.IsNumeric(TypeCategory::Integer) ||
++            type.IsNumeric(TypeCategory::Real) ||
++            type.IsNumeric(TypeCategory::Complex);
++
++      case parser::DefinedOperator::IntrinsicOperator::AND:
++      case parser::DefinedOperator::IntrinsicOperator::OR:
++      case parser::DefinedOperator::IntrinsicOperator::EQV:
++      case parser::DefinedOperator::IntrinsicOperator::NEQV:
++        return isLogical(type);
++
++      // Reduction identifier is not in OMP5.2 Table 5.2
++      default:
++        DIE("This should have been caught in CheckIntrinsicOperator");
++        return false;
++      }
++    }
++    return true;
++  }};
+ 
+-              // Reduction identifier is not in OMP5.2 Table 5.2
+-              default:
+-                DIE("This should have been caught in CheckIntrinsicOperator");
+-                ok = false;
+-                break;
+-              }
+-            }
+-          },
+-          [&](const parser::ProcedureDesignator &procD) {
+-            const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
+-            if (name && name->symbol) {
+-              const SourceName &realName{name->symbol->GetUltimate().name()};
+-              // OMP5.2: The type [...] of a list item that appears in a
+-              // reduction clause must be valid for the combiner expression
+-              if (realName == "iand" || realName == "ior" ||
+-                  realName == "ieor") {
+-                // IAND: arguments must be integers: F2023 16.9.100
+-                // IEOR: arguments must be integers: F2023 16.9.106
+-                // IOR: arguments must be integers: F2023 16.9.111
+-                ok = type.IsNumeric(TypeCategory::Integer);
+-              } else if (realName == "max" || realName == "min") {
+-                // MAX: arguments must be integer, real, or character:
+-                // F2023 16.9.135
+-                // MIN: arguments must be integer, real, or character:
+-                // F2023 16.9.141
+-                ok = type.IsNumeric(TypeCategory::Integer) ||
+-                    type.IsNumeric(TypeCategory::Real) || IsCharacter(type);
+-              }
+-            }
+-          },
+-      },
+-      definedOp->u);
++  auto checkDesignator{[&](const parser::ProcedureDesignator &procD) {
++    const parser::Name *name{std::get_if<parser::Name>(&procD.u)};
++    if (name && name->symbol) {
++      const SourceName &realName{name->symbol->GetUltimate().name()};
++      // OMP5.2: The type [...] of a list item that appears in a
++      // reduction clause must be valid for the combiner expression
++      if (realName == "iand" || realName == "ior" || realName == "ieor") {
++        // IAND: arguments must be integers: F2023 16.9.100
++        // IEOR: arguments must be integers: F2023 16.9.106
++        // IOR: arguments must be integers: F2023 16.9.111
++        return type.IsNumeric(TypeCategory::Integer);
++      } else if (realName == "max" || realName == "min") {
++        // MAX: arguments must be integer, real, or character:
++        // F2023 16.9.135
++        // MIN: arguments must be integer, real, or character:
++        // F2023 16.9.141
++        return type.IsNumeric(TypeCategory::Integer) ||
++            type.IsNumeric(TypeCategory::Real) || isCharacter(type);
++      }
++    }
++    // TODO: user defined reduction operators. Just allow everything for now.
++    return true;
++  }};
+ 
+-  return ok;
++  return common::visit(
++      common::visitors{checkOperator, checkDesignator}, ident.u);
+ }
+ 
+-void OmpStructureChecker::CheckReductionTypeList(
+-    const parser::OmpClause::Reduction &x) {
+-  const auto &ompObjectList{std::get<parser::OmpObjectList>(x.v.t)};
++void OmpStructureChecker::CheckReductionObjectTypes(
++    const parser::OmpObjectList &objects,
++    const parser::OmpReductionIdentifier &ident) {
+   SymbolSourceMap symbols;
+-  GetSymbolsInObjectList(ompObjectList, symbols);
++  GetSymbolsInObjectList(objects, symbols);
+ 
+   for (auto &[symbol, source] : symbols) {
+     if (auto *type{symbol->GetType()}) {
+-      if (!IsReductionAllowedForType(x, *type)) {
++      if (!IsReductionAllowedForType(ident, *type)) {
+         context_.Say(source,
+             "The type of '%s' is incompatible with the reduction operator."_err_en_US,
+             symbol->name());
+@@ -3220,13 +3221,12 @@ void OmpStructureChecker::CheckReductionModifier(
+ }
+ 
+ void OmpStructureChecker::CheckReductionArraySection(
+-    const parser::OmpObjectList &ompObjectList) {
++    const parser::OmpObjectList &ompObjectList, llvm::omp::Clause clauseId) {
+   for (const auto &ompObject : ompObjectList.v) {
+     if (const auto *dataRef{parser::Unwrap<parser::DataRef>(ompObject)}) {
+       if (const auto *arrayElement{
+               parser::Unwrap<parser::ArrayElement>(ompObject)}) {
+-        CheckArraySection(*arrayElement, GetLastName(*dataRef),
+-            llvm::omp::Clause::OMPC_reduction);
++        CheckArraySection(*arrayElement, GetLastName(*dataRef), clauseId);
+       }
+     }
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 89af46d9171ad..387025657f673 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -226,10 +226,10 @@ class OmpStructureChecker
+   std::int64_t GetOrdCollapseLevel(const parser::OpenMPLoopConstruct &x);
+   void CheckReductionObjects(
+       const parser::OmpObjectList &objects, llvm::omp::Clause clauseId);
+-  bool CheckReductionOperators(const parser::OmpClause::Reduction &);
+-  bool CheckIntrinsicOperator(
+-      const parser::DefinedOperator::IntrinsicOperator &);
+-  void CheckReductionTypeList(const parser::OmpClause::Reduction &);
++  bool CheckReductionOperator(const parser::OmpReductionIdentifier &ident,
++      parser::CharBlock source, llvm::omp::Clause clauseId);
++  void CheckReductionObjectTypes(const parser::OmpObjectList &objects,
++      const parser::OmpReductionIdentifier &ident);
+   void CheckReductionModifier(const parser::OmpReductionModifier &);
+   void CheckMasterNesting(const parser::OpenMPBlockConstruct &x);
+   void ChecksOnOrderedAsBlock();
+@@ -237,7 +237,8 @@ class OmpStructureChecker
+   void CheckScan(const parser::OpenMPSimpleStandaloneConstruct &x);
+   void ChecksOnOrderedAsStandalone();
+   void CheckOrderedDependClause(std::optional<std::int64_t> orderedValue);
+-  void CheckReductionArraySection(const parser::OmpObjectList &ompObjectList);
++  void CheckReductionArraySection(
++      const parser::OmpObjectList &ompObjectList, llvm::omp::Clause clauseId);
+   void CheckArraySection(const parser::ArrayElement &arrayElement,
+       const parser::Name &name, const llvm::omp::Clause clause);
+   void CheckSharedBindingInOuterContext(
+diff --git a/flang/test/Parser/OpenMP/in-reduction-clause.f90 b/flang/test/Parser/OpenMP/in-reduction-clause.f90
+index ab26ca2d9300f..8a0bede62f03f 100644
+--- a/flang/test/Parser/OpenMP/in-reduction-clause.f90
++++ b/flang/test/Parser/OpenMP/in-reduction-clause.f90
+@@ -5,16 +5,16 @@
+ 
+ subroutine omp_in_reduction_taskgroup()
+     integer :: z, i
+-    !CHECK: !$OMP TASKGROUP  TASK_REDUCTION(+:z)
++    !CHECK: !$OMP TASKGROUP  TASK_REDUCTION(+: z)
+     !$omp taskgroup task_reduction(+:z)
+-    !CHECK-NEXT: !$OMP TASK  IN_REDUCTION(+:z)
++    !CHECK-NEXT: !$OMP TASK  IN_REDUCTION(+: z)
+         !$omp task in_reduction(+:z)
+     !CHECK-NEXT: z=z+5_4
+             z = z + 5
+     !CHECK-NEXT: !$OMP END TASK
+         !$omp end task
+ 
+-    !CHECK-NEXT: !$OMP TASKLOOP  IN_REDUCTION(+:z)
++    !CHECK-NEXT: !$OMP TASKLOOP  IN_REDUCTION(+: z)
+         !$omp taskloop in_reduction(+:z)
+     !CHECK-NEXT: DO i=1_4,10_4
+             do i=1,10
+@@ -31,7 +31,7 @@ end subroutine omp_in_reduction_taskgroup
+ !PARSE-TREE: OpenMPConstruct -> OpenMPBlockConstruct
+ !PARSE-TREE-NEXT: OmpBeginBlockDirective
+ !PARSE-TREE-NEXT: OmpBlockDirective -> llvm::omp::Directive = taskgroup
+-!PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> TaskReduction -> OmpReductionClause
++!PARSE-TREE-NEXT: OmpClauseList -> OmpClause -> TaskReduction -> OmpTaskReductionClause
+ 
+ !PARSE-TREE: OpenMPConstruct -> OpenMPBlockConstruct
+ !PARSE-TREE-NEXT: OmpBeginBlockDirective
+@@ -49,9 +49,9 @@ end subroutine omp_in_reduction_taskgroup
+ 
+ subroutine omp_in_reduction_parallel()
+     integer :: z
+-    !CHECK: !$OMP PARALLEL  REDUCTION(+:z)
++    !CHECK: !$OMP PARALLEL  REDUCTION(+: z)
+     !$omp parallel reduction(+:z)
+-    !CHECK-NEXT: !$OMP TASKLOOP SIMD  IN_REDUCTION(+:z)
++    !CHECK-NEXT: !$OMP TASKLOOP SIMD  IN_REDUCTION(+: z)
+         !$omp taskloop simd in_reduction(+:z)
+     !CHECK-NEXT: DO i=1_4,10_4
+             do i=1,10
+diff --git a/flang/test/Parser/OpenMP/reduction-modifier.f90 b/flang/test/Parser/OpenMP/reduction-modifier.f90
+index 64cd452e839e7..56303af66395e 100644
+--- a/flang/test/Parser/OpenMP/reduction-modifier.f90
++++ b/flang/test/Parser/OpenMP/reduction-modifier.f90
+@@ -4,7 +4,7 @@
+ subroutine foo()
+   integer :: i, j
+   j = 0
+-! CHECK: !$OMP DO  REDUCTION(TASK, *:j)
++! CHECK: !$OMP DO  REDUCTION(TASK, *: j)
+ ! PARSE-TREE: | | ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPLoopConstruct
+ ! PARSE-TREE: | | | OmpBeginLoopDirective
+ ! PARSE-TREE: | | | | OmpLoopDirective -> llvm::omp::Directive = do
+diff --git a/flang/test/Parser/OpenMP/task-reduction-clause.f90 b/flang/test/Parser/OpenMP/task-reduction-clause.f90
+new file mode 100644
+index 0000000000000..248ff7918dbe5
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/task-reduction-clause.f90
+@@ -0,0 +1,23 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=50 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=50 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00
++  integer :: x
++!$omp taskgroup task_reduction(+: x)
++  x = x + 1
++!$omp end taskgroup
++end
++
++!UNPARSE: SUBROUTINE f00
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TASKGROUP  TASK_REDUCTION(+: x)
++!UNPARSE:   x=x+1_4
++!UNPARSE: !$OMP END TASKGROUP
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpBeginBlockDirective
++!PARSE-TREE: | OmpBlockDirective -> llvm::omp::Directive = taskgroup
++!PARSE-TREE: | OmpClauseList -> OmpClause -> TaskReduction -> OmpTaskReductionClause
++!PARSE-TREE: | | Modifier -> OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: Block
+diff --git a/flang/test/Preprocessing/directive-contin-with-pp.F90 b/flang/test/Preprocessing/directive-contin-with-pp.F90
+index 544c6619f6b53..6e84c2bde52f9 100644
+--- a/flang/test/Preprocessing/directive-contin-with-pp.F90
++++ b/flang/test/Preprocessing/directive-contin-with-pp.F90
+@@ -70,13 +70,13 @@ subroutine s3
+ !CHECK:   !DIR$ IGNORE_TKR x5
+ !CHECK:   !DIR$ IGNORE_TKR x6
+ !CHECK:   STOP 1_4
+-!CHECK: !$OMP PARALLEL DO  REDUCTION(+:x)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(+: x)
+ !CHECK:   DO j1=1_4,n
+ !CHECK:   END DO
+-!CHECK: !$OMP PARALLEL DO  REDUCTION(+:x)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(+: x)
+ !CHECK:   DO j2=1_4,n
+ !CHECK:   END DO
+-!CHECK: !$OMP PARALLEL DO  REDUCTION(+:x)
++!CHECK: !$OMP PARALLEL DO  REDUCTION(+: x)
+ !CHECK:   DO j3=1_4,n
+ !CHECK:   END DO
+ !CHECK:  END SUBROUTINE
+diff --git a/flang/test/Semantics/OpenMP/in-reduction.f90 b/flang/test/Semantics/OpenMP/in-reduction.f90
+new file mode 100644
+index 0000000000000..1b82134b7104b
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/in-reduction.f90
+@@ -0,0 +1,70 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=50
++
++subroutine f00
++  real :: x
++!ERROR: The type of 'x' is incompatible with the reduction operator.
++!$omp target in_reduction(.or.: x)
++!$omp end target
++end
++
++subroutine f01
++  real :: x
++!ERROR: Invalid reduction operator in IN_REDUCTION clause.
++!$omp target in_reduction(.not.: x)
++!$omp end target
++end
++
++subroutine f02(p)
++  integer, pointer, intent(in) :: p
++!ERROR: Pointer 'p' with the INTENT(IN) attribute may not appear in a IN_REDUCTION clause
++!$omp target in_reduction(+: p)
++!$omp end target
++end
++
++subroutine f03
++  common /c/ a, b 
++!ERROR: Common block names are not allowed in IN_REDUCTION clause
++!$omp target in_reduction(+: /c/)
++!$omp end target
++end
++
++subroutine f04
++  integer :: x(10)
++!ERROR: Reference to 'x' must be a contiguous object
++!$omp target in_reduction(+: x(1:10:2))
++!$omp end target
++end
++
++subroutine f05
++  integer :: x(10)
++!ERROR: 'x' in IN_REDUCTION clause is a zero size array section
++!$omp target in_reduction(+: x(1:0))
++!$omp end target
++end
++
++subroutine f06
++  type t
++    integer :: a(10)
++  end type
++  type(t) :: x
++!ERROR: The base expression of an array element or section in IN_REDUCTION clause must be an identifier
++!$omp target in_reduction(+: x%a(2))
++!$omp end target
++end
++
++subroutine f07
++  type t
++    integer :: a(10)
++  end type
++  type(t) :: x
++!ERROR: The base expression of an array element or section in IN_REDUCTION clause must be an identifier
++!$omp target in_reduction(+: x%a(1:10))
++!$omp end target
++end
++
++subroutine f08
++  integer :: x
++!ERROR: Type parameter inquiry is not permitted in IN_REDUCTION clause
++!$omp target in_reduction(+: x%kind)
++!$omp end target
++end
+diff --git a/flang/test/Semantics/OpenMP/symbol08.f90 b/flang/test/Semantics/OpenMP/symbol08.f90
+index 69ccd17391b54..80ae1c6d2242b 100644
+--- a/flang/test/Semantics/OpenMP/symbol08.f90
++++ b/flang/test/Semantics/OpenMP/symbol08.f90
+@@ -130,13 +130,14 @@ subroutine dotprod (b, c, n, block_size, num_teams, block_threads)
+  !REF: /dotprod/sum
+  sum = 0.0e0
+ !$omp target  map(to:b,c)  map(tofrom:sum)
+-!$omp teams  num_teams(num_teams) thread_limit(block_threads) reduction(+:sum)
++!$omp teams  num_teams(num_teams) thread_limit(block_threads) reduction(+: sum&
++!$OMP&)
+ !$omp distribute
+  !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/i0 (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+  !REF: /dotprod/n
+  !REF: /dotprod/block_size
+  do i0=1,n,block_size
+-!$omp parallel do  reduction(+:sum)
++!$omp parallel do  reduction(+: sum)
+   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
+   !DEF: /dotprod/OtherConstruct1/OtherConstruct1/OtherConstruct1/OtherConstruct1/i0 HostAssoc INTEGER(4)
+   !DEF: /dotprod/min ELEMENTAL, INTRINSIC, PURE (Function) ProcEntity
+diff --git a/flang/test/Semantics/OpenMP/task-reduction.f90 b/flang/test/Semantics/OpenMP/task-reduction.f90
+new file mode 100644
+index 0000000000000..5a18ee48e7728
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/task-reduction.f90
+@@ -0,0 +1,70 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=50
++
++subroutine f00
++  real :: x
++!ERROR: The type of 'x' is incompatible with the reduction operator.
++!$omp taskgroup task_reduction(.or.: x)
++!$omp end taskgroup
++end
++
++subroutine f01
++  real :: x
++!ERROR: Invalid reduction operator in TASK_REDUCTION clause.
++!$omp taskgroup task_reduction(.not.: x)
++!$omp end taskgroup
++end
++
++subroutine f02(p)
++  integer, pointer, intent(in) :: p
++!ERROR: Pointer 'p' with the INTENT(IN) attribute may not appear in a TASK_REDUCTION clause
++!$omp taskgroup task_reduction(+: p)
++!$omp end taskgroup
++end
++
++subroutine f03
++  common /c/ a, b 
++!ERROR: Common block names are not allowed in TASK_REDUCTION clause
++!$omp taskgroup task_reduction(+: /c/)
++!$omp end taskgroup
++end
++
++subroutine f04
++  integer :: x(10)
++!ERROR: Reference to 'x' must be a contiguous object
++!$omp taskgroup task_reduction(+: x(1:10:2))
++!$omp end taskgroup
++end
++
++subroutine f05
++  integer :: x(10)
++!ERROR: 'x' in TASK_REDUCTION clause is a zero size array section
++!$omp taskgroup task_reduction(+: x(1:0))
++!$omp end taskgroup
++end
++
++subroutine f06
++  type t
++    integer :: a(10)
++  end type
++  type(t) :: x
++!ERROR: The base expression of an array element or section in TASK_REDUCTION clause must be an identifier
++!$omp taskgroup task_reduction(+: x%a(2))
++!$omp end taskgroup
++end
++
++subroutine f07
++  type t
++    integer :: a(10)
++  end type
++  type(t) :: x
++!ERROR: The base expression of an array element or section in TASK_REDUCTION clause must be an identifier
++!$omp taskgroup task_reduction(+: x%a(1:10))
++!$omp end taskgroup
++end
++
++subroutine f08
++  integer :: x
++!ERROR: Type parameter inquiry is not permitted in TASK_REDUCTION clause
++!$omp taskgroup task_reduction(+: x%kind)
++!$omp end taskgroup
++end
+diff --git a/flang/test/Semantics/OpenMP/taskgroup01.f90 b/flang/test/Semantics/OpenMP/taskgroup01.f90
+index e05051387411a..ded5d47525af4 100644
+--- a/flang/test/Semantics/OpenMP/taskgroup01.f90
++++ b/flang/test/Semantics/OpenMP/taskgroup01.f90
+@@ -41,6 +41,8 @@
+     !$omp task
+       !$omp taskgroup task_reduction(+ : reduction_var)
+           print *, "The "
++  !ERROR: The type of 'reduction_var' is incompatible with the reduction operator.
++  !ERROR: The type of 'reduction_var' is incompatible with the reduction operator.
+         !$omp taskgroup task_reduction(.or. : reduction_var) task_reduction(.and. : reduction_var)
+           print *, "almighty sun"
+         !$omp end taskgroup
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index bd7fb2361aaeb..9f76473702cdc 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -463,7 +463,7 @@ def OMPC_Sizes: Clause<"sizes"> {
+ }
+ def OMPC_TaskReduction : Clause<"task_reduction"> {
+   let clangClass = "OMPTaskReductionClause";
+-  let flangClass = "OmpReductionClause";
++  let flangClass = "OmpTaskReductionClause";
+ }
+ def OMPC_ThreadLimit : Clause<"thread_limit"> {
+   let clangClass = "OMPThreadLimitClause";

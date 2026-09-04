@@ -1,0 +1,342 @@
+diff --git a/flang/lib/Optimizer/Builder/FIRBuilder.cpp b/flang/lib/Optimizer/Builder/FIRBuilder.cpp
+index 3c3fd02d7c88e..4a1772ac91e6f 100644
+--- a/flang/lib/Optimizer/Builder/FIRBuilder.cpp
++++ b/flang/lib/Optimizer/Builder/FIRBuilder.cpp
+@@ -252,11 +252,10 @@ mlir::Block *fir::FirOpBuilder::getAllocaBlock() {
+               .getParentOfType<mlir::omp::OutlineableOpenMPOpInterface>()) {
+     return ompOutlineableIface.getAllocaBlock();
+   }
+-  if (getRegion().getParentOfType<mlir::omp::DeclareReductionOp>())
+-    return &getRegion().front();
+-  if (auto accRecipeIface =
+-          getRegion().getParentOfType<mlir::acc::RecipeInterface>()) {
+-    return accRecipeIface.getAllocaBlock(getRegion());
++
++  if (auto recipeIface =
++          getRegion().getParentOfType<mlir::accomp::RecipeInterface>()) {
++    return recipeIface.getAllocaBlock(getRegion());
+   }
+ 
+   return getEntryBlock();
+diff --git a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90 b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+index aa835f82b2730..833976ff284a8 100644
+--- a/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
++++ b/flang/test/Lower/OpenMP/delayed-privatization-allocatable-firstprivate.f90
+@@ -1,10 +1,13 @@
+ ! Test delayed privatization for allocatables: `firstprivate`.
+ 
++! RUN: split-file %s %t
++
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
+-! RUN:   -o - %s 2>&1 | FileCheck %s
+-! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %s 2>&1 |\
++! RUN:   -o - %t/test_ir.f90 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %t/test_ir.f90 2>&1 |\
+ ! RUN:   FileCheck %s
+ 
++!--- test_ir.f90
+ subroutine delayed_privatization_allocatable
+   implicit none
+   integer, allocatable :: var1
+@@ -34,3 +37,26 @@ subroutine delayed_privatization_allocatable
+ ! CHECK-NEXT:    %[[ORIG_BASE_LD:.*]] = fir.load %[[ORIG_BASE_ADDR]]
+ ! CHECK-NEXT:    hlfir.assign %[[ORIG_BASE_LD]] to %[[PRIV_BASE_BOX]] temporary_lhs
+ ! CHECK-NEXT:  }
++
++! RUN: %flang -c -emit-llvm -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %t/test_compilation_to_obj.f90 | \
++! RUN:   llvm-dis 2>&1 |\
++! RUN:   FileCheck %s -check-prefix=LLVM
++
++!--- test_compilation_to_obj.f90
++
++program compilation_to_obj
++  real, allocatable :: t(:)
++
++!$omp parallel firstprivate(t)
++  t(1) = 3.14
++!$omp end parallel
++
++end program compilation_to_obj
++
++! LLVM: @[[GLOB_VAR:[^[:space:]]+]]t = internal global
++
++! LLVM: define internal void @_QQmain..omp_par
++! LLVM: %[[LOCAL_VAR:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, align 8
++! LLVM-NEXT: %[[GLOB_VAL:.*]] = load { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] }, ptr @[[GLOB_VAR]]t, align 8
++! LLVM-NEXT: store { ptr, i64, i32, i8, i8, i8, i8, [1 x [3 x i64]] } %[[GLOB_VAL]], ptr %[[LOCAL_VAR]], align 8
+diff --git a/mlir/include/mlir/Dialect/OpenACC/CMakeLists.txt b/mlir/include/mlir/Dialect/OpenACC/CMakeLists.txt
+index 8a4b1c7b196ea..2aa4b1828e0ad 100644
+--- a/mlir/include/mlir/Dialect/OpenACC/CMakeLists.txt
++++ b/mlir/include/mlir/Dialect/OpenACC/CMakeLists.txt
+@@ -27,4 +27,3 @@ mlir_tablegen(OpenACCTypeInterfaces.cpp.inc -gen-type-interface-defs)
+ add_public_tablegen_target(MLIROpenACCTypeInterfacesIncGen)
+ add_dependencies(mlir-headers MLIROpenACCTypeInterfacesIncGen)
+ 
+-add_mlir_interface(OpenACCOpsInterfaces)
+diff --git a/mlir/include/mlir/Dialect/OpenACC/OpenACC.h b/mlir/include/mlir/Dialect/OpenACC/OpenACC.h
+index 0c8e0b4587820..c53a437ac092b 100644
+--- a/mlir/include/mlir/Dialect/OpenACC/OpenACC.h
++++ b/mlir/include/mlir/Dialect/OpenACC/OpenACC.h
+@@ -34,7 +34,7 @@
+ #define GET_ATTRDEF_CLASSES
+ #include "mlir/Dialect/OpenACC/OpenACCOpsAttributes.h.inc"
+ 
+-#include "mlir/Dialect/OpenACC/OpenACCInterfaces.h"
++#include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h"
+ 
+ #define GET_OP_CLASSES
+ #include "mlir/Dialect/OpenACC/OpenACCOps.h.inc"
+diff --git a/mlir/include/mlir/Dialect/OpenACC/OpenACCInterfaces.h b/mlir/include/mlir/Dialect/OpenACC/OpenACCInterfaces.h
+deleted file mode 100644
+index 5ce094969728f..0000000000000
+--- a/mlir/include/mlir/Dialect/OpenACC/OpenACCInterfaces.h
++++ /dev/null
+@@ -1,20 +0,0 @@
+-//===- OpenACCInterfaces.h - MLIR Interfaces for OpenACC --------*- C++ -*-===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-//
+-// This file declares OpenACC Interface implementations for the OpenACC dialect.
+-//
+-//===----------------------------------------------------------------------===//
+-
+-#ifndef MLIR_DIALECT_OPENACC_OPENACCINTERFACES_H_
+-#define MLIR_DIALECT_OPENACC_OPENACCINTERFACES_H_
+-
+-#include "mlir/IR/OpDefinition.h"
+-
+-#include "mlir/Dialect/OpenACC/OpenACCOpsInterfaces.h.inc"
+-
+-#endif // MLIR_DIALECT_OPENACC_OPENACCINTERFACES_H_
+diff --git a/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td b/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
+index b5ad46361fa69..361ede110ed13 100644
+--- a/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
++++ b/mlir/include/mlir/Dialect/OpenACC/OpenACCOps.td
+@@ -22,9 +22,9 @@ include "mlir/IR/OpBase.td"
+ include "mlir/IR/SymbolInterfaces.td"
+ include "mlir/Dialect/OpenACC/OpenACCBase.td"
+ include "mlir/Dialect/OpenACC/OpenACCOpsTypes.td"
+-include "mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td"
+ include "mlir/Dialect/OpenACC/OpenACCTypeInterfaces.td"
+ include "mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.td"
++include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td"
+ 
+ // AccCommon requires definition of OpenACC_Dialect.
+ include "mlir/Dialect/OpenACC/AccCommon.td"
+diff --git a/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/CMakeLists.txt b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/CMakeLists.txt
+index 1f0d0ceb99df2..7753089fcc2f4 100644
+--- a/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/CMakeLists.txt
++++ b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/CMakeLists.txt
+@@ -1 +1,3 @@
+ add_mlir_interface(AtomicInterfaces)
++
++add_mlir_interface(OpenACCMPOpsInterfaces)
+diff --git a/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h
+new file mode 100644
+index 0000000000000..6576f874c9a30
+--- /dev/null
++++ b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h
+@@ -0,0 +1,21 @@
++//===- OpenACCMPOpsInterfaces.h - MLIR Interfaces for OpenACC/MP *- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file declares OpenACC/OpenMP Interface implementations for the
++// OpenACC/OpenMP dialects.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef OPENACC_MP_COMMON_INTERFACES_OPSINTERFACES_H_
++#define OPENACC_MP_COMMON_INTERFACES_OPSINTERFACES_H_
++
++#include "mlir/IR/OpDefinition.h"
++
++#include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h.inc"
++
++#endif // OPENACC_MP_COMMON_INTERFACES_OPSINTERFACES_H_
+diff --git a/mlir/include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td
+similarity index 73%
+rename from mlir/include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td
+rename to mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td
+index 4c721a328bce7..2c5fbbb795d74 100644
+--- a/mlir/include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td
++++ b/mlir/include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td
+@@ -1,4 +1,4 @@
+-//===-- OpenACCOpsInterfaces.td - OpenACC op interfaces ----*- tablegen -*-===//
++//===-- OpenACCMPOpsInterfaces.td - OpenACC/MP op interfaces - tablegen -*-===//
+ //
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+@@ -6,20 +6,20 @@
+ //
+ //===----------------------------------------------------------------------===//
+ //
+-// This is the OpenACC Dialect interfaces definition file.
++// This is the OpenACC/OpenMP Dialect interfaces definition file.
+ //
+ //===----------------------------------------------------------------------===//
+ 
+-#ifndef OPENACC_OPS_INTERFACES
+-#define OPENACC_OPS_INTERFACES
++#ifndef OPENACC_MP_COMMON_OPS_INTERFACES
++#define OPENACC_MP_COMMON_OPS_INTERFACES
+ 
+ include "mlir/IR/OpBase.td"
+ 
+ def RecipeInterface : OpInterface<"RecipeInterface"> {
+     let description = [{
+-      OpenACC operations with one or more regions holding executable code.
++      OpenACC/OpenMP operations with one or more regions holding executable code.
+     }];
+-    let cppNamespace = "::mlir::acc";
++    let cppNamespace = "::mlir::accomp";
+     let methods = [
+       InterfaceMethod<
+         /*description=*/[{
+@@ -38,4 +38,4 @@ def RecipeInterface : OpInterface<"RecipeInterface"> {
+     ];
+ }
+ 
+-#endif // OPENACC_OPS_INTERFACES
++#endif // OPENACC_MP_COMMON_OPS_INTERFACES
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
+index c656bdc870976..bee21432196e4 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
+@@ -15,6 +15,7 @@
+ 
+ #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+ #include "mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.h"
++#include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h"
+ #include "mlir/IR/Dialect.h"
+ #include "mlir/IR/OpDefinition.h"
+ #include "mlir/IR/PatternMatch.h"
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index dc9ac2b9de22f..f28911adccd02 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -16,6 +16,7 @@
+ 
+ include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
+ include "mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.td"
++include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td"
+ include "mlir/Dialect/OpenMP/OpenMPAttrDefs.td"
+ include "mlir/Dialect/OpenMP/OpenMPOpBase.td"
+ include "mlir/Interfaces/ControlFlowInterfaces.td"
+@@ -28,7 +29,7 @@ include "mlir/IR/SymbolInterfaces.td"
+ // 2.19.4 Data-Sharing Attribute Clauses
+ //===----------------------------------------------------------------------===//
+ 
+-def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove]> {
++def PrivateClauseOp : OpenMP_Op<"private", [IsolatedFromAbove, RecipeInterface]> {
+   let summary = "Provides declaration of [first]private logic.";
+   let description = [{
+     This operation provides a declaration of how to implement the
+@@ -2091,7 +2092,8 @@ def CancellationPointOp : OpenMP_Op<"cancellation_point"> {
+ //===----------------------------------------------------------------------===//
+ 
+ def DeclareReductionOp : OpenMP_Op<"declare_reduction", [Symbol,
+-                                                         IsolatedFromAbove]> {
++                                                         IsolatedFromAbove,
++                                                         RecipeInterface]> {
+   let summary = "declares a reduction kind";
+ 
+   let description = [{
+diff --git a/mlir/lib/Dialect/OpenACC/IR/CMakeLists.txt b/mlir/lib/Dialect/OpenACC/IR/CMakeLists.txt
+index b802de165b8f3..387a6903b9d8b 100644
+--- a/mlir/lib/Dialect/OpenACC/IR/CMakeLists.txt
++++ b/mlir/lib/Dialect/OpenACC/IR/CMakeLists.txt
+@@ -8,7 +8,7 @@ add_mlir_dialect_library(MLIROpenACCDialect
+   MLIROpenACCOpsIncGen
+   MLIROpenACCEnumsIncGen
+   MLIROpenACCAttributesIncGen
+-  MLIROpenACCOpsInterfacesIncGen
++  MLIROpenACCMPOpsInterfacesIncGen
+   MLIROpenACCTypeInterfacesIncGen
+ 
+   LINK_LIBS PUBLIC
+diff --git a/mlir/lib/Dialect/OpenACC/IR/OpenACC.cpp b/mlir/lib/Dialect/OpenACC/IR/OpenACC.cpp
+index 9ba96e4be7d1f..1c8ce1ca3bce3 100644
+--- a/mlir/lib/Dialect/OpenACC/IR/OpenACC.cpp
++++ b/mlir/lib/Dialect/OpenACC/IR/OpenACC.cpp
+@@ -24,8 +24,8 @@ using namespace acc;
+ 
+ #include "mlir/Dialect/OpenACC/OpenACCOpsDialect.cpp.inc"
+ #include "mlir/Dialect/OpenACC/OpenACCOpsEnums.cpp.inc"
+-#include "mlir/Dialect/OpenACC/OpenACCOpsInterfaces.cpp.inc"
+ #include "mlir/Dialect/OpenACC/OpenACCTypeInterfaces.cpp.inc"
++#include "mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.cpp.inc"
+ 
+ namespace {
+ struct MemRefPointerLikeModel
+diff --git a/mlir/lib/Dialect/OpenACC/Transforms/CMakeLists.txt b/mlir/lib/Dialect/OpenACC/Transforms/CMakeLists.txt
+index db3dccd9751cf..2a29bd1c9cfa9 100644
+--- a/mlir/lib/Dialect/OpenACC/Transforms/CMakeLists.txt
++++ b/mlir/lib/Dialect/OpenACC/Transforms/CMakeLists.txt
+@@ -9,7 +9,7 @@ add_mlir_dialect_library(MLIROpenACCTransforms
+   MLIROpenACCOpsIncGen
+   MLIROpenACCEnumsIncGen
+   MLIROpenACCAttributesIncGen
+-  MLIROpenACCOpsInterfacesIncGen
++  MLIROpenACCMPOpsInterfacesIncGen
+   MLIROpenACCTypeInterfacesIncGen
+ 
+   LINK_LIBS PUBLIC
+diff --git a/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel b/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
+index dcd8125f34b9f..7b0f82b090708 100644
+--- a/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
++++ b/utils/bazel/llvm-project-overlay/mlir/BUILD.bazel
+@@ -9937,10 +9937,10 @@ td_library(
+         "include/mlir/Dialect/OpenACC/AccCommon.td",
+         "include/mlir/Dialect/OpenACC/OpenACCBase.td",
+         "include/mlir/Dialect/OpenACC/OpenACCOps.td",
+-        "include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td",
+         "include/mlir/Dialect/OpenACC/OpenACCOpsTypes.td",
+         "include/mlir/Dialect/OpenACC/OpenACCTypeInterfaces.td",
+         "include/mlir/Dialect/OpenACCMPCommon/Interfaces/AtomicInterfaces.td",
++        "include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td",
+     ],
+     includes = ["include"],
+     deps = [
+@@ -9951,19 +9951,19 @@ td_library(
+ )
+ 
+ gentbl_cc_library(
+-    name = "OpenACCOpsInterfacesIncGen",
++    name = "OpenACCMPOpsInterfacesIncGen",
+     tbl_outs = [
+         (
+             ["-gen-op-interface-decls"],
+-            "include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.h.inc",
++            "include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.h.inc",
+         ),
+         (
+             ["-gen-op-interface-defs"],
+-            "include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.cpp.inc",
++            "include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.cpp.inc",
+         ),
+     ],
+     tblgen = ":mlir-tblgen",
+-    td_file = "include/mlir/Dialect/OpenACC/OpenACCOpsInterfaces.td",
++    td_file = "include/mlir/Dialect/OpenACCMPCommon/Interfaces/OpenACCMPOpsInterfaces.td",
+     deps = [":OpenAccOpsTdFiles"],
+ )
+ 
+@@ -10099,7 +10099,7 @@ cc_library(
+         ":LoopLikeInterface",
+         ":MemRefDialect",
+         ":OpenACCOpsIncGen",
+-        ":OpenACCOpsInterfacesIncGen",
++        ":OpenACCMPOpsInterfacesIncGen",
+         ":OpenACCTypeInterfacesIncGen",
+         ":OpenACCTypesIncGen",
+         ":SideEffectInterfaces",

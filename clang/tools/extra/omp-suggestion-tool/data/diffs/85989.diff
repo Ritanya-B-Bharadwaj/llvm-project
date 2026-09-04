@@ -1,0 +1,861 @@
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index 4d0a993d02752..50f7b68d80cb1 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -745,7 +745,8 @@ class Symbol {
+       OmpCommonBlock, OmpReduction, OmpAligned, OmpNontemporal, OmpAllocate,
+       OmpDeclarativeAllocateDirective, OmpExecutableAllocateDirective,
+       OmpDeclareSimd, OmpDeclareTarget, OmpThreadprivate, OmpDeclareReduction,
+-      OmpFlushed, OmpCriticalLock, OmpIfSpecified, OmpNone, OmpPreDetermined);
++      OmpFlushed, OmpCriticalLock, OmpIfSpecified, OmpNone, OmpPreDetermined,
++      OmpImplicit);
+   using Flags = common::EnumSet<Flag, Flag_enumSize>;
+ 
+   const Scope &owner() const { return *owner_; }
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 2a418396cdafc..ad3b5ed54c7ac 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -27,8 +27,10 @@ void DataSharingProcessor::processStep1(
+     llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms) {
+   collectSymbolsForPrivatization();
+   collectDefaultSymbols();
++  collectImplicitSymbols();
+   privatize(clauseOps, privateSyms);
+   defaultPrivatize(clauseOps, privateSyms);
++  implicitPrivatize(clauseOps, privateSyms);
+   insertBarrier();
+ }
+ 
+@@ -302,6 +304,48 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+   }
+ }
+ 
++static const Fortran::parser::CharBlock *
++getSource(const Fortran::semantics::SemanticsContext &semaCtx,
++          const Fortran::lower::pft::Evaluation &eval) {
++  const Fortran::parser::CharBlock *source = nullptr;
++
++  auto ompConsVisit = [&](const Fortran::parser::OpenMPConstruct &x) {
++    std::visit(Fortran::common::visitors{
++                   [&](const Fortran::parser::OpenMPSectionsConstruct &x) {
++                     source = &std::get<0>(x.t).source;
++                   },
++                   [&](const Fortran::parser::OpenMPLoopConstruct &x) {
++                     source = &std::get<0>(x.t).source;
++                   },
++                   [&](const Fortran::parser::OpenMPBlockConstruct &x) {
++                     source = &std::get<0>(x.t).source;
++                   },
++                   [&](const Fortran::parser::OpenMPCriticalConstruct &x) {
++                     source = &std::get<0>(x.t).source;
++                   },
++                   [&](const Fortran::parser::OpenMPAtomicConstruct &x) {
++                     std::visit([&](const auto &x) { source = &x.source; },
++                                x.u);
++                   },
++                   [&](const auto &x) { source = &x.source; },
++               },
++               x.u);
++  };
++
++  eval.visit(Fortran::common::visitors{
++      [&](const Fortran::parser::OpenMPConstruct &x) { ompConsVisit(x); },
++      [&](const Fortran::parser::OpenMPDeclarativeConstruct &x) {
++        source = &x.source;
++      },
++      [&](const Fortran::parser::OmpEndLoopDirective &x) {
++        source = &x.source;
++      },
++      [&](const auto &x) {},
++  });
++
++  return source;
++}
++
+ void DataSharingProcessor::collectSymbolsInNestedRegions(
+     Fortran::lower::pft::Evaluation &eval,
+     Fortran::semantics::Symbol::Flag flag,
+@@ -329,11 +373,49 @@ void DataSharingProcessor::collectSymbolsInNestedRegions(
+ // Later, in current context, all symbols in the set
+ // `defaultSymbols` - `symbolsInNestedRegions` will be privatized.
+ void DataSharingProcessor::collectSymbols(
+-    Fortran::semantics::Symbol::Flag flag) {
+-  converter.collectSymbolSet(eval, defaultSymbols, flag,
++    Fortran::semantics::Symbol::Flag flag,
++    llvm::SetVector<const Fortran::semantics::Symbol *> &symbols) {
++  // Collect all scopes associated with 'eval'.
++  llvm::SetVector<const Fortran::semantics::Scope *> clauseScopes;
++  std::function<void(const Fortran::semantics::Scope *)> collectScopes =
++      [&](const Fortran::semantics::Scope *scope) {
++        clauseScopes.insert(scope);
++        for (const Fortran::semantics::Scope &child : scope->children())
++          collectScopes(&child);
++      };
++  const Fortran::parser::CharBlock *source =
++      clauses.empty() ? getSource(semaCtx, eval) : &clauses.front().source;
++  const Fortran::semantics::Scope *curScope = nullptr;
++  if (source && !source->empty()) {
++    curScope = &semaCtx.FindScope(*source);
++    collectScopes(curScope);
++  }
++  // Collect all symbols referenced in the evaluation being processed,
++  // that matches 'flag'.
++  llvm::SetVector<const Fortran::semantics::Symbol *> allSymbols;
++  converter.collectSymbolSet(eval, allSymbols, flag,
+                              /*collectSymbols=*/true,
+                              /*collectHostAssociatedSymbols=*/true);
++  llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInNestedRegions;
+   collectSymbolsInNestedRegions(eval, flag, symbolsInNestedRegions);
++  // Filter-out symbols that must not be privatized.
++  bool collectImplicit = flag == Fortran::semantics::Symbol::Flag::OmpImplicit;
++  auto isPrivatizable = [](const Fortran::semantics::Symbol &sym) -> bool {
++    return !Fortran::semantics::IsProcedure(sym) &&
++           !sym.GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
++           !sym.GetUltimate().has<Fortran::semantics::NamelistDetails>() &&
++           !Fortran::semantics::IsImpliedDoIndex(sym.GetUltimate());
++  };
++  for (const auto *sym : allSymbols) {
++    assert(curScope && "couldn't find current scope");
++    if (isPrivatizable(*sym) && !symbolsInNestedRegions.contains(sym) &&
++        !privatizedSymbols.contains(sym) &&
++        !sym->test(Fortran::semantics::Symbol::Flag::OmpPreDetermined) &&
++        (collectImplicit ||
++         !sym->test(Fortran::semantics::Symbol::Flag::OmpImplicit)) &&
++        clauseScopes.contains(&sym->owner()))
++      symbols.insert(sym);
++  }
+ }
+ 
+ void DataSharingProcessor::collectDefaultSymbols() {
+@@ -342,13 +424,22 @@ void DataSharingProcessor::collectDefaultSymbols() {
+     if (const auto *defaultClause =
+             std::get_if<omp::clause::Default>(&clause.u)) {
+       if (defaultClause->v == DataSharingAttribute::Private)
+-        collectSymbols(Fortran::semantics::Symbol::Flag::OmpPrivate);
++        collectSymbols(Fortran::semantics::Symbol::Flag::OmpPrivate,
++                       defaultSymbols);
+       else if (defaultClause->v == DataSharingAttribute::Firstprivate)
+-        collectSymbols(Fortran::semantics::Symbol::Flag::OmpFirstPrivate);
++        collectSymbols(Fortran::semantics::Symbol::Flag::OmpFirstPrivate,
++                       defaultSymbols);
+     }
+   }
+ }
+ 
++void DataSharingProcessor::collectImplicitSymbols() {
++  // There will be no implicit symbols when a default clause is present.
++  if (defaultSymbols.empty())
++    collectSymbols(Fortran::semantics::Symbol::Flag::OmpImplicit,
++                   implicitSymbols);
++}
++
+ void DataSharingProcessor::privatize(
+     mlir::omp::PrivateClauseOps *clauseOps,
+     llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms) {
+@@ -378,15 +469,15 @@ void DataSharingProcessor::copyLastPrivatize(mlir::Operation *op) {
+ void DataSharingProcessor::defaultPrivatize(
+     mlir::omp::PrivateClauseOps *clauseOps,
+     llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms) {
+-  for (const Fortran::semantics::Symbol *sym : defaultSymbols) {
+-    if (!Fortran::semantics::IsProcedure(*sym) &&
+-        !sym->GetUltimate().has<Fortran::semantics::DerivedTypeDetails>() &&
+-        !sym->GetUltimate().has<Fortran::semantics::NamelistDetails>() &&
+-        !Fortran::semantics::IsImpliedDoIndex(sym->GetUltimate()) &&
+-        !symbolsInNestedRegions.contains(sym) &&
+-        !privatizedSymbols.contains(sym))
+-      doPrivatize(sym, clauseOps, privateSyms);
+-  }
++  for (const Fortran::semantics::Symbol *sym : defaultSymbols)
++    doPrivatize(sym, clauseOps, privateSyms);
++}
++
++void DataSharingProcessor::implicitPrivatize(
++    mlir::omp::PrivateClauseOps *clauseOps,
++    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms) {
++  for (const Fortran::semantics::Symbol *sym : implicitSymbols)
++    doPrivatize(sym, clauseOps, privateSyms);
+ }
+ 
+ void DataSharingProcessor::doPrivatize(
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.h b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+index 5d1bce4f5036a..ec6848f7bba36 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.h
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+@@ -39,10 +39,11 @@ class DataSharingProcessor {
+   // Symbols in private, firstprivate, and/or lastprivate clauses.
+   llvm::SetVector<const Fortran::semantics::Symbol *> privatizedSymbols;
+   llvm::SetVector<const Fortran::semantics::Symbol *> defaultSymbols;
+-  llvm::SetVector<const Fortran::semantics::Symbol *> symbolsInNestedRegions;
++  llvm::SetVector<const Fortran::semantics::Symbol *> implicitSymbols;
+   llvm::DenseMap<const Fortran::semantics::Symbol *, mlir::omp::PrivateClauseOp>
+       symToPrivatizer;
+   Fortran::lower::AbstractConverter &converter;
++  Fortran::semantics::SemanticsContext &semaCtx;
+   fir::FirOpBuilder &firOpBuilder;
+   omp::List<omp::Clause> clauses;
+   Fortran::lower::pft::Evaluation &eval;
+@@ -50,7 +51,9 @@ class DataSharingProcessor {
+   Fortran::lower::SymMap *symTable;
+ 
+   bool needBarrier();
+-  void collectSymbols(Fortran::semantics::Symbol::Flag flag);
++  void
++  collectSymbols(Fortran::semantics::Symbol::Flag flag,
++                 llvm::SetVector<const Fortran::semantics::Symbol *> &symbols);
+   void collectSymbolsInNestedRegions(
+       Fortran::lower::pft::Evaluation &eval,
+       Fortran::semantics::Symbol::Flag flag,
+@@ -62,12 +65,16 @@ class DataSharingProcessor {
+   void collectSymbolsForPrivatization();
+   void insertBarrier();
+   void collectDefaultSymbols();
++  void collectImplicitSymbols();
+   void privatize(
+       mlir::omp::PrivateClauseOps *clauseOps,
+       llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms);
+   void defaultPrivatize(
+       mlir::omp::PrivateClauseOps *clauseOps,
+       llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms);
++  void implicitPrivatize(
++      mlir::omp::PrivateClauseOps *clauseOps,
++      llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *privateSyms);
+   void doPrivatize(
+       const Fortran::semantics::Symbol *sym,
+       mlir::omp::PrivateClauseOps *clauseOps,
+@@ -89,7 +96,7 @@ class DataSharingProcessor {
+                        Fortran::lower::pft::Evaluation &eval,
+                        bool useDelayedPrivatization = false,
+                        Fortran::lower::SymMap *symTable = nullptr)
+-      : hasLastPrivateOp(false), converter(converter),
++      : hasLastPrivateOp(false), converter(converter), semaCtx(semaCtx),
+         firOpBuilder(converter.getFirOpBuilder()), clauses(clauses), eval(eval),
+         useDelayedPrivatization(useDelayedPrivatization), symTable(symTable) {}
+ 
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index c99b1c413970e..9c5d81be7ab7f 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2028,34 +2028,108 @@ void OmpAttributeVisitor::Post(const parser::Name &name) {
+       if (found->test(semantics::Symbol::Flag::OmpThreadprivate))
+         return;
+     }
+-    std::vector<Symbol *> defaultDSASymbols;
++
++    // Implicitly determined DSAs
++    // OMP 5.2 5.1.1 - Variables Referenced in a Construct
++    Symbol *lastDeclSymbol = nullptr;
++    std::optional<Symbol::Flag> prevDSA;
+     for (int dirDepth{0}; dirDepth < (int)dirContext_.size(); ++dirDepth) {
+       DirContext &dirContext = dirContext_[dirDepth];
+-      bool hasDataSharingAttr{false};
++      std::optional<Symbol::Flag> dsa;
++
+       for (auto symMap : dirContext.objectWithDSA) {
+         // if the `symbol` already has a data-sharing attribute
+         if (symMap.first->name() == name.symbol->name()) {
+-          hasDataSharingAttr = true;
++          dsa = symMap.second;
+           break;
+         }
+       }
+-      if (hasDataSharingAttr) {
+-        if (defaultDSASymbols.size())
+-          symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
++
++      // When handling each implicit rule, either a new private symbol is
++      // declared or the last declared symbol is used.
++      // In the latter case, it's necessary to insert a new symbol in the scope
++      // being processed, associated with the last declared symbol.
++      // This captures the fact that, although we are using the last declared
++      // symbol, its DSA could be different in this scope.
++      // Also, because of how symbols are collected in lowering, not inserting
++      // a new symbol in this scope could lead to the conclusion that the
++      // symbol was declared in this construct, which would result in wrong
++      // privatization code being generated.
++      // Consider the following example:
++      //
++      // !$omp parallel default(private)              ! p1
++      //   !$omp parallel default(private) shared(x)  ! p2
++      //     x = 10
++      //   !$omp end parallel
++      // !$omp end parallel
++      //
++      // If a new x symbol was not inserted in the inner parallel construct
++      // (p2), it would use the x symbol definition from the enclosing scope.
++      // Then, when p2's default symbols were collected in lowering, the x
++      // symbol from the outer parallel construct (p1) would be collected, as
++      // it would have the private flag set (note that symbols that don't have
++      // any private flag are considered as shared).
++      // This would make x appear to be defined in p2, causing it to be
++      // privatized in p2 and its privatization in p1 to be skipped.
++      auto declNewSymbol = [&](Symbol::Flag flag) {
++        Symbol *hostSymbol =
++            lastDeclSymbol ? lastDeclSymbol : &symbol->GetUltimate();
++        lastDeclSymbol = DeclarePrivateAccessEntity(
++            *hostSymbol, flag, context_.FindScope(dirContext.directiveSource));
++        return lastDeclSymbol;
++      };
++      auto useLastDeclSymbol = [&]() {
++        if (lastDeclSymbol)
++          MakeAssocSymbol(symbol->name(), *lastDeclSymbol,
+               context_.FindScope(dirContext.directiveSource));
++      };
++
++      if (dsa.has_value()) {
++        useLastDeclSymbol();
++        prevDSA = dsa;
+         continue;
+       }
+ 
+-      if (dirContext.defaultDSA == semantics::Symbol::Flag::OmpPrivate ||
+-          dirContext.defaultDSA == semantics::Symbol::Flag::OmpFirstPrivate) {
+-        Symbol *hostSymbol = defaultDSASymbols.size() ? defaultDSASymbols.back()
+-                                                      : &symbol->GetUltimate();
+-        defaultDSASymbols.push_back(
+-            DeclarePrivateAccessEntity(*hostSymbol, dirContext.defaultDSA,
+-                context_.FindScope(dirContext.directiveSource)));
+-      } else if (defaultDSASymbols.size())
+-        symbol = &MakeAssocSymbol(symbol->name(), *defaultDSASymbols.back(),
+-            context_.FindScope(dirContext.directiveSource));
++      bool taskGenDir = llvm::omp::taskGeneratingSet.test(dirContext.directive);
++      bool targetDir = llvm::omp::allTargetSet.test(dirContext.directive);
++      bool parallelDir = llvm::omp::allParallelSet.test(dirContext.directive);
++
++      if (dirContext.defaultDSA == Symbol::Flag::OmpPrivate ||
++          dirContext.defaultDSA == Symbol::Flag::OmpFirstPrivate ||
++          dirContext.defaultDSA == Symbol::Flag::OmpShared) {
++        // 1) default
++        // Allowed only with parallel, teams and task generating constructs.
++        assert(parallelDir || taskGenDir ||
++            llvm::omp::allTeamsSet.test(dirContext.directive));
++        if (dirContext.defaultDSA != Symbol::Flag::OmpShared)
++          declNewSymbol(dirContext.defaultDSA);
++        else
++          useLastDeclSymbol();
++        dsa = dirContext.defaultDSA;
++      } else if (parallelDir) {
++        // 2) parallel -> shared
++        useLastDeclSymbol();
++        dsa = Symbol::Flag::OmpShared;
++      } else if (!taskGenDir && !targetDir) {
++        // 3) enclosing context
++        useLastDeclSymbol();
++        dsa = prevDSA;
++      } else if (targetDir) {
++        // TODO 4) not mapped target variable -> firstprivate
++        dsa = prevDSA;
++      } else if (taskGenDir) {
++        // TODO 5) dummy arg in orphaned taskgen construct -> firstprivate
++        if (prevDSA == Symbol::Flag::OmpShared) {
++          // 6) shared in enclosing context -> shared
++          useLastDeclSymbol();
++          dsa = Symbol::Flag::OmpShared;
++        } else {
++          // 7) firstprivate
++          dsa = Symbol::Flag::OmpFirstPrivate;
++          declNewSymbol(*dsa)->set(Symbol::Flag::OmpImplicit);
++        }
++      }
++      prevDSA = dsa;
+     }
+   } // within OpenMP construct
+ }
+diff --git a/flang/test/Lower/OpenMP/default-clause-byref.f90 b/flang/test/Lower/OpenMP/default-clause-byref.f90
+index ec8bfbc397d2e..62ba67e5962f4 100644
+--- a/flang/test/Lower/OpenMP/default-clause-byref.f90
++++ b/flang/test/Lower/OpenMP/default-clause-byref.f90
+@@ -240,14 +240,12 @@ subroutine nested_default_clause_tests
+ !CHECK: omp.terminator
+ !CHECK: }
+ !CHECK: omp.parallel {
+-!CHECK: %[[PRIVATE_INNER_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_testsEz"}
+-!CHECK: %[[PRIVATE_INNER_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_Z]] {uniq_name = "_QFnested_default_clause_testsEz"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_testsEw"}
+ !CHECK: %[[PRIVATE_INNER_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_W]] {uniq_name = "_QFnested_default_clause_testsEw"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_testsEx"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_testsEx"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP_1:.*]] = fir.load %[[PRIVATE_INNER_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_INNER_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_Z_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_INNER_W_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+diff --git a/flang/test/Lower/OpenMP/default-clause.f90 b/flang/test/Lower/OpenMP/default-clause.f90
+index c9e76780de5de..a90f0f4ef5f84 100644
+--- a/flang/test/Lower/OpenMP/default-clause.f90
++++ b/flang/test/Lower/OpenMP/default-clause.f90
+@@ -250,14 +250,12 @@ subroutine nested_default_clause_test1
+ !CHECK: omp.terminator
+ !CHECK: }
+ !CHECK: omp.parallel {
+-!CHECK: %[[PRIVATE_INNER_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFnested_default_clause_test2Ez"}
+-!CHECK: %[[PRIVATE_INNER_Z_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_Z]] {uniq_name = "_QFnested_default_clause_test2Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_W:.*]] = fir.alloca i32 {bindc_name = "w", pinned, uniq_name = "_QFnested_default_clause_test2Ew"}
+ !CHECK: %[[PRIVATE_INNER_W_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_W]] {uniq_name = "_QFnested_default_clause_test2Ew"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[PRIVATE_INNER_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFnested_default_clause_test2Ex"}
+ !CHECK: %[[PRIVATE_INNER_X_DECL:.*]]:2 = hlfir.declare %[[PRIVATE_INNER_X]] {uniq_name = "_QFnested_default_clause_test2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+ !CHECK: %[[TEMP_1:.*]] = fir.load %[[PRIVATE_INNER_X_DECL]]#0 : !fir.ref<i32>
+-!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_INNER_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK: %[[TEMP_2:.*]] = fir.load %[[PRIVATE_Z_DECL]]#0 : !fir.ref<i32>
+ !CHECK: %[[RESULT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
+ !CHECK: hlfir.assign %[[RESULT]] to %[[PRIVATE_INNER_W_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK: omp.terminator
+diff --git a/flang/test/Lower/OpenMP/implicit-dsa.f90 b/flang/test/Lower/OpenMP/implicit-dsa.f90
+new file mode 100644
+index 0000000000000..0f67d5bfd194f
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/implicit-dsa.f90
+@@ -0,0 +1,275 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++! Checks lowering of OpenMP variables with implicitly determined DSAs.
++
++! Basic cases.
++!CHECK-LABEL: func @_QPimplicit_dsa_test1
++!CHECK:       %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test1Ex"}
++!CHECK:       %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test1Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFimplicit_dsa_test1Ey"}
++!CHECK:       %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFimplicit_dsa_test1Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Z:.*]] = fir.alloca i32 {bindc_name = "z", uniq_name = "_QFimplicit_dsa_test1Ez"}
++!CHECK:       %[[Z_DECL:.*]]:2 = hlfir.declare %[[Z]] {uniq_name = "_QFimplicit_dsa_test1Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       omp.task {
++!CHECK-NEXT:    %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test1Ey"}
++!CHECK-NEXT:    %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test1Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:    %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test1Ex"}
++!CHECK-NEXT:    %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test1Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:    %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NOT:     fir.alloca
++!CHECK:       }
++!CHECK:       omp.task {
++!CHECK-NOT:     fir.alloca
++!CHECK:       }
++subroutine implicit_dsa_test1
++  integer :: x, y, z
++
++  !$omp task private(y) shared(z)
++    x = y + z
++  !$omp end task
++
++  !$omp task default(shared)
++    x = y + z
++  !$omp end task
++end subroutine
++
++! Nested task with implicit firstprivate DSA variable.
++!CHECK-LABEL: func @_QPimplicit_dsa_test2
++!CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test2Ex"}
++!CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: omp.task {
++!CHECK:   omp.task {
++!CHECK:     %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test2Ex"}
++!CHECK:     %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test2Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:     %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:   }
++!CHECK: }
++subroutine implicit_dsa_test2
++  integer :: x
++
++  !$omp task
++    !$omp task
++      x = 1
++    !$omp end task
++  !$omp end task
++end subroutine
++
++! Nested tasks with implicit shared DSA variables.
++!CHECK-LABEL: func @_QPimplicit_dsa_test3
++!CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test3Ex"}
++!CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test3Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFimplicit_dsa_test3Ey"}
++!CHECK: %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFimplicit_dsa_test3Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: %[[Z:.*]] = fir.alloca i32 {bindc_name = "z", uniq_name = "_QFimplicit_dsa_test3Ez"}
++!CHECK: %[[Z_DECL:.*]]:2 = hlfir.declare %[[Z]] {uniq_name = "_QFimplicit_dsa_test3Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: omp.parallel {
++!CHECK:   omp.task {
++!CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK:     hlfir.assign %[[ONE]] to %[[X_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK:     hlfir.assign %[[ONE]] to %[[Y_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:   }
++!CHECK:   omp.task {
++!CHECK:     %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test3Ex"}
++!CHECK:     %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test3Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:     %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++!CHECK:     hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK:     hlfir.assign %[[ONE]] to %[[PRIV_X_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:     %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK:     hlfir.assign %[[ONE]] to %[[Z_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:   }
++!CHECK: }
++subroutine implicit_dsa_test3
++  integer :: x, y, z
++
++  !$omp parallel
++    !$omp task
++      x = 1
++      y = 1
++    !$omp end task
++
++    !$omp task firstprivate(x)
++      x = 1
++      z = 1
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Task with implicit firstprivate DSA variables, enclosed in private context.
++!CHECK-LABEL: func @_QPimplicit_dsa_test4
++!CHECK:       %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test4Ex"}
++!CHECK:       %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFimplicit_dsa_test4Ey"}
++!CHECK:       %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFimplicit_dsa_test4Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Z:.*]] = fir.alloca i32 {bindc_name = "z", uniq_name = "_QFimplicit_dsa_test4Ez"}
++!CHECK:       %[[Z_DECL:.*]]:2 = hlfir.declare %[[Z]] {uniq_name = "_QFimplicit_dsa_test4Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       omp.parallel {
++!CHECK:         %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test4Ex"}
++!CHECK:         %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:         %[[PRIV_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test4Ez"}
++!CHECK:         %[[PRIV_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV_Z]] {uniq_name = "_QFimplicit_dsa_test4Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:         %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test4Ey"}
++!CHECK:         %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test4Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:         omp.task {
++!CHECK-NEXT:      %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test4Ex"}
++!CHECK-NEXT:      %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      %[[PRIV2_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test4Ez"}
++!CHECK-NEXT:      %[[PRIV2_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV2_Z]] {uniq_name = "_QFimplicit_dsa_test4Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[PRIV_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Z_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:           %[[ZERO:.*]] = arith.constant 0 : i32
++!CHECK-NEXT:      hlfir.assign %[[ZERO]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:           %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK-NEXT:      hlfir.assign %[[ONE]] to %[[PRIV2_Z_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:         }
++!CHECK:         omp.task {
++!CHECK-NEXT:      %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test4Ex"}
++!CHECK-NEXT:      %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test4Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      %[[PRIV2_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test4Ey"}
++!CHECK-NEXT:      %[[PRIV2_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV2_Y]] {uniq_name = "_QFimplicit_dsa_test4Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[PRIV_Y_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV2_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:           %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK-NEXT:      hlfir.assign %[[ONE]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:           %[[ZERO:.*]] = arith.constant 0 : i32
++!CHECK-NEXT:      hlfir.assign %[[ZERO]] to %[[PRIV2_Z_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:         }
++!CHECK:       }
++subroutine implicit_dsa_test4
++  integer :: x, y, z
++
++  !$omp parallel default(private)
++    !$omp task
++      x = 0
++      z = 1
++    !$omp end task
++
++    !$omp task
++      x = 1
++      y = 0
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Inner parallel using implicit firstprivate symbol.
++!CHECK-LABEL: func @_QPimplicit_dsa_test5
++!CHECK: %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test5Ex"}
++!CHECK: %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test5Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK: omp.parallel {
++!CHECK:     %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test5Ex"}
++!CHECK:     %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test5Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:   omp.task {
++!CHECK:     %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test5Ex"}
++!CHECK:     %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test5Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:      %[[TEMP:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
++!CHECK:      hlfir.assign %[[TEMP]] to %[[PRIV2_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:     omp.parallel {
++!CHECK:       %[[ONE:.*]] = arith.constant 1 : i32
++!CHECK:       hlfir.assign %[[ONE]] to %[[PRIV2_X_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:     }
++!CHECK:   }
++!CHECK: }
++subroutine implicit_dsa_test5
++  integer :: x
++
++  !$omp parallel default(private)
++    !$omp task
++      !$omp parallel
++        x = 1
++      !$omp end parallel
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Constructs nested inside a task with implicit DSA variables.
++!CHECK-LABEL: func @_QPimplicit_dsa_test6
++!CHECK:       %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test6Ex"}
++!CHECK:       %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFimplicit_dsa_test6Ey"}
++!CHECK:       %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFimplicit_dsa_test6Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Z:.*]] = fir.alloca i32 {bindc_name = "z", uniq_name = "_QFimplicit_dsa_test6Ez"}
++!CHECK:       %[[Z_DECL:.*]]:2 = hlfir.declare %[[Z]] {uniq_name = "_QFimplicit_dsa_test6Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       omp.task {
++!CHECK-NEXT:    %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test6Ex"}
++!CHECK-NEXT:    %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:    %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test6Ey"}
++!CHECK-NEXT:    %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test6Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:    %[[TEMP2:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:    %[[PRIV_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test6Ez"}
++!CHECK-NEXT:    %[[PRIV_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV_Z]] {uniq_name = "_QFimplicit_dsa_test6Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:    %[[TEMP3:.*]] = fir.load %[[Z_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:    hlfir.assign %[[TEMP3]] to %[[PRIV_Z_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:         omp.parallel {
++!CHECK:           %[[PRIV2_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test6Ex"}
++!CHECK:           %[[PRIV2_X_DECL:.*]]:2 = hlfir.declare %[[PRIV2_X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NOT:       hlfir.assign
++!CHECK:           %[[PRIV2_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test6Ey"}
++!CHECK:           %[[PRIV2_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV2_Y]] {uniq_name = "_QFimplicit_dsa_test6Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NOT:       hlfir.assign
++!CHECK:           hlfir.assign %{{.*}} to %[[PRIV2_X_DECL]]
++!CHECK:         }
++!CHECK:         omp.parallel {
++!CHECK-NEXT:      %[[PRIV3_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test6Ex"}
++!CHECK-NEXT:      %[[PRIV3_X_DECL:.*]]:2 = hlfir.declare %[[PRIV3_X]] {uniq_name = "_QFimplicit_dsa_test6Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP4:.*]] = fir.load %[[PRIV_X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP4]] to %[[PRIV3_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      %[[PRIV3_Z:.*]] = fir.alloca i32 {bindc_name = "z", pinned, uniq_name = "_QFimplicit_dsa_test6Ez"}
++!CHECK-NEXT:      %[[PRIV3_Z_DECL:.*]]:2 = hlfir.declare %[[PRIV3_Z]] {uniq_name = "_QFimplicit_dsa_test6Ez"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP5:.*]] = fir.load %[[PRIV_Z_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP5]] to %[[PRIV3_Z_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:           hlfir.assign %{{.*}} to %[[PRIV_Y_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:         }
++!CHECK:       }
++subroutine implicit_dsa_test6
++  integer :: x, y, z
++
++  !$omp task
++    !$omp parallel default(private)
++      x = y
++    !$omp end parallel
++
++    !$omp parallel default(firstprivate) shared(y)
++      y = x + z
++    !$omp end parallel
++  !$omp end task
++end subroutine
++
++! Test taskgroup - it uses the same scope as task.
++!CHECK-LABEL: func @_QPimplicit_dsa_test7
++!CHECK:       %[[X:.*]] = fir.alloca i32 {bindc_name = "x", uniq_name = "_QFimplicit_dsa_test7Ex"}
++!CHECK:       %[[X_DECL:.*]]:2 = hlfir.declare %[[X]] {uniq_name = "_QFimplicit_dsa_test7Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       %[[Y:.*]] = fir.alloca i32 {bindc_name = "y", uniq_name = "_QFimplicit_dsa_test7Ey"}
++!CHECK:       %[[Y_DECL:.*]]:2 = hlfir.declare %[[Y]] {uniq_name = "_QFimplicit_dsa_test7Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK:       omp.task {
++!CHECK:         omp.taskgroup {
++!CHECK-NEXT:      %[[PRIV_X:.*]] = fir.alloca i32 {bindc_name = "x", pinned, uniq_name = "_QFimplicit_dsa_test7Ex"}
++!CHECK-NEXT:      %[[PRIV_X_DECL:.*]]:2 = hlfir.declare %[[PRIV_X]] {uniq_name = "_QFimplicit_dsa_test7Ex"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP:.*]] = fir.load %[[X_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP]] to %[[PRIV_X_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK-NEXT:      %[[PRIV_Y:.*]] = fir.alloca i32 {bindc_name = "y", pinned, uniq_name = "_QFimplicit_dsa_test7Ey"}
++!CHECK-NEXT:      %[[PRIV_Y_DECL:.*]]:2 = hlfir.declare %[[PRIV_Y]] {uniq_name = "_QFimplicit_dsa_test7Ey"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++!CHECK-NEXT:      %[[TEMP2:.*]] = fir.load %[[Y_DECL]]#0 : !fir.ref<i32>
++!CHECK-NEXT:      hlfir.assign %[[TEMP2]] to %[[PRIV_Y_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++!CHECK:         }
++!CHECK:       }
++subroutine implicit_dsa_test7
++  integer :: x, y
++
++  !$omp task
++    !$omp taskgroup
++      x = y
++    !$omp end taskgroup
++  !$omp end task
++end subroutine
++
++! TODO Test taskloop
+diff --git a/flang/test/Semantics/OpenMP/implicit-dsa.f90 b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+new file mode 100644
+index 0000000000000..92d2421d06f97
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+@@ -0,0 +1,158 @@
++! RUN: %python %S/../test_symbols.py %s %flang_fc1 -fopenmp
++
++! Test symbols generated in block constructs that have implicitly
++! determined DSAs.
++
++! Basic cases.
++!DEF: /implicit_dsa_test1 (Subroutine) Subprogram
++subroutine implicit_dsa_test1
++  !DEF: /implicit_dsa_test1/i ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test1/x ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test1/y ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test1/z ObjectEntity INTEGER(4)
++  integer i, x, y, z
++
++  !$omp task private(y) shared(z)
++    !DEF: /implicit_dsa_test1/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++    !DEF: /implicit_dsa_test1/OtherConstruct1/y (OmpPrivate) HostAssoc INTEGER(4)
++    !REF: /implicit_dsa_test1/z
++    x = y + z
++  !$omp end task
++
++  !$omp task default(shared)
++    !REF: /implicit_dsa_test1/x
++    !REF: /implicit_dsa_test1/y
++    !REF: /implicit_dsa_test1/z
++    x = y + z
++  !$omp end task
++
++  !$omp taskloop
++    !DEF: /implicit_dsa_test1/OtherConstruct3/i (OmpPrivate, OmpPreDetermined) HostAssoc INTEGER(4)
++    do i = 0, 10
++      !DEF: /implicit_dsa_test1/OtherConstruct3/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test1/OtherConstruct3/y (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      !REF: /implicit_dsa_test1/OtherConstruct3/i
++      x = y + i
++    end do
++  !$omp end taskloop
++end subroutine
++
++! Nested task with implicit firstprivate DSA variable.
++!DEF: /implicit_dsa_test2 (Subroutine) Subprogram
++subroutine implicit_dsa_test2
++  !DEF: /implicit_dsa_test2/x ObjectEntity INTEGER(4)
++  integer x
++
++  !$omp task
++    !$omp task
++      !DEF: /implicit_dsa_test2/OtherConstruct1/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      x = 1
++    !$omp end task
++  !$omp end task
++end subroutine
++
++! Nested tasks with implicit shared DSA variables.
++!DEF: /implicit_dsa_test3 (Subroutine) Subprogram
++subroutine implicit_dsa_test3
++  !DEF: /implicit_dsa_test3/x ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test3/y ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test3/z ObjectEntity INTEGER(4)
++  integer x, y, z
++
++  !$omp parallel
++    !$omp task
++      !REF: /implicit_dsa_test3/x
++      x = 1
++      !REF: /implicit_dsa_test3/y
++      y = 1
++    !$omp end task
++
++    !$omp task firstprivate(x)
++      !DEF: /implicit_dsa_test3/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate) HostAssoc INTEGER(4)
++      x = 1
++      !REF: /implicit_dsa_test3/z
++      z = 1
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Task with implicit firstprivate DSA variables, enclosed in private context.
++!DEF: /implicit_dsa_test4 (Subroutine) Subprogram
++subroutine implicit_dsa_test4
++  !DEF: /implicit_dsa_test4/x ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test4/y ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test4/z ObjectEntity INTEGER(4)
++  integer x, y, z
++
++  !$omp parallel default(private)
++    !$omp task
++      !DEF: /implicit_dsa_test4/OtherConstruct1/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      x = 0
++      !DEF: /implicit_dsa_test4/OtherConstruct1/OtherConstruct1/z (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      z = 1
++    !$omp end task
++
++    !$omp task
++      !DEF: /implicit_dsa_test4/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      x = 1
++      !DEF: /implicit_dsa_test4/OtherConstruct1/OtherConstruct2/y (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      y = 0
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Inner parallel using implicit firstprivate symbol.
++!DEF: /implicit_dsa_test5 (Subroutine) Subprogram
++subroutine implicit_dsa_test5
++  !DEF: /implicit_dsa_test5/x ObjectEntity INTEGER(4)
++  integer x
++
++  !$omp parallel default(private)
++    !$omp task
++      !$omp parallel
++        !DEF: /implicit_dsa_test5/OtherConstruct1/OtherConstruct1/OtherConstruct1/x HostAssoc INTEGER(4)
++        x = 1
++      !$omp end parallel
++    !$omp end task
++  !$omp end parallel
++end subroutine
++
++! Constructs nested inside a task with implicit DSA variables.
++!DEF: /implicit_dsa_test6 (Subroutine) Subprogram
++subroutine implicit_dsa_test6
++  !DEF: /implicit_dsa_test6/x ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test6/y ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test6/z ObjectEntity INTEGER(4)
++  integer x, y, z
++
++  !$omp task
++    !$omp parallel default(private)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct1/x (OmpPrivate) HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct1/y (OmpPrivate) HostAssoc INTEGER(4)
++      x = y
++    !$omp end parallel
++
++    !$omp parallel default(firstprivate) shared(y)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/y HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/x (OmpFirstPrivate) HostAssocINTEGER(4)
++      !DEF: /implicit_dsa_test6/OtherConstruct1/OtherConstruct2/z (OmpFirstPrivate) HostAssocINTEGER(4)
++      y = x + z
++    !$omp end parallel
++  !$omp end task
++end subroutine
++
++! Test taskgroup - it uses the same scope as task.
++!DEF: /implicit_dsa_test7 (Subroutine) Subprogram
++subroutine implicit_dsa_test7
++  !DEF: /implicit_dsa_test7/x ObjectEntity INTEGER(4)
++  !DEF: /implicit_dsa_test7/y ObjectEntity INTEGER(4)
++  integer x, y
++
++  !$omp task
++    !$omp taskgroup
++      !DEF: /implicit_dsa_test7/OtherConstruct1/x (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      !DEF: /implicit_dsa_test7/OtherConstruct1/y (OmpFirstPrivate, OmpImplicit) HostAssoc INTEGER(4)
++      x = y
++    !$omp end taskgroup
++  !$omp end task
++end subroutine
+diff --git a/flang/test/Semantics/OpenMP/symbol08.f90 b/flang/test/Semantics/OpenMP/symbol08.f90
+index 50f34b736cdb7..3af85af74ee97 100644
+--- a/flang/test/Semantics/OpenMP/symbol08.f90
++++ b/flang/test/Semantics/OpenMP/symbol08.f90
+@@ -94,7 +94,7 @@ subroutine test_taskloop
+   !DEF: /test_taskloop/OtherConstruct1/j (OmpPrivate) HostAssoc INTEGER(4)
+   !REF: /test_taskloop/OtherConstruct1/i
+   do j=1,i
+-   !REF: /test_taskloop/a
++   !DEF: /test_taskloop/OtherConstruct1/a (OmpFirstPrivate, OmpImplicit) HostAssoc REAL(4)
+    !REF: /test_taskloop/OtherConstruct1/j
+    !REF: /test_taskloop/OtherConstruct1/i
+    a(j,i) = 3.14

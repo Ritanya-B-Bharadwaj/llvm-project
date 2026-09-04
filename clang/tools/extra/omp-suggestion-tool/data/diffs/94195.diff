@@ -1,0 +1,629 @@
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index b206040c237c5..e2b55fcc64062 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -48,14 +48,13 @@ DataSharingProcessor::DataSharingProcessor(
+ }
+ 
+ void DataSharingProcessor::processStep1(
+-    mlir::omp::PrivateClauseOps *clauseOps,
+-    llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms) {
++    mlir::omp::PrivateClauseOps *clauseOps) {
+   collectSymbolsForPrivatization();
+   collectDefaultSymbols();
+   collectImplicitSymbols();
+   collectPreDeterminedSymbols();
+ 
+-  privatize(clauseOps, privateSyms);
++  privatize(clauseOps);
+ 
+   insertBarrier();
+ }
+@@ -415,16 +414,14 @@ void DataSharingProcessor::collectPreDeterminedSymbols() {
+                    preDeterminedSymbols);
+ }
+ 
+-void DataSharingProcessor::privatize(
+-    mlir::omp::PrivateClauseOps *clauseOps,
+-    llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms) {
++void DataSharingProcessor::privatize(mlir::omp::PrivateClauseOps *clauseOps) {
+   for (const semantics::Symbol *sym : allPrivatizedSymbols) {
+     if (const auto *commonDet =
+             sym->detailsIf<semantics::CommonBlockDetails>()) {
+       for (const auto &mem : commonDet->objects())
+-        doPrivatize(&*mem, clauseOps, privateSyms);
++        doPrivatize(&*mem, clauseOps);
+     } else
+-      doPrivatize(sym, clauseOps, privateSyms);
++      doPrivatize(sym, clauseOps);
+   }
+ }
+ 
+@@ -441,9 +438,8 @@ void DataSharingProcessor::copyLastPrivatize(mlir::Operation *op) {
+     }
+ }
+ 
+-void DataSharingProcessor::doPrivatize(
+-    const semantics::Symbol *sym, mlir::omp::PrivateClauseOps *clauseOps,
+-    llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms) {
++void DataSharingProcessor::doPrivatize(const semantics::Symbol *sym,
++                                       mlir::omp::PrivateClauseOps *clauseOps) {
+   if (!useDelayedPrivatization) {
+     cloneSymbol(sym);
+     copyFirstPrivateSymbol(sym);
+@@ -548,9 +544,6 @@ void DataSharingProcessor::doPrivatize(
+     clauseOps->privateVars.push_back(hsb.getAddr());
+   }
+ 
+-  if (privateSyms)
+-    privateSyms->push_back(sym);
+-
+   symToPrivatizer[sym] = privatizerOp;
+ }
+ 
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.h b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+index fb340e6fdb106..7c0c831ed43a8 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.h
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+@@ -105,18 +105,15 @@ class DataSharingProcessor {
+   void collectDefaultSymbols();
+   void collectImplicitSymbols();
+   void collectPreDeterminedSymbols();
+-  void privatize(mlir::omp::PrivateClauseOps *clauseOps,
+-                 llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms);
++  void privatize(mlir::omp::PrivateClauseOps *clauseOps);
+   void defaultPrivatize(
+       mlir::omp::PrivateClauseOps *clauseOps,
+       llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms);
+   void implicitPrivatize(
+       mlir::omp::PrivateClauseOps *clauseOps,
+       llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms);
+-  void
+-  doPrivatize(const semantics::Symbol *sym,
+-              mlir::omp::PrivateClauseOps *clauseOps,
+-              llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms);
++  void doPrivatize(const semantics::Symbol *sym,
++                   mlir::omp::PrivateClauseOps *clauseOps);
+   void copyLastPrivatize(mlir::Operation *op);
+   void insertLastPrivateCompare(mlir::Operation *op);
+   void cloneSymbol(const semantics::Symbol *sym);
+@@ -147,15 +144,18 @@ class DataSharingProcessor {
+   // Step2 performs the copying for lastprivates and requires knowledge of the
+   // MLIR operation to insert the last private update. Step2 adds
+   // dealocation code as well.
+-  void processStep1(
+-      mlir::omp::PrivateClauseOps *clauseOps = nullptr,
+-      llvm::SmallVectorImpl<const semantics::Symbol *> *privateSyms = nullptr);
++  void processStep1(mlir::omp::PrivateClauseOps *clauseOps = nullptr);
+   void processStep2(mlir::Operation *op, bool isLoop);
+ 
+   void setLoopIV(mlir::Value iv) {
+     assert(!loopIV && "Loop iteration variable already set");
+     loopIV = iv;
+   }
++
++  const llvm::SetVector<const semantics::Symbol *> &
++  getAllSymbolsToPrivatize() const {
++    return allPrivatizedSymbols;
++  }
+ };
+ 
+ } // namespace omp
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index f84440d95ec11..184c43ff9fe91 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -456,6 +456,33 @@ markDeclareTarget(mlir::Operation *op, lower::AbstractConverter &converter,
+   declareTargetOp.setDeclareTarget(deviceType, captureClause);
+ }
+ 
++/// For an operation that takes `omp.private` values as region args, this util
++/// merges the private vars info into the region arguments list.
++///
++/// \tparam OMPOP  - the OpenMP op that takes `omp.private` inputs.
++/// \tparam InfoTy - the type of private info we want to merge; e.g. mlir::Type
++/// or mlir::Location fields of the private var list.
++///
++/// \param [in] op                 - the op accepting `omp.private` inputs.
++/// \param [in] currentList        - the current list of region info that we
++/// want to merge private info with. For example this could be the list of types
++/// or locations of previous arguments to \op's region.
++/// \param [in] infoAccessor       - for a private variable, this returns the
++/// data we want to merge: type or location.
++/// \param [out] allRegionArgsInfo - the merged list of region info.
++template <typename OMPOp, typename InfoTy>
++static void
++mergePrivateVarsInfo(OMPOp op, llvm::ArrayRef<InfoTy> currentList,
++                     llvm::function_ref<InfoTy(mlir::Value)> infoAccessor,
++                     llvm::SmallVectorImpl<InfoTy> &allRegionArgsInfo) {
++  mlir::OperandRange privateVars = op.getPrivateVars();
++
++  llvm::transform(currentList, std::back_inserter(allRegionArgsInfo),
++                  [](InfoTy i) { return i; });
++  llvm::transform(privateVars, std::back_inserter(allRegionArgsInfo),
++                  infoAccessor);
++}
++
+ //===----------------------------------------------------------------------===//
+ // Op body generation helper structures and functions
+ //===----------------------------------------------------------------------===//
+@@ -758,6 +785,7 @@ genBodyOfTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                   llvm::ArrayRef<const semantics::Symbol *> mapSyms,
+                   llvm::ArrayRef<mlir::Location> mapSymLocs,
+                   llvm::ArrayRef<mlir::Type> mapSymTypes,
++                  DataSharingProcessor &dsp,
+                   const mlir::Location &currentLocation,
+                   const ConstructQueue &queue, ConstructQueue::iterator item) {
+   assert(mapSymTypes.size() == mapSymLocs.size());
+@@ -765,8 +793,20 @@ genBodyOfTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::Region &region = targetOp.getRegion();
+ 
+-  auto *regionBlock =
+-      firOpBuilder.createBlock(&region, {}, mapSymTypes, mapSymLocs);
++  llvm::SmallVector<mlir::Type> allRegionArgTypes;
++  mergePrivateVarsInfo(targetOp, mapSymTypes,
++                       llvm::function_ref<mlir::Type(mlir::Value)>{
++                           [](mlir::Value v) { return v.getType(); }},
++                       allRegionArgTypes);
++
++  llvm::SmallVector<mlir::Location> allRegionArgLocs;
++  mergePrivateVarsInfo(targetOp, mapSymLocs,
++                       llvm::function_ref<mlir::Location(mlir::Value)>{
++                           [](mlir::Value v) { return v.getLoc(); }},
++                       allRegionArgLocs);
++
++  auto *regionBlock = firOpBuilder.createBlock(&region, {}, allRegionArgTypes,
++                                               allRegionArgLocs);
+ 
+   // Clones the `bounds` placing them inside the target region and returns them.
+   auto cloneBound = [&](mlir::Value bound) {
+@@ -830,6 +870,20 @@ genBodyOfTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+         });
+   }
+ 
++  for (auto [argIndex, argSymbol] :
++       llvm::enumerate(dsp.getAllSymbolsToPrivatize())) {
++    argIndex = mapSyms.size() + argIndex;
++
++    const mlir::BlockArgument &arg = region.getArgument(argIndex);
++    converter.bindSymbol(*argSymbol,
++                         hlfir::translateToExtendedValue(
++                             currentLocation, firOpBuilder, hlfir::Entity{arg},
++                             /*contiguousHint=*/
++                             evaluate::IsSimplyContiguous(
++                                 *argSymbol, converter.getFoldingContext()))
++                             .first);
++  }
++
+   // Check if cloning the bounds introduced any dependency on the outer region.
+   // If so, then either clone them as well if they are MemoryEffectFree, or else
+   // copy them to a new temporary and add them to the map and block_argument
+@@ -907,6 +961,8 @@ genBodyOfTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   } else {
+     genNestedEvaluations(converter, eval);
+   }
++
++  dsp.processStep2(targetOp, /*isLoop=*/false);
+ }
+ 
+ template <typename OpTy, typename... Args>
+@@ -1048,15 +1104,18 @@ static void genTargetClauses(
+                         devicePtrSyms);
+   cp.processMap(loc, stmtCtx, clauseOps, &mapSyms, &mapLocs, &mapTypes);
+   cp.processThreadLimit(stmtCtx, clauseOps);
+-  // TODO Support delayed privatization.
+ 
+   if (processHostOnlyClauses)
+     cp.processNowait(clauseOps);
+ 
+   cp.processTODO<clause::Allocate, clause::Defaultmap, clause::Firstprivate,
+-                 clause::InReduction, clause::Private, clause::Reduction,
++                 clause::InReduction, clause::Reduction,
+                  clause::UsesAllocators>(loc,
+                                          llvm::omp::Directive::OMPD_target);
++
++  // `target private(..)` is only supported in delayed privatization mode.
++  if (!enableDelayedPrivatization)
++    cp.processTODO<clause::Private>(loc, llvm::omp::Directive::OMPD_target);
+ }
+ 
+ static void genTargetDataClauses(
+@@ -1289,7 +1348,6 @@ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   lower::StatementContext stmtCtx;
+   mlir::omp::ParallelClauseOps clauseOps;
+-  llvm::SmallVector<const semantics::Symbol *> privateSyms;
+   llvm::SmallVector<mlir::Type> reductionTypes;
+   llvm::SmallVector<const semantics::Symbol *> reductionSyms;
+   genParallelClauses(converter, semaCtx, stmtCtx, item->clauses, loc,
+@@ -1319,7 +1377,7 @@ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                            /*useDelayedPrivatization=*/true, &symTable);
+ 
+   if (privatize)
+-    dsp.processStep1(&clauseOps, &privateSyms);
++    dsp.processStep1(&clauseOps);
+ 
+   auto genRegionEntryCB = [&](mlir::Operation *op) {
+     auto parallelOp = llvm::cast<mlir::omp::ParallelOp>(op);
+@@ -1327,26 +1385,27 @@ genParallelOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+     llvm::SmallVector<mlir::Location> reductionLocs(
+         clauseOps.reductionVars.size(), loc);
+ 
+-    mlir::OperandRange privateVars = parallelOp.getPrivateVars();
+-    mlir::Region &region = parallelOp.getRegion();
++    llvm::SmallVector<mlir::Type> allRegionArgTypes;
++    mergePrivateVarsInfo(parallelOp, llvm::ArrayRef(reductionTypes),
++                         llvm::function_ref<mlir::Type(mlir::Value)>{
++                             [](mlir::Value v) { return v.getType(); }},
++                         allRegionArgTypes);
+ 
+-    llvm::SmallVector<mlir::Type> privateVarTypes = reductionTypes;
+-    privateVarTypes.reserve(privateVarTypes.size() + privateVars.size());
+-    llvm::transform(privateVars, std::back_inserter(privateVarTypes),
+-                    [](mlir::Value v) { return v.getType(); });
++    llvm::SmallVector<mlir::Location> allRegionArgLocs;
++    mergePrivateVarsInfo(parallelOp, llvm::ArrayRef(reductionLocs),
++                         llvm::function_ref<mlir::Location(mlir::Value)>{
++                             [](mlir::Value v) { return v.getLoc(); }},
++                         allRegionArgLocs);
+ 
+-    llvm::SmallVector<mlir::Location> privateVarLocs = reductionLocs;
+-    privateVarLocs.reserve(privateVarLocs.size() + privateVars.size());
+-    llvm::transform(privateVars, std::back_inserter(privateVarLocs),
+-                    [](mlir::Value v) { return v.getLoc(); });
+-
+-    firOpBuilder.createBlock(&region, /*insertPt=*/{}, privateVarTypes,
+-                             privateVarLocs);
++    mlir::Region &region = parallelOp.getRegion();
++    firOpBuilder.createBlock(&region, /*insertPt=*/{}, allRegionArgTypes,
++                             allRegionArgLocs);
+ 
+     llvm::SmallVector<const semantics::Symbol *> allSymbols = reductionSyms;
+-    allSymbols.append(privateSyms);
++    allSymbols.append(dsp.getAllSymbolsToPrivatize().begin(),
++                      dsp.getAllSymbolsToPrivatize().end());
++
+     for (auto [arg, prv] : llvm::zip_equal(allSymbols, region.getArguments())) {
+-      fir::ExtendedValue hostExV = converter.getSymbolExtendedValue(*arg);
+       converter.bindSymbol(*arg, hlfir::translateToExtendedValue(
+                                      loc, firOpBuilder, hlfir::Entity{prv},
+                                      /*contiguousHint=*/
+@@ -1541,11 +1600,22 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    deviceAddrLocs, deviceAddrTypes, devicePtrSyms,
+                    devicePtrLocs, devicePtrTypes);
+ 
++  llvm::SmallVector<const semantics::Symbol *> privateSyms;
++  DataSharingProcessor dsp(converter, semaCtx, item->clauses, eval,
++                           /*shouldCollectPreDeterminedSymbols=*/
++                           lower::omp::isLastItemInQueue(item, queue),
++                           /*useDelayedPrivatization=*/true, &symTable);
++  dsp.processStep1(&clauseOps);
++
+   // 5.8.1 Implicit Data-Mapping Attribute Rules
+   // The following code follows the implicit data-mapping rules to map all the
+-  // symbols used inside the region that have not been explicitly mapped using
+-  // the map clause.
++  // symbols used inside the region that do not have explicit data-environment
++  // attribute clauses (neither data-sharing; e.g. `private`, nor `map`
++  // clauses).
+   auto captureImplicitMap = [&](const semantics::Symbol &sym) {
++    if (dsp.getAllSymbolsToPrivatize().contains(&sym))
++      return;
++
+     if (llvm::find(mapSyms, &sym) == mapSyms.end()) {
+       mlir::Value baseOp = converter.getSymbolAddress(sym);
+       if (!baseOp)
+@@ -1632,7 +1702,7 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+ 
+   auto targetOp = firOpBuilder.create<mlir::omp::TargetOp>(loc, clauseOps);
+   genBodyOfTargetOp(converter, symTable, semaCtx, eval, targetOp, mapSyms,
+-                    mapLocs, mapTypes, loc, queue, item);
++                    mapLocs, mapTypes, dsp, loc, queue, item);
+   return targetOp;
+ }
+ 
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-allocatable.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-allocatable.f90
+new file mode 100644
+index 0000000000000..17a28c6a5ab7d
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-allocatable.f90
+@@ -0,0 +1,71 @@
++! Tests delayed privatization for `targets ... private(..)` for allocatables.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %s 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %s 2>&1 \
++! RUN:   | FileCheck %s
++
++subroutine target_allocatable
++  implicit none
++  integer, allocatable :: alloc_var
++
++  !$omp target private(alloc_var)
++    alloc_var = 10
++  !$omp end target
++end subroutine target_allocatable
++
++! CHECK-LABEL: omp.private {type = private}
++! CHECK-SAME:    @[[VAR_PRIVATIZER_SYM:.*]] :
++! CHECK-SAME:      [[TYPE:!fir.ref<!fir.box<!fir.heap<i32>>>]] alloc {
++! CHECK:  ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++! CHECK:    %[[PRIV_ALLOC:.*]] = fir.alloca !fir.box<!fir.heap<i32>> {bindc_name = "alloc_var", {{.*}}}
++
++! CHECK-NEXT:   %[[PRIV_ARG_VAL:.*]] = fir.load %[[PRIV_ARG]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   %[[PRIV_ARG_BOX:.*]] = fir.box_addr %[[PRIV_ARG_VAL]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
++! CHECK-NEXT:   %[[PRIV_ARG_ADDR:.*]] = fir.convert %[[PRIV_ARG_BOX]] : (!fir.heap<i32>) -> i64
++! CHECK-NEXT:   %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:   %[[ALLOC_COND:.*]] = arith.cmpi ne, %[[PRIV_ARG_ADDR]], %[[C0]] : i64
++
++! CHECK-NEXT:   fir.if %[[ALLOC_COND]] {
++! CHECK:          %[[PRIV_ALLOCMEM:.*]] = fir.allocmem i32 {fir.must_be_heap = true, {{.*}}}
++! CHECK-NEXT:     %[[PRIV_ALLOCMEM_BOX:.*]] = fir.embox %[[PRIV_ALLOCMEM]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++! CHECK-NEXT:     fir.store %[[PRIV_ALLOCMEM_BOX]] to %[[PRIV_ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   } else {
++! CHECK-NEXT:     %[[ZERO_BITS:.*]] = fir.zero_bits !fir.heap<i32>
++! CHECK-NEXT:     %[[ZERO_BOX:.*]] = fir.embox %[[ZERO_BITS]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++! CHECK-NEXT:     fir.store %[[ZERO_BOX]] to %[[PRIV_ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   }
++
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]]
++! CHECK-NEXT:   omp.yield(%[[PRIV_DECL]]#0 : [[TYPE]])
++
++! CHECK-NEXT: } dealloc {
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[TYPE]]):
++
++! CHECK-NEXT:   %[[PRIV_VAL:.*]] = fir.load %[[PRIV_ARG]]
++! CHECK-NEXT:   %[[PRIV_ADDR:.*]] = fir.box_addr %[[PRIV_VAL]]
++! CHECK-NEXT:   %[[PRIV_ADDR_I64:.*]] = fir.convert %[[PRIV_ADDR]]
++! CHECK-NEXT:   %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:   %[[PRIV_NULL_COND:.*]] = arith.cmpi ne, %[[PRIV_ADDR_I64]], %[[C0]] : i64
++
++! CHECK-NEXT:   fir.if %[[PRIV_NULL_COND]] {
++! CHECK:          %[[PRIV_VAL_2:.*]] = fir.load %[[PRIV_ARG]]
++! CHECK-NEXT:     %[[PRIV_ADDR_2:.*]] = fir.box_addr %[[PRIV_VAL_2]]
++! CHECK-NEXT:     fir.freemem %[[PRIV_ADDR_2]]
++! CHECK-NEXT:     %[[ZEROS:.*]] = fir.zero_bits
++! CHECK-NEXT:     %[[ZEROS_BOX:.*]]  = fir.embox %[[ZEROS]]
++! CHECK-NEXT:     fir.store %[[ZEROS_BOX]] to %[[PRIV_ARG]]
++! CHECK-NEXT:   }
++
++! CHECK-NEXT:   omp.yield
++! CHECK-NEXT: }
++
++
++! CHECK-LABEL: func.func @_QPtarget_allocatable() {
++
++! CHECK:  %[[VAR_ALLOC:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
++! CHECK-SAME: {bindc_name = "alloc_var", {{.*}}}
++! CHECK:  %[[VAR_DECL:.*]]:2 = hlfir.declare %[[VAR_ALLOC]]
++
++! CHECK:  omp.target private(
++! CHECK-SAME: @[[VAR_PRIVATIZER_SYM]] %[[VAR_DECL]]#0 -> %{{.*}} : [[TYPE]]) {
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-multiple-variables.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-multiple-variables.f90
+new file mode 100644
+index 0000000000000..8682a420e89d9
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-multiple-variables.f90
+@@ -0,0 +1,175 @@
++! Tests delayed privatization for `targets ... private(..)` for allocatables.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %s 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %s 2>&1 \
++! RUN:   | FileCheck %s
++
++subroutine target_allocatable(lb, ub, l)
++  implicit none
++  integer mapped_var
++  integer, allocatable :: alloc_var
++  real :: real_var
++
++  integer(8) :: lb, ub
++  real, dimension(lb:ub) :: real_arr
++
++  complex :: comp_var
++
++  integer(8):: l
++  character(len = l)  :: char_var
++
++  !$omp target private(alloc_var, real_var) private(lb, real_arr) &
++  !$omp&  private(comp_var) private(char_var)
++    mapped_var = 5
++
++    alloc_var = 10
++    real_var = 3.14
++
++    real_arr(lb + 1) = 6.28
++
++    comp_var = comp_var * comp_var
++
++    char_var = "hello"
++  !$omp end target
++end subroutine target_allocatable
++
++! Test the privatizer for `character`
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[CHAR_PRIVATIZER_SYM:[^[:space:]]+char_var[^[:space:]]+]]
++! CHECK-SAME:   : [[CHAR_TYPE:!fir.boxchar<1>]] alloc {
++!
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[CHAR_TYPE]]):
++! CHECK-NEXT:   %[[UNBOX:.*]]:2 = fir.unboxchar %[[PRIV_ARG]]
++! CHECK:        %[[PRIV_ALLOC:.*]] = fir.alloca !fir.char<1,?>(%[[UNBOX]]#1 : index)
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]] typeparams %[[UNBOX]]#1
++! CHECK-NEXT:   omp.yield(%[[PRIV_DECL]]#0 : [[CHAR_TYPE]])
++! CHECK-NEXT: }
++
++! Test the privatizer for `complex`
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[COMP_PRIVATIZER_SYM:[^[:space:]]+comp_var[^[:space:]]+]]
++! CHECK-SAME:   : [[COMP_TYPE:!fir.ref<!fir.complex<4>>]] alloc {
++!
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[COMP_TYPE]]):
++! CHECK-NEXT:   %[[PRIV_ALLOC:.*]] = fir.alloca !fir.complex<4>
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]]
++! CHECK-NEXT:   omp.yield(%[[PRIV_DECL]]#0 : [[COMP_TYPE]])
++! CHECK-NEXT: }
++
++! Test the privatizer for `real(:)`
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[ARR_PRIVATIZER_SYM:[^[:space:]]+real_arr[^[:space:]]+]]
++! CHECK-SAME:   : [[ARR_TYPE:!fir.box<!fir.array<\?xf32>>]] alloc {
++!
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[ARR_TYPE]]):
++! CHECK:        %[[C0:.*]] = arith.constant 0 : index
++! CHECK-NEXT:   %[[DIMS:.*]]:3 = fir.box_dims %[[PRIV_ARG]], %[[C0]] : ([[ARR_TYPE]], index)
++! CHECK:        %[[PRIV_ALLOCA:.*]] = fir.alloca !fir.array<{{\?}}xf32>
++! CHECK-NEXT:   %[[SHAPE_SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOCA]](%[[SHAPE_SHIFT]])
++! CHECK-NEXT:  omp.yield(%[[PRIV_DECL]]#0 : [[ARR_TYPE]])
++! CHECK-NEXT: }
++
++! Test the privatizer for `real(:)`'s lower bound
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[LB_PRIVATIZER_SYM:[^[:space:]]+lb[^[:space:]]+]]
++! CHECK-SAME:   : [[LB_TYPE:!fir.ref<i64>]] alloc {
++
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[LB_TYPE]]):
++! CHECK-NEXT:   %[[PRIV_ALLOCA:.*]] = fir.alloca i64
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOCA]]
++! CHECK-NEXT:  omp.yield(%[[PRIV_DECL]]#0 : [[LB_TYPE]])
++! CHECK-NEXT: }
++
++! Test the privatizer for `real`
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[REAL_PRIVATIZER_SYM:[^[:space:]]+real_var[^[:space:]]+]]
++! CHECK-SAME:   : [[REAL_TYPE:!fir.ref<f32>]] alloc {
++
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[REAL_TYPE]]):
++! CHECK-NEXT:   %[[PRIV_ALLOCA:.*]] = fir.alloca f32
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOCA]]
++! CHECK-NEXT:  omp.yield(%[[PRIV_DECL]]#0 : [[REAL_TYPE]])
++! CHECK-NEXT: }
++
++! Test the privatizer for `allocatable`
++!
++! CHECK:      omp.private {type = private}
++! CHECK-SAME:   @[[ALLOC_PRIVATIZER_SYM:[^[:space:]]+alloc_var[^[:space:]]+]]
++! CHECK-SAME:   : [[ALLOC_TYPE:!fir.ref<!fir.box<!fir.heap<i32>>>]] alloc {
++!
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[ALLOC_TYPE]]):
++! CHECK:        %[[PRIV_ALLOC:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
++! CHECK-NEXT:   %[[PRIV_ARG_VAL:.*]] = fir.load %[[PRIV_ARG]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   %[[PRIV_ARG_BOX:.*]] = fir.box_addr %[[PRIV_ARG_VAL]] : (!fir.box<!fir.heap<i32>>) -> !fir.heap<i32>
++! CHECK-NEXT:   %[[PRIV_ARG_ADDR:.*]] = fir.convert %[[PRIV_ARG_BOX]] : (!fir.heap<i32>) -> i64
++! CHECK-NEXT:   %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:   %[[ALLOC_COND:.*]] = arith.cmpi ne, %[[PRIV_ARG_ADDR]], %[[C0]] : i64
++!
++! CHECK-NEXT:   fir.if %[[ALLOC_COND]] {
++! CHECK:          %[[PRIV_ALLOCMEM:.*]] = fir.allocmem i32 {fir.must_be_heap = true, {{.*}}}
++! CHECK-NEXT:     %[[PRIV_ALLOCMEM_BOX:.*]] = fir.embox %[[PRIV_ALLOCMEM]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++! CHECK-NEXT:     fir.store %[[PRIV_ALLOCMEM_BOX]] to %[[PRIV_ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   } else {
++! CHECK-NEXT:     %[[ZERO_BITS:.*]] = fir.zero_bits !fir.heap<i32>
++! CHECK-NEXT:     %[[ZERO_BOX:.*]] = fir.embox %[[ZERO_BITS]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++! CHECK-NEXT:     fir.store %[[ZERO_BOX]] to %[[PRIV_ALLOC]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:   }
++!
++! CHECK-NEXT:   %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]]
++! CHECK-NEXT:   omp.yield(%[[PRIV_DECL]]#0 : [[ALLOC_TYPE]])
++!
++! CHECK-NEXT: } dealloc {
++! CHECK-NEXT: ^bb0(%[[PRIV_ARG:.*]]: [[ALLOC_TYPE]]):
++!
++! CHECK-NEXT:   %[[PRIV_VAL:.*]] = fir.load %[[PRIV_ARG]]
++! CHECK-NEXT:   %[[PRIV_ADDR:.*]] = fir.box_addr %[[PRIV_VAL]]
++! CHECK-NEXT:   %[[PRIV_ADDR_I64:.*]] = fir.convert %[[PRIV_ADDR]]
++! CHECK-NEXT:   %[[C0:.*]] = arith.constant 0 : i64
++! CHECK-NEXT:   %[[PRIV_NULL_COND:.*]] = arith.cmpi ne, %[[PRIV_ADDR_I64]], %[[C0]] : i64
++!
++! CHECK-NEXT:   fir.if %[[PRIV_NULL_COND]] {
++! CHECK:          %[[PRIV_VAL_2:.*]] = fir.load %[[PRIV_ARG]]
++! CHECK-NEXT:     %[[PRIV_ADDR_2:.*]] = fir.box_addr %[[PRIV_VAL_2]]
++! CHECK-NEXT:     fir.freemem %[[PRIV_ADDR_2]]
++! CHECK-NEXT:     %[[ZEROS:.*]] = fir.zero_bits
++! CHECK-NEXT:     %[[ZEROS_BOX:.*]]  = fir.embox %[[ZEROS]]
++! CHECK-NEXT:     fir.store %[[ZEROS_BOX]] to %[[PRIV_ARG]]
++! CHECK-NEXT:   }
++!
++! CHECK-NEXT:   omp.yield
++! CHECK-NEXT: }
++
++! CHECK:      func.func @_QPtarget_allocatable
++! CHECK:        %[[MAPPED_ALLOC:.*]] = fir.alloca i32 {bindc_name = "mapped_var", {{.*}}}
++! CHECK-NEXT:   %[[MAPPED_DECL:.*]]:2 = hlfir.declare %[[MAPPED_ALLOC]]
++! CHECK:        %[[MAPPED_MI:.*]] = omp.map.info var_ptr(%[[MAPPED_DECL]]#1 : !fir.ref<i32>, i32)
++
++! CHECK:        omp.target
++! CHECK-SAME:     map_entries(%[[MAPPED_MI]] -> %[[MAPPED_ARG:.*]] : !fir.ref<i32>)
++! CHECK-SAME:     private(
++! CHECK-SAME:       @[[ALLOC_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[ALLOC_ARG:.*]] : !fir.ref<!fir.box<!fir.heap<i32>>>,
++! CHECK-SAME:       @[[REAL_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[REAL_ARG:.*]] : !fir.ref<f32>,
++! CHECK-SAME:       @[[LB_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[LB_ARG:.*]] : !fir.ref<i64>,
++! CHECK-SAME:       @[[ARR_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[ARR_ARG:.*]] : !fir.box<!fir.array<?xf32>>,
++! CHECK-SAME:       @[[COMP_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[COMP_ARG:.*]] : !fir.ref<!fir.complex<4>>,
++! CHECK-SAME:       @[[CHAR_PRIVATIZER_SYM]] %{{[^[:space:]]+}}#0 -> %[[CHAR_ARG:.*]] : !fir.boxchar<1>) {
++! CHECK-NOT:      fir.alloca
++! CHECK:          hlfir.declare %[[MAPPED_ARG]]
++! CHECK:          hlfir.declare %[[ALLOC_ARG]]
++! CHECK:          hlfir.declare %[[REAL_ARG]]
++! CHECK:          hlfir.declare %[[LB_ARG]]
++! CHECK:          %[[ARR_ARG_ADDR:.*]] = fir.box_addr %[[ARR_ARG]]
++! CHECK:          hlfir.declare %[[ARR_ARG_ADDR]]
++! CHECK:          hlfir.declare %[[COMP_ARG]]
++! CHECK:          %[[CHAR_ARG_UNBOX:.*]]:2 = fir.unboxchar %[[CHAR_ARG]]
++! CHECK:          hlfir.declare %[[CHAR_ARG_UNBOX]]
++! CHECK:          omp.terminator
++! CHECK-NEXT:   }
++
+diff --git a/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-simple.f90 b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-simple.f90
+new file mode 100644
+index 0000000000000..94edeaa5a7ef1
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/DelayedPrivatization/target-private-simple.f90
+@@ -0,0 +1,40 @@
++! Tests delayed privatization for `targets ... private(..)` for simple variables.
++
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -mmlir --openmp-enable-delayed-privatization \
++! RUN:   -o - %s 2>&1 | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp --openmp-enable-delayed-privatization -o - %s 2>&1 \
++! RUN:   | FileCheck %s
++
++subroutine target_simple
++  implicit none
++  integer :: simple_var
++
++  !$omp target private(simple_var)
++    simple_var = 10
++  !$omp end target
++end subroutine target_simple
++
++! CHECK-LABEL: omp.private {type = private}
++! CHECK-SAME:              @[[VAR_PRIVATIZER_SYM:.*]] : !fir.ref<i32> alloc {
++! CHECK:  ^bb0(%[[PRIV_ARG:.*]]: !fir.ref<i32>):
++! CHECK:    %[[PRIV_ALLOC:.*]] = fir.alloca i32 {bindc_name = "simple_var", {{.*}}}
++! CHECK:    %[[PRIV_DECL:.*]]:2 = hlfir.declare %[[PRIV_ALLOC]]
++! CHECK:    omp.yield(%[[PRIV_DECL]]#0 : !fir.ref<i32>)
++! CHECK: }
++
++! CHECK-LABEL: func.func @_QPtarget_simple() {
++! CHECK:  %[[VAR_ALLOC:.*]] = fir.alloca i32 {bindc_name = "simple_var", {{.*}}}
++! CHECK:  %[[VAR_DECL:.*]]:2 = hlfir.declare %[[VAR_ALLOC]]
++
++! CHECK:  omp.target private(
++! CHECK-SAME: @[[VAR_PRIVATIZER_SYM]] %[[VAR_DECL]]#0 -> %{{.*}} : !fir.ref<i32>) {
++! CHECK:    ^bb0(%[[REG_ARG:.*]]: !fir.ref<i32>):
++! CHECK:      %[[REG_DECL:.*]]:2 = hlfir.declare %[[REG_ARG]]
++! CHECK:      %[[C10:.*]] = arith.constant 10
++! CHECK:      hlfir.assign %[[C10]] to %[[REG_DECL]]#0
++! CHECK:      omp.terminator
++! CHECK:    }
++
++! CHECK:    return
++! CHECK:  }
++

@@ -1,0 +1,3803 @@
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 52c3479b1ea95..0a57a1496289f 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -31,57 +31,33 @@ static void checkMapType(mlir::Location location, mlir::Type type) {
+ }
+ 
+ static mlir::omp::ScheduleModifier
+-translateScheduleModifier(const omp::clause::Schedule::ModType &m) {
++translateScheduleModifier(const omp::clause::Schedule::OrderingModifier &m) {
+   switch (m) {
+-  case omp::clause::Schedule::ModType::Monotonic:
++  case omp::clause::Schedule::OrderingModifier::Monotonic:
+     return mlir::omp::ScheduleModifier::monotonic;
+-  case omp::clause::Schedule::ModType::Nonmonotonic:
++  case omp::clause::Schedule::OrderingModifier::Nonmonotonic:
+     return mlir::omp::ScheduleModifier::nonmonotonic;
+-  case omp::clause::Schedule::ModType::Simd:
+-    return mlir::omp::ScheduleModifier::simd;
+   }
+   return mlir::omp::ScheduleModifier::none;
+ }
+ 
+ static mlir::omp::ScheduleModifier
+ getScheduleModifier(const omp::clause::Schedule &clause) {
+-  using ScheduleModifier = omp::clause::Schedule::ScheduleModifier;
+-  const auto &modifier = std::get<std::optional<ScheduleModifier>>(clause.t);
+-  // The input may have the modifier any order, so we look for one that isn't
+-  // SIMD. If modifier is not set at all, fall down to the bottom and return
+-  // "none".
+-  if (modifier) {
+-    using ModType = omp::clause::Schedule::ModType;
+-    const auto &modType1 = std::get<ModType>(modifier->t);
+-    if (modType1 == ModType::Simd) {
+-      const auto &modType2 = std::get<std::optional<ModType>>(modifier->t);
+-      if (modType2 && *modType2 != ModType::Simd)
+-        return translateScheduleModifier(*modType2);
+-      return mlir::omp::ScheduleModifier::none;
+-    }
+-
+-    return translateScheduleModifier(modType1);
+-  }
++  using Schedule = omp::clause::Schedule;
++  const auto &modifier =
++      std::get<std::optional<Schedule::OrderingModifier>>(clause.t);
++  if (modifier)
++    return translateScheduleModifier(*modifier);
+   return mlir::omp::ScheduleModifier::none;
+ }
+ 
+ static mlir::omp::ScheduleModifier
+ getSimdModifier(const omp::clause::Schedule &clause) {
+-  using ScheduleModifier = omp::clause::Schedule::ScheduleModifier;
+-  const auto &modifier = std::get<std::optional<ScheduleModifier>>(clause.t);
+-  // Either of the two possible modifiers in the input can be the SIMD modifier,
+-  // so look in either one, and return simd if we find one. Not found = return
+-  // "none".
+-  if (modifier) {
+-    using ModType = omp::clause::Schedule::ModType;
+-    const auto &modType1 = std::get<ModType>(modifier->t);
+-    if (modType1 == ModType::Simd)
+-      return mlir::omp::ScheduleModifier::simd;
+-
+-    const auto &modType2 = std::get<std::optional<ModType>>(modifier->t);
+-    if (modType2 && *modType2 == ModType::Simd)
+-      return mlir::omp::ScheduleModifier::simd;
+-  }
++  using Schedule = omp::clause::Schedule;
++  const auto &modifier =
++      std::get<std::optional<Schedule::ChunkModifier>>(clause.t);
++  if (modifier && *modifier == Schedule::ChunkModifier::Simd)
++    return mlir::omp::ScheduleModifier::simd;
+   return mlir::omp::ScheduleModifier::none;
+ }
+ 
+@@ -94,36 +70,31 @@ genAllocateClause(Fortran::lower::AbstractConverter &converter,
+   mlir::Location currentLocation = converter.getCurrentLocation();
+   Fortran::lower::StatementContext stmtCtx;
+ 
+-  const omp::ObjectList &objectList = std::get<omp::ObjectList>(clause.t);
+-  const auto &modifier =
+-      std::get<std::optional<omp::clause::Allocate::Modifier>>(clause.t);
+-
+-  // If the allocate modifier is present, check if we only use the allocator
+-  // submodifier.  ALIGN in this context is unimplemented
+-  const bool onlyAllocator =
+-      modifier &&
+-      std::holds_alternative<omp::clause::Allocate::Modifier::Allocator>(
+-          modifier->u);
++  auto &objects = std::get<omp::ObjectList>(clause.t);
+ 
+-  if (modifier && !onlyAllocator) {
++  using Allocate = omp::clause::Allocate;
++  // ALIGN in this context is unimplemented
++  if (std::get<std::optional<Allocate::AlignModifier>>(clause.t))
+     TODO(currentLocation, "OmpAllocateClause ALIGN modifier");
+-  }
+ 
+   // Check if allocate clause has allocator specified. If so, add it
+   // to list of allocators, otherwise, add default allocator to
+   // list of allocators.
+-  if (onlyAllocator) {
+-    const auto &value =
+-        std::get<omp::clause::Allocate::Modifier::Allocator>(modifier->u);
+-    mlir::Value operand =
+-        fir::getBase(converter.genExprValue(value.v, stmtCtx));
+-    allocatorOperands.append(objectList.size(), operand);
++  using SimpleModifier = Allocate::AllocatorSimpleModifier;
++  using ComplexModifier = Allocate::AllocatorComplexModifier;
++  if (auto &mod = std::get<std::optional<SimpleModifier>>(clause.t)) {
++    mlir::Value operand = fir::getBase(converter.genExprValue(*mod, stmtCtx));
++    allocatorOperands.append(objects.size(), operand);
++  } else if (auto &mod = std::get<std::optional<ComplexModifier>>(clause.t)) {
++    mlir::Value operand = fir::getBase(converter.genExprValue(mod->v, stmtCtx));
++    allocatorOperands.append(objects.size(), operand);
+   } else {
+     mlir::Value operand = firOpBuilder.createIntegerConstant(
+         currentLocation, firOpBuilder.getI32Type(), 1);
+-    allocatorOperands.append(objectList.size(), operand);
++    allocatorOperands.append(objects.size(), operand);
+   }
+-  genObjectList(objectList, converter, allocateOperands);
++
++  genObjectList(objects, converter, allocateOperands);
+ }
+ 
+ static mlir::omp::ClauseProcBindKindAttr
+@@ -131,16 +102,16 @@ genProcBindKindAttr(fir::FirOpBuilder &firOpBuilder,
+                     const omp::clause::ProcBind &clause) {
+   mlir::omp::ClauseProcBindKind procBindKind;
+   switch (clause.v) {
+-  case omp::clause::ProcBind::Type::Master:
++  case omp::clause::ProcBind::AffinityPolicy::Master:
+     procBindKind = mlir::omp::ClauseProcBindKind::Master;
+     break;
+-  case omp::clause::ProcBind::Type::Close:
++  case omp::clause::ProcBind::AffinityPolicy::Close:
+     procBindKind = mlir::omp::ClauseProcBindKind::Close;
+     break;
+-  case omp::clause::ProcBind::Type::Spread:
++  case omp::clause::ProcBind::AffinityPolicy::Spread:
+     procBindKind = mlir::omp::ClauseProcBindKind::Spread;
+     break;
+-  case omp::clause::ProcBind::Type::Primary:
++  case omp::clause::ProcBind::AffinityPolicy::Primary:
+     procBindKind = mlir::omp::ClauseProcBindKind::Primary;
+     break;
+   }
+@@ -150,21 +121,22 @@ genProcBindKindAttr(fir::FirOpBuilder &firOpBuilder,
+ 
+ static mlir::omp::ClauseTaskDependAttr
+ genDependKindAttr(fir::FirOpBuilder &firOpBuilder,
+-                  const omp::clause::Depend &clause) {
++                  const omp::clause::Depend::TaskDependenceType kind) {
+   mlir::omp::ClauseTaskDepend pbKind;
+-  const auto &inOut = std::get<omp::clause::Depend::InOut>(clause.u);
+-  switch (std::get<omp::clause::Depend::Type>(inOut.t)) {
+-  case omp::clause::Depend::Type::In:
++  switch (kind) {
++  case omp::clause::Depend::TaskDependenceType::In:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependin;
+     break;
+-  case omp::clause::Depend::Type::Out:
++  case omp::clause::Depend::TaskDependenceType::Out:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependout;
+     break;
+-  case omp::clause::Depend::Type::Inout:
++  case omp::clause::Depend::TaskDependenceType::Inout:
+     pbKind = mlir::omp::ClauseTaskDepend::taskdependinout;
+     break;
+-  default:
+-    llvm_unreachable("unknown parser task dependence type");
++  case omp::clause::Depend::TaskDependenceType::Mutexinoutset:
++  case omp::clause::Depend::TaskDependenceType::Inoutset:
++  case omp::clause::Depend::TaskDependenceType::Depobj:
++    llvm_unreachable("unhandled parser task dependence type");
+     break;
+   }
+   return mlir::omp::ClauseTaskDependAttr::get(firOpBuilder.getContext(),
+@@ -295,16 +267,16 @@ bool ClauseProcessor::processDefault() const {
+   if (auto *clause = findUniqueClause<omp::clause::Default>()) {
+     // Private, Firstprivate, Shared, None
+     switch (clause->v) {
+-    case omp::clause::Default::Type::Shared:
+-    case omp::clause::Default::Type::None:
++    case omp::clause::Default::DataSharingAttribute::Shared:
++    case omp::clause::Default::DataSharingAttribute::None:
+       // Default clause with shared or none do not require any handling since
+       // Shared is the default behavior in the IR and None is only required
+       // for semantic checks.
+       break;
+-    case omp::clause::Default::Type::Private:
++    case omp::clause::Default::DataSharingAttribute::Private:
+       // TODO Support default(private)
+       break;
+-    case omp::clause::Default::Type::Firstprivate:
++    case omp::clause::Default::DataSharingAttribute::Firstprivate:
+       // TODO Support default(firstprivate)
+       break;
+     }
+@@ -337,13 +309,13 @@ bool ClauseProcessor::processDeviceType(
+   if (auto *clause = findUniqueClause<omp::clause::DeviceType>()) {
+     // Case: declare target ... device_type(any | host | nohost)
+     switch (clause->v) {
+-    case omp::clause::DeviceType::Type::Nohost:
++    case omp::clause::DeviceType::DeviceTypeDescription::Nohost:
+       result = mlir::omp::DeclareTargetDeviceType::nohost;
+       break;
+-    case omp::clause::DeviceType::Type::Host:
++    case omp::clause::DeviceType::DeviceTypeDescription::Host:
+       result = mlir::omp::DeclareTargetDeviceType::host;
+       break;
+-    case omp::clause::DeviceType::Type::Any:
++    case omp::clause::DeviceType::DeviceTypeDescription::Any:
+       result = mlir::omp::DeclareTargetDeviceType::any;
+       break;
+     }
+@@ -391,7 +363,9 @@ bool ClauseProcessor::processNumTeams(Fortran::lower::StatementContext &stmtCtx,
+   // TODO Get lower and upper bounds for num_teams when parser is updated to
+   // accept both.
+   if (auto *clause = findUniqueClause<omp::clause::NumTeams>()) {
+-    result = fir::getBase(converter.genExprValue(clause->v, stmtCtx));
++    // auto lowerBound = std::get<std::optional<ExprTy>>(clause->t);
++    auto &upperBound = std::get<ExprTy>(clause->t);
++    result = fir::getBase(converter.genExprValue(upperBound, stmtCtx));
+     return true;
+   }
+   return false;
+@@ -456,24 +430,23 @@ bool ClauseProcessor::processSchedule(
+   if (auto *clause = findUniqueClause<omp::clause::Schedule>()) {
+     fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+     mlir::MLIRContext *context = firOpBuilder.getContext();
+-    const auto &scheduleType =
+-        std::get<omp::clause::Schedule::ScheduleType>(clause->t);
++    const auto &scheduleType = std::get<omp::clause::Schedule::Kind>(clause->t);
+ 
+     mlir::omp::ClauseScheduleKind scheduleKind;
+     switch (scheduleType) {
+-    case omp::clause::Schedule::ScheduleType::Static:
++    case omp::clause::Schedule::Kind::Static:
+       scheduleKind = mlir::omp::ClauseScheduleKind::Static;
+       break;
+-    case omp::clause::Schedule::ScheduleType::Dynamic:
++    case omp::clause::Schedule::Kind::Dynamic:
+       scheduleKind = mlir::omp::ClauseScheduleKind::Dynamic;
+       break;
+-    case omp::clause::Schedule::ScheduleType::Guided:
++    case omp::clause::Schedule::Kind::Guided:
+       scheduleKind = mlir::omp::ClauseScheduleKind::Guided;
+       break;
+-    case omp::clause::Schedule::ScheduleType::Auto:
++    case omp::clause::Schedule::Kind::Auto:
+       scheduleKind = mlir::omp::ClauseScheduleKind::Auto;
+       break;
+-    case omp::clause::Schedule::ScheduleType::Runtime:
++    case omp::clause::Schedule::Kind::Runtime:
+       scheduleKind = mlir::omp::ClauseScheduleKind::Runtime;
+       break;
+     }
+@@ -749,13 +722,15 @@ bool ClauseProcessor::processDepend(
+   return findRepeatableClause<omp::clause::Depend>(
+       [&](const omp::clause::Depend &clause,
+           const Fortran::parser::CharBlock &) {
+-        assert(std::holds_alternative<omp::clause::Depend::InOut>(clause.u) &&
+-               "Only InOut is handled at the moment");
+-        const auto &inOut = std::get<omp::clause::Depend::InOut>(clause.u);
+-        const auto &objects = std::get<omp::ObjectList>(inOut.t);
++        using Depend = omp::clause::Depend;
++        assert(std::holds_alternative<Depend::WithLocators>(clause.u) &&
++               "Only the modern form is handled at the moment");
++        auto &modern = std::get<Depend::WithLocators>(clause.u);
++        auto kind = std::get<Depend::TaskDependenceType>(modern.t);
++        auto &objects = std::get<omp::ObjectList>(modern.t);
+ 
+         mlir::omp::ClauseTaskDependAttr dependTypeOperand =
+-            genDependKindAttr(firOpBuilder, clause);
++            genDependKindAttr(firOpBuilder, kind);
+         dependTypeOperands.append(objects.size(), dependTypeOperand);
+ 
+         for (const omp::Object &object : objects) {
+@@ -844,39 +819,42 @@ bool ClauseProcessor::processMap(
+           const Fortran::parser::CharBlock &source) {
+         using Map = omp::clause::Map;
+         mlir::Location clauseLocation = converter.genLocation(source);
+-        const auto &oMapType = std::get<std::optional<Map::MapType>>(clause.t);
++        const auto &mapType = std::get<std::optional<Map::MapType>>(clause.t);
+         llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+             llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_NONE;
+         // If the map type is specified, then process it else Tofrom is the
+         // default.
+-        if (oMapType) {
+-          const Map::MapType::Type &mapType =
+-              std::get<Map::MapType::Type>(oMapType->t);
+-          switch (mapType) {
+-          case Map::MapType::Type::To:
++        if (mapType) {
++          switch (*mapType) {
++          case Map::MapType::To:
+             mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO;
+             break;
+-          case Map::MapType::Type::From:
++          case Map::MapType::From:
+             mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+             break;
+-          case Map::MapType::Type::Tofrom:
++          case Map::MapType::Tofrom:
+             mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+                            llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+             break;
+-          case Map::MapType::Type::Alloc:
+-          case Map::MapType::Type::Release:
++          case Map::MapType::Alloc:
++          case Map::MapType::Release:
+             // alloc and release is the default map_type for the Target Data
+             // Ops, i.e. if no bits for map_type is supplied then alloc/release
+             // is implicitly assumed based on the target directive. Default
+             // value for Target Data and Enter Data is alloc and for Exit Data
+             // it is release.
+             break;
+-          case Map::MapType::Type::Delete:
++          case Map::MapType::Delete:
+             mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_DELETE;
+           }
+ 
+-          if (std::get<std::optional<Map::MapType::Always>>(oMapType->t))
+-            mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
++          auto &modTypeMods =
++              std::get<std::optional<Map::MapTypeModifiers>>(clause.t);
++          if (modTypeMods) {
++            if (llvm::is_contained(*modTypeMods, Map::MapTypeModifier::Always))
++              mapTypeBits |=
++                  llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_ALWAYS;
++          }
+         } else {
+           mapTypeBits |= llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO |
+                          llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+@@ -972,7 +950,7 @@ bool ClauseProcessor::processTo(
+   return findRepeatableClause<omp::clause::To>(
+       [&](const omp::clause::To &clause, const Fortran::parser::CharBlock &) {
+         // Case: declare target to(func, var1, var2)...
+-        gatherFuncAndVarSyms(clause.v,
++        gatherFuncAndVarSyms(std::get<ObjectList>(clause.t),
+                              mlir::omp::DeclareTargetCaptureClause::to, result);
+       });
+ }
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index 8582716e6b9a7..c0c603feb296a 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -200,7 +200,8 @@ bool ClauseProcessor::processMotionClauses(
+                 ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
+                 : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+ 
+-        for (const omp::Object &object : clause.v) {
++        auto &objects = std::get<ObjectList>(clause.t);
++        for (const omp::Object &object : objects) {
+           llvm::SmallVector<mlir::Value> bounds;
+           std::stringstream asFortran;
+           Fortran::lower::AddrAndBoundsInfo info =
+diff --git a/flang/lib/Lower/OpenMP/ClauseT.h b/flang/lib/Lower/OpenMP/ClauseT.h
+deleted file mode 100644
+index 2aae29af29214..0000000000000
+--- a/flang/lib/Lower/OpenMP/ClauseT.h
++++ /dev/null
+@@ -1,714 +0,0 @@
+-//===- ClauseT -- clause template definitions -----------------------------===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-#ifndef FORTRAN_LOWER_OPENMP_CLAUSET_H
+-#define FORTRAN_LOWER_OPENMP_CLAUSET_H
+-
+-#include "flang/Parser/parse-tree.h" // For enum reuse
+-
+-#include "llvm/ADT/ArrayRef.h"
+-#include "llvm/ADT/DenseMap.h"
+-#include "llvm/ADT/DenseSet.h"
+-#include "llvm/ADT/STLExtras.h"
+-#include "llvm/ADT/SmallVector.h"
+-#include "llvm/Support/raw_ostream.h"
+-
+-#include <algorithm>
+-#include <iterator>
+-#include <optional>
+-#include <tuple>
+-#include <type_traits>
+-#include <utility>
+-#include <variant>
+-
+-#include "llvm/Frontend/OpenMP/OMP.h.inc"
+-
+-namespace tomp {
+-
+-template <typename T>
+-using ListT = llvm::SmallVector<T, 0>;
+-
+-// A specialization of ObjectT<Id, Expr> must provide the following definitions:
+-// {
+-//    using IdType = Id;
+-//    using ExprType = Expr;
+-//
+-//    auto id() const -> Id {
+-//      return the identifier of the object (for use in tests for
+-//         presence/absence of the object)
+-//    }
+-//
+-//    auto ref() const -> const Expr& {
+-//      return the expression accessing (referencing) the object
+-//    }
+-// }
+-//
+-// For example, the ObjectT instance created for "var[x+1]" would have
+-// the `id()` return the identifier for `var`, and the `ref()` return the
+-// representation of the array-access `var[x+1]`.
+-template <typename Id, typename Expr>
+-struct ObjectT;
+-
+-template <typename I, typename E>
+-using ObjectListT = ListT<ObjectT<I, E>>;
+-
+-namespace clause {
+-// Helper objects
+-
+-template <typename I, typename E>
+-struct DefinedOperatorT {
+-  struct DefinedOpName {
+-    using WrapperTrait = std::true_type;
+-    ObjectT<I, E> v;
+-  };
+-  using IntrinsicOperator = Fortran::parser::DefinedOperator::IntrinsicOperator;
+-  using UnionTrait = std::true_type;
+-  std::variant<DefinedOpName, IntrinsicOperator> u;
+-};
+-
+-template <typename I, typename E>
+-struct ProcedureDesignatorT {
+-  using WrapperTrait = std::true_type;
+-  ObjectT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct ReductionOperatorT {
+-  using UnionTrait = std::true_type;
+-  std::variant<DefinedOperatorT<I, E>, ProcedureDesignatorT<I, E>> u;
+-};
+-
+-template <typename I, typename E>
+-struct AcqRelT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AcquireT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AdjustArgsT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AffinityT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AlignT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AppendArgsT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct AtT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct BindT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct CancellationConstructTypeT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct CaptureT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct CompareT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct DepobjT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct DestroyT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct DetachT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct DoacrossT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct DynamicAllocatorsT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ExclusiveT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct FailT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct FlushT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct FullT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct InbranchT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct InclusiveT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct IndirectT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct InitT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct MatchT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct MemoryOrderT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct MergeableT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct MessageT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct NogroupT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct NotinbranchT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct NowaitT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct OmpxAttributeT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct OmpxBareT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ReadT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct RelaxedT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ReleaseT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ReverseOffloadT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct SeqCstT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct SeverityT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct SimdT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ThreadprivateT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct ThreadsT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UnifiedAddressT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UnifiedSharedMemoryT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UnknownT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UntiedT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UpdateT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UseT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct UsesAllocatorsT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct WeakT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct WhenT {
+-  using EmptyTrait = std::true_type;
+-};
+-template <typename I, typename E>
+-struct WriteT {
+-  using EmptyTrait = std::true_type;
+-};
+-
+-template <typename I, typename E>
+-struct AlignedT {
+-  using TupleTrait = std::true_type;
+-  std::tuple<ObjectListT<I, E>, std::optional<E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct AllocateT {
+-  struct Modifier {
+-    struct Allocator {
+-      using WrapperTrait = std::true_type;
+-      E v;
+-    };
+-    struct Align {
+-      using WrapperTrait = std::true_type;
+-      E v;
+-    };
+-    struct ComplexModifier {
+-      using TupleTrait = std::true_type;
+-      std::tuple<Allocator, Align> t;
+-    };
+-    using UnionTrait = std::true_type;
+-    std::variant<Allocator, ComplexModifier, Align> u;
+-  };
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<Modifier>, ObjectListT<I, E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct AllocatorT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct AtomicDefaultMemOrderT {
+-  using WrapperTrait = std::true_type;
+-  using OmpAtomicDefaultMemOrderType =
+-      Fortran::common::OmpAtomicDefaultMemOrderType;
+-  OmpAtomicDefaultMemOrderType v;
+-};
+-
+-template <typename I, typename E>
+-struct CollapseT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct CopyinT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct CopyprivateT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct DefaultmapT {
+-  using ImplicitBehavior =
+-      Fortran::parser::OmpDefaultmapClause::ImplicitBehavior;
+-  using VariableCategory =
+-      Fortran::parser::OmpDefaultmapClause::VariableCategory;
+-  using TupleTrait = std::true_type;
+-  std::tuple<ImplicitBehavior, std::optional<VariableCategory>> t;
+-};
+-
+-template <typename I, typename E>
+-struct DefaultT {
+-  using Type = Fortran::parser::OmpDefaultClause::Type;
+-  using WrapperTrait = std::true_type;
+-  Type v;
+-};
+-
+-template <typename I, typename E>
+-struct DependT {
+-  struct Source {
+-    using EmptyTrait = std::true_type;
+-  };
+-  struct Sink {
+-    using Length = std::tuple<DefinedOperatorT<I, E>, E>;
+-    using Vec = std::tuple<ObjectT<I, E>, std::optional<Length>>;
+-    using WrapperTrait = std::true_type;
+-    ListT<Vec> v;
+-  };
+-  using Type = Fortran::parser::OmpDependenceType::Type;
+-  struct InOut {
+-    using TupleTrait = std::true_type;
+-    std::tuple<Type, ObjectListT<I, E>> t;
+-  };
+-  using UnionTrait = std::true_type;
+-  std::variant<Source, Sink, InOut> u;
+-};
+-
+-template <typename I, typename E>
+-struct DeviceT {
+-  using DeviceModifier = Fortran::parser::OmpDeviceClause::DeviceModifier;
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<DeviceModifier>, E> t;
+-};
+-
+-template <typename I, typename E>
+-struct DeviceTypeT {
+-  using Type = Fortran::parser::OmpDeviceTypeClause::Type;
+-  using WrapperTrait = std::true_type;
+-  Type v;
+-};
+-
+-template <typename I, typename E>
+-struct DistScheduleT {
+-  using WrapperTrait = std::true_type;
+-  std::optional<E> v;
+-};
+-
+-template <typename I, typename E>
+-struct EnterT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct FilterT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct FinalT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct FirstprivateT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct FromT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct GrainsizeT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct HasDeviceAddrT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct HintT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct IfT {
+-  using DirectiveNameModifier =
+-      Fortran::parser::OmpIfClause::DirectiveNameModifier;
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<DirectiveNameModifier>, E> t;
+-};
+-
+-template <typename I, typename E>
+-struct InReductionT {
+-  using TupleTrait = std::true_type;
+-  std::tuple<ReductionOperatorT<I, E>, ObjectListT<I, E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct IsDevicePtrT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct LastprivateT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct LinearT {
+-  struct Modifier {
+-    using Type = Fortran::parser::OmpLinearModifier::Type;
+-    using WrapperTrait = std::true_type;
+-    Type v;
+-  };
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<Modifier>, ObjectListT<I, E>, std::optional<E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct LinkT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct MapT {
+-  struct MapType {
+-    struct Always {
+-      using EmptyTrait = std::true_type;
+-    };
+-    using Type = Fortran::parser::OmpMapType::Type;
+-    using TupleTrait = std::true_type;
+-    std::tuple<std::optional<Always>, Type> t;
+-  };
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<MapType>, ObjectListT<I, E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct NocontextT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct NontemporalT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct NovariantsT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct NumTasksT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct NumTeamsT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct NumThreadsT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct OmpxDynCgroupMemT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct OrderedT {
+-  using WrapperTrait = std::true_type;
+-  std::optional<E> v;
+-};
+-
+-template <typename I, typename E>
+-struct OrderT {
+-  using Kind = Fortran::parser::OmpOrderModifier::Kind;
+-  using Type = Fortran::parser::OmpOrderClause::Type;
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<Kind>, Type> t;
+-};
+-
+-template <typename I, typename E>
+-struct PartialT {
+-  using WrapperTrait = std::true_type;
+-  std::optional<E> v;
+-};
+-
+-template <typename I, typename E>
+-struct PriorityT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct PrivateT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct ProcBindT {
+-  using Type = Fortran::parser::OmpProcBindClause::Type;
+-  using WrapperTrait = std::true_type;
+-  Type v;
+-};
+-
+-template <typename I, typename E>
+-struct ReductionT {
+-  using TupleTrait = std::true_type;
+-  std::tuple<ReductionOperatorT<I, E>, ObjectListT<I, E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct SafelenT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct ScheduleT {
+-  using ModType = Fortran::parser::OmpScheduleModifierType::ModType;
+-  struct ScheduleModifier {
+-    using TupleTrait = std::true_type;
+-    std::tuple<ModType, std::optional<ModType>> t;
+-  };
+-  using ScheduleType = Fortran::parser::OmpScheduleClause::ScheduleType;
+-  using TupleTrait = std::true_type;
+-  std::tuple<std::optional<ScheduleModifier>, ScheduleType, std::optional<E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct SharedT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct SimdlenT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct SizesT {
+-  using WrapperTrait = std::true_type;
+-  ListT<E> v;
+-};
+-
+-template <typename I, typename E>
+-struct TaskReductionT {
+-  using TupleTrait = std::true_type;
+-  std::tuple<ReductionOperatorT<I, E>, ObjectListT<I, E>> t;
+-};
+-
+-template <typename I, typename E>
+-struct ThreadLimitT {
+-  using WrapperTrait = std::true_type;
+-  E v;
+-};
+-
+-template <typename I, typename E>
+-struct ToT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct UniformT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct UseDeviceAddrT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-struct UseDevicePtrT {
+-  using WrapperTrait = std::true_type;
+-  ObjectListT<I, E> v;
+-};
+-
+-template <typename I, typename E>
+-using UnionOfAllClausesT = std::variant<
+-    AcqRelT<I, E>, AcquireT<I, E>, AdjustArgsT<I, E>, AffinityT<I, E>,
+-    AlignT<I, E>, AlignedT<I, E>, AllocateT<I, E>, AllocatorT<I, E>,
+-    AppendArgsT<I, E>, AtT<I, E>, AtomicDefaultMemOrderT<I, E>, BindT<I, E>,
+-    CancellationConstructTypeT<I, E>, CaptureT<I, E>, CollapseT<I, E>,
+-    CompareT<I, E>, CopyprivateT<I, E>, CopyinT<I, E>, DefaultT<I, E>,
+-    DefaultmapT<I, E>, DependT<I, E>, DepobjT<I, E>, DestroyT<I, E>,
+-    DetachT<I, E>, DeviceT<I, E>, DeviceTypeT<I, E>, DistScheduleT<I, E>,
+-    DoacrossT<I, E>, DynamicAllocatorsT<I, E>, EnterT<I, E>, ExclusiveT<I, E>,
+-    FailT<I, E>, FilterT<I, E>, FinalT<I, E>, FirstprivateT<I, E>, FlushT<I, E>,
+-    FromT<I, E>, FullT<I, E>, GrainsizeT<I, E>, HasDeviceAddrT<I, E>,
+-    HintT<I, E>, IfT<I, E>, InReductionT<I, E>, InbranchT<I, E>,
+-    InclusiveT<I, E>, IndirectT<I, E>, InitT<I, E>, IsDevicePtrT<I, E>,
+-    LastprivateT<I, E>, LinearT<I, E>, LinkT<I, E>, MapT<I, E>, MatchT<I, E>,
+-    MemoryOrderT<I, E>, MergeableT<I, E>, MessageT<I, E>, NogroupT<I, E>,
+-    NowaitT<I, E>, NocontextT<I, E>, NontemporalT<I, E>, NotinbranchT<I, E>,
+-    NovariantsT<I, E>, NumTasksT<I, E>, NumTeamsT<I, E>, NumThreadsT<I, E>,
+-    OmpxAttributeT<I, E>, OmpxDynCgroupMemT<I, E>, OmpxBareT<I, E>,
+-    OrderT<I, E>, OrderedT<I, E>, PartialT<I, E>, PriorityT<I, E>,
+-    PrivateT<I, E>, ProcBindT<I, E>, ReadT<I, E>, ReductionT<I, E>,
+-    RelaxedT<I, E>, ReleaseT<I, E>, ReverseOffloadT<I, E>, SafelenT<I, E>,
+-    ScheduleT<I, E>, SeqCstT<I, E>, SeverityT<I, E>, SharedT<I, E>, SimdT<I, E>,
+-    SimdlenT<I, E>, SizesT<I, E>, TaskReductionT<I, E>, ThreadLimitT<I, E>,
+-    ThreadprivateT<I, E>, ThreadsT<I, E>, ToT<I, E>, UnifiedAddressT<I, E>,
+-    UnifiedSharedMemoryT<I, E>, UniformT<I, E>, UnknownT<I, E>, UntiedT<I, E>,
+-    UpdateT<I, E>, UseT<I, E>, UseDeviceAddrT<I, E>, UseDevicePtrT<I, E>,
+-    UsesAllocatorsT<I, E>, WeakT<I, E>, WhenT<I, E>, WriteT<I, E>>;
+-} // namespace clause
+-
+-template <typename Id, typename Expr>
+-struct ClauseT {
+-  llvm::omp::Clause id; // The numeric id of the clause
+-  using UnionTrait = std::true_type;
+-  clause::UnionOfAllClausesT<Id, Expr> u;
+-};
+-
+-} // namespace tomp
+-
+-#endif // FORTRAN_LOWER_OPENMP_CLAUSET_H
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 70f232a4858e1..f48e84f511a44 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -189,29 +189,96 @@ getBaseObject(const Object &object,
+   return std::nullopt;
+ }
+ 
+-namespace clause {
+-// Helper objects
+-#ifdef EMPTY_CLASS
+-#undef EMPTY_CLASS
+-#endif
+-#define EMPTY_CLASS(cls)                                                       \
+-  cls make(const parser::OmpClause::cls &, semantics::SemanticsContext &) {    \
++// Helper macros
++#define MAKE_EMPTY_CLASS(cls, from_cls)                                        \
++  cls make(const parser::OmpClause::from_cls &,                                \
++           semantics::SemanticsContext &) {                                    \
++    static_assert(cls::EmptyTrait::value);                                     \
+     return cls{};                                                              \
+   }                                                                            \
+   [[maybe_unused]] extern int xyzzy_semicolon_absorber
+ 
+-#ifdef WRAPPER_CLASS
+-#undef WRAPPER_CLASS
+-#endif
+-#define WRAPPER_CLASS(cls, content)                                            \
++#define MAKE_INCOMPLETE_CLASS(cls, from_cls)                                   \
++  cls make(const parser::OmpClause::from_cls &,                                \
++           semantics::SemanticsContext &) {                                    \
++    static_assert(cls::IncompleteTrait::value);                                \
++    return cls{};                                                              \
++  }                                                                            \
+   [[maybe_unused]] extern int xyzzy_semicolon_absorber
+-#define GEN_FLANG_CLAUSE_PARSER_CLASSES
+-#include "llvm/Frontend/OpenMP/OMP.inc"
+-#undef EMPTY_CLASS
+-#undef WRAPPER_CLASS
++
++#define MS(x, y) CLAUSET_SCOPED_ENUM_MEMBER_CONVERT(x, y)
++#define MU(x, y) CLAUSET_UNSCOPED_ENUM_MEMBER_CONVERT(x, y)
++
++namespace clause {
++MAKE_EMPTY_CLASS(AcqRel, AcqRel);
++MAKE_EMPTY_CLASS(Acquire, Acquire);
++MAKE_EMPTY_CLASS(Capture, Capture);
++MAKE_EMPTY_CLASS(Compare, Compare);
++MAKE_EMPTY_CLASS(DynamicAllocators, DynamicAllocators);
++MAKE_EMPTY_CLASS(Full, Full);
++MAKE_EMPTY_CLASS(Inbranch, Inbranch);
++MAKE_EMPTY_CLASS(Mergeable, Mergeable);
++MAKE_EMPTY_CLASS(Nogroup, Nogroup);
++// MAKE_EMPTY_CLASS(NoOpenmp, );         // missing-in-parser
++// MAKE_EMPTY_CLASS(NoOpenmpRoutines, ); // missing-in-parser
++// MAKE_EMPTY_CLASS(NoParallelism, );    // missing-in-parser
++MAKE_EMPTY_CLASS(Notinbranch, Notinbranch);
++MAKE_EMPTY_CLASS(Nowait, Nowait);
++MAKE_EMPTY_CLASS(OmpxAttribute, OmpxAttribute);
++MAKE_EMPTY_CLASS(OmpxBare, OmpxBare);
++MAKE_EMPTY_CLASS(Read, Read);
++MAKE_EMPTY_CLASS(Relaxed, Relaxed);
++MAKE_EMPTY_CLASS(Release, Release);
++MAKE_EMPTY_CLASS(ReverseOffload, ReverseOffload);
++MAKE_EMPTY_CLASS(SeqCst, SeqCst);
++MAKE_EMPTY_CLASS(Simd, Simd);
++MAKE_EMPTY_CLASS(Threads, Threads);
++MAKE_EMPTY_CLASS(UnifiedAddress, UnifiedAddress);
++MAKE_EMPTY_CLASS(UnifiedSharedMemory, UnifiedSharedMemory);
++MAKE_EMPTY_CLASS(Unknown, Unknown);
++MAKE_EMPTY_CLASS(Untied, Untied);
++MAKE_EMPTY_CLASS(Weak, Weak);
++MAKE_EMPTY_CLASS(Write, Write);
++
++// Artificial clauses
++MAKE_EMPTY_CLASS(CancellationConstructType, CancellationConstructType);
++MAKE_EMPTY_CLASS(Depobj, Depobj);
++MAKE_EMPTY_CLASS(Flush, Flush);
++MAKE_EMPTY_CLASS(MemoryOrder, MemoryOrder);
++MAKE_EMPTY_CLASS(Threadprivate, Threadprivate);
++
++MAKE_INCOMPLETE_CLASS(AdjustArgs, AdjustArgs);
++MAKE_INCOMPLETE_CLASS(AppendArgs, AppendArgs);
++MAKE_INCOMPLETE_CLASS(Match, Match);
++// MAKE_INCOMPLETE_CLASS(Otherwise, );   // missing-in-parser
++MAKE_INCOMPLETE_CLASS(When, When);
+ 
+ DefinedOperator makeDefinedOperator(const parser::DefinedOperator &inp,
+                                     semantics::SemanticsContext &semaCtx) {
++  CLAUSET_ENUM_CONVERT( //
++      convert, parser::DefinedOperator::IntrinsicOperator,
++      DefinedOperator::IntrinsicOperator,
++      // clang-format off
++      MS(Add,      Add)
++      MS(AND,      AND)
++      MS(Concat,   Concat)
++      MS(Divide,   Divide)
++      MS(EQ,       EQ)
++      MS(EQV,      EQV)
++      MS(GE,       GE)
++      MS(GT,       GT)
++      MS(NOT,      NOT)
++      MS(LE,       LE)
++      MS(LT,       LT)
++      MS(Multiply, Multiply)
++      MS(NE,       NE)
++      MS(NEQV,     NEQV)
++      MS(OR,       OR)
++      MS(Power,    Power)
++      MS(Subtract, Subtract)
++      // clang-format on
++  );
++
+   return std::visit(
+       common::visitors{
+           [&](const parser::DefinedOpName &s) {
+@@ -219,7 +286,7 @@ DefinedOperator makeDefinedOperator(const parser::DefinedOperator &inp,
+                 DefinedOperator::DefinedOpName{makeObject(s.v, semaCtx)}};
+           },
+           [&](const parser::DefinedOperator::IntrinsicOperator &s) {
+-            return DefinedOperator{s};
++            return DefinedOperator{convert(s)};
+           },
+       },
+       inp.u);
+@@ -252,7 +319,26 @@ ReductionOperator makeReductionOperator(const parser::OmpReductionOperator &inp,
+       inp.u);
+ }
+ 
+-// Actual clauses. Each T (where OmpClause::T exists) has its "make".
++// --------------------------------------------------------------------
++// Actual clauses. Each T (where tomp::T exists in ClauseT) has its "make".
++
++// Absent: missing-in-parser
++// AcqRel: empty
++// Acquire: empty
++// AdjustArgs: incomplate
++
++Affinity make(const parser::OmpClause::Affinity &inp,
++              semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: affinity");
++}
++
++Align make(const parser::OmpClause::Align &inp,
++           semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: align");
++}
++
+ Aligned make(const parser::OmpClause::Aligned &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpAlignedClause
+@@ -260,8 +346,8 @@ Aligned make(const parser::OmpClause::Aligned &inp,
+   auto &t1 = std::get<std::optional<parser::ScalarIntConstantExpr>>(inp.v.t);
+ 
+   return Aligned{{
+-      makeList(t0, semaCtx),
+-      maybeApply(makeExprFn(semaCtx), t1),
++      /*Alignment=*/maybeApply(makeExprFn(semaCtx), t1),
++      /*List=*/makeList(t0, semaCtx),
+   }};
+ }
+ 
+@@ -272,39 +358,57 @@ Allocate make(const parser::OmpClause::Allocate &inp,
+   auto &t0 = std::get<std::optional<wrapped::AllocateModifier>>(inp.v.t);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+ 
+-  auto convert = [&](auto &&s) -> Allocate::Modifier {
+-    using Modifier = Allocate::Modifier;
+-    using Allocator = Modifier::Allocator;
+-    using Align = Modifier::Align;
+-    using ComplexModifier = Modifier::ComplexModifier;
++  if (!t0) {
++    return Allocate{{/*AllocatorSimpleModifier=*/std::nullopt,
++                     /*AllocatorComplexModifier=*/std::nullopt,
++                     /*AlignModifier=*/std::nullopt,
++                     /*List=*/makeList(t1, semaCtx)}};
++  }
+ 
+-    return std::visit(
+-        common::visitors{
+-            [&](const wrapped::AllocateModifier::Allocator &v) {
+-              return Modifier{Allocator{makeExpr(v.v, semaCtx)}};
+-            },
+-            [&](const wrapped::AllocateModifier::ComplexModifier &v) {
+-              auto &s0 = std::get<wrapped::AllocateModifier::Allocator>(v.t);
+-              auto &s1 = std::get<wrapped::AllocateModifier::Align>(v.t);
+-              return Modifier{ComplexModifier{{
+-                  Allocator{makeExpr(s0.v, semaCtx)},
+-                  Align{makeExpr(s1.v, semaCtx)},
+-              }}};
+-            },
+-            [&](const wrapped::AllocateModifier::Align &v) {
+-              return Modifier{Align{makeExpr(v.v, semaCtx)}};
+-            },
+-        },
+-        s.u);
+-  };
++  using Tuple = decltype(Allocate::t);
+ 
+-  return Allocate{{maybeApply(convert, t0), makeList(t1, semaCtx)}};
++  return Allocate{std::visit(
++      common::visitors{
++          // simple-modifier
++          [&](const wrapped::AllocateModifier::Allocator &v) -> Tuple {
++            return {/*AllocatorSimpleModifier=*/makeExpr(v.v, semaCtx),
++                    /*AllocatorComplexModifier=*/std::nullopt,
++                    /*AlignModifier=*/std::nullopt,
++                    /*List=*/makeList(t1, semaCtx)};
++          },
++          // complex-modifier + align-modifier
++          [&](const wrapped::AllocateModifier::ComplexModifier &v) -> Tuple {
++            auto &s0 = std::get<wrapped::AllocateModifier::Allocator>(v.t);
++            auto &s1 = std::get<wrapped::AllocateModifier::Align>(v.t);
++            return {
++                /*AllocatorSimpleModifier=*/std::nullopt,
++                /*AllocatorComplexModifier=*/Allocator{makeExpr(s0.v, semaCtx)},
++                /*AlignModifier=*/Align{makeExpr(s1.v, semaCtx)},
++                /*List=*/makeList(t1, semaCtx)};
++          },
++          // align-modifier
++          [&](const wrapped::AllocateModifier::Align &v) -> Tuple {
++            return {/*AllocatorSimpleModifier=*/std::nullopt,
++                    /*AllocatorComplexModifier=*/std::nullopt,
++                    /*AlignModifier=*/Align{makeExpr(v.v, semaCtx)},
++                    /*List=*/makeList(t1, semaCtx)};
++          },
++      },
++      t0->u)};
+ }
+ 
+ Allocator make(const parser::OmpClause::Allocator &inp,
+                semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return Allocator{makeExpr(inp.v, semaCtx)};
++  return Allocator{/*Allocator=*/makeExpr(inp.v, semaCtx)};
++}
++
++// AppendArgs: incomplete
++
++At make(const parser::OmpClause::At &inp,
++        semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: at");
+ }
+ 
+ // Never called, but needed for using "make" as a Clause visitor.
+@@ -312,25 +416,65 @@ Allocator make(const parser::OmpClause::Allocator &inp,
+ AtomicDefaultMemOrder make(const parser::OmpClause::AtomicDefaultMemOrder &inp,
+                            semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpAtomicDefaultMemOrderClause
+-  return AtomicDefaultMemOrder{inp.v.v};
++  CLAUSET_ENUM_CONVERT( //
++      convert, common::OmpAtomicDefaultMemOrderType,
++      AtomicDefaultMemOrder::MemoryOrder,
++      // clang-format off
++      MS(AcqRel,   AcqRel)
++      MS(Relaxed,  Relaxed)
++      MS(SeqCst,   SeqCst)
++      // clang-format on
++  );
++
++  return AtomicDefaultMemOrder{/*MemoryOrder=*/convert(inp.v.v)};
+ }
+ 
++Bind make(const parser::OmpClause::Bind &inp,
++          semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: bind");
++}
++
++// CancellationConstructType: empty
++// Capture: empty
++
+ Collapse make(const parser::OmpClause::Collapse &inp,
+               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntConstantExpr
+-  return Collapse{makeExpr(inp.v, semaCtx)};
++  return Collapse{/*N=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// Compare: empty
++// Contains: missing-in-parser
++
+ Copyin make(const parser::OmpClause::Copyin &inp,
+             semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Copyin{makeList(inp.v, semaCtx)};
++  return Copyin{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ Copyprivate make(const parser::OmpClause::Copyprivate &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Copyprivate{makeList(inp.v, semaCtx)};
++  return Copyprivate{/*List=*/makeList(inp.v, semaCtx)};
++}
++
++Default make(const parser::OmpClause::Default &inp,
++             semantics::SemanticsContext &semaCtx) {
++  // inp.v -> parser::OmpDefaultClause
++  using wrapped = parser::OmpDefaultClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert, wrapped::Type, Default::DataSharingAttribute,
++      // clang-format off
++      MS(Firstprivate, Firstprivate)
++      MS(None,         None)
++      MS(Private,      Private)
++      MS(Shared,       Shared)
++      // clang-format on
++  );
++
++  return Default{/*DataSharingAttribute=*/convert(inp.v.v)};
+ }
+ 
+ Defaultmap make(const parser::OmpClause::Defaultmap &inp,
+@@ -338,51 +482,111 @@ Defaultmap make(const parser::OmpClause::Defaultmap &inp,
+   // inp.v -> parser::OmpDefaultmapClause
+   using wrapped = parser::OmpDefaultmapClause;
+ 
++  CLAUSET_ENUM_CONVERT( //
++      convert1, wrapped::ImplicitBehavior, Defaultmap::ImplicitBehavior,
++      // clang-format off
++      MS(Alloc,        Alloc)
++      MS(To,           To)
++      MS(From,         From)
++      MS(Tofrom,       Tofrom)
++      MS(Firstprivate, Firstprivate)
++      MS(None,         None)
++      MS(Default,      Default)
++      // MS(, Present)  missing-in-parser
++      // clang-format on
++  );
++
++  CLAUSET_ENUM_CONVERT( //
++      convert2, wrapped::VariableCategory, Defaultmap::VariableCategory,
++      // clang-format off
++      MS(Scalar,       Scalar)
++      MS(Aggregate,    Aggregate)
++      MS(Pointer,      Pointer)
++      MS(Allocatable,  Allocatable)
++      // clang-format on
++  );
++
+   auto &t0 = std::get<wrapped::ImplicitBehavior>(inp.v.t);
+   auto &t1 = std::get<std::optional<wrapped::VariableCategory>>(inp.v.t);
+-  return Defaultmap{{t0, t1}};
+-}
+-
+-Default make(const parser::OmpClause::Default &inp,
+-             semantics::SemanticsContext &semaCtx) {
+-  // inp.v -> parser::OmpDefaultClause
+-  return Default{inp.v.v};
++  return Defaultmap{{/*ImplicitBehavior=*/convert1(t0),
++                     /*VariableCategory=*/maybeApply(convert2, t1)}};
+ }
+ 
+ Depend make(const parser::OmpClause::Depend &inp,
+             semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpDependClause
+   using wrapped = parser::OmpDependClause;
+-
+-  return std::visit(
++  using Variant = decltype(Depend::u);
++  // Iteration is the equivalent of parser::OmpDependSinkVec
++  using Iteration = Doacross::Vector::value_type; // LoopIterationT
++
++  CLAUSET_ENUM_CONVERT( //
++      convert1, parser::OmpDependenceType::Type, Depend::TaskDependenceType,
++      // clang-format off
++      MS(In,     In)
++      MS(Out,    Out)
++      MS(Inout,  Inout)
++      // MS(, Mutexinoutset)   // missing-in-parser
++      // MS(, Inputset)        // missing-in-parser
++      // MS(, Depobj)          // missing-in-parser
++      // clang-format on
++  );
++
++  return Depend{std::visit( //
+       common::visitors{
+-          [&](const wrapped::Source &s) { return Depend{Depend::Source{}}; },
+-          [&](const wrapped::Sink &s) {
+-            auto convert = [&](const parser::OmpDependSinkVec &v) {
++          // Doacross
++          [&](const wrapped::Source &s) -> Variant {
++            return Doacross{
++                {/*DependenceType=*/Doacross::DependenceType::Source,
++                 /*Vector=*/{}}};
++          },
++          // Doacross
++          [&](const wrapped::Sink &s) -> Variant {
++            using DependLength = parser::OmpDependSinkVecLength;
++            auto convert2 = [&](const parser::OmpDependSinkVec &v) {
+               auto &t0 = std::get<parser::Name>(v.t);
+-              auto &t1 =
+-                  std::get<std::optional<parser::OmpDependSinkVecLength>>(v.t);
+-              auto convert1 = [&](const parser::OmpDependSinkVecLength &u) {
++              auto &t1 = std::get<std::optional<DependLength>>(v.t);
++
++              auto convert3 = [&](const DependLength &u) {
+                 auto &s0 = std::get<parser::DefinedOperator>(u.t);
+                 auto &s1 = std::get<parser::ScalarIntConstantExpr>(u.t);
+-                return Depend::Sink::Length{makeDefinedOperator(s0, semaCtx),
+-                                            makeExpr(s1, semaCtx)};
++                return Iteration::Distance{
++                    {makeDefinedOperator(s0, semaCtx), makeExpr(s1, semaCtx)}};
+               };
+-              return Depend::Sink::Vec{makeObject(t0, semaCtx),
+-                                       maybeApply(convert1, t1)};
++              return Iteration{
++                  {makeObject(t0, semaCtx), maybeApply(convert3, t1)}};
+             };
+-            return Depend{Depend::Sink{makeList(s.v, convert)}};
++            return Doacross{{/*DependenceType=*/Doacross::DependenceType::Sink,
++                             /*Vector=*/makeList(s.v, convert2)}};
+           },
+-          [&](const wrapped::InOut &s) {
++          // Depend::WithLocators
++          [&](const wrapped::InOut &s) -> Variant {
+             auto &t0 = std::get<parser::OmpDependenceType>(s.t);
+             auto &t1 = std::get<std::list<parser::Designator>>(s.t);
+-            auto convert = [&](const parser::Designator &t) {
++            auto convert4 = [&](const parser::Designator &t) {
+               return makeObject(t, semaCtx);
+             };
+-            return Depend{Depend::InOut{{t0.v, makeList(t1, convert)}}};
++            return Depend::WithLocators{
++                {/*TaskDependenceType=*/convert1(t0.v),
++                 /*Iterator=*/std::nullopt,
++                 /*LocatorList=*/makeList(t1, convert4)}};
+           },
+       },
+-      inp.v.u);
++      inp.v.u)};
++}
++
++// Depobj: empty
++
++Destroy make(const parser::OmpClause::Destroy &inp,
++             semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: destroy");
++}
++
++Detach make(const parser::OmpClause::Detach &inp,
++            semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: detach");
+ }
+ 
+ Device make(const parser::OmpClause::Device &inp,
+@@ -390,100 +594,188 @@ Device make(const parser::OmpClause::Device &inp,
+   // inp.v -> parser::OmpDeviceClause
+   using wrapped = parser::OmpDeviceClause;
+ 
++  CLAUSET_ENUM_CONVERT( //
++      convert, parser::OmpDeviceClause::DeviceModifier, Device::DeviceModifier,
++      // clang-format off
++      MS(Ancestor,   Ancestor)
++      MS(Device_Num, DeviceNum)
++      // clang-format on
++  );
+   auto &t0 = std::get<std::optional<wrapped::DeviceModifier>>(inp.v.t);
+   auto &t1 = std::get<parser::ScalarIntExpr>(inp.v.t);
+-  return Device{{t0, makeExpr(t1, semaCtx)}};
++  return Device{{/*DeviceModifier=*/maybeApply(convert, t0),
++                 /*DeviceDescription=*/makeExpr(t1, semaCtx)}};
+ }
+ 
+ DeviceType make(const parser::OmpClause::DeviceType &inp,
+                 semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpDeviceTypeClause
+-  return DeviceType{inp.v.v};
++  using wrapped = parser::OmpDeviceTypeClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert, wrapped::Type, DeviceType::DeviceTypeDescription,
++      // clang-format off
++      MS(Any,    Any)
++      MS(Host,   Host)
++      MS(Nohost, Nohost)
++      // clang-format om
++  );
++  return DeviceType{/*DeviceTypeDescription=*/convert(inp.v.v)};
+ }
+ 
+ DistSchedule make(const parser::OmpClause::DistSchedule &inp,
+                   semantics::SemanticsContext &semaCtx) {
+   // inp.v -> std::optional<parser::ScalarIntExpr>
+-  return DistSchedule{maybeApply(makeExprFn(semaCtx), inp.v)};
++  return DistSchedule{{/*Kind=*/DistSchedule::Kind::Static,
++                       /*ChunkSize=*/maybeApply(makeExprFn(semaCtx), inp.v)}};
+ }
+ 
++Doacross make(const parser::OmpClause::Doacross &inp,
++              semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: doacross");
++}
++
++// DynamicAllocators: empty
++
+ Enter make(const parser::OmpClause::Enter &inp,
+            semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Enter{makeList(inp.v, semaCtx)};
++  return Enter{makeList(/*List=*/inp.v, semaCtx)};
++}
++
++Exclusive make(const parser::OmpClause::Exclusive &inp,
++               semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: exclusive");
++}
++
++Fail make(const parser::OmpClause::Fail &inp,
++          semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: fail");
+ }
+ 
+ Filter make(const parser::OmpClause::Filter &inp,
+             semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return Filter{makeExpr(inp.v, semaCtx)};
++  return Filter{/*ThreadNum=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
+ Final make(const parser::OmpClause::Final &inp,
+            semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarLogicalExpr
+-  return Final{makeExpr(inp.v, semaCtx)};
++  return Final{/*Finalize=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
+ Firstprivate make(const parser::OmpClause::Firstprivate &inp,
+                   semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Firstprivate{makeList(inp.v, semaCtx)};
++  return Firstprivate{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
++// Flush: empty
++
+ From make(const parser::OmpClause::From &inp,
+           semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return From{makeList(inp.v, semaCtx)};
++  return From{{/*Expectation=*/std::nullopt, /*Mapper=*/std::nullopt,
++               /*Iterator=*/std::nullopt,
++               /*LocatorList=*/makeList(inp.v, semaCtx)}};
+ }
+ 
++// Full: empty
++
+ Grainsize make(const parser::OmpClause::Grainsize &inp,
+                semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return Grainsize{makeExpr(inp.v, semaCtx)};
++  return Grainsize{{/*Prescriptiveness=*/std::nullopt,
++                    /*GrainSize=*/makeExpr(inp.v, semaCtx)}};
+ }
+ 
+ HasDeviceAddr make(const parser::OmpClause::HasDeviceAddr &inp,
+                    semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return HasDeviceAddr{makeList(inp.v, semaCtx)};
++  return HasDeviceAddr{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ Hint make(const parser::OmpClause::Hint &inp,
+           semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ConstantExpr
+-  return Hint{makeExpr(inp.v, semaCtx)};
++  return Hint{/*HintExpr=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// Holds: missing-in-parser
++
+ If make(const parser::OmpClause::If &inp,
+         semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpIfClause
+   using wrapped = parser::OmpIfClause;
+ 
++  CLAUSET_ENUM_CONVERT( //
++      convert, wrapped::DirectiveNameModifier, llvm::omp::Directive,
++      // clang-format off
++      MS(Parallel,         OMPD_parallel)
++      MS(Simd,             OMPD_simd)
++      MS(Target,           OMPD_target)
++      MS(TargetData,       OMPD_target_data)
++      MS(TargetEnterData,  OMPD_target_enter_data)
++      MS(TargetExitData,   OMPD_target_exit_data)
++      MS(TargetUpdate,     OMPD_target_update)
++      MS(Task,             OMPD_task)
++      MS(Taskloop,         OMPD_taskloop)
++      MS(Teams,            OMPD_teams)
++      // clang-format on
++  );
+   auto &t0 = std::get<std::optional<wrapped::DirectiveNameModifier>>(inp.v.t);
+   auto &t1 = std::get<parser::ScalarLogicalExpr>(inp.v.t);
+-  return If{{t0, makeExpr(t1, semaCtx)}};
++  return If{{/*DirectiveNameModifier=*/maybeApply(convert, t0),
++             /*IfExpression=*/makeExpr(t1, semaCtx)}};
+ }
+ 
++// Inbranch: empty
++
++Inclusive make(const parser::OmpClause::Inclusive &inp,
++               semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: inclusive");
++}
++
++Indirect make(const parser::OmpClause::Indirect &inp,
++              semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: indirect");
++}
++
++Init make(const parser::OmpClause::Init &inp,
++          semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: init");
++}
++
++// Initializer: missing-in-parser
++
+ InReduction make(const parser::OmpClause::InReduction &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpInReductionClause
+   auto &t0 = std::get<parser::OmpReductionOperator>(inp.v.t);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+   return InReduction{
+-      {makeReductionOperator(t0, semaCtx), makeList(t1, semaCtx)}};
++      {/*ReductionIdentifiers=*/{makeReductionOperator(t0, semaCtx)},
++       /*List=*/makeList(t1, semaCtx)}};
+ }
+ 
+ IsDevicePtr make(const parser::OmpClause::IsDevicePtr &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return IsDevicePtr{makeList(inp.v, semaCtx)};
++  return IsDevicePtr{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ Lastprivate make(const parser::OmpClause::Lastprivate &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Lastprivate{makeList(inp.v, semaCtx)};
++  return Lastprivate{{/*LastprivateModifier=*/std::nullopt,
++                      /*List=*/makeList(inp.v, semaCtx)}};
+ }
+ 
+ Linear make(const parser::OmpClause::Linear &inp,
+@@ -491,140 +783,244 @@ Linear make(const parser::OmpClause::Linear &inp,
+   // inp.v -> parser::OmpLinearClause
+   using wrapped = parser::OmpLinearClause;
+ 
+-  return std::visit(
++  CLAUSET_ENUM_CONVERT( //
++      convert, parser::OmpLinearModifier::Type, Linear::LinearModifier,
++      // clang-format off
++      MS(Ref,  Ref)
++      MS(Val,  Val)
++      MS(Uval, Uval)
++      // clang-format on
++  );
++
++  using Tuple = decltype(Linear::t);
++
++  return Linear{std::visit(
+       common::visitors{
+-          [&](const wrapped::WithModifier &s) {
+-            return Linear{{Linear::Modifier{s.modifier.v},
+-                           makeList(s.names, makeObjectFn(semaCtx)),
+-                           maybeApply(makeExprFn(semaCtx), s.step)}};
++          [&](const wrapped::WithModifier &s) -> Tuple {
++            return {
++                /*StepSimpleModifier=*/std::nullopt,
++                /*StepComplexModifier=*/maybeApply(makeExprFn(semaCtx), s.step),
++                /*LinearModifier=*/convert(s.modifier.v),
++                /*List=*/makeList(s.names, makeObjectFn(semaCtx))};
+           },
+-          [&](const wrapped::WithoutModifier &s) {
+-            return Linear{{std::nullopt,
+-                           makeList(s.names, makeObjectFn(semaCtx)),
+-                           maybeApply(makeExprFn(semaCtx), s.step)}};
++          [&](const wrapped::WithoutModifier &s) -> Tuple {
++            return {
++                /*StepSimpleModifier=*/maybeApply(makeExprFn(semaCtx), s.step),
++                /*StepComplexModifier=*/std::nullopt,
++                /*LinearModifier=*/std::nullopt,
++                /*List=*/makeList(s.names, makeObjectFn(semaCtx))};
+           },
+       },
+-      inp.v.u);
++      inp.v.u)};
+ }
+ 
+ Link make(const parser::OmpClause::Link &inp,
+           semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Link{makeList(inp.v, semaCtx)};
++  return Link{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ Map make(const parser::OmpClause::Map &inp,
+          semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpMapClause
++
++  CLAUSET_ENUM_CONVERT( //
++      convert1, parser::OmpMapType::Type, Map::MapType,
++      // clang-format off
++      MS(To,       To)
++      MS(From,     From)
++      MS(Tofrom,   Tofrom)
++      MS(Alloc,    Alloc)
++      MS(Release,  Release)
++      MS(Delete,   Delete)
++      // clang-format on
++  );
++
++  // No convert2: MapTypeModifier is not an enum in parser.
++
+   auto &t0 = std::get<std::optional<parser::OmpMapType>>(inp.v.t);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+-  auto convert = [](const parser::OmpMapType &s) {
+-    auto &s0 = std::get<std::optional<parser::OmpMapType::Always>>(s.t);
+-    auto &s1 = std::get<parser::OmpMapType::Type>(s.t);
+-    auto convertT = [](parser::OmpMapType::Always) {
+-      return Map::MapType::Always{};
+-    };
+-    return Map::MapType{{maybeApply(convertT, s0), s1}};
+-  };
+-  return Map{{maybeApply(convert, t0), makeList(t1, semaCtx)}};
++
++  if (!t0) {
++    return Map{{/*MapType=*/std::nullopt, /*MapTypeModifiers=*/std::nullopt,
++                /*Mapper=*/std::nullopt, /*Iterator=*/std::nullopt,
++                /*LocatorList=*/makeList(t1, semaCtx)}};
++  }
++
++  auto &s0 = std::get<std::optional<parser::OmpMapType::Always>>(t0->t);
++  auto &s1 = std::get<parser::OmpMapType::Type>(t0->t);
++
++  std::optional<Map::MapTypeModifiers> maybeList;
++  if (s0)
++    maybeList = Map::MapTypeModifiers{Map::MapTypeModifier::Always};
++
++  return Map{{/*MapType=*/convert1(s1),
++              /*MapTypeModifiers=*/maybeList,
++              /*Mapper=*/std::nullopt, /*Iterator=*/std::nullopt,
++              /*LocatorList=*/makeList(t1, semaCtx)}};
++}
++
++// Match: incomplete
++// MemoryOrder: empty
++// Mergeable: empty
++
++Message make(const parser::OmpClause::Message &inp,
++             semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: message");
+ }
+ 
+ Nocontext make(const parser::OmpClause::Nocontext &inp,
+                semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarLogicalExpr
+-  return Nocontext{makeExpr(inp.v, semaCtx)};
++  return Nocontext{/*DoNotUpdateContext=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// Nogroup: empty
++
+ Nontemporal make(const parser::OmpClause::Nontemporal &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> std::list<parser::Name>
+-  return Nontemporal{makeList(inp.v, makeObjectFn(semaCtx))};
++  return Nontemporal{/*List=*/makeList(inp.v, makeObjectFn(semaCtx))};
+ }
+ 
++// NoOpenmp: missing-in-parser
++// NoOpenmpRoutines: missing-in-parser
++// NoParallelism: missing-in-parser
++// Notinbranch: empty
++
+ Novariants make(const parser::OmpClause::Novariants &inp,
+                 semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarLogicalExpr
+-  return Novariants{makeExpr(inp.v, semaCtx)};
++  return Novariants{/*DoNotUseVariant=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// Nowait: empty
++
+ NumTasks make(const parser::OmpClause::NumTasks &inp,
+               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return NumTasks{makeExpr(inp.v, semaCtx)};
++  return NumTasks{{/*Prescriptiveness=*/std::nullopt,
++                   /*NumTasks=*/makeExpr(inp.v, semaCtx)}};
+ }
+ 
+ NumTeams make(const parser::OmpClause::NumTeams &inp,
+               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return NumTeams{makeExpr(inp.v, semaCtx)};
++  return NumTeams{{/*LowerBound=*/std::nullopt,
++                   /*UpperBound=*/makeExpr(inp.v, semaCtx)}};
+ }
+ 
+ NumThreads make(const parser::OmpClause::NumThreads &inp,
+                 semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return NumThreads{makeExpr(inp.v, semaCtx)};
++  return NumThreads{/*Nthreads=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// OmpxAttribute: empty
++// OmpxBare: empty
++
+ OmpxDynCgroupMem make(const parser::OmpClause::OmpxDynCgroupMem &inp,
+                       semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+   return OmpxDynCgroupMem{makeExpr(inp.v, semaCtx)};
+ }
+ 
+-Ordered make(const parser::OmpClause::Ordered &inp,
+-             semantics::SemanticsContext &semaCtx) {
+-  // inp.v -> std::optional<parser::ScalarIntConstantExpr>
+-  return Ordered{maybeApply(makeExprFn(semaCtx), inp.v)};
+-}
+-
+ Order make(const parser::OmpClause::Order &inp,
+            semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpOrderClause
+   using wrapped = parser::OmpOrderClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert1, parser::OmpOrderModifier::Kind, Order::OrderModifier,
++      // clang-format off
++      MS(Reproducible,   Reproducible)
++      MS(Unconstrained,  Unconstrained)
++      // clang-format on
++  );
++
++  CLAUSET_ENUM_CONVERT( //
++      convert2, wrapped::Type, Order::Ordering,
++      // clang-format off
++      MS(Concurrent, Concurrent)
++      // clang-format on
++  );
++
+   auto &t0 = std::get<std::optional<parser::OmpOrderModifier>>(inp.v.t);
+   auto &t1 = std::get<wrapped::Type>(inp.v.t);
+-  auto convert = [](const parser::OmpOrderModifier &s) -> Order::Kind {
+-    return std::get<parser::OmpOrderModifier::Kind>(s.u);
++
++  auto convert3 = [&](const parser::OmpOrderModifier &s) {
++    return std::visit(
++        [&](parser::OmpOrderModifier::Kind k) { return convert1(k); }, s.u);
+   };
+-  return Order{{maybeApply(convert, t0), t1}};
++  return Order{
++      {/*OrderModifier=*/maybeApply(convert3, t0), /*Ordering=*/convert2(t1)}};
+ }
+ 
++Ordered make(const parser::OmpClause::Ordered &inp,
++             semantics::SemanticsContext &semaCtx) {
++  // inp.v -> std::optional<parser::ScalarIntConstantExpr>
++  return Ordered{/*N=*/maybeApply(makeExprFn(semaCtx), inp.v)};
++}
++
++// Otherwise: incomplete, missing-in-parser
++
+ Partial make(const parser::OmpClause::Partial &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> std::optional<parser::ScalarIntConstantExpr>
+-  return Partial{maybeApply(makeExprFn(semaCtx), inp.v)};
++  return Partial{/*UnrollFactor=*/maybeApply(makeExprFn(semaCtx), inp.v)};
+ }
+ 
+ Priority make(const parser::OmpClause::Priority &inp,
+               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return Priority{makeExpr(inp.v, semaCtx)};
++  return Priority{/*PriorityValue=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
+ Private make(const parser::OmpClause::Private &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Private{makeList(inp.v, semaCtx)};
++  return Private{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ ProcBind make(const parser::OmpClause::ProcBind &inp,
+               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpProcBindClause
+-  return ProcBind{inp.v.v};
++  using wrapped = parser::OmpProcBindClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert, wrapped::Type, ProcBind::AffinityPolicy,
++      // clang-format off
++      MS(Close,    Close)
++      MS(Master,   Master)
++      MS(Spread,   Spread)
++      MS(Primary,  Primary)
++      // clang-format on
++  );
++  return ProcBind{/*AffinityPolicy=*/convert(inp.v.v)};
+ }
+ 
++// Read: empty
++
+ Reduction make(const parser::OmpClause::Reduction &inp,
+                semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpReductionClause
+   auto &t0 = std::get<parser::OmpReductionOperator>(inp.v.t);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+-  return Reduction{{makeReductionOperator(t0, semaCtx), makeList(t1, semaCtx)}};
++  return Reduction{
++      {/*ReductionIdentifiers=*/{makeReductionOperator(t0, semaCtx)},
++       /*ReductionModifier=*/std::nullopt,
++       /*List=*/makeList(t1, semaCtx)}};
+ }
+ 
++// Relaxed: empty
++// Release: empty
++// ReverseOffload: empty
++
+ Safelen make(const parser::OmpClause::Safelen &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntConstantExpr
+-  return Safelen{makeExpr(inp.v, semaCtx)};
++  return Safelen{/*Length=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
+ Schedule make(const parser::OmpClause::Schedule &inp,
+@@ -632,41 +1028,97 @@ Schedule make(const parser::OmpClause::Schedule &inp,
+   // inp.v -> parser::OmpScheduleClause
+   using wrapped = parser::OmpScheduleClause;
+ 
++  CLAUSET_ENUM_CONVERT( //
++      convert1, wrapped::ScheduleType, Schedule::Kind,
++      // clang-format off
++      MS(Static,   Static)
++      MS(Dynamic,  Dynamic)
++      MS(Guided,   Guided)
++      MS(Auto,     Auto)
++      MS(Runtime,  Runtime)
++      // clang-format on
++  );
++
++  CLAUSET_ENUM_CONVERT( //
++      convert2, parser::OmpScheduleModifierType::ModType,
++      Schedule::OrderingModifier,
++      // clang-format off
++      MS(Monotonic,    Monotonic)
++      MS(Nonmonotonic, Nonmonotonic)
++      // clang-format on
++  );
++
++  CLAUSET_ENUM_CONVERT( //
++      convert3, parser::OmpScheduleModifierType::ModType,
++      Schedule::ChunkModifier,
++      // clang-format off
++      MS(Simd, Simd)
++      // clang-format on
++  );
++
+   auto &t0 = std::get<std::optional<parser::OmpScheduleModifier>>(inp.v.t);
+   auto &t1 = std::get<wrapped::ScheduleType>(inp.v.t);
+   auto &t2 = std::get<std::optional<parser::ScalarIntExpr>>(inp.v.t);
+ 
+-  auto convert = [](auto &&s) -> Schedule::ScheduleModifier {
+-    auto &s0 = std::get<parser::OmpScheduleModifier::Modifier1>(s.t);
+-    auto &s1 =
+-        std::get<std::optional<parser::OmpScheduleModifier::Modifier2>>(s.t);
++  if (!t0) {
++    return Schedule{{/*Kind=*/convert1(t1), /*OrderingModifier=*/std::nullopt,
++                     /*ChunkModifier=*/std::nullopt,
++                     /*ChunkSize=*/maybeApply(makeExprFn(semaCtx), t2)}};
++  }
+ 
+-    auto convert1 = [](auto &&v) { // Modifier1 or Modifier2
+-      return v.v.v;
+-    };
+-    return Schedule::ScheduleModifier{{s0.v.v, maybeApply(convert1, s1)}};
+-  };
++  // The members of parser::OmpScheduleModifier correspond to OrderingModifier,
++  // and ChunkModifier, but they can appear in any order.
++  auto &m1 = std::get<parser::OmpScheduleModifier::Modifier1>(t0->t);
++  auto &m2 =
++      std::get<std::optional<parser::OmpScheduleModifier::Modifier2>>(t0->t);
++
++  std::optional<Schedule::OrderingModifier> omod;
++  std::optional<Schedule::ChunkModifier> cmod;
++
++  if (m1.v.v == parser::OmpScheduleModifierType::ModType::Simd) {
++    // m1 is chunk-modifier
++    cmod = convert3(m1.v.v);
++    if (m2)
++      omod = convert2(m2->v.v);
++  } else {
++    // m1 is ordering-modifier
++    omod = convert2(m1.v.v);
++    if (m2)
++      cmod = convert3(m2->v.v);
++  }
++
++  return Schedule{{/*Kind=*/convert1(t1),
++                   /*OrderingModifier=*/omod,
++                   /*ChunkModifier=*/cmod,
++                   /*ChunkSize=*/maybeApply(makeExprFn(semaCtx), t2)}};
++}
+ 
+-  return Schedule{
+-      {maybeApply(convert, t0), t1, maybeApply(makeExprFn(semaCtx), t2)}};
++// SeqCst: empty
++
++Severity make(const parser::OmpClause::Severity &inp,
++              semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: severity");
+ }
+ 
+ Shared make(const parser::OmpClause::Shared &inp,
+             semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return Shared{makeList(inp.v, semaCtx)};
++  return Shared{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
++// Simd: empty
++
+ Simdlen make(const parser::OmpClause::Simdlen &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntConstantExpr
+-  return Simdlen{makeExpr(inp.v, semaCtx)};
++  return Simdlen{/*Length=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
+ Sizes make(const parser::OmpClause::Sizes &inp,
+            semantics::SemanticsContext &semaCtx) {
+   // inp.v -> std::list<parser::ScalarIntExpr>
+-  return Sizes{makeList(inp.v, makeExprFn(semaCtx))};
++  return Sizes{/*SizeList=*/makeList(inp.v, makeExprFn(semaCtx))};
+ }
+ 
+ TaskReduction make(const parser::OmpClause::TaskReduction &inp,
+@@ -675,38 +1127,72 @@ TaskReduction make(const parser::OmpClause::TaskReduction &inp,
+   auto &t0 = std::get<parser::OmpReductionOperator>(inp.v.t);
+   auto &t1 = std::get<parser::OmpObjectList>(inp.v.t);
+   return TaskReduction{
+-      {makeReductionOperator(t0, semaCtx), makeList(t1, semaCtx)}};
++      {/*ReductionIdentifiers=*/{makeReductionOperator(t0, semaCtx)},
++       /*List=*/makeList(t1, semaCtx)}};
+ }
+ 
+ ThreadLimit make(const parser::OmpClause::ThreadLimit &inp,
+                  semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::ScalarIntExpr
+-  return ThreadLimit{makeExpr(inp.v, semaCtx)};
++  return ThreadLimit{/*Threadlim=*/makeExpr(inp.v, semaCtx)};
+ }
+ 
++// Threadprivate: empty
++// Threads: empty
++
+ To make(const parser::OmpClause::To &inp,
+         semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return To{makeList(inp.v, semaCtx)};
++  return To{{/*Expectation=*/std::nullopt, /*Mapper=*/std::nullopt,
++             /*Iterator=*/std::nullopt,
++             /*LocatorList=*/makeList(inp.v, semaCtx)}};
+ }
+ 
++// UnifiedAddress: empty
++// UnifiedSharedMemory: empty
++
+ Uniform make(const parser::OmpClause::Uniform &inp,
+              semantics::SemanticsContext &semaCtx) {
+   // inp.v -> std::list<parser::Name>
+-  return Uniform{makeList(inp.v, makeObjectFn(semaCtx))};
++  return Uniform{/*ParameterList=*/makeList(inp.v, makeObjectFn(semaCtx))};
++}
++
++// Unknown: empty
++// Untied: empty
++
++Update make(const parser::OmpClause::Update &inp,
++            semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  return Update{/*TaskDependenceType=*/std::nullopt};
++}
++
++Use make(const parser::OmpClause::Use &inp,
++         semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: use");
+ }
+ 
+ UseDeviceAddr make(const parser::OmpClause::UseDeviceAddr &inp,
+                    semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return UseDeviceAddr{makeList(inp.v, semaCtx)};
++  return UseDeviceAddr{/*List=*/makeList(inp.v, semaCtx)};
+ }
+ 
+ UseDevicePtr make(const parser::OmpClause::UseDevicePtr &inp,
+                   semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpObjectList
+-  return UseDevicePtr{makeList(inp.v, semaCtx)};
++  return UseDevicePtr{/*List=*/makeList(inp.v, semaCtx)};
++}
++
++UsesAllocators make(const parser::OmpClause::UsesAllocators &inp,
++                    semantics::SemanticsContext &semaCtx) {
++  // inp -> empty
++  llvm_unreachable("Empty: uses_allocators");
+ }
++
++// Weak: empty
++// When: incomplete
++// Write: empty
+ } // namespace clause
+ 
+ Clause makeClause(const Fortran::parser::OmpClause &cls,
+diff --git a/flang/lib/Lower/OpenMP/Clauses.h b/flang/lib/Lower/OpenMP/Clauses.h
+index 3fba593b5349c..af1318226e8cb 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.h
++++ b/flang/lib/Lower/OpenMP/Clauses.h
+@@ -8,8 +8,6 @@
+ #ifndef FORTRAN_LOWER_OPENMP_CLAUSES_H
+ #define FORTRAN_LOWER_OPENMP_CLAUSES_H
+ 
+-#include "ClauseT.h"
+-
+ #include "flang/Evaluate/expression.h"
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Semantics/expression.h"
+@@ -17,6 +15,7 @@
+ #include "flang/Semantics/symbol.h"
+ 
+ #include "llvm/ADT/STLExtras.h"
++#include "llvm/Frontend/OpenMP/ClauseT.h"
+ 
+ #include <optional>
+ #include <type_traits>
+@@ -28,32 +27,32 @@ using SomeType = evaluate::SomeType;
+ using SomeExpr = semantics::SomeExpr;
+ using MaybeExpr = semantics::MaybeExpr;
+ 
+-using SymIdent = semantics::Symbol *;
+-using SymReference = SomeExpr;
++using TypeTy = SomeType;
++using IdTy = semantics::Symbol *;
++using ExprTy = SomeExpr;
+ 
+ template <typename T>
+ using List = tomp::ListT<T>;
+ } // namespace Fortran::lower::omp
+ 
+-namespace tomp {
++namespace tomp::type {
+ template <>
+-struct ObjectT<Fortran::lower::omp::SymIdent,
+-               Fortran::lower::omp::SymReference> {
+-  using IdType = Fortran::lower::omp::SymIdent;
+-  using ExprType = Fortran::lower::omp::SymReference;
++struct ObjectT<Fortran::lower::omp::IdTy, Fortran::lower::omp::ExprTy> {
++  using IdTy = Fortran::lower::omp::IdTy;
++  using ExprTy = Fortran::lower::omp::ExprTy;
+ 
+-  const IdType &id() const { return symbol; }
+-  const std::optional<ExprType> &ref() const { return designator; }
++  const IdTy &id() const { return symbol; }
++  const std::optional<ExprTy> &ref() const { return designator; }
+ 
+-  IdType symbol;
+-  std::optional<ExprType> designator;
++  IdTy symbol;
++  std::optional<ExprTy> designator;
+ };
+-} // namespace tomp
++} // namespace tomp::type
+ 
+ namespace Fortran::lower::omp {
+ 
+-using Object = tomp::ObjectT<SymIdent, SymReference>;
+-using ObjectList = tomp::ObjectListT<SymIdent, SymReference>;
++using Object = tomp::ObjectT<IdTy, ExprTy>;
++using ObjectList = tomp::ObjectListT<IdTy, ExprTy>;
+ 
+ Object makeObject(const parser::OmpObject &object,
+                   semantics::SemanticsContext &semaCtx);
+@@ -94,13 +93,14 @@ inline ObjectList makeList(const parser::OmpObjectList &objects,
+   return makeList(objects.v, makeObjectFn(semaCtx));
+ }
+ 
+-template <typename FuncTy, typename ElemTy,
+-          typename ResultTy = std::invoke_result_t<FuncTy, ElemTy>>
++template <typename FuncTy, //
++          typename ArgTy,  //
++          typename ResultTy = std::invoke_result_t<FuncTy, ArgTy>>
+ std::optional<ResultTy> maybeApply(FuncTy &&func,
+-                                   const std::optional<ElemTy> &inp) {
+-  if (!inp)
++                                   const std::optional<ArgTy> &arg) {
++  if (!arg)
+     return std::nullopt;
+-  return std::move(func(*inp));
++  return std::move(func(*arg));
+ }
+ 
+ std::optional<Object>
+@@ -108,91 +108,142 @@ getBaseObject(const Object &object,
+               Fortran::semantics::SemanticsContext &semaCtx);
+ 
+ namespace clause {
+-using DefinedOperator = tomp::clause::DefinedOperatorT<SymIdent, SymReference>;
+-using ProcedureDesignator =
+-    tomp::clause::ProcedureDesignatorT<SymIdent, SymReference>;
+-using ReductionOperator =
+-    tomp::clause::ReductionOperatorT<SymIdent, SymReference>;
+-
+-#ifdef EMPTY_CLASS
+-#undef EMPTY_CLASS
+-#endif
+-#define EMPTY_CLASS(cls)                                                       \
+-  using cls = tomp::clause::cls##T<SymIdent, SymReference>
+-
+-#ifdef WRAPPER_CLASS
+-#undef WRAPPER_CLASS
+-#endif
+-#define WRAPPER_CLASS(cls, content)                                            \
+-  [[maybe_unused]] extern int xyzzy_semicolon_absorber
+-#define GEN_FLANG_CLAUSE_PARSER_CLASSES
+-#include "llvm/Frontend/OpenMP/OMP.inc"
+-#undef EMPTY_CLASS
+-#undef WRAPPER_CLASS
++using DefinedOperator = tomp::type::DefinedOperatorT<IdTy, ExprTy>;
++using ProcedureDesignator = tomp::type::ProcedureDesignatorT<IdTy, ExprTy>;
++using ReductionOperator = tomp::type::ReductionIdentifierT<IdTy, ExprTy>;
+ 
+ // "Requires" clauses are handled early on, and the aggregated information
+ // is stored in the Symbol details of modules, programs, and subprograms.
+ // These clauses are still handled here to cover all alternatives in the
+ // main clause variant.
+ 
+-using Aligned = tomp::clause::AlignedT<SymIdent, SymReference>;
+-using Allocate = tomp::clause::AllocateT<SymIdent, SymReference>;
+-using Allocator = tomp::clause::AllocatorT<SymIdent, SymReference>;
++using AcqRel = tomp::clause::AcqRelT<TypeTy, IdTy, ExprTy>;
++using Acquire = tomp::clause::AcquireT<TypeTy, IdTy, ExprTy>;
++using AdjustArgs = tomp::clause::AdjustArgsT<TypeTy, IdTy, ExprTy>;
++using Affinity = tomp::clause::AffinityT<TypeTy, IdTy, ExprTy>;
++using Aligned = tomp::clause::AlignedT<TypeTy, IdTy, ExprTy>;
++using Align = tomp::clause::AlignT<TypeTy, IdTy, ExprTy>;
++using Allocate = tomp::clause::AllocateT<TypeTy, IdTy, ExprTy>;
++using Allocator = tomp::clause::AllocatorT<TypeTy, IdTy, ExprTy>;
++using AppendArgs = tomp::clause::AppendArgsT<TypeTy, IdTy, ExprTy>;
+ using AtomicDefaultMemOrder =
+-    tomp::clause::AtomicDefaultMemOrderT<SymIdent, SymReference>;
+-using Collapse = tomp::clause::CollapseT<SymIdent, SymReference>;
+-using Copyin = tomp::clause::CopyinT<SymIdent, SymReference>;
+-using Copyprivate = tomp::clause::CopyprivateT<SymIdent, SymReference>;
+-using Defaultmap = tomp::clause::DefaultmapT<SymIdent, SymReference>;
+-using Default = tomp::clause::DefaultT<SymIdent, SymReference>;
+-using Depend = tomp::clause::DependT<SymIdent, SymReference>;
+-using Device = tomp::clause::DeviceT<SymIdent, SymReference>;
+-using DeviceType = tomp::clause::DeviceTypeT<SymIdent, SymReference>;
+-using DistSchedule = tomp::clause::DistScheduleT<SymIdent, SymReference>;
+-using Enter = tomp::clause::EnterT<SymIdent, SymReference>;
+-using Filter = tomp::clause::FilterT<SymIdent, SymReference>;
+-using Final = tomp::clause::FinalT<SymIdent, SymReference>;
+-using Firstprivate = tomp::clause::FirstprivateT<SymIdent, SymReference>;
+-using From = tomp::clause::FromT<SymIdent, SymReference>;
+-using Grainsize = tomp::clause::GrainsizeT<SymIdent, SymReference>;
+-using HasDeviceAddr = tomp::clause::HasDeviceAddrT<SymIdent, SymReference>;
+-using Hint = tomp::clause::HintT<SymIdent, SymReference>;
+-using If = tomp::clause::IfT<SymIdent, SymReference>;
+-using InReduction = tomp::clause::InReductionT<SymIdent, SymReference>;
+-using IsDevicePtr = tomp::clause::IsDevicePtrT<SymIdent, SymReference>;
+-using Lastprivate = tomp::clause::LastprivateT<SymIdent, SymReference>;
+-using Linear = tomp::clause::LinearT<SymIdent, SymReference>;
+-using Link = tomp::clause::LinkT<SymIdent, SymReference>;
+-using Map = tomp::clause::MapT<SymIdent, SymReference>;
+-using Nocontext = tomp::clause::NocontextT<SymIdent, SymReference>;
+-using Nontemporal = tomp::clause::NontemporalT<SymIdent, SymReference>;
+-using Novariants = tomp::clause::NovariantsT<SymIdent, SymReference>;
+-using NumTasks = tomp::clause::NumTasksT<SymIdent, SymReference>;
+-using NumTeams = tomp::clause::NumTeamsT<SymIdent, SymReference>;
+-using NumThreads = tomp::clause::NumThreadsT<SymIdent, SymReference>;
+-using OmpxDynCgroupMem =
+-    tomp::clause::OmpxDynCgroupMemT<SymIdent, SymReference>;
+-using Ordered = tomp::clause::OrderedT<SymIdent, SymReference>;
+-using Order = tomp::clause::OrderT<SymIdent, SymReference>;
+-using Partial = tomp::clause::PartialT<SymIdent, SymReference>;
+-using Priority = tomp::clause::PriorityT<SymIdent, SymReference>;
+-using Private = tomp::clause::PrivateT<SymIdent, SymReference>;
+-using ProcBind = tomp::clause::ProcBindT<SymIdent, SymReference>;
+-using Reduction = tomp::clause::ReductionT<SymIdent, SymReference>;
+-using Safelen = tomp::clause::SafelenT<SymIdent, SymReference>;
+-using Schedule = tomp::clause::ScheduleT<SymIdent, SymReference>;
+-using Shared = tomp::clause::SharedT<SymIdent, SymReference>;
+-using Simdlen = tomp::clause::SimdlenT<SymIdent, SymReference>;
+-using Sizes = tomp::clause::SizesT<SymIdent, SymReference>;
+-using TaskReduction = tomp::clause::TaskReductionT<SymIdent, SymReference>;
+-using ThreadLimit = tomp::clause::ThreadLimitT<SymIdent, SymReference>;
+-using To = tomp::clause::ToT<SymIdent, SymReference>;
+-using Uniform = tomp::clause::UniformT<SymIdent, SymReference>;
+-using UseDeviceAddr = tomp::clause::UseDeviceAddrT<SymIdent, SymReference>;
+-using UseDevicePtr = tomp::clause::UseDevicePtrT<SymIdent, SymReference>;
++    tomp::clause::AtomicDefaultMemOrderT<TypeTy, IdTy, ExprTy>;
++using At = tomp::clause::AtT<TypeTy, IdTy, ExprTy>;
++using Bind = tomp::clause::BindT<TypeTy, IdTy, ExprTy>;
++using Capture = tomp::clause::CaptureT<TypeTy, IdTy, ExprTy>;
++using Collapse = tomp::clause::CollapseT<TypeTy, IdTy, ExprTy>;
++using Compare = tomp::clause::CompareT<TypeTy, IdTy, ExprTy>;
++using Copyin = tomp::clause::CopyinT<TypeTy, IdTy, ExprTy>;
++using Copyprivate = tomp::clause::CopyprivateT<TypeTy, IdTy, ExprTy>;
++using Defaultmap = tomp::clause::DefaultmapT<TypeTy, IdTy, ExprTy>;
++using Default = tomp::clause::DefaultT<TypeTy, IdTy, ExprTy>;
++using Depend = tomp::clause::DependT<TypeTy, IdTy, ExprTy>;
++using Destroy = tomp::clause::DestroyT<TypeTy, IdTy, ExprTy>;
++using Detach = tomp::clause::DetachT<TypeTy, IdTy, ExprTy>;
++using Device = tomp::clause::DeviceT<TypeTy, IdTy, ExprTy>;
++using DeviceType = tomp::clause::DeviceTypeT<TypeTy, IdTy, ExprTy>;
++using DistSchedule = tomp::clause::DistScheduleT<TypeTy, IdTy, ExprTy>;
++using Doacross = tomp::clause::DoacrossT<TypeTy, IdTy, ExprTy>;
++using DynamicAllocators =
++    tomp::clause::DynamicAllocatorsT<TypeTy, IdTy, ExprTy>;
++using Enter = tomp::clause::EnterT<TypeTy, IdTy, ExprTy>;
++using Exclusive = tomp::clause::ExclusiveT<TypeTy, IdTy, ExprTy>;
++using Fail = tomp::clause::FailT<TypeTy, IdTy, ExprTy>;
++using Filter = tomp::clause::FilterT<TypeTy, IdTy, ExprTy>;
++using Final = tomp::clause::FinalT<TypeTy, IdTy, ExprTy>;
++using Firstprivate = tomp::clause::FirstprivateT<TypeTy, IdTy, ExprTy>;
++using From = tomp::clause::FromT<TypeTy, IdTy, ExprTy>;
++using Full = tomp::clause::FullT<TypeTy, IdTy, ExprTy>;
++using Grainsize = tomp::clause::GrainsizeT<TypeTy, IdTy, ExprTy>;
++using HasDeviceAddr = tomp::clause::HasDeviceAddrT<TypeTy, IdTy, ExprTy>;
++using Hint = tomp::clause::HintT<TypeTy, IdTy, ExprTy>;
++using If = tomp::clause::IfT<TypeTy, IdTy, ExprTy>;
++using Inbranch = tomp::clause::InbranchT<TypeTy, IdTy, ExprTy>;
++using Inclusive = tomp::clause::InclusiveT<TypeTy, IdTy, ExprTy>;
++using Indirect = tomp::clause::IndirectT<TypeTy, IdTy, ExprTy>;
++using Init = tomp::clause::InitT<TypeTy, IdTy, ExprTy>;
++using InReduction = tomp::clause::InReductionT<TypeTy, IdTy, ExprTy>;
++using IsDevicePtr = tomp::clause::IsDevicePtrT<TypeTy, IdTy, ExprTy>;
++using Lastprivate = tomp::clause::LastprivateT<TypeTy, IdTy, ExprTy>;
++using Linear = tomp::clause::LinearT<TypeTy, IdTy, ExprTy>;
++using Link = tomp::clause::LinkT<TypeTy, IdTy, ExprTy>;
++using Map = tomp::clause::MapT<TypeTy, IdTy, ExprTy>;
++using Match = tomp::clause::MatchT<TypeTy, IdTy, ExprTy>;
++using Mergeable = tomp::clause::MergeableT<TypeTy, IdTy, ExprTy>;
++using Message = tomp::clause::MessageT<TypeTy, IdTy, ExprTy>;
++using Nocontext = tomp::clause::NocontextT<TypeTy, IdTy, ExprTy>;
++using Nogroup = tomp::clause::NogroupT<TypeTy, IdTy, ExprTy>;
++using Nontemporal = tomp::clause::NontemporalT<TypeTy, IdTy, ExprTy>;
++using Notinbranch = tomp::clause::NotinbranchT<TypeTy, IdTy, ExprTy>;
++using Novariants = tomp::clause::NovariantsT<TypeTy, IdTy, ExprTy>;
++using Nowait = tomp::clause::NowaitT<TypeTy, IdTy, ExprTy>;
++using NumTasks = tomp::clause::NumTasksT<TypeTy, IdTy, ExprTy>;
++using NumTeams = tomp::clause::NumTeamsT<TypeTy, IdTy, ExprTy>;
++using NumThreads = tomp::clause::NumThreadsT<TypeTy, IdTy, ExprTy>;
++using OmpxAttribute = tomp::clause::OmpxAttributeT<TypeTy, IdTy, ExprTy>;
++using OmpxBare = tomp::clause::OmpxBareT<TypeTy, IdTy, ExprTy>;
++using OmpxDynCgroupMem = tomp::clause::OmpxDynCgroupMemT<TypeTy, IdTy, ExprTy>;
++using Ordered = tomp::clause::OrderedT<TypeTy, IdTy, ExprTy>;
++using Order = tomp::clause::OrderT<TypeTy, IdTy, ExprTy>;
++using Partial = tomp::clause::PartialT<TypeTy, IdTy, ExprTy>;
++using Priority = tomp::clause::PriorityT<TypeTy, IdTy, ExprTy>;
++using Private = tomp::clause::PrivateT<TypeTy, IdTy, ExprTy>;
++using ProcBind = tomp::clause::ProcBindT<TypeTy, IdTy, ExprTy>;
++using Read = tomp::clause::ReadT<TypeTy, IdTy, ExprTy>;
++using Reduction = tomp::clause::ReductionT<TypeTy, IdTy, ExprTy>;
++using Relaxed = tomp::clause::RelaxedT<TypeTy, IdTy, ExprTy>;
++using Release = tomp::clause::ReleaseT<TypeTy, IdTy, ExprTy>;
++using ReverseOffload = tomp::clause::ReverseOffloadT<TypeTy, IdTy, ExprTy>;
++using Safelen = tomp::clause::SafelenT<TypeTy, IdTy, ExprTy>;
++using Schedule = tomp::clause::ScheduleT<TypeTy, IdTy, ExprTy>;
++using SeqCst = tomp::clause::SeqCstT<TypeTy, IdTy, ExprTy>;
++using Severity = tomp::clause::SeverityT<TypeTy, IdTy, ExprTy>;
++using Shared = tomp::clause::SharedT<TypeTy, IdTy, ExprTy>;
++using Simdlen = tomp::clause::SimdlenT<TypeTy, IdTy, ExprTy>;
++using Simd = tomp::clause::SimdT<TypeTy, IdTy, ExprTy>;
++using Sizes = tomp::clause::SizesT<TypeTy, IdTy, ExprTy>;
++using TaskReduction = tomp::clause::TaskReductionT<TypeTy, IdTy, ExprTy>;
++using ThreadLimit = tomp::clause::ThreadLimitT<TypeTy, IdTy, ExprTy>;
++using Threads = tomp::clause::ThreadsT<TypeTy, IdTy, ExprTy>;
++using To = tomp::clause::ToT<TypeTy, IdTy, ExprTy>;
++using UnifiedAddress = tomp::clause::UnifiedAddressT<TypeTy, IdTy, ExprTy>;
++using UnifiedSharedMemory =
++    tomp::clause::UnifiedSharedMemoryT<TypeTy, IdTy, ExprTy>;
++using Uniform = tomp::clause::UniformT<TypeTy, IdTy, ExprTy>;
++using Unknown = tomp::clause::UnknownT<TypeTy, IdTy, ExprTy>;
++using Untied = tomp::clause::UntiedT<TypeTy, IdTy, ExprTy>;
++using Update = tomp::clause::UpdateT<TypeTy, IdTy, ExprTy>;
++using UseDeviceAddr = tomp::clause::UseDeviceAddrT<TypeTy, IdTy, ExprTy>;
++using UseDevicePtr = tomp::clause::UseDevicePtrT<TypeTy, IdTy, ExprTy>;
++using UsesAllocators = tomp::clause::UsesAllocatorsT<TypeTy, IdTy, ExprTy>;
++using Use = tomp::clause::UseT<TypeTy, IdTy, ExprTy>;
++using Weak = tomp::clause::WeakT<TypeTy, IdTy, ExprTy>;
++using When = tomp::clause::WhenT<TypeTy, IdTy, ExprTy>;
++using Write = tomp::clause::WriteT<TypeTy, IdTy, ExprTy>;
+ } // namespace clause
+ 
+-struct Clause : public tomp::ClauseT<SymIdent, SymReference> {
++struct CancellationConstructType {
++  using EmptyTrait = std::true_type;
++};
++struct Depobj {
++  using EmptyTrait = std::true_type;
++};
++struct Flush {
++  using EmptyTrait = std::true_type;
++};
++struct MemoryOrder {
++  using EmptyTrait = std::true_type;
++};
++struct Threadprivate {
++  using EmptyTrait = std::true_type;
++};
++
++using ClauseBase = tomp::ClauseT<TypeTy, IdTy, ExprTy,
++                                 // Extras...
++                                 CancellationConstructType, Depobj, Flush,
++                                 MemoryOrder, Threadprivate>;
++
++struct Clause : public ClauseBase {
+   parser::CharBlock source;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index e1aa7524e930d..e114ab9f4548a 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -99,7 +99,8 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
+       collectOmpObjectListSymbol(firstPrivateClause->v, privatizedSymbols);
+     } else if (const auto &lastPrivateClause =
+                    std::get_if<omp::clause::Lastprivate>(&clause.u)) {
+-      collectOmpObjectListSymbol(lastPrivateClause->v, privatizedSymbols);
++      const ObjectList &objects = std::get<ObjectList>(lastPrivateClause->t);
++      collectOmpObjectListSymbol(objects, privatizedSymbols);
+       hasLastPrivateOp = true;
+     } else if (std::get_if<omp::clause::Collapse>(&clause.u)) {
+       hasCollapse = true;
+@@ -286,12 +287,13 @@ void DataSharingProcessor::collectSymbols(
+ }
+ 
+ void DataSharingProcessor::collectDefaultSymbols() {
++  using DataSharingAttribute = omp::clause::Default::DataSharingAttribute;
+   for (const omp::Clause &clause : clauses) {
+     if (const auto *defaultClause =
+             std::get_if<omp::clause::Default>(&clause.u)) {
+-      if (defaultClause->v == omp::clause::Default::Type::Private)
++      if (defaultClause->v == DataSharingAttribute::Private)
+         collectSymbols(Fortran::semantics::Symbol::Flag::OmpPrivate);
+-      else if (defaultClause->v == omp::clause::Default::Type::Firstprivate)
++      else if (defaultClause->v == DataSharingAttribute::Firstprivate)
+         collectSymbols(Fortran::semantics::Symbol::Flag::OmpFirstPrivate);
+     }
+   }
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 02901ed070a76..0cf2a8f97040a 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -13,6 +13,7 @@
+ #include "flang/Lower/OpenMP.h"
+ 
+ #include "ClauseProcessor.h"
++#include "Clauses.h"
+ #include "DataSharingProcessor.h"
+ #include "DirectivesCommon.h"
+ #include "ReductionProcessor.h"
+@@ -555,7 +556,7 @@ genParallelOp(Fortran::lower::AbstractConverter &converter,
+   llvm::SmallVector<const Fortran::semantics::Symbol *> reductionSymbols;
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(clause::If::DirectiveNameModifier::Parallel, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_parallel, ifClauseOperand);
+   cp.processNumThreads(stmtCtx, numThreadsClauseOperand);
+   cp.processProcBind(procBindKindAttr);
+   cp.processDefault();
+@@ -726,7 +727,7 @@ genTaskOp(Fortran::lower::AbstractConverter &converter,
+       dependOperands;
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(clause::If::DirectiveNameModifier::Task, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_task, ifClauseOperand);
+   cp.processAllocate(allocatorOperands, allocateOperands);
+   cp.processDefault();
+   cp.processFinal(stmtCtx, finalClauseOperand);
+@@ -838,7 +839,7 @@ genTargetDataOp(Fortran::lower::AbstractConverter &converter,
+   llvm::SmallVector<const Fortran::semantics::Symbol *> useDeviceSymbols;
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(clause::If::DirectiveNameModifier::TargetData, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_target_data, ifClauseOperand);
+   cp.processDevice(stmtCtx, deviceOperand);
+   cp.processUseDevicePtr(devicePtrOperands, useDeviceTypes, useDeviceLocs,
+                          useDeviceSymbols);
+@@ -883,24 +884,20 @@ static OpTy genTargetEnterExitDataUpdateOp(
+   llvm::SmallVector<mlir::Value> mapOperands, dependOperands;
+   llvm::SmallVector<mlir::Attribute> dependTypeOperands;
+ 
+-  clause::If::DirectiveNameModifier directiveName;
+   // GCC 9.3.0 emits a (probably) bogus warning about an unused variable.
+   [[maybe_unused]] llvm::omp::Directive directive;
+   if constexpr (std::is_same_v<OpTy, mlir::omp::TargetEnterDataOp>) {
+-    directiveName = clause::If::DirectiveNameModifier::TargetEnterData;
+     directive = llvm::omp::Directive::OMPD_target_enter_data;
+   } else if constexpr (std::is_same_v<OpTy, mlir::omp::TargetExitDataOp>) {
+-    directiveName = clause::If::DirectiveNameModifier::TargetExitData;
+     directive = llvm::omp::Directive::OMPD_target_exit_data;
+   } else if constexpr (std::is_same_v<OpTy, mlir::omp::TargetUpdateOp>) {
+-    directiveName = clause::If::DirectiveNameModifier::TargetUpdate;
+     directive = llvm::omp::Directive::OMPD_target_update;
+   } else {
+     return nullptr;
+   }
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(directiveName, ifClauseOperand);
++  cp.processIf(directive, ifClauseOperand);
+   cp.processDevice(stmtCtx, deviceOperand);
+   cp.processDepend(dependTypeOperands, dependOperands);
+   cp.processNowait(nowaitAttr);
+@@ -1092,7 +1089,7 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
+   llvm::SmallVector<const Fortran::semantics::Symbol *> mapSymbols;
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(clause::If::DirectiveNameModifier::Target, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_target, ifClauseOperand);
+   cp.processDevice(stmtCtx, deviceOperand);
+   cp.processThreadLimit(stmtCtx, threadLimitOperand);
+   cp.processDepend(dependTypeOperands, dependOperands);
+@@ -1218,7 +1215,7 @@ genTeamsOp(Fortran::lower::AbstractConverter &converter,
+   llvm::SmallVector<mlir::Attribute> reductionDeclSymbols;
+ 
+   ClauseProcessor cp(converter, semaCtx, clauseList);
+-  cp.processIf(clause::If::DirectiveNameModifier::Teams, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_teams, ifClauseOperand);
+   cp.processAllocate(allocatorOperands, allocateOperands);
+   cp.processDefault();
+   cp.processNumTeams(stmtCtx, numTeamsClauseOperand);
+@@ -1510,7 +1507,7 @@ createSimdLoop(Fortran::lower::AbstractConverter &converter,
+   cp.processCollapse(loc, eval, lowerBound, upperBound, step, iv);
+   cp.processScheduleChunk(stmtCtx, scheduleChunkClauseOperand);
+   cp.processReduction(loc, reductionVars, reductionTypes, reductionDeclSymbols);
+-  cp.processIf(clause::If::DirectiveNameModifier::Simd, ifClauseOperand);
++  cp.processIf(llvm::omp::Directive::OMPD_simd, ifClauseOperand);
+   cp.processSimdlen(simdlenClauseOperand);
+   cp.processSafelen(safelenClauseOperand);
+   cp.processTODO<clause::Aligned, clause::Allocate, clause::Linear,
+@@ -2360,8 +2357,11 @@ void Fortran::lower::genOpenMPReduction(
+   for (const Clause &clause : clauses) {
+     if (const auto &reductionClause =
+             std::get_if<clause::Reduction>(&clause.u)) {
+-      const auto &redOperator{
+-          std::get<clause::ReductionOperator>(reductionClause->t)};
++      const auto &redOperatorList{
++          std::get<clause::Reduction::ReductionIdentifiers>(
++              reductionClause->t)};
++      assert(redOperatorList.size() == 1 && "Expecting single operator");
++      const auto &redOperator = redOperatorList.front();
+       const auto &objects{std::get<ObjectList>(reductionClause->t)};
+       if (const auto *reductionOp =
+               std::get_if<clause::DefinedOperator>(&redOperator.u)) {
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index 2477f635792a2..0d05ca5aee658 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -496,8 +496,10 @@ void ReductionProcessor::addDeclareReduction(
+         *reductionSymbols) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   mlir::omp::DeclareReductionOp decl;
+-  const auto &redOperator{
+-      std::get<omp::clause::ReductionOperator>(reduction.t)};
++  const auto &redOperatorList{
++      std::get<omp::clause::Reduction::ReductionIdentifiers>(reduction.t)};
++  assert(redOperatorList.size() == 1 && "Expecting single operator");
++  const auto &redOperator = redOperatorList.front();
+   const auto &objectList{std::get<omp::ObjectList>(reduction.t)};
+ 
+   if (!std::holds_alternative<omp::clause::DefinedOperator>(redOperator.u)) {
+diff --git a/llvm/include/llvm/Frontend/OpenMP/ClauseT.h b/llvm/include/llvm/Frontend/OpenMP/ClauseT.h
+new file mode 100644
+index 0000000000000..c48b9169c60ed
+--- /dev/null
++++ b/llvm/include/llvm/Frontend/OpenMP/ClauseT.h
+@@ -0,0 +1,1123 @@
++//===- ClauseT.h -- clause template definitions ---------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++#ifndef FORTRAN_LOWER_OPENMP_CLAUSET_H
++#define FORTRAN_LOWER_OPENMP_CLAUSET_H
++
++#include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/Frontend/OpenMP/OMP.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <algorithm>
++#include <iterator>
++#include <optional>
++#include <tuple>
++#include <type_traits>
++#include <utility>
++#include <variant>
++
++#define ENUM(Name, ...) enum class Name { __VA_ARGS__ }
++#define OPT(x) std::optional<x>
++
++// A number of OpenMP clauses contain values that come from a given set of
++// possibilities. In the IR these are usually represented by enums. Both
++// clang and flang use different types for the enums, and the enum elements
++// representing the same thing may have different values between clang and
++// flang.
++// Since the representation below tries to adhere to the spec, and be source
++// language agnostic, it defines its own enums, independent from any language
++// frontend. As a consequence, when instantiating the templates below,
++// frontend-specific enums need to be translated into the representation
++// used here. The macros below are intended to assist with the conversion.
++
++// Helper macro for enum-class conversion.
++#define CLAUSET_SCOPED_ENUM_MEMBER_CONVERT(Ov, Tv)                             \
++  if (v == OtherEnum::Ov) {                                                    \
++    return ThisEnum::Tv;                                                       \
++  }
++
++// Helper macro for enum (non-class) conversion.
++#define CLAUSET_UNSCOPED_ENUM_MEMBER_CONVERT(Ov, Tv)                           \
++  if (v == Ov) {                                                               \
++    return ThisEnum::Tv;                                                       \
++  }
++
++#define CLAUSET_ENUM_CONVERT(func, OtherE, ThisE, Maps)                        \
++  auto func = [](OtherE v) -> ThisE {                                          \
++    using ThisEnum = ThisE;                                                    \
++    using OtherEnum = OtherE;                                                  \
++    (void)sizeof(OtherEnum); /*Avoid "unused local typedef" warning*/          \
++    Maps;                                                                      \
++    llvm_unreachable("Unexpected value in " #OtherE);                          \
++  }
++
++// Usage:
++//
++// Given two enums,
++//   enum class Other { o1, o2 };
++//   enum class This { t1, t2 };
++// generate conversion function "Func : Other -> This" with
++//   CLAUSET_ENUM_CONVERT(
++//       Func, Other, This,
++//       CLAUSET_ENUM_MEMBER_CONVERT(o1, t1)      // <- No comma
++//       CLAUSET_ENUM_MEMBER_CONVERT(o2, t2)
++//       ...
++//   )
++//
++// Note that the sequence of M(other-value, this-value) is separated
++// with _spaces_, not commas.
++
++namespace detail {
++// Type trait to determine whether T is a specialization of std::variant.
++template <typename T> struct is_variant {
++  static constexpr bool value = false;
++};
++
++template <typename... Ts> struct is_variant<std::variant<Ts...>> {
++  static constexpr bool value = true;
++};
++
++template <typename T> constexpr bool is_variant_v = is_variant<T>::value;
++
++// Helper utility to create a type which is a union of two given variants.
++template <typename...> struct UnionOfTwo;
++
++template <typename... Types1, typename... Types2>
++struct UnionOfTwo<std::variant<Types1...>, std::variant<Types2...>> {
++  using type = std::variant<Types1..., Types2...>;
++};
++} // namespace detail
++
++namespace tomp {
++namespace type {
++
++// Helper utility to create a type which is a union of an arbitrary number
++// of variants.
++template <typename...> struct Union;
++
++template <> struct Union<> {
++  // Legal to define, illegal to instantiate.
++  using type = std::variant<>;
++};
++
++template <typename T, typename... Ts> struct Union<T, Ts...> {
++  static_assert(detail::is_variant_v<T>);
++  using type =
++      typename detail::UnionOfTwo<T, typename Union<Ts...>::type>::type;
++};
++
++template <typename T> using ListT = llvm::SmallVector<T, 0>;
++
++// The ObjectT class represents a variable (as defined in the OpenMP spec).
++//
++// A specialization of ObjectT<Id, Expr> must provide the following definitions:
++// {
++//    using IdTy = Id;
++//    using ExprTy = Expr;
++//
++//    auto id() const -> IdTy {
++//      return the identifier of the object (for use in tests for
++//         presence/absence of the object)
++//    }
++//
++//    auto ref() const -> (e.g. const ExprTy&) {
++//      return the expression accessing (referencing) the object
++//    }
++// }
++//
++// For example, the ObjectT instance created for "var[x+1]" would have
++// the `id()` return the identifier for `var`, and the `ref()` return the
++// representation of the array-access `var[x+1]`.
++//
++// The identity of an object must always be present, i.e. it cannot be
++// nullptr, std::nullopt, etc. The reference is optional.
++//
++// Note: the ObjectT template is not defined. Any user of it is expected to
++// provide their own specialization that conforms to the above requirements.
++template <typename IdType, typename ExprType> struct ObjectT;
++
++template <typename I, typename E> using ObjectListT = ListT<ObjectT<I, E>>;
++
++using DirectiveName = llvm::omp::Directive;
++
++template <typename I, typename E> //
++struct DefinedOperatorT {
++  struct DefinedOpName {
++    using WrapperTrait = std::true_type;
++    ObjectT<I, E> v;
++  };
++  ENUM(IntrinsicOperator, Power, Multiply, Divide, Add, Subtract, Concat, LT,
++       LE, EQ, NE, GE, GT, NOT, AND, OR, EQV, NEQV, Min, Max);
++  using UnionTrait = std::true_type;
++  std::variant<DefinedOpName, IntrinsicOperator> u;
++};
++
++template <typename E> //
++struct RangeT {
++  // range-specification: begin : end[: step]
++  using TupleTrait = std::true_type;
++  std::tuple<E, E, OPT(E)> t;
++};
++
++template <typename TypeType, typename IdType, typename ExprType> //
++struct IteratorSpecifierT {
++  // iterators-specifier: [ iterator-type ] identifier = range-specification
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(TypeType), ObjectT<IdType, ExprType>, RangeT<ExprType>> t;
++};
++
++// Note:
++// For motion or map clauses the OpenMP spec allows a unique mapper modifier.
++// In practice, since these clauses apply to multiple objects, there can be
++// multiple effective mappers applicable to these objects (due to overloads,
++// etc.). Because of that store a list of mappers every time a mapper modifier
++// is allowed. If the mapper list contains a single element, it applies to
++// all objects in the clause, otherwise there should be as many mappers as
++// there are objects.
++template <typename I, typename E> //
++struct MapperT {
++  using MapperIdentifier = ObjectT<I, E>;
++  using WrapperTrait = std::true_type;
++  MapperIdentifier v;
++};
++
++ENUM(MemoryOrder, AcqRel, Acquire, Relaxed, Release, SeqCst);
++ENUM(MotionExpectation, Present);
++ENUM(TaskDependenceType, In, Out, Inout, Mutexinoutset, Inoutset, Depobj);
++
++template <typename I, typename E> //
++struct LoopIterationT {
++  struct Distance {
++    using TupleTrait = std::true_type;
++    std::tuple<DefinedOperatorT<I, E>, E> t;
++  };
++  using TupleTrait = std::true_type;
++  std::tuple<ObjectT<I, E>, OPT(Distance)> t;
++};
++
++template <typename I, typename E> //
++struct ProcedureDesignatorT {
++  using WrapperTrait = std::true_type;
++  ObjectT<I, E> v;
++};
++
++// Note:
++// For reduction clauses the OpenMP spec allows a unique reduction identifier.
++// For reasons analogous to those listed for the MapperT type, clauses that
++// according to the spec contain a reduction identifier will contain a list of
++// reduction identifiers. The same constraints apply: there is either a single
++// identifier that applies to all objects, or there are as many identifiers
++// as there are objects.
++template <typename I, typename E> //
++struct ReductionIdentifierT {
++  using UnionTrait = std::true_type;
++  std::variant<DefinedOperatorT<I, E>, ProcedureDesignatorT<I, E>> u;
++};
++
++template <typename T, typename I, typename E> //
++using IteratorT = ListT<IteratorSpecifierT<T, I, E>>;
++} // namespace type
++
++template <typename T> using ListT = type::ListT<T>;
++
++template <typename I, typename E> using ObjectT = type::ObjectT<I, E>;
++template <typename I, typename E> using ObjectListT = type::ObjectListT<I, E>;
++
++template <typename T, typename I, typename E>
++using IteratorT = type::IteratorT<T, I, E>;
++
++template <
++    typename ContainerTy, typename FunctionTy,
++    typename ElemTy = typename llvm::remove_cvref_t<ContainerTy>::value_type,
++    typename ResultTy = std::invoke_result_t<FunctionTy, ElemTy>>
++ListT<ResultTy> makeList(ContainerTy &&container, FunctionTy &&func) {
++  ListT<ResultTy> v;
++  llvm::transform(container, std::back_inserter(v), func);
++  return v;
++}
++
++namespace clause {
++template <typename T, typename I, typename E> //
++struct AbsentT {
++  using List = ListT<type::DirectiveName>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct AcqRelT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct AcquireT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct AdjustArgsT {
++  using IncompleteTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct AffinityT {
++  using Iterator = type::IteratorT<T, I, E>;
++  using LocatorList = ObjectListT<I, E>;
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Iterator), LocatorList> t;
++};
++
++template <typename T, typename I, typename E> //
++struct AlignT {
++  using Alignment = E;
++
++  using WrapperTrait = std::true_type;
++  Alignment v;
++};
++
++template <typename T, typename I, typename E> //
++struct AlignedT {
++  using Alignment = E;
++  using List = ObjectListT<I, E>;
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Alignment), List> t;
++};
++
++template <typename T, typename I, typename E> //
++struct AllocatorT;
++
++template <typename T, typename I, typename E> //
++struct AllocateT {
++  using AllocatorSimpleModifier = E;
++  using AllocatorComplexModifier = AllocatorT<T, I, E>;
++  using AlignModifier = AlignT<T, I, E>;
++  using List = ObjectListT<I, E>;
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(AllocatorSimpleModifier), OPT(AllocatorComplexModifier),
++             OPT(AlignModifier), List>
++      t;
++};
++
++template <typename T, typename I, typename E> //
++struct AllocatorT {
++  using Allocator = E;
++  using WrapperTrait = std::true_type;
++  Allocator v;
++};
++
++template <typename T, typename I, typename E> //
++struct AppendArgsT {
++  using IncompleteTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct AtT {
++  ENUM(ActionTime, Compilation, Execution);
++  using WrapperTrait = std::true_type;
++  ActionTime v;
++};
++
++template <typename T, typename I, typename E> //
++struct AtomicDefaultMemOrderT {
++  using MemoryOrder = type::MemoryOrder;
++  using WrapperTrait = std::true_type;
++  MemoryOrder v; // Name not provided in spec
++};
++
++template <typename T, typename I, typename E> //
++struct BindT {
++  ENUM(Binding, Teams, Parallel, Thread);
++  using WrapperTrait = std::true_type;
++  Binding v;
++};
++
++template <typename T, typename I, typename E> //
++struct CaptureT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct CollapseT {
++  using N = E;
++  using WrapperTrait = std::true_type;
++  N v;
++};
++
++template <typename T, typename I, typename E> //
++struct CompareT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct ContainsT {
++  using List = ListT<type::DirectiveName>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct CopyinT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct CopyprivateT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct DefaultT {
++  ENUM(DataSharingAttribute, Firstprivate, None, Private, Shared);
++  using WrapperTrait = std::true_type;
++  DataSharingAttribute v;
++};
++
++template <typename T, typename I, typename E> //
++struct DefaultmapT {
++  ENUM(ImplicitBehavior, Alloc, To, From, Tofrom, Firstprivate, None, Default,
++       Present);
++  ENUM(VariableCategory, Scalar, Aggregate, Pointer, Allocatable);
++  using TupleTrait = std::true_type;
++  std::tuple<ImplicitBehavior, OPT(VariableCategory)> t;
++};
++
++template <typename T, typename I, typename E> //
++struct DoacrossT;
++
++template <typename T, typename I, typename E> //
++struct DependT {
++  using Iterator = type::IteratorT<T, I, E>;
++  using LocatorList = ObjectListT<I, E>;
++  using TaskDependenceType = tomp::type::TaskDependenceType;
++
++  struct WithLocators { // Modern form
++    using TupleTrait = std::true_type;
++    // Empty LocatorList means "omp_all_memory".
++    std::tuple<TaskDependenceType, OPT(Iterator), LocatorList> t;
++  };
++
++  using Doacross = DoacrossT<T, I, E>;
++  using UnionTrait = std::true_type;
++  std::variant<Doacross, WithLocators> u; // Doacross form is legacy
++};
++
++template <typename T, typename I, typename E> //
++struct DestroyT {
++  using DestroyVar = ObjectT<I, E>;
++  using WrapperTrait = std::true_type;
++  // DestroyVar can be ommitted in "depobj destroy".
++  OPT(DestroyVar) v;
++};
++
++template <typename T, typename I, typename E> //
++struct DetachT {
++  using EventHandle = ObjectT<I, E>;
++  using WrapperTrait = std::true_type;
++  EventHandle v;
++};
++
++template <typename T, typename I, typename E> //
++struct DeviceT {
++  using DeviceDescription = E;
++  ENUM(DeviceModifier, Ancestor, DeviceNum);
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(DeviceModifier), DeviceDescription> t;
++};
++
++template <typename T, typename I, typename E> //
++struct DeviceTypeT {
++  ENUM(DeviceTypeDescription, Any, Host, Nohost);
++  using WrapperTrait = std::true_type;
++  DeviceTypeDescription v;
++};
++
++template <typename T, typename I, typename E> //
++struct DistScheduleT {
++  ENUM(Kind, Static);
++  using ChunkSize = E;
++  using TupleTrait = std::true_type;
++  std::tuple<Kind, OPT(ChunkSize)> t;
++};
++
++template <typename T, typename I, typename E> //
++struct DoacrossT {
++  using Vector = ListT<type::LoopIterationT<I, E>>;
++  ENUM(DependenceType, Source, Sink);
++  using TupleTrait = std::true_type;
++  // Empty Vector means "omp_cur_iteration"
++  std::tuple<DependenceType, Vector> t;
++};
++
++template <typename T, typename I, typename E> //
++struct DynamicAllocatorsT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct EnterT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct ExclusiveT {
++  using WrapperTrait = std::true_type;
++  using List = ObjectListT<I, E>;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct FailT {
++  using MemoryOrder = type::MemoryOrder;
++  using WrapperTrait = std::true_type;
++  MemoryOrder v;
++};
++
++template <typename T, typename I, typename E> //
++struct FilterT {
++  using ThreadNum = E;
++  using WrapperTrait = std::true_type;
++  ThreadNum v;
++};
++
++template <typename T, typename I, typename E> //
++struct FinalT {
++  using Finalize = E;
++  using WrapperTrait = std::true_type;
++  Finalize v;
++};
++
++template <typename T, typename I, typename E> //
++struct FirstprivateT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct FromT {
++  using LocatorList = ObjectListT<I, E>;
++  using Expectation = type::MotionExpectation;
++  using Iterator = type::IteratorT<T, I, E>;
++  // See note at the definition of the MapperT type.
++  using Mappers = ListT<type::MapperT<I, E>>; // Not a spec name
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Expectation), OPT(Mappers), OPT(Iterator), LocatorList> t;
++};
++
++template <typename T, typename I, typename E> //
++struct FullT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct GrainsizeT {
++  ENUM(Prescriptiveness, Strict);
++  using GrainSize = E;
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Prescriptiveness), GrainSize> t;
++};
++
++template <typename T, typename I, typename E> //
++struct HasDeviceAddrT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct HintT {
++  using HintExpr = E;
++  using WrapperTrait = std::true_type;
++  HintExpr v;
++};
++
++template <typename T, typename I, typename E> //
++struct HoldsT {
++  using WrapperTrait = std::true_type;
++  E v; // No argument name in spec 5.2
++};
++
++template <typename T, typename I, typename E> //
++struct IfT {
++  using DirectiveNameModifier = type::DirectiveName;
++  using IfExpression = E;
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(DirectiveNameModifier), IfExpression> t;
++};
++
++template <typename T, typename I, typename E> //
++struct InbranchT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct InclusiveT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct IndirectT {
++  using InvokedByFptr = E;
++  using WrapperTrait = std::true_type;
++  InvokedByFptr v;
++};
++
++template <typename T, typename I, typename E> //
++struct InitT {
++  using ForeignRuntimeId = E;
++  using InteropVar = ObjectT<I, E>;
++  using InteropPreference = ListT<ForeignRuntimeId>;
++  ENUM(InteropType, Target, Targetsync);   // Repeatable
++  using InteropTypes = ListT<InteropType>; // Not a spec name
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(InteropPreference), InteropTypes, InteropVar> t;
++};
++
++template <typename T, typename I, typename E> //
++struct InitializerT {
++  using InitializerExpr = E;
++  using WrapperTrait = std::true_type;
++  InitializerExpr v;
++};
++
++template <typename T, typename I, typename E> //
++struct InReductionT {
++  using List = ObjectListT<I, E>;
++  // See note at the definition of the ReductionIdentifierT type.
++  // The name ReductionIdentifiers is not a spec name.
++  using ReductionIdentifiers = ListT<type::ReductionIdentifierT<I, E>>;
++  using TupleTrait = std::true_type;
++  std::tuple<ReductionIdentifiers, List> t;
++};
++
++template <typename T, typename I, typename E> //
++struct IsDevicePtrT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct LastprivateT {
++  using List = ObjectListT<I, E>;
++  ENUM(LastprivateModifier, Conditional);
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(LastprivateModifier), List> t;
++};
++
++template <typename T, typename I, typename E> //
++struct LinearT {
++  // std::get<type> won't work here due to duplicate types in the tuple.
++  using List = ObjectListT<I, E>;
++  using StepSimpleModifier = E;
++  using StepComplexModifier = E;
++  ENUM(LinearModifier, Ref, Val, Uval);
++
++  using TupleTrait = std::true_type;
++  // Step == nullptr means 1.
++  std::tuple<OPT(StepSimpleModifier), OPT(StepComplexModifier),
++             OPT(LinearModifier), List>
++      t;
++};
++
++template <typename T, typename I, typename E> //
++struct LinkT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct MapT {
++  using LocatorList = ObjectListT<I, E>;
++  ENUM(MapType, To, From, Tofrom, Alloc, Release, Delete);
++  ENUM(MapTypeModifier, Always, Close, Present, OmpxHold);
++  // See note at the definition of the MapperT type.
++  using Mappers = ListT<type::MapperT<I, E>>; // Not a spec name
++  using Iterator = type::IteratorT<T, I, E>;
++  using MapTypeModifiers = ListT<MapTypeModifier>; // Not a spec name
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(MapType), OPT(MapTypeModifiers), OPT(Mappers), OPT(Iterator),
++             LocatorList>
++      t;
++};
++
++template <typename T, typename I, typename E> //
++struct MatchT {
++  using IncompleteTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct MergeableT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct MessageT {
++  using MsgString = E;
++  using WrapperTrait = std::true_type;
++  MsgString v;
++};
++
++template <typename T, typename I, typename E> //
++struct NocontextT {
++  using DoNotUpdateContext = E;
++  using WrapperTrait = std::true_type;
++  DoNotUpdateContext v;
++};
++
++template <typename T, typename I, typename E> //
++struct NogroupT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NontemporalT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct NoOpenmpT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NoOpenmpRoutinesT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NoParallelismT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NotinbranchT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NovariantsT {
++  using DoNotUseVariant = E;
++  using WrapperTrait = std::true_type;
++  DoNotUseVariant v;
++};
++
++template <typename T, typename I, typename E> //
++struct NowaitT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct NumTasksT {
++  using NumTasks = E;
++  ENUM(Prescriptiveness, Strict);
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Prescriptiveness), NumTasks> t;
++};
++
++template <typename T, typename I, typename E> //
++struct NumTeamsT {
++  using TupleTrait = std::true_type;
++  using LowerBound = E;
++  using UpperBound = E;
++  std::tuple<OPT(LowerBound), UpperBound> t;
++};
++
++template <typename T, typename I, typename E> //
++struct NumThreadsT {
++  using Nthreads = E;
++  using WrapperTrait = std::true_type;
++  Nthreads v;
++};
++
++template <typename T, typename I, typename E> //
++struct OmpxAttributeT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct OmpxBareT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct OmpxDynCgroupMemT {
++  using WrapperTrait = std::true_type;
++  E v;
++};
++
++template <typename T, typename I, typename E> //
++struct OrderT {
++  ENUM(OrderModifier, Reproducible, Unconstrained);
++  ENUM(Ordering, Concurrent);
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(OrderModifier), Ordering> t;
++};
++
++template <typename T, typename I, typename E> //
++struct OrderedT {
++  using N = E;
++  using WrapperTrait = std::true_type;
++  OPT(N) v;
++};
++
++template <typename T, typename I, typename E> //
++struct OtherwiseT {
++  using IncompleteTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct PartialT {
++  using UnrollFactor = E;
++  using WrapperTrait = std::true_type;
++  OPT(UnrollFactor) v;
++};
++
++template <typename T, typename I, typename E> //
++struct PriorityT {
++  using PriorityValue = E;
++  using WrapperTrait = std::true_type;
++  PriorityValue v;
++};
++
++template <typename T, typename I, typename E> //
++struct PrivateT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct ProcBindT {
++  ENUM(AffinityPolicy, Close, Master, Spread, Primary);
++  using WrapperTrait = std::true_type;
++  AffinityPolicy v;
++};
++
++template <typename T, typename I, typename E> //
++struct ReadT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct ReductionT {
++  using List = ObjectListT<I, E>;
++  // See note at the definition of the ReductionIdentifierT type.
++  // The name ReductionIdentifiers is not a spec name.
++  using ReductionIdentifiers = ListT<type::ReductionIdentifierT<I, E>>;
++  ENUM(ReductionModifier, Default, Inscan, Task);
++  using TupleTrait = std::true_type;
++  std::tuple<ReductionIdentifiers, OPT(ReductionModifier), List> t;
++};
++
++template <typename T, typename I, typename E> //
++struct RelaxedT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct ReleaseT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct ReverseOffloadT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct SafelenT {
++  using Length = E;
++  using WrapperTrait = std::true_type;
++  Length v;
++};
++
++template <typename T, typename I, typename E> //
++struct ScheduleT {
++  ENUM(Kind, Static, Dynamic, Guided, Auto, Runtime);
++  using ChunkSize = E;
++  ENUM(OrderingModifier, Monotonic, Nonmonotonic);
++  ENUM(ChunkModifier, Simd);
++  using TupleTrait = std::true_type;
++  std::tuple<Kind, OPT(OrderingModifier), OPT(ChunkModifier), OPT(ChunkSize)> t;
++};
++
++template <typename T, typename I, typename E> //
++struct SeqCstT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct SeverityT {
++  ENUM(SevLevel, Fatal, Warning);
++  using WrapperTrait = std::true_type;
++  SevLevel v;
++};
++
++template <typename T, typename I, typename E> //
++struct SharedT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct SimdT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct SimdlenT {
++  using Length = E;
++  using WrapperTrait = std::true_type;
++  Length v;
++};
++
++template <typename T, typename I, typename E> //
++struct SizesT {
++  using SizeList = ListT<E>;
++  using WrapperTrait = std::true_type;
++  SizeList v;
++};
++
++template <typename T, typename I, typename E> //
++struct TaskReductionT {
++  using List = ObjectListT<I, E>;
++  // See note at the definition of the ReductionIdentifierT type.
++  // The name ReductionIdentifiers is not a spec name.
++  using ReductionIdentifiers = ListT<type::ReductionIdentifierT<I, E>>;
++  using TupleTrait = std::true_type;
++  std::tuple<ReductionIdentifiers, List> t;
++};
++
++template <typename T, typename I, typename E> //
++struct ThreadLimitT {
++  using Threadlim = E;
++  using WrapperTrait = std::true_type;
++  Threadlim v;
++};
++
++template <typename T, typename I, typename E> //
++struct ThreadsT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct ToT {
++  using LocatorList = ObjectListT<I, E>;
++  using Expectation = type::MotionExpectation;
++  // See note at the definition of the MapperT type.
++  using Mappers = ListT<type::MapperT<I, E>>; // Not a spec name
++  using Iterator = type::IteratorT<T, I, E>;
++
++  using TupleTrait = std::true_type;
++  std::tuple<OPT(Expectation), OPT(Mappers), OPT(Iterator), LocatorList> t;
++};
++
++template <typename T, typename I, typename E> //
++struct UnifiedAddressT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct UnifiedSharedMemoryT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct UniformT {
++  using ParameterList = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  ParameterList v;
++};
++
++template <typename T, typename I, typename E> //
++struct UnknownT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct UntiedT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct UpdateT {
++  using TaskDependenceType = tomp::type::TaskDependenceType;
++  using WrapperTrait = std::true_type;
++  OPT(TaskDependenceType) v;
++};
++
++template <typename T, typename I, typename E> //
++struct UseT {
++  using InteropVar = ObjectT<I, E>;
++  using WrapperTrait = std::true_type;
++  InteropVar v;
++};
++
++template <typename T, typename I, typename E> //
++struct UseDeviceAddrT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct UseDevicePtrT {
++  using List = ObjectListT<I, E>;
++  using WrapperTrait = std::true_type;
++  List v;
++};
++
++template <typename T, typename I, typename E> //
++struct UsesAllocatorsT {
++  using MemSpace = E;
++  using TraitsArray = ObjectT<I, E>;
++  using Allocator = E;
++  using AllocatorSpec =
++      std::tuple<OPT(MemSpace), OPT(TraitsArray), Allocator>; // Not a spec name
++  using Allocators = ListT<AllocatorSpec>;                    // Not a spec name
++  using WrapperTrait = std::true_type;
++  Allocators v;
++};
++
++template <typename T, typename I, typename E> //
++struct WeakT {
++  using EmptyTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct WhenT {
++  using IncompleteTrait = std::true_type;
++};
++
++template <typename T, typename I, typename E> //
++struct WriteT {
++  using EmptyTrait = std::true_type;
++};
++
++// ---
++
++template <typename T, typename I, typename E>
++using ExtensionClausesT =
++    std::variant<OmpxAttributeT<T, I, E>, OmpxBareT<T, I, E>,
++                 OmpxDynCgroupMemT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using EmptyClausesT = std::variant<
++    AcqRelT<T, I, E>, AcquireT<T, I, E>, CaptureT<T, I, E>, CompareT<T, I, E>,
++    DynamicAllocatorsT<T, I, E>, FullT<T, I, E>, InbranchT<T, I, E>,
++    MergeableT<T, I, E>, NogroupT<T, I, E>, NoOpenmpRoutinesT<T, I, E>,
++    NoOpenmpT<T, I, E>, NoParallelismT<T, I, E>, NotinbranchT<T, I, E>,
++    NowaitT<T, I, E>, ReadT<T, I, E>, RelaxedT<T, I, E>, ReleaseT<T, I, E>,
++    ReverseOffloadT<T, I, E>, SeqCstT<T, I, E>, SimdT<T, I, E>,
++    ThreadsT<T, I, E>, UnifiedAddressT<T, I, E>, UnifiedSharedMemoryT<T, I, E>,
++    UnknownT<T, I, E>, UntiedT<T, I, E>, UseT<T, I, E>, WeakT<T, I, E>,
++    WriteT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using IncompleteClausesT =
++    std::variant<AdjustArgsT<T, I, E>, AppendArgsT<T, I, E>, MatchT<T, I, E>,
++                 OtherwiseT<T, I, E>, WhenT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using TupleClausesT =
++    std::variant<AffinityT<T, I, E>, AlignedT<T, I, E>, AllocateT<T, I, E>,
++                 DefaultmapT<T, I, E>, DeviceT<T, I, E>, DistScheduleT<T, I, E>,
++                 DoacrossT<T, I, E>, FromT<T, I, E>, GrainsizeT<T, I, E>,
++                 IfT<T, I, E>, InitT<T, I, E>, InReductionT<T, I, E>,
++                 LastprivateT<T, I, E>, LinearT<T, I, E>, MapT<T, I, E>,
++                 NumTasksT<T, I, E>, OrderT<T, I, E>, ReductionT<T, I, E>,
++                 ScheduleT<T, I, E>, TaskReductionT<T, I, E>, ToT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using UnionClausesT = std::variant<DependT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using WrapperClausesT = std::variant<
++    AbsentT<T, I, E>, AlignT<T, I, E>, AllocatorT<T, I, E>,
++    AtomicDefaultMemOrderT<T, I, E>, AtT<T, I, E>, BindT<T, I, E>,
++    CollapseT<T, I, E>, ContainsT<T, I, E>, CopyinT<T, I, E>,
++    CopyprivateT<T, I, E>, DefaultT<T, I, E>, DestroyT<T, I, E>,
++    DetachT<T, I, E>, DeviceTypeT<T, I, E>, EnterT<T, I, E>,
++    ExclusiveT<T, I, E>, FailT<T, I, E>, FilterT<T, I, E>, FinalT<T, I, E>,
++    FirstprivateT<T, I, E>, HasDeviceAddrT<T, I, E>, HintT<T, I, E>,
++    HoldsT<T, I, E>, InclusiveT<T, I, E>, IndirectT<T, I, E>,
++    InitializerT<T, I, E>, IsDevicePtrT<T, I, E>, LinkT<T, I, E>,
++    MessageT<T, I, E>, NocontextT<T, I, E>, NontemporalT<T, I, E>,
++    NovariantsT<T, I, E>, NumTeamsT<T, I, E>, NumThreadsT<T, I, E>,
++    OrderedT<T, I, E>, PartialT<T, I, E>, PriorityT<T, I, E>, PrivateT<T, I, E>,
++    ProcBindT<T, I, E>, SafelenT<T, I, E>, SeverityT<T, I, E>, SharedT<T, I, E>,
++    SimdlenT<T, I, E>, SizesT<T, I, E>, ThreadLimitT<T, I, E>,
++    UniformT<T, I, E>, UpdateT<T, I, E>, UseDeviceAddrT<T, I, E>,
++    UseDevicePtrT<T, I, E>, UsesAllocatorsT<T, I, E>>;
++
++template <typename T, typename I, typename E>
++using UnionOfAllClausesT = typename type::Union< //
++    EmptyClausesT<T, I, E>,                      //
++    ExtensionClausesT<T, I, E>,                  //
++    IncompleteClausesT<T, I, E>,                 //
++    TupleClausesT<T, I, E>,                      //
++    UnionClausesT<T, I, E>,                      //
++    WrapperClausesT<T, I, E>                     //
++    >::type;
++
++} // namespace clause
++
++// The variant wrapper that encapsulates all possible specific clauses.
++// The `Extras` arguments are additional types representing local extensions
++// to the clause set, e.g.
++//
++// using Clause = ClauseT<Type, Id, Expr,
++//                        MyClause1, MyClause2>;
++//
++// The member Clause::u will be a variant containing all specific clauses
++// defined above, plus MyClause1 and MyClause2.
++template <typename TypeType, typename IdType, typename ExprType,
++          typename... Extras>
++struct ClauseT {
++  using TypeTy = TypeType;
++  using IdTy = IdType;
++  using ExprTy = ExprType;
++
++  using VariantTy = typename type::Union<
++      clause::UnionOfAllClausesT<TypeType, IdType, ExprType>,
++      std::variant<Extras...>>::type;
++
++  llvm::omp::Clause id; // The numeric id of the clause
++  using UnionTrait = std::true_type;
++  VariantTy u;
++};
++
++} // namespace tomp
++
++#undef OPT
++#undef ENUM
++
++#endif // FORTRAN_LOWER_OPENMP_CLAUSET_H

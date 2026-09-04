@@ -1,0 +1,353 @@
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 4ebbd241d2f0b..ee582608e999e 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -9258,6 +9258,11 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
+           A->render(Args, LinkerArgs);
+       }
+ 
++      // If this is OpenMP the device linker will need `-lompdevice`.
++      if (Kind == Action::OFK_OpenMP && !Args.hasArg(OPT_no_offloadlib) &&
++          (TC->getTriple().isAMDGPU() || TC->getTriple().isNVPTX()))
++        LinkerArgs.emplace_back("-lompdevice");
++
+       // Forward all of these to the appropriate toolchain.
+       for (StringRef Arg : CompilerArgs)
+         CmdArgs.push_back(Args.MakeArgString(
+diff --git a/clang/lib/Driver/ToolChains/CommonArgs.cpp b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+index b43472a52038b..2e23f9e3f7397 100644
+--- a/clang/lib/Driver/ToolChains/CommonArgs.cpp
++++ b/clang/lib/Driver/ToolChains/CommonArgs.cpp
+@@ -1296,10 +1296,6 @@ bool tools::addOpenMPRuntime(const Compilation &C, ArgStringList &CmdArgs,
+   if (IsOffloadingHost)
+     CmdArgs.push_back("-lomptarget");
+ 
+-  if (IsOffloadingHost &&
+-      Args.hasFlag(options::OPT_offloadlib, options::OPT_no_offloadlib, true))
+-    CmdArgs.push_back("-lomptarget.devicertl");
+-
+   addArchSpecificRPath(TC, Args, CmdArgs);
+ 
+   addOpenMPRuntimeLibraryPath(TC, Args, CmdArgs);
+diff --git a/clang/test/Driver/openmp-offload-gpu.c b/clang/test/Driver/openmp-offload-gpu.c
+index 1f7e2996068c4..807ea2c6e5f86 100644
+--- a/clang/test/Driver/openmp-offload-gpu.c
++++ b/clang/test/Driver/openmp-offload-gpu.c
+@@ -324,18 +324,18 @@
+ // RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp --offload-arch=sm_52 --cuda-path=%S/Inputs/CUDA_102/usr/local/cuda \
+ // RUN:     -foffload-lto %s 2>&1 | FileCheck --check-prefix=CHECK-LTO-LIBRARY %s
+ 
+-// CHECK-LTO-LIBRARY: {{.*}}-lomptarget{{.*}}-lomptarget.devicertl
++// CHECK-LTO-LIBRARY: --device-linker={{.*}}=-lomp{{.*}}-lomptarget{{.*}}
+ 
+ // RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp --offload-arch=sm_52 --cuda-path=%S/Inputs/CUDA_102/usr/local/cuda \
+ // RUN:     --libomptarget-nvptx-bc-path=%S/Inputs/libomptarget/libomptarget-nvptx-test.bc %s 2>&1 \
+ // RUN:   | FileCheck --check-prefix=CHECK-NO-LTO-LIBRARY %s
+ 
+-// CHECK-NO-LTO-LIBRARY: {{.*}}-lomptarget{{.*}}-lomptarget.devicertl
++// CHECK-NO-LTO-LIBRARY: --device-linker={{.*}}=-lomp{{.*}}-lomptarget{{.*}}
+ 
+ // RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp --offload-arch=sm_52 -nogpulib \
+ // RUN:     -foffload-lto %s 2>&1 | FileCheck --check-prefix=CHECK-NO-LIBRARY %s
+ 
+-// CHECK-NO-LIBRARY-NOT: {{.*}}-lomptarget{{.*}}-lomptarget.devicertl
++// CHECK-NO-LIBRARY-NOT: --device-linker={{.*}}=-lomp{{.*}}-lomptarget{{.*}}
+ 
+ // RUN:   %clang -### --target=x86_64-unknown-linux-gnu -fopenmp=libomp --offload-arch=sm_52 -nogpulib \
+ // RUN:     -Xoffload-linker a -Xoffload-linker-nvptx64-nvidia-cuda b -Xoffload-linker-nvptx64 c \
+diff --git a/offload/DeviceRTL/CMakeLists.txt b/offload/DeviceRTL/CMakeLists.txt
+index 8f2a1fd01fabc..2da2ade94f4e4 100644
+--- a/offload/DeviceRTL/CMakeLists.txt
++++ b/offload/DeviceRTL/CMakeLists.txt
+@@ -16,23 +16,10 @@ if (LLVM_DIR)
+   # Builds that use pre-installed LLVM have LLVM_DIR set.
+   # A standalone or LLVM_ENABLE_RUNTIMES=openmp build takes this route
+   find_program(CLANG_TOOL clang PATHS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+-  find_program(PACKAGER_TOOL clang-offload-packager PATHS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+-  find_program(LINK_TOOL llvm-link PATHS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+-  find_program(OPT_TOOL opt PATHS ${LLVM_TOOLS_BINARY_DIR} NO_DEFAULT_PATH)
+-  if ((NOT CLANG_TOOL) OR (NOT LINK_TOOL) OR (NOT OPT_TOOL) OR (NOT PACKAGER_TOOL))
+-    message(STATUS "Not building DeviceRTL. Missing clang: ${CLANG_TOOL}, llvm-link: ${LINK_TOOL}, opt: ${OPT_TOOL}, or clang-offload-packager: ${PACKAGER_TOOL}")
+-    return()
+-  else()
+-    message(STATUS "Building DeviceRTL. Using clang: ${CLANG_TOOL}, llvm-link: ${LINK_TOOL} and opt: ${OPT_TOOL}")
+-  endif()
+ elseif (LLVM_TOOL_CLANG_BUILD AND NOT CMAKE_CROSSCOMPILING AND NOT OPENMP_STANDALONE_BUILD)
+   # LLVM in-tree builds may use CMake target names to discover the tools.
+   # A LLVM_ENABLE_PROJECTS=openmp build takes this route
+   set(CLANG_TOOL $<TARGET_FILE:clang>)
+-  set(PACKAGER_TOOL $<TARGET_FILE:clang-offload-packager>)
+-  set(LINK_TOOL $<TARGET_FILE:llvm-link>)
+-  set(OPT_TOOL $<TARGET_FILE:opt>)
+-  message(STATUS "Building DeviceRTL. Using clang from in-tree build")
+ else()
+   message(STATUS "Not building DeviceRTL. No appropriate clang found")
+   return()
+@@ -82,8 +69,6 @@ set(src_files
+ # propagation. That said, we will run the vectorizer again after the runtime
+ # has been linked into the user program.
+ set(clang_opt_flags -O3 -mllvm -openmp-opt-disable -DSHARED_SCRATCHPAD_SIZE=512 -mllvm -vectorize-slp=false )
+-set(link_opt_flags  -O3        -openmp-opt-disable -attributor-enable=module -vectorize-slp=false )
+-set(link_export_flag -passes=internalize -internalize-public-api-file=${source_directory}/exports)
+ 
+ # If the user built with the GPU C library enabled we will use that instead.
+ if(${LIBOMPTARGET_GPU_LIBC_SUPPORT})
+@@ -107,15 +92,13 @@ set(bc_flags -c -flto -std=c++17 -fvisibility=hidden
+ )
+ 
+ # first create an object target
+-add_library(omptarget.devicertl.all_objs OBJECT IMPORTED)
+ function(compileDeviceRTLLibrary target_name target_triple)
+   set(target_bc_flags ${ARGN})
+ 
+-  set(bc_files "")
+   foreach(src ${src_files})
+     get_filename_component(infile ${src} ABSOLUTE)
+     get_filename_component(outfile ${src} NAME)
+-    set(outfile "${outfile}-${target_name}.bc")
++    set(outfile "${outfile}-${target_name}.o")
+     set(depfile "${outfile}.d")
+ 
+     # Passing an empty CPU to -march= suppressed target specific metadata.
+@@ -142,99 +125,40 @@ function(compileDeviceRTLLibrary target_name target_triple)
+     endif()
+     set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${outfile})
+ 
+-    list(APPEND bc_files ${outfile})
++    list(APPEND obj_files ${CMAKE_CURRENT_BINARY_DIR}/${outfile})
+   endforeach()
+-
+-  set(bclib_name "libomptarget-${target_name}.bc")
+-
+-  # Link to a bitcode library.
+-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/linked_${bclib_name}
+-      COMMAND ${LINK_TOOL}
+-        -o ${CMAKE_CURRENT_BINARY_DIR}/linked_${bclib_name} ${bc_files}
+-      DEPENDS ${bc_files}
+-      COMMENT "Linking LLVM bitcode ${bclib_name}"
+-  )
+-
+-  if(TARGET llvm-link)
+-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/linked_${bclib_name}
+-      DEPENDS llvm-link
+-      APPEND)
+-  endif()
+-
+-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/internalized_${bclib_name}
+-      COMMAND ${OPT_TOOL} ${link_export_flag} ${CMAKE_CURRENT_BINARY_DIR}/linked_${bclib_name}
+-                      -o ${CMAKE_CURRENT_BINARY_DIR}/internalized_${bclib_name}
+-      DEPENDS ${source_directory}/exports ${CMAKE_CURRENT_BINARY_DIR}/linked_${bclib_name}
+-      COMMENT "Internalizing LLVM bitcode ${bclib_name}"
+-  )
+-  if(TARGET opt)
+-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/internalized_${bclib_name}
+-      DEPENDS opt
+-      APPEND)
+-  endif()
+-
+-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name}
+-      COMMAND ${OPT_TOOL} ${link_opt_flags} ${CMAKE_CURRENT_BINARY_DIR}/internalized_${bclib_name}
+-                      -o ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name}
+-      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/internalized_${bclib_name}
+-      COMMENT "Optimizing LLVM bitcode ${bclib_name}"
+-  )
+-  if(TARGET opt)
+-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name}
+-      DEPENDS opt
+-      APPEND)
+-  endif()
+-
+-  set(bclib_target_name "omptarget-${target_name}-bc")
+-  add_custom_target(${bclib_target_name} DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name})
+-
+-  # Copy library to destination.
+-  add_custom_command(TARGET ${bclib_target_name} POST_BUILD
+-                    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name}
+-                    ${LIBOMPTARGET_LIBRARY_DIR})
+-  add_dependencies(omptarget.devicertl.${target_name} ${bclib_target_name})
+-
+-  set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${bclib_name} ${LIBOMPTARGET_LIBRARY_DIR}/${bclib_name})
+-
+-  # Install bitcode library under the lib destination folder.
+-  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name} DESTINATION "${OFFLOAD_INSTALL_LIBDIR}")
+-
+-  set(target_feature "")
+-  if("${target_triple}" STREQUAL "nvptx64-nvidia-cuda")
+-    set(target_feature "feature=+ptx63")
+-  endif()
+-
+-  # Package the bitcode in the bitcode and embed it in an ELF for the static library
+-  add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/packaged_${bclib_name}
+-      COMMAND ${PACKAGER_TOOL} -o ${CMAKE_CURRENT_BINARY_DIR}/packaged_${bclib_name}
+-        "--image=file=${CMAKE_CURRENT_BINARY_DIR}/${bclib_name},${target_feature},triple=${target_triple},arch=generic,kind=openmp"
+-      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${bclib_name}
+-      COMMENT "Packaging LLVM offloading binary ${bclib_name}.out"
+-  )
+-  if(TARGET clang-offload-packager)
+-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/packaged_${bclib_name}
+-      DEPENDS clang-offload-packager
+-      APPEND)
+-  endif()
+-
+-  set(output_name "${CMAKE_CURRENT_BINARY_DIR}/devicertl-${target_name}.o")
+-  add_custom_command(OUTPUT ${output_name}
+-    COMMAND ${CLANG_TOOL} --std=c++17 -c -nostdlib
+-            -Xclang -fembed-offload-object=${CMAKE_CURRENT_BINARY_DIR}/packaged_${bclib_name}
+-            -o ${output_name}
+-            ${source_directory}/Stub.cpp
+-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/packaged_${bclib_name} ${source_directory}/Stub.cpp
+-    COMMENT "Embedding LLVM offloading binary in devicertl-${target_name}.o"
+-    VERBATIM
++  # Trick to combine these into a bitcode file via the linker's LTO pass. This
++  # is used to provide the legacy `libomptarget-<name>.bc` files. Hack this
++  # through as an executable to get it to use the relocatable link.
++  add_executable(libomptarget-${target_name} ${obj_files})
++  set_target_properties(libomptarget-${target_name} PROPERTIES
++    RUNTIME_OUTPUT_DIRECTORY ${LIBOMPTARGET_LLVM_LIBRARY_INTDIR}
++    LINKER_LANGUAGE CXX
++    BUILD_RPATH ""
++    INSTALL_RPATH ""
++    RUNTIME_OUTPUT_NAME libomptarget-${target_name}.bc)
++  target_compile_options(libomptarget-${target_name} PRIVATE "--target=${target_triple}")
++  target_link_options(libomptarget-${target_name} PRIVATE "--target=${target_triple}"
++                      "-r" "-nostdlib" "-flto" "-Wl,--lto-emit-llvm")
++  install(TARGETS libomptarget-${target_name}
++          PERMISSIONS OWNER_WRITE OWNER_READ GROUP_READ WORLD_READ
++          DESTINATION ${OFFLOAD_INSTALL_LIBDIR})
++
++  add_library(omptarget.${target_name}.all_objs OBJECT IMPORTED)
++  set_property(TARGET omptarget.${target_name}.all_objs APPEND PROPERTY IMPORTED_OBJECTS
++               ${LIBOMPTARGET_LLVM_LIBRARY_INTDIR}/libomptarget-${target_name}.bc)
++
++  # Archive all the object files generated above into a static library
++  add_library(omptarget.${target_name} STATIC)
++  set_target_properties(omptarget.${target_name} PROPERTIES
++    ARCHIVE_OUTPUT_DIRECTORY "${LIBOMPTARGET_LLVM_LIBRARY_INTDIR}/${target_triple}"
++    ARCHIVE_OUTPUT_NAME ompdevice
++    LINKER_LANGUAGE CXX
+   )
+-  if(TARGET clang)
+-    add_custom_command(OUTPUT ${output_name}
+-      DEPENDS clang
+-      APPEND)
+-  endif()
++  target_link_libraries(omptarget.${target_name} PRIVATE omptarget.${target_name}.all_objs)
+ 
+-  set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_MAKE_CLEAN_FILES ${output_name})
+-  set_property(TARGET omptarget.devicertl.all_objs APPEND PROPERTY IMPORTED_OBJECTS ${output_name})
++  install(TARGETS omptarget.${target_name}
++          ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}/${target_triple}")
+ 
+   if (CMAKE_EXPORT_COMPILE_COMMANDS)
+     set(ide_target_name omptarget-ide-${target_name})
+@@ -254,18 +178,10 @@ function(compileDeviceRTLLibrary target_name target_triple)
+   endif()
+ endfunction()
+ 
+-add_custom_target(omptarget.devicertl.amdgpu)
+-compileDeviceRTLLibrary(amdgpu amdgcn-amd-amdhsa -Xclang -mcode-object-version=none)
+-
+-add_custom_target(omptarget.devicertl.nvptx)
+-compileDeviceRTLLibrary(nvptx nvptx64-nvidia-cuda --cuda-feature=+ptx63)
+-
+-# Archive all the object files generated above into a static library
+-add_library(omptarget.devicertl STATIC)
+-set_target_properties(omptarget.devicertl PROPERTIES
+-  ARCHIVE_OUTPUT_DIRECTORY "${LIBOMPTARGET_LLVM_LIBRARY_INTDIR}"
+-  LINKER_LANGUAGE CXX
+-)
+-target_link_libraries(omptarget.devicertl PRIVATE omptarget.devicertl.all_objs)
++if(NOT LLVM_TARGETS_TO_BUILD OR "AMDGPU" IN_LIST LLVM_TARGETS_TO_BUILD)
++  compileDeviceRTLLibrary(amdgpu amdgcn-amd-amdhsa -Xclang -mcode-object-version=none)
++endif()
+ 
+-install(TARGETS omptarget.devicertl ARCHIVE DESTINATION ${OFFLOAD_INSTALL_LIBDIR})
++if(NOT LLVM_TARGETS_TO_BUILD OR "NVPTX" IN_LIST LLVM_TARGETS_TO_BUILD)
++  compileDeviceRTLLibrary(nvptx nvptx64-nvidia-cuda --cuda-feature=+ptx63)
++endif()
+diff --git a/offload/DeviceRTL/src/exports b/offload/DeviceRTL/src/exports
+deleted file mode 100644
+index 01667e7aba827..0000000000000
+--- a/offload/DeviceRTL/src/exports
++++ /dev/null
+@@ -1,19 +0,0 @@
+-omp_*
+-ompx_*
+-*llvm_*
+-__kmpc_*
+-
+-__omp_rtl_debug_kind
+-__omp_rtl_assume_no_thread_state
+-__omp_rtl_assume_no_nested_parallelism
+-
+-_ZN4ompx*
+-
+-IsSPMDMode
+-
+-malloc
+-free
+-memcmp
+-printf
+-__llvm_rpc_client
+-__assert_fail
+diff --git a/offload/test/lit.cfg b/offload/test/lit.cfg
+index f017bca85dd4f..8cdf2f3f13681 100644
+--- a/offload/test/lit.cfg
++++ b/offload/test/lit.cfg
+@@ -164,7 +164,7 @@ else: # Unices
+     if config.cuda_libdir:
+         config.test_flags += " -Wl,-rpath," + config.cuda_libdir
+     if config.libomptarget_current_target.startswith('nvptx'):
+-        config.test_flags_clang += " --libomptarget-nvptx-bc-path=" + config.library_dir + '/DeviceRTL'
++        config.test_flags_clang += " --libomptarget-nvptx-bc-path=" + config.llvm_library_intdir
+     if config.libomptarget_current_target.endswith('-LTO'):
+         config.test_flags += " -foffload-lto"
+     if config.libomptarget_current_target.endswith('-JIT-LTO') and evaluate_bool_env(
+@@ -173,22 +173,6 @@ else: # Unices
+         config.test_flags += " -foffload-lto"
+         config.test_flags += " -Wl,--embed-bitcode"
+ 
+-def remove_suffix_if_present(name):
+-    if name.endswith('-LTO'):
+-        return name[:-4]
+-    elif name.endswith('-JIT-LTO'):
+-        return name[:-8]
+-    else:
+-        return name
+-
+-def add_libraries(source):
+-    if config.libomptarget_has_libc:
+-        return source + " -Xoffload-linker " + "-lc " + \
+-               "-Xoffload-linker " + "-lm " + \
+-               config.llvm_library_intdir + "/libomptarget.devicertl.a"
+-    else:
+-        return source + " " + config.llvm_library_intdir + "/libomptarget.devicertl.a"
+-
+ # Add platform targets
+ host_targets = [
+     "aarch64-unknown-linux-gnu",
+@@ -207,6 +191,24 @@ if config.libomptarget_current_target.startswith('amdgcn'):
+ if config.libomptarget_current_target in host_targets:
+     config.available_features.add('host')
+ 
++def remove_suffix_if_present(name):
++    if name.endswith('-LTO'):
++        return name[:-4]
++    elif name.endswith('-JIT-LTO'):
++        return name[:-8]
++    else:
++        return name
++
++def add_libraries(source):
++    if "gpu" not in config.available_features:
++        return source
++    if config.libomptarget_has_libc:
++        return source + " -Xoffload-linker -lc " + \
++               "-Xoffload-linker -lm " + \
++               "-Xoffload-linker -lompdevice"
++    else:
++        return source + " " + "-Xoffload-lnker -lompdevice"
++
+ # substitutions
+ # - for targets that exist in the system create the actual command.
+ # - for valid targets that do not exist in the system, return false, so that the

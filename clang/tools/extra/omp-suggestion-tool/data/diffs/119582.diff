@@ -1,0 +1,347 @@
+diff --git a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+index 2dc480f0c901b..665b92be00898 100644
+--- a/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
++++ b/flang/examples/FlangOmpReport/FlangOmpReportVisitor.cpp
+@@ -143,6 +143,10 @@ std::string OpenMPCounterVisitor::getName(const OpenMPConstruct &c) {
+                 },
+                 c.u);
+           },
++          [&](const OpenMPErrorConstruct &c) -> std::string {
++            const CharBlock &source{std::get<0>(c.t).source};
++            return normalize_construct_name(source.ToString());
++          },
+           [&](const OpenMPSectionConstruct &c) -> std::string {
+             return "section";
+           },
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 7c0f04091362b..940caaeea9c3b 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -488,6 +488,9 @@ class ParseTreeDumper {
+   NODE(parser, OmpAlignment)
+   NODE(parser, OmpAlignedClause)
+   NODE(OmpAlignedClause, Modifier)
++  NODE(parser, OmpAtClause)
++  NODE_ENUM(OmpAtClause, ActionTime)
++  NODE_ENUM(OmpSeverityClause, Severity)
+   NODE(parser, OmpAtomic)
+   NODE(parser, OmpAtomicCapture)
+   NODE(OmpAtomicCapture, Stmt1)
+@@ -566,6 +569,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpStepSimpleModifier)
+   NODE(parser, OmpLoopDirective)
+   NODE(parser, OmpMapClause)
++  NODE(parser, OmpMessageClause)
+   NODE(OmpMapClause, Modifier)
+   static std::string GetNodeName(const llvm::omp::Clause &x) {
+     return llvm::Twine(
+@@ -609,6 +613,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpScheduleClause)
+   NODE(OmpScheduleClause, Modifier)
+   NODE_ENUM(OmpScheduleClause, Kind)
++  NODE(parser, OmpSeverityClause)
+   NODE(parser, OmpDeviceClause)
+   NODE(OmpDeviceClause, Modifier)
+   NODE(parser, OmpDeviceModifier)
+@@ -657,6 +662,7 @@ class ParseTreeDumper {
+   NODE(parser, OmpAtomicDefaultMemOrderClause)
+   NODE_ENUM(common, OmpAtomicDefaultMemOrderType)
+   NODE(parser, OpenMPDepobjConstruct)
++  NODE(parser, OpenMPErrorConstruct)
+   NODE(parser, OpenMPFlushConstruct)
+   NODE(parser, OpenMPLoopConstruct)
+   NODE(parser, OpenMPExecutableAllocate)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 8086c31031011..1d97126d17dbc 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3778,6 +3778,13 @@ struct OmpAllocateClause {
+   std::tuple<MODIFIERS(), OmpObjectList> t;
+ };
+ 
++// Ref: [5.2:216-217 (sort of, as it's only mentioned in passing)
++// AT(compilation|execution)
++struct OmpAtClause {
++  ENUM_CLASS(ActionTime, Compilation, Execution);
++  WRAPPER_CLASS_BOILERPLATE(OmpAtClause, ActionTime);
++};
++
+ // Ref: [5.0:60-63], [5.1:83-86], [5.2:210-213]
+ //
+ // atomic-default-mem-order-clause ->
+@@ -4028,6 +4035,13 @@ struct OmpMapClause {
+   std::tuple<MODIFIERS(), OmpObjectList, /*CommaSeparated=*/bool> t;
+ };
+ 
++// Ref: [5.2:217-218]
++// message-clause ->
++//    MESSAGE("message-text")
++struct OmpMessageClause {
++  WRAPPER_CLASS_BOILERPLATE(OmpMessageClause, Expr);
++};
++
+ // Ref: [4.5:87-91], [5.0:140-146], [5.1:166-171], [5.2:270]
+ //
+ // num-tasks-clause ->
+@@ -4090,6 +4104,14 @@ struct OmpScheduleClause {
+   std::tuple<MODIFIERS(), Kind, std::optional<ScalarIntExpr>> t;
+ };
+ 
++// REF: [5.2:217]
++// severity-clause ->
++//    SEVERITY(warning|fatal)
++struct OmpSeverityClause {
++  ENUM_CLASS(Severity, Fatal, Warning);
++  WRAPPER_CLASS_BOILERPLATE(OmpSeverityClause, Severity);
++};
++
+ // Ref: [5.0:232-234], [5.1:264-266], [5.2:137]
+ //
+ // task-reduction-clause ->
+@@ -4476,6 +4498,14 @@ struct OpenMPDepobjConstruct {
+   std::tuple<Verbatim, OmpObject, OmpClause> t;
+ };
+ 
++// Ref: OpenMP [5.2:216-218]
++// ERROR AT(compilation|execution) SEVERITY(fatal|warning) MESSAGE("msg-str)
++struct OpenMPErrorConstruct {
++  TUPLE_CLASS_BOILERPLATE(OpenMPErrorConstruct);
++  CharBlock source;
++  std::tuple<Verbatim, OmpClauseList> t;
++};
++
+ // 2.17.8 flush -> FLUSH [memory-order-clause] [(variable-name-list)]
+ struct OpenMPFlushConstruct {
+   TUPLE_CLASS_BOILERPLATE(OpenMPFlushConstruct);
+@@ -4548,7 +4578,7 @@ struct OpenMPConstruct {
+   UNION_CLASS_BOILERPLATE(OpenMPConstruct);
+   std::variant<OpenMPStandaloneConstruct, OpenMPSectionsConstruct,
+       OpenMPSectionConstruct, OpenMPLoopConstruct, OpenMPBlockConstruct,
+-      OpenMPAtomicConstruct, OpenMPDeclarativeAllocate,
++      OpenMPAtomicConstruct, OpenMPDeclarativeAllocate, OpenMPErrorConstruct,
+       OpenMPExecutableAllocate, OpenMPAllocatorsConstruct,
+       OpenMPCriticalConstruct>
+       u;
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index c167d347b4315..6d32d5f70049e 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2909,6 +2909,13 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                 queue.begin(), name);
+ }
+ 
++static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
++                   semantics::SemanticsContext &semaCtx,
++                   lower::pft::Evaluation &eval,
++                   const parser::OpenMPErrorConstruct &) {
++  TODO(converter.getCurrentLocation(), "OpenMPErrorConstruct");
++}
++
+ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+                    semantics::SemanticsContext &semaCtx,
+                    lower::pft::Evaluation &eval,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 7d10de8c60977..59b8cd53f48f3 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -567,6 +567,16 @@ TYPE_PARSER(construct<OmpBindClause>(
+     "TEAMS" >> pure(OmpBindClause::Binding::Teams) ||
+     "THREAD" >> pure(OmpBindClause::Binding::Thread)))
+ 
++TYPE_PARSER(construct<OmpAtClause>(
++    "EXECUTION" >> pure(OmpAtClause::ActionTime::Execution) ||
++    "COMPILATION" >> pure(OmpAtClause::ActionTime::Compilation)))
++
++TYPE_PARSER(construct<OmpSeverityClause>(
++    "FATAL" >> pure(OmpSeverityClause::Severity::Fatal) ||
++    "WARNING" >> pure(OmpSeverityClause::Severity::Warning)))
++
++TYPE_PARSER(construct<OmpMessageClause>(expr))
++
+ TYPE_PARSER(
+     "ACQUIRE" >> construct<OmpClause>(construct<OmpClause::Acquire>()) ||
+     "ACQ_REL" >> construct<OmpClause>(construct<OmpClause::AcqRel>()) ||
+@@ -578,6 +588,8 @@ TYPE_PARSER(
+                       parenthesized(Parser<OmpAllocateClause>{}))) ||
+     "ALLOCATOR" >> construct<OmpClause>(construct<OmpClause::Allocator>(
+                        parenthesized(scalarIntExpr))) ||
++    "AT" >> construct<OmpClause>(construct<OmpClause::At>(
++                parenthesized(Parser<OmpAtClause>{}))) ||
+     "ATOMIC_DEFAULT_MEM_ORDER" >>
+         construct<OmpClause>(construct<OmpClause::AtomicDefaultMemOrder>(
+             parenthesized(Parser<OmpAtomicDefaultMemOrderClause>{}))) ||
+@@ -645,6 +657,8 @@ TYPE_PARSER(
+     "MAP" >> construct<OmpClause>(construct<OmpClause::Map>(
+                  parenthesized(Parser<OmpMapClause>{}))) ||
+     "MERGEABLE" >> construct<OmpClause>(construct<OmpClause::Mergeable>()) ||
++    "MESSAGE" >> construct<OmpClause>(construct<OmpClause::Message>(
++                     parenthesized(Parser<OmpMessageClause>{}))) ||
+     "NOGROUP" >> construct<OmpClause>(construct<OmpClause::Nogroup>()) ||
+     "NONTEMPORAL" >> construct<OmpClause>(construct<OmpClause::Nontemporal>(
+                          parenthesized(nonemptyList(name)))) ||
+@@ -687,6 +701,8 @@ TYPE_PARSER(
+     "SCHEDULE" >> construct<OmpClause>(construct<OmpClause::Schedule>(
+                       parenthesized(Parser<OmpScheduleClause>{}))) ||
+     "SEQ_CST" >> construct<OmpClause>(construct<OmpClause::SeqCst>()) ||
++    "SEVERITY" >> construct<OmpClause>(construct<OmpClause::Severity>(
++                      parenthesized(Parser<OmpSeverityClause>{}))) ||
+     "SHARED" >> construct<OmpClause>(construct<OmpClause::Shared>(
+                     parenthesized(Parser<OmpObjectList>{}))) ||
+     "SIMD"_id >> construct<OmpClause>(construct<OmpClause::Simd>()) ||
+@@ -1010,6 +1026,9 @@ TYPE_PARSER(sourced(construct<OmpCriticalDirective>(verbatim("CRITICAL"_tok),
+ TYPE_PARSER(construct<OpenMPCriticalConstruct>(
+     Parser<OmpCriticalDirective>{}, block, Parser<OmpEndCriticalDirective>{}))
+ 
++TYPE_PARSER(sourced(construct<OpenMPErrorConstruct>(
++    verbatim("ERROR"_tok), Parser<OmpClauseList>{})))
++
+ // 2.11.3 Executable Allocate directive
+ TYPE_PARSER(
+     sourced(construct<OpenMPExecutableAllocate>(verbatim("ALLOCATE"_tok),
+@@ -1107,6 +1126,7 @@ TYPE_CONTEXT_PARSER("OpenMP construct"_en_US,
+                 // OpenMPStandaloneConstruct to resolve !$OMP ORDERED
+                 construct<OpenMPConstruct>(Parser<OpenMPStandaloneConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPAtomicConstruct>{}),
++                construct<OpenMPConstruct>(Parser<OpenMPErrorConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPExecutableAllocate>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPAllocatorsConstruct>{}),
+                 construct<OpenMPConstruct>(Parser<OpenMPDeclarativeAllocate>{}),
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4b8e2624e36ca..0a6af7435b4a2 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2706,6 +2706,15 @@ class UnparseVisitor {
+     Put(")\n");
+     EndOpenMP();
+   }
++  bool Pre(const OmpMessageClause &x) {
++    Walk(x.v);
++    return false;
++  }
++  void Unparse(const OpenMPErrorConstruct &x) {
++    Word("!$OMP ERROR ");
++    Walk(x.t);
++    Put("\n");
++  }
+   void Unparse(const OmpSectionsDirective &x) {
+     switch (x.v) {
+     case llvm::omp::Directive::OMPD_sections:
+@@ -2896,6 +2905,7 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(InquireSpec::LogVar, Kind)
+   WALK_NESTED_ENUM(ProcedureStmt, Kind) // R1506
+   WALK_NESTED_ENUM(UseStmt, ModuleNature) // R1410
++  WALK_NESTED_ENUM(OmpAtClause, ActionTime) // OMP at
+   WALK_NESTED_ENUM(OmpBindClause, Binding) // OMP bind
+   WALK_NESTED_ENUM(OmpProcBindClause, AffinityPolicy) // OMP proc_bind
+   WALK_NESTED_ENUM(OmpDefaultClause, DataSharingAttribute) // OMP default
+@@ -2907,6 +2917,7 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(OmpOrderingModifier, Value) // OMP ordering-modifier
+   WALK_NESTED_ENUM(OmpTaskDependenceType, Value) // OMP task-dependence-type
+   WALK_NESTED_ENUM(OmpScheduleClause, Kind) // OMP schedule-kind
++  WALK_NESTED_ENUM(OmpSeverityClause, Severity) // OMP severity
+   WALK_NESTED_ENUM(OmpDeviceModifier, Value) // OMP device modifier
+   WALK_NESTED_ENUM(
+       OmpDeviceTypeClause, DeviceTypeDescription) // OMP device_type
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index d63f7a5aea3ab..2a0dcfff0f114 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1690,6 +1690,15 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareTargetConstruct &x) {
+   dirContext_.pop_back();
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OpenMPErrorConstruct &x) {
++  const auto &dir{std::get<parser::Verbatim>(x.t)};
++  PushContextAndClauseSets(dir.source, llvm::omp::Directive::OMPD_error);
++}
++
++void OmpStructureChecker::Leave(const parser::OpenMPErrorConstruct &x) {
++  dirContext_.pop_back();
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPExecutableAllocate &x) {
+   isPredefinedAllocator = true;
+   const auto &dir{std::get<parser::Verbatim>(x.t)};
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index f3592b2160fac..346a7bed9138f 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -102,6 +102,8 @@ class OmpStructureChecker
+   void Enter(const parser::OmpDeclareTargetWithList &);
+   void Enter(const parser::OmpDeclareTargetWithClause &);
+   void Leave(const parser::OmpDeclareTargetWithClause &);
++  void Enter(const parser::OpenMPErrorConstruct &);
++  void Leave(const parser::OpenMPErrorConstruct &);
+   void Enter(const parser::OpenMPExecutableAllocate &);
+   void Leave(const parser::OpenMPExecutableAllocate &);
+   void Enter(const parser::OpenMPAllocatorsConstruct &);
+diff --git a/flang/test/Lower/OpenMP/Todo/error.f90 b/flang/test/Lower/OpenMP/Todo/error.f90
+new file mode 100644
+index 0000000000000..b97e2c20a0cdf
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/error.f90
+@@ -0,0 +1,7 @@
++! RUN: %not_todo_cmd %flang_fc1 -emit-fir -fopenmp -fopenmp-version=51 -o - %s 2>&1 | FileCheck %s
++
++! CHECK: not yet implemented: OpenMPErrorConstruct
++program p
++  integer, allocatable :: x
++  !$omp error at(compilation) severity(warning) message("an error")
++end program p
+diff --git a/flang/test/Parser/OpenMP/error-unparse.f90 b/flang/test/Parser/OpenMP/error-unparse.f90
+new file mode 100644
+index 0000000000000..fce5d8cf22863
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/error-unparse.f90
+@@ -0,0 +1,23 @@
++! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-unparse-no-sema %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1  -fopenmp-version=51 -fopenmp -fdebug-dump-parse-tree-no-sema %s 2>&1 | FileCheck %s --check-prefix="PARSE-TREE"
++program main
++  character(*), parameter :: message = "This is an error"
++  !CHECK: !$OMP ERROR AT(COMPILATION) SEVERITY(WARNING) MESSAGE("some message here")
++  !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPErrorConstruct
++  !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Compilation
++  !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Warning
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> LiteralConstant -> CharLiteralConstant
++  !$omp error at(compilation) severity(warning) message("some message here")
++  !CHECK: !$OMP ERROR AT(COMPILATION) SEVERITY(FATAL) MESSAGE(message)
++  !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPErrorConstruct
++  !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Compilation
++  !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Fatal
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> Designator -> DataRef -> Name = 'message'
++  !$omp error at(compilation) severity(fatal) message(message)
++  !CHECK: !$OMP ERROR AT(EXECUTION) SEVERITY(FATAL) MESSAGE(message)
++  !PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPErrorConstruct
++  !PARSE-TREE: OmpClauseList -> OmpClause -> At -> OmpAtClause -> ActionTime = Execution
++  !PARSE-TREE: OmpClause -> Severity -> OmpSeverityClause -> Severity = Fatal
++  !PARSE-TREE:  OmpClause -> Message -> OmpMessageClause -> Expr -> Designator ->  DataRef -> Name = 'message'
++  !$omp error at(EXECUTION) severity(fatal) message(message)
++end program main
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 4f23a6792d634..90e381f548b09 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -66,6 +66,7 @@ def OMPC_AppendArgs : Clause<"append_args"> {
+ }
+ def OMPC_At : Clause<"at"> {
+   let clangClass = "OMPAtClause";
++  let flangClass = "OmpAtClause";
+ }
+ def OMPC_AtomicDefaultMemOrder : Clause<"atomic_default_mem_order"> {
+   let clangClass = "OMPAtomicDefaultMemOrderClause";
+@@ -288,6 +289,7 @@ def OMPC_Mergeable : Clause<"mergeable"> {
+ }
+ def OMPC_Message : Clause<"message"> {
+   let clangClass = "OMPMessageClause";
++  let flangClass = "OmpMessageClause";
+ }
+ def OMPC_NoOpenMP : Clause<"no_openmp"> {
+   let clangClass = "OMPNoOpenMPClause";
+@@ -445,6 +447,7 @@ def OMPC_SeqCst : Clause<"seq_cst"> {
+ }
+ def OMPC_Severity : Clause<"severity"> {
+   let clangClass = "OMPSeverityClause";
++  let flangClass = "OmpSeverityClause";
+ }
+ def OMPC_Shared : Clause<"shared"> {
+   let clangClass = "OMPSharedClause";

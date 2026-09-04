@@ -1,0 +1,547 @@
+diff --git a/clang/lib/CodeGen/CGOpenMPRuntime.cpp b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+index 3747b00d4893a..5e9f89b18918d 100644
+--- a/clang/lib/CodeGen/CGOpenMPRuntime.cpp
++++ b/clang/lib/CodeGen/CGOpenMPRuntime.cpp
+@@ -9672,8 +9672,8 @@ static void emitTargetCallKernelLaunch(
+         DynCGGroupMem, HasNoWait);
+ 
+     CGF.Builder.restoreIP(OMPRuntime->getOMPBuilder().emitKernelLaunch(
+-        CGF.Builder, OutlinedFn, OutlinedFnID, EmitTargetCallFallbackCB, Args,
+-        DeviceID, RTLoc, AllocaIP));
++        CGF.Builder, OutlinedFnID, EmitTargetCallFallbackCB, Args, DeviceID,
++        RTLoc, AllocaIP));
+   };
+ 
+   if (RequiresOuterTask)
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+index 8834c3b1f5011..c4735ec41e713 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMPIRBuilder.h
+@@ -2264,6 +2264,9 @@ class OpenMPIRBuilder {
+ 
+     bool EmitDebug = false;
+ 
++    /// Whether the `target ... data` directive has a `nowait` clause.
++    bool HasNoWait = false;
++
+     explicit TargetDataInfo() {}
+     explicit TargetDataInfo(bool RequiresDevicePointerInfo,
+                             bool SeparateBeginEndCalls)
+@@ -2342,7 +2345,6 @@ class OpenMPIRBuilder {
+   /// Generate a target region entry call and host fallback call.
+   ///
+   /// \param Loc The location at which the request originated and is fulfilled.
+-  /// \param OutlinedFn The outlined kernel function.
+   /// \param OutlinedFnID The ooulined function ID.
+   /// \param EmitTargetCallFallbackCB Call back function to generate host
+   ///        fallback code.
+@@ -2350,18 +2352,27 @@ class OpenMPIRBuilder {
+   /// \param DeviceID Identifier for the device via the 'device' clause.
+   /// \param RTLoc Source location identifier
+   /// \param AllocaIP The insertion point to be used for alloca instructions.
+-  InsertPointTy emitKernelLaunch(
+-      const LocationDescription &Loc, Function *OutlinedFn, Value *OutlinedFnID,
+-      EmitFallbackCallbackTy EmitTargetCallFallbackCB, TargetKernelArgs &Args,
+-      Value *DeviceID, Value *RTLoc, InsertPointTy AllocaIP);
++  InsertPointTy
++  emitKernelLaunch(const LocationDescription &Loc, Value *OutlinedFnID,
++                   EmitFallbackCallbackTy EmitTargetCallFallbackCB,
++                   TargetKernelArgs &Args, Value *DeviceID, Value *RTLoc,
++                   InsertPointTy AllocaIP);
++
++  /// Callback type for generating the bodies of device directives that require
++  /// outer target tasks (e.g. in case of having `nowait` or `depend` clauses).
++  ///
++  /// \param DeviceID The ID of the device on which the target region will
++  ///        execute.
++  /// \param RTLoc Source location identifier
++  /// \Param TargetTaskAllocaIP Insertion point for the alloca block of the
++  ///        generated task.
++  using TargetTaskBodyCallbackTy =
++      function_ref<void(Value *DeviceID, Value *RTLoc,
++                        IRBuilderBase::InsertPoint TargetTaskAllocaIP)>;
+ 
+   /// Generate a target-task for the target construct
+   ///
+-  /// \param OutlinedFn The outlined device/target kernel function.
+-  /// \param OutlinedFnID The ooulined function ID.
+-  /// \param EmitTargetCallFallbackCB Call back function to generate host
+-  ///        fallback code.
+-  /// \param Args Data structure holding information about the kernel arguments.
++  /// \param TaskBodyCB Callback to generate the actual body of the target task.
+   /// \param DeviceID Identifier for the device via the 'device' clause.
+   /// \param RTLoc Source location identifier
+   /// \param AllocaIP The insertion point to be used for alloca instructions.
+@@ -2370,10 +2381,10 @@ class OpenMPIRBuilder {
+   /// \param HasNoWait True if the target construct had 'nowait' on it, false
+   ///        otherwise
+   InsertPointTy emitTargetTask(
+-      Function *OutlinedFn, Value *OutlinedFnID,
+-      EmitFallbackCallbackTy EmitTargetCallFallbackCB, TargetKernelArgs &Args,
+-      Value *DeviceID, Value *RTLoc, InsertPointTy AllocaIP,
+-      SmallVector<OpenMPIRBuilder::DependData> &Dependencies, bool HasNoWait);
++      TargetTaskBodyCallbackTy TaskBodyCB, Value *DeviceID, Value *RTLoc,
++      OpenMPIRBuilder::InsertPointTy AllocaIP,
++      const SmallVector<llvm::OpenMPIRBuilder::DependData> &Dependencies,
++      bool HasNoWait);
+ 
+   /// Emit the arguments to be passed to the runtime library based on the
+   /// arrays of base pointers, pointers, sizes, map types, and mappers.  If
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index 31482206238ae..be93f9f2e1fdc 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -1080,8 +1080,8 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetKernel(
+ }
+ 
+ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitKernelLaunch(
+-    const LocationDescription &Loc, Function *OutlinedFn, Value *OutlinedFnID,
+-    EmitFallbackCallbackTy emitTargetCallFallbackCB, TargetKernelArgs &Args,
++    const LocationDescription &Loc, Value *OutlinedFnID,
++    EmitFallbackCallbackTy EmitTargetCallFallbackCB, TargetKernelArgs &Args,
+     Value *DeviceID, Value *RTLoc, InsertPointTy AllocaIP) {
+ 
+   if (!updateToLocation(Loc))
+@@ -1134,7 +1134,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitKernelLaunch(
+ 
+   auto CurFn = Builder.GetInsertBlock()->getParent();
+   emitBlock(OffloadFailedBlock, CurFn);
+-  Builder.restoreIP(emitTargetCallFallbackCB(Builder.saveIP()));
++  Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
+   emitBranch(OffloadContBlock);
+   emitBlock(OffloadContBlock, CurFn, /*IsFinished=*/true);
+   return Builder.saveIP();
+@@ -1736,7 +1736,7 @@ void OpenMPIRBuilder::createTaskyield(const LocationDescription &Loc) {
+ // - All code is inserted in the entry block of the current function.
+ static Value *emitTaskDependencies(
+     OpenMPIRBuilder &OMPBuilder,
+-    SmallVectorImpl<OpenMPIRBuilder::DependData> &Dependencies) {
++    const SmallVectorImpl<OpenMPIRBuilder::DependData> &Dependencies) {
+   // Early return if we have no dependencies to process
+   if (Dependencies.empty())
+     return nullptr;
+@@ -6403,16 +6403,44 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::createTargetData(
+       SrcLocInfo = getOrCreateIdent(SrcLocStr, SrcLocStrSize);
+     }
+ 
+-    Value *OffloadingArgs[] = {SrcLocInfo,           DeviceID,
+-                               PointerNum,           RTArgs.BasePointersArray,
+-                               RTArgs.PointersArray, RTArgs.SizesArray,
+-                               RTArgs.MapTypesArray, RTArgs.MapNamesArray,
+-                               RTArgs.MappersArray};
++    SmallVector<llvm::Value *, 13> OffloadingArgs = {
++        SrcLocInfo,           DeviceID,
++        PointerNum,           RTArgs.BasePointersArray,
++        RTArgs.PointersArray, RTArgs.SizesArray,
++        RTArgs.MapTypesArray, RTArgs.MapNamesArray,
++        RTArgs.MappersArray};
+ 
+     if (IsStandAlone) {
+       assert(MapperFunc && "MapperFunc missing for standalone target data");
+-      Builder.CreateCall(getOrCreateRuntimeFunctionPtr(*MapperFunc),
+-                         OffloadingArgs);
++
++      auto TaskBodyCB = [&](Value *, Value *, IRBuilderBase::InsertPoint) {
++        if (Info.HasNoWait) {
++          OffloadingArgs.append({llvm::Constant::getNullValue(Int32),
++                                 llvm::Constant::getNullValue(VoidPtr),
++                                 llvm::Constant::getNullValue(Int32),
++                                 llvm::Constant::getNullValue(VoidPtr)});
++        }
++
++        Builder.CreateCall(getOrCreateRuntimeFunctionPtr(*MapperFunc),
++                           OffloadingArgs);
++
++        if (Info.HasNoWait) {
++          BasicBlock *OffloadContBlock =
++              BasicBlock::Create(Builder.getContext(), "omp_offload.cont");
++          Function *CurFn = Builder.GetInsertBlock()->getParent();
++          emitBlock(OffloadContBlock, CurFn, /*IsFinished=*/true);
++          Builder.restoreIP(Builder.saveIP());
++        }
++      };
++
++      bool RequiresOuterTargetTask = Info.HasNoWait;
++
++      if (!RequiresOuterTargetTask)
++        TaskBodyCB(/*DeviceID=*/nullptr, /*RTLoc=*/nullptr,
++                   /*TargetTaskAllocaIP=*/{});
++      else
++        emitTargetTask(TaskBodyCB, DeviceID, SrcLocInfo, AllocaIP,
++                       /*Dependencies=*/{}, Info.HasNoWait);
+     } else {
+       Function *BeginMapperFunc = getOrCreateRuntimeFunctionPtr(
+           omp::OMPRTL___tgt_target_data_begin_mapper);
+@@ -6836,13 +6864,18 @@ static void emitTargetOutlinedFunction(
+   OMPBuilder.emitTargetRegionFunction(EntryInfo, GenerateOutlinedFunction,
+                                       IsOffloadEntry, OutlinedFn, OutlinedFnID);
+ }
++
+ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+-    Function *OutlinedFn, Value *OutlinedFnID,
+-    EmitFallbackCallbackTy EmitTargetCallFallbackCB, TargetKernelArgs &Args,
+-    Value *DeviceID, Value *RTLoc, OpenMPIRBuilder::InsertPointTy AllocaIP,
+-    SmallVector<llvm::OpenMPIRBuilder::DependData> &Dependencies,
++    TargetTaskBodyCallbackTy TaskBodyCB, Value *DeviceID, Value *RTLoc,
++    OpenMPIRBuilder::InsertPointTy AllocaIP,
++    const SmallVector<llvm::OpenMPIRBuilder::DependData> &Dependencies,
+     bool HasNoWait) {
+ 
++  // The following explains the code-gen scenario for the `target` directive. A
++  // similar scneario is followed for other device-related directives (e.g.
++  // `target enter data`) but in similar fashion since we only need to emit task
++  // that encapsulates the proper runtime call.
++  //
+   // When we arrive at this function, the target region itself has been
+   // outlined into the function OutlinedFn.
+   // So at ths point, for
+@@ -6950,22 +6983,7 @@ OpenMPIRBuilder::InsertPointTy OpenMPIRBuilder::emitTargetTask(
+ 
+   Builder.restoreIP(TargetTaskBodyIP);
+ 
+-  if (OutlinedFnID) {
+-    // emitKernelLaunch makes the necessary runtime call to offload the kernel.
+-    // We then outline all that code into a separate function
+-    // ('kernel_launch_function' in the pseudo code above). This function is
+-    // then called by the target task proxy function (see
+-    // '@.omp_target_task_proxy_func' in the pseudo code above)
+-    // "@.omp_target_task_proxy_func' is generated by
+-    // emitTargetTaskProxyFunction.
+-    Builder.restoreIP(emitKernelLaunch(Builder, OutlinedFn, OutlinedFnID,
+-                                       EmitTargetCallFallbackCB, Args, DeviceID,
+-                                       RTLoc, TargetTaskAllocaIP));
+-  } else {
+-    // When OutlinedFnID is set to nullptr, then it's not an offloading call. In
+-    // this case, we execute the host implementation directly.
+-    Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
+-  }
++  TaskBodyCB(DeviceID, RTLoc, TargetTaskAllocaIP);
+ 
+   OI.ExitBB = Builder.saveIP().getBlock();
+   OI.PostOutlineCB = [this, ToBeDeleted, Dependencies, HasNoWait,
+@@ -7153,6 +7171,29 @@ emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+   bool HasDependencies = Dependencies.size() > 0;
+   bool RequiresOuterTargetTask = HasNoWait || HasDependencies;
+ 
++  OpenMPIRBuilder::TargetKernelArgs KArgs;
++
++  auto TaskBodyCB = [&](Value *DeviceID, Value *RTLoc,
++                        IRBuilderBase::InsertPoint TargetTaskAllocaIP) {
++    if (OutlinedFnID) {
++      // emitKernelLaunch makes the necessary runtime call to offload the
++      // kernel. We then outline all that code into a separate function
++      // ('kernel_launch_function' in the pseudo code above). This function is
++      // then called by the target task proxy function (see
++      // '@.omp_target_task_proxy_func' in the pseudo code above)
++      // "@.omp_target_task_proxy_func' is generated by
++      // emitTargetTaskProxyFunction.
++      Builder.restoreIP(OMPBuilder.emitKernelLaunch(
++          Builder, OutlinedFnID, EmitTargetCallFallbackCB, KArgs, DeviceID,
++          RTLoc, TargetTaskAllocaIP));
++    } else {
++      // When OutlinedFnID is set to nullptr, then it's not an offloading
++      // call. In this case, we execute the host implementation directly.
++      OMPBuilder.Builder.restoreIP(
++          EmitTargetCallFallbackCB(OMPBuilder.Builder.saveIP()));
++    }
++  };
++
+   // If we don't have an ID for the target region, it means an offload entry
+   // wasn't created. In this case we just run the host fallback directly.
+   if (!OutlinedFnID) {
+@@ -7160,11 +7201,10 @@ emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+       // Arguments that are intended to be directly forwarded to an
+       // emitKernelLaunch call are pased as nullptr, since OutlinedFnID=nullptr
+       // results in that call not being done.
+-      OpenMPIRBuilder::TargetKernelArgs KArgs;
+-      Builder.restoreIP(OMPBuilder.emitTargetTask(
+-          OutlinedFn, /*OutlinedFnID=*/nullptr, EmitTargetCallFallbackCB, KArgs,
+-          /*DeviceID=*/nullptr, /*RTLoc=*/nullptr, AllocaIP, Dependencies,
+-          HasNoWait));
++      Builder.restoreIP(OMPBuilder.emitTargetTask(TaskBodyCB,
++                                                  /*DeviceID=*/nullptr,
++                                                  /*RTLoc=*/nullptr, AllocaIP,
++                                                  Dependencies, HasNoWait));
+     } else {
+       Builder.restoreIP(EmitTargetCallFallbackCB(Builder.saveIP()));
+     }
+@@ -7201,20 +7241,19 @@ emitTargetCall(OpenMPIRBuilder &OMPBuilder, IRBuilderBase &Builder,
+   // TODO: Use correct DynCGGroupMem
+   Value *DynCGGroupMem = Builder.getInt32(0);
+ 
+-  OpenMPIRBuilder::TargetKernelArgs KArgs(NumTargetItems, RTArgs, NumIterations,
+-                                          NumTeamsC, NumThreadsC, DynCGGroupMem,
+-                                          HasNoWait);
++  KArgs = OpenMPIRBuilder::TargetKernelArgs(
++      NumTargetItems, RTArgs, NumIterations, NumTeamsC, NumThreadsC,
++      DynCGGroupMem, HasNoWait);
+ 
+   // The presence of certain clauses on the target directive require the
+   // explicit generation of the target task.
+   if (RequiresOuterTargetTask) {
+     Builder.restoreIP(OMPBuilder.emitTargetTask(
+-        OutlinedFn, OutlinedFnID, EmitTargetCallFallbackCB, KArgs, DeviceID,
+-        RTLoc, AllocaIP, Dependencies, HasNoWait));
++        TaskBodyCB, DeviceID, RTLoc, AllocaIP, Dependencies, HasNoWait));
+   } else {
+     Builder.restoreIP(OMPBuilder.emitKernelLaunch(
+-        Builder, OutlinedFn, OutlinedFnID, EmitTargetCallFallbackCB, KArgs,
+-        DeviceID, RTLoc, AllocaIP));
++        Builder, OutlinedFnID, EmitTargetCallFallbackCB, KArgs, DeviceID, RTLoc,
++        AllocaIP));
+   }
+ }
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index 7c45e89cd8ac4..27cd38dc3c62d 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -2886,6 +2886,8 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+   DataLayout DL = DataLayout(op->getParentOfType<ModuleOp>());
+ 
+   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
++  llvm::OpenMPIRBuilder::TargetDataInfo info(/*RequiresDevicePointerInfo=*/true,
++                                             /*SeparateBeginEndCalls=*/true);
+ 
+   LogicalResult result =
+       llvm::TypeSwitch<Operation *, LogicalResult>(op)
+@@ -2905,9 +2907,9 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+             return success();
+           })
+           .Case([&](omp::TargetEnterDataOp enterDataOp) {
+-            if (enterDataOp.getNowait())
++            if (!enterDataOp.getDependVars().empty())
+               return (LogicalResult)(enterDataOp.emitError(
+-                  "`nowait` is not supported yet"));
++                  "`depend` is not supported yet"));
+ 
+             if (auto ifVar = enterDataOp.getIfExpr())
+               ifCond = moduleTranslation.lookupValue(ifVar);
+@@ -2917,14 +2919,18 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+                       dyn_cast<LLVM::ConstantOp>(devId.getDefiningOp()))
+                 if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                   deviceID = intAttr.getInt();
+-            RTLFn = llvm::omp::OMPRTL___tgt_target_data_begin_mapper;
++            RTLFn =
++                enterDataOp.getNowait()
++                    ? llvm::omp::OMPRTL___tgt_target_data_begin_nowait_mapper
++                    : llvm::omp::OMPRTL___tgt_target_data_begin_mapper;
+             mapVars = enterDataOp.getMapVars();
++            info.HasNoWait = enterDataOp.getNowait();
+             return success();
+           })
+           .Case([&](omp::TargetExitDataOp exitDataOp) {
+-            if (exitDataOp.getNowait())
++            if (!exitDataOp.getDependVars().empty())
+               return (LogicalResult)(exitDataOp.emitError(
+-                  "`nowait` is not supported yet"));
++                  "`depend` is not supported yet"));
+ 
+             if (auto ifVar = exitDataOp.getIfExpr())
+               ifCond = moduleTranslation.lookupValue(ifVar);
+@@ -2935,14 +2941,17 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+                 if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                   deviceID = intAttr.getInt();
+ 
+-            RTLFn = llvm::omp::OMPRTL___tgt_target_data_end_mapper;
++            RTLFn = exitDataOp.getNowait()
++                        ? llvm::omp::OMPRTL___tgt_target_data_end_nowait_mapper
++                        : llvm::omp::OMPRTL___tgt_target_data_end_mapper;
+             mapVars = exitDataOp.getMapVars();
++            info.HasNoWait = exitDataOp.getNowait();
+             return success();
+           })
+           .Case([&](omp::TargetUpdateOp updateDataOp) {
+-            if (updateDataOp.getNowait())
++            if (!updateDataOp.getDependVars().empty())
+               return (LogicalResult)(updateDataOp.emitError(
+-                  "`nowait` is not supported yet"));
++                  "`depend` is not supported yet"));
+ 
+             if (auto ifVar = updateDataOp.getIfExpr())
+               ifCond = moduleTranslation.lookupValue(ifVar);
+@@ -2953,8 +2962,12 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+                 if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+                   deviceID = intAttr.getInt();
+ 
+-            RTLFn = llvm::omp::OMPRTL___tgt_target_data_update_mapper;
++            RTLFn =
++                updateDataOp.getNowait()
++                    ? llvm::omp::OMPRTL___tgt_target_data_update_nowait_mapper
++                    : llvm::omp::OMPRTL___tgt_target_data_update_mapper;
+             mapVars = updateDataOp.getMapVars();
++            info.HasNoWait = updateDataOp.getNowait();
+             return success();
+           })
+           .Default([&](Operation *op) {
+@@ -3005,9 +3018,6 @@ convertOmpTargetData(Operation *op, llvm::IRBuilderBase &builder,
+                                                  : basePointer);
+       };
+ 
+-  llvm::OpenMPIRBuilder::TargetDataInfo info(/*RequiresDevicePointerInfo=*/true,
+-                                             /*SeparateBeginEndCalls=*/true);
+-
+   using BodyGenTy = llvm::OpenMPIRBuilder::BodyGenTy;
+   LogicalResult bodyGenStatus = success();
+   auto bodyGenCB = [&](InsertPointTy codeGenIP, BodyGenTy bodyGenType) {
+diff --git a/mlir/test/Target/LLVMIR/omptarget-nowait-unsupported-llvm.mlir b/mlir/test/Target/LLVMIR/omptarget-nowait-unsupported-llvm.mlir
+deleted file mode 100644
+index 1e2fbe86d13c4..0000000000000
+--- a/mlir/test/Target/LLVMIR/omptarget-nowait-unsupported-llvm.mlir
++++ /dev/null
+@@ -1,39 +0,0 @@
+-// RUN: not mlir-translate -mlir-to-llvmir -split-input-file %s 2>&1 | FileCheck %s
+-
+-llvm.func @_QPopenmp_target_data_update() {
+-  %0 = llvm.mlir.constant(1 : i64) : i64
+-  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
+-  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+-
+-  // CHECK: error: `nowait` is not supported yet
+-  omp.target_update map_entries(%2 : !llvm.ptr) nowait
+-
+-  llvm.return
+-}
+-
+-// -----
+-
+-llvm.func @_QPopenmp_target_data_enter() {
+-  %0 = llvm.mlir.constant(1 : i64) : i64
+-  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
+-  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+-
+-  // CHECK: error: `nowait` is not supported yet
+-  omp.target_enter_data map_entries(%2 : !llvm.ptr) nowait
+-
+-  llvm.return
+-}
+-
+-
+-// -----
+-
+-llvm.func @_QPopenmp_target_data_exit() {
+-  %0 = llvm.mlir.constant(1 : i64) : i64
+-  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
+-  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+-
+-  // CHECK: error: `nowait` is not supported yet
+-  omp.target_exit_data map_entries(%2 : !llvm.ptr) nowait
+-
+-  llvm.return
+-}
+diff --git a/mlir/test/Target/LLVMIR/omptargetdata-nowait-llvm.mlir b/mlir/test/Target/LLVMIR/omptargetdata-nowait-llvm.mlir
+new file mode 100644
+index 0000000000000..8124d02ef2174
+--- /dev/null
++++ b/mlir/test/Target/LLVMIR/omptargetdata-nowait-llvm.mlir
+@@ -0,0 +1,110 @@
++// RUN: mlir-translate -mlir-to-llvmir -split-input-file %s 2>&1 | FileCheck %s
++
++llvm.func @_QPopenmp_target_data_enter() {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
++  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
++
++  omp.target_enter_data map_entries(%2 : !llvm.ptr) nowait
++
++  llvm.return
++}
++
++// CHECK: define void @_QPopenmp_target_data_enter() {
++
++// CHECK:   %[[TASK:.*]] = call ptr @__kmpc_omp_target_task_alloc
++// CHECK-SAME:     (ptr @{{.*}}, i32 %{{.*}}, i32 {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr
++// CHECK-SAME:     @[[TASK_PROXY_FUNC:.*]], i64 {{.*}})
++
++// CHECK:   call i32 @__kmpc_omp_task(ptr {{.*}}, i32 %{{.*}}, ptr %[[TASK]])
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_BODY_FUNC:.*]](i32 %[[TID:.*]], ptr %[[TASK_ARG:.*]]) {
++// CHECK:   %[[OFFLOAD_BASE_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 0
++// CHECK:   %[[OFFLOAD_BASE_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_BASE_PTRS]], align 8
++// CHECK:   %[[OFFLOAD_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 1
++// CHECK:   %[[OFFLOAD_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_PTRS]], align 8
++
++// CHECK:  call void @__tgt_target_data_begin_nowait_mapper(
++// CHECK-SAME: ptr @{{.*}}, i64 -1, i32 1,
++// CHECK-SAME: ptr %[[OFFLOAD_BASE_PTRS_VAL]], ptr %[[OFFLOAD_PTRS_VAL]],
++// CHECK-SAME: ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr null, i32 0, ptr null, i32 0, ptr null)
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_PROXY_FUNC]](i32 %{{.*}}, ptr %{{.*}}) {
++// CHECK:   call void @[[TASK_BODY_FUNC]](i32 %{{.*}}, ptr %{{.*}})
++// CHECK: }
++
++// -----
++
++llvm.func @_QPopenmp_target_data_update() {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
++  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
++
++  omp.target_update map_entries(%2 : !llvm.ptr) nowait
++
++  llvm.return
++}
++
++// CHECK: define void @_QPopenmp_target_data_update() {
++
++// CHECK:   %[[TASK:.*]] = call ptr @__kmpc_omp_target_task_alloc
++// CHECK-SAME:     (ptr @{{.*}}, i32 %{{.*}}, i32 {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr
++// CHECK-SAME:     @[[TASK_PROXY_FUNC:.*]], i64 {{.*}})
++
++// CHECK:   call i32 @__kmpc_omp_task(ptr {{.*}}, i32 %{{.*}}, ptr %[[TASK]])
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_BODY_FUNC:.*]](i32 %[[TID:.*]], ptr %[[TASK_ARG:.*]]) {
++// CHECK:   %[[OFFLOAD_BASE_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 0
++// CHECK:   %[[OFFLOAD_BASE_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_BASE_PTRS]], align 8
++// CHECK:   %[[OFFLOAD_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 1
++// CHECK:   %[[OFFLOAD_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_PTRS]], align 8
++
++// CHECK:  call void @__tgt_target_data_update_nowait_mapper(
++// CHECK-SAME: ptr @{{.*}}, i64 -1, i32 1,
++// CHECK-SAME: ptr %[[OFFLOAD_BASE_PTRS_VAL]], ptr %[[OFFLOAD_PTRS_VAL]],
++// CHECK-SAME: ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr null, i32 0, ptr null, i32 0, ptr null)
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_PROXY_FUNC]](i32 %{{.*}}, ptr %{{.*}}) {
++// CHECK:   call void @[[TASK_BODY_FUNC]](i32 %{{.*}}, ptr %{{.*}})
++// CHECK: }
++
++// -----
++
++llvm.func @_QPopenmp_target_data_exit() {
++  %0 = llvm.mlir.constant(1 : i64) : i64
++  %1 = llvm.alloca %0 x i32 {bindc_name = "i", in_type = i32, operand_segment_sizes = array<i32: 0, 0>, uniq_name = "_QFopenmp_target_dataEi"} : (i64) -> !llvm.ptr
++  %2 = omp.map.info var_ptr(%1 : !llvm.ptr, i32)   map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
++
++  omp.target_exit_data map_entries(%2 : !llvm.ptr) nowait
++
++  llvm.return
++}
++
++// CHECK: define void @_QPopenmp_target_data_exit() {
++
++// CHECK:   %[[TASK:.*]] = call ptr @__kmpc_omp_target_task_alloc
++// CHECK-SAME:     (ptr @{{.*}}, i32 %{{.*}}, i32 {{.*}}, i64 {{.*}}, i64 {{.*}}, ptr
++// CHECK-SAME:     @[[TASK_PROXY_FUNC:.*]], i64 {{.*}})
++
++// CHECK:   call i32 @__kmpc_omp_task(ptr {{.*}}, i32 %{{.*}}, ptr %[[TASK]])
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_BODY_FUNC:.*]](i32 %[[TID:.*]], ptr %[[TASK_ARG:.*]]) {
++// CHECK:   %[[OFFLOAD_BASE_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 0
++// CHECK:   %[[OFFLOAD_BASE_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_BASE_PTRS]], align 8
++// CHECK:   %[[OFFLOAD_PTRS:.*]] = getelementptr { ptr, ptr }, ptr %[[TASK_ARG]], i32 0, i32 1
++// CHECK:   %[[OFFLOAD_PTRS_VAL:.*]] = load ptr, ptr %[[OFFLOAD_PTRS]], align 8
++
++// CHECK:  call void @__tgt_target_data_end_nowait_mapper(
++// CHECK-SAME: ptr @{{.*}}, i64 -1, i32 1,
++// CHECK-SAME: ptr %[[OFFLOAD_BASE_PTRS_VAL]], ptr %[[OFFLOAD_PTRS_VAL]],
++// CHECK-SAME: ptr @{{.*}}, ptr @{{.*}}, ptr @{{.*}}, ptr null, i32 0, ptr null, i32 0, ptr null)
++// CHECK: }
++
++// CHECK: define internal void @[[TASK_PROXY_FUNC]](i32 %{{.*}}, ptr %{{.*}}) {
++// CHECK:   call void @[[TASK_BODY_FUNC]](i32 %{{.*}}, ptr %{{.*}})
++// CHECK: }

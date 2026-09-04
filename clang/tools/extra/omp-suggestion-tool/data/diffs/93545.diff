@@ -1,0 +1,110 @@
+diff --git a/flang/include/flang/Optimizer/Transforms/Passes.h b/flang/include/flang/Optimizer/Transforms/Passes.h
+index ebdd60630c330..151719ea71ef0 100644
+--- a/flang/include/flang/Optimizer/Transforms/Passes.h
++++ b/flang/include/flang/Optimizer/Transforms/Passes.h
+@@ -51,6 +51,7 @@ namespace fir {
+ #define GEN_PASS_DECL_STACKARRAYS
+ #define GEN_PASS_DECL_LOOPVERSIONING
+ #define GEN_PASS_DECL_ADDALIASTAGS
++#define GEN_PASS_DECL_OMPMAPINFOFINALIZATIONPASS
+ #include "flang/Optimizer/Transforms/Passes.h.inc"
+ 
+ std::unique_ptr<mlir::Pass> createAffineDemotionPass();
+@@ -70,7 +71,6 @@ std::unique_ptr<mlir::Pass> createAlgebraicSimplificationPass();
+ std::unique_ptr<mlir::Pass>
+ createAlgebraicSimplificationPass(const mlir::GreedyRewriteConfig &config);
+ 
+-std::unique_ptr<mlir::Pass> createOMPMapInfoFinalizationPass();
+ std::unique_ptr<mlir::Pass> createOMPFunctionFilteringPass();
+ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+ createOMPMarkDeclareTargetPass();
+diff --git a/flang/include/flang/Optimizer/Transforms/Passes.td b/flang/include/flang/Optimizer/Transforms/Passes.td
+index f494da555f5ae..b0f1ad61251ce 100644
+--- a/flang/include/flang/Optimizer/Transforms/Passes.td
++++ b/flang/include/flang/Optimizer/Transforms/Passes.td
+@@ -324,14 +324,13 @@ def LoopVersioning : Pass<"loop-versioning", "mlir::func::FuncOp"> {
+ }
+ 
+ def OMPMapInfoFinalizationPass
+-    : Pass<"omp-map-info-finalization", "mlir::func::FuncOp"> {
++    : Pass<"omp-map-info-finalization"> {
+   let summary = "expands OpenMP MapInfo operations containing descriptors";
+   let description = [{
+     Expands MapInfo operations containing descriptor types into multiple 
+     MapInfo's for each pointer element in the descriptor that requires 
+     explicit individual mapping by the OpenMP runtime.
+   }];
+-  let constructor = "::fir::createOMPMapInfoFinalizationPass()";
+   let dependentDialects = ["mlir::omp::OpenMPDialect"];
+ }
+ 
+diff --git a/flang/include/flang/Tools/CLOptions.inc b/flang/include/flang/Tools/CLOptions.inc
+index 61ea7a7f9bbdd..e0141a3d76f0a 100644
+--- a/flang/include/flang/Tools/CLOptions.inc
++++ b/flang/include/flang/Tools/CLOptions.inc
+@@ -345,7 +345,8 @@ inline void createHLFIRToFIRPassPipeline(
+ /// rather than the host device.
+ inline void createOpenMPFIRPassPipeline(
+     mlir::PassManager &pm, bool isTargetDevice) {
+-  pm.addPass(fir::createOMPMapInfoFinalizationPass());
++  addNestedPassToAllTopLevelOperations(
++      pm, fir::createOMPMapInfoFinalizationPass);
+   pm.addPass(fir::createOMPMarkDeclareTargetPass());
+   if (isTargetDevice)
+     pm.addPass(fir::createOMPFunctionFilteringPass());
+diff --git a/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp b/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
+index 5a5d4b9e0da4e..35203fe89f5bc 100644
+--- a/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
++++ b/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
+@@ -76,7 +76,9 @@ class OMPMapInfoFinalizationPass
+     // alloca.
+     if (mlir::isa<fir::BaseBoxType>(descriptor.getType())) {
+       mlir::OpBuilder::InsertPoint insPt = builder.saveInsertionPoint();
+-      builder.setInsertionPointToStart(builder.getAllocaBlock());
++      mlir::Block *allocaBlock = builder.getAllocaBlock();
++      assert(allocaBlock && "No alloca block found for this top level op");
++      builder.setInsertionPointToStart(allocaBlock);
+       auto alloca = builder.create<fir::AllocaOp>(loc, descriptor.getType());
+       builder.restoreInsertionPoint(insPt);
+       builder.create<fir::StoreOp>(loc, descriptor, alloca);
+@@ -217,17 +219,23 @@ class OMPMapInfoFinalizationPass
+     mapClauseOwner.getMapOperandsMutable().assign(newMapOps);
+   }
+ 
+-  // This pass executes on mlir::ModuleOp's finding omp::MapInfoOp's containing
+-  // descriptor based types (allocatables, pointers, assumed shape etc.) and
+-  // expanding them into multiple omp::MapInfoOp's for each pointer member
+-  // contained within the descriptor.
++  // This pass executes on omp::MapInfoOp's containing descriptor based types
++  // (allocatables, pointers, assumed shape etc.) and expanding them into
++  // multiple omp::MapInfoOp's for each pointer member contained within the
++  // descriptor.
++  //
++  // From the perspective of the MLIR pass manager this runs on the top level
++  // operation (usually function) containing the MapInfoOp because this pass
++  // will mutate siblings of MapInfoOp.
+   void runOnOperation() override {
+-    mlir::func::FuncOp func = getOperation();
+-    mlir::ModuleOp module = func->getParentOfType<mlir::ModuleOp>();
++    mlir::ModuleOp module =
++        mlir::dyn_cast_or_null<mlir::ModuleOp>(getOperation());
++    if (!module)
++      module = getOperation()->getParentOfType<mlir::ModuleOp>();
+     fir::KindMapping kindMap = fir::getKindMapping(module);
+     fir::FirOpBuilder builder{module, std::move(kindMap)};
+ 
+-    func->walk([&](mlir::omp::MapInfoOp op) {
++    getOperation()->walk([&](mlir::omp::MapInfoOp op) {
+       // TODO: Currently only supports a single user for the MapInfoOp, this
+       // is fine for the moment as the Fortran Frontend will generate a
+       // new MapInfoOp per Target operation for the moment. However, when/if
+@@ -253,9 +261,3 @@ class OMPMapInfoFinalizationPass
+ };
+ 
+ } // namespace
+-
+-namespace fir {
+-std::unique_ptr<mlir::Pass> createOMPMapInfoFinalizationPass() {
+-  return std::make_unique<OMPMapInfoFinalizationPass>();
+-}
+-} // namespace fir

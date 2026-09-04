@@ -1,0 +1,181 @@
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index ab90b4609e855..b04d57ec30e4f 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -557,7 +557,6 @@ static void processHostEvalClauses(lower::AbstractConverter &converter,
+     HostEvalInfo &hostInfo = hostEvalInfo.back();
+ 
+     switch (extractOmpDirective(*ompEval)) {
+-    // Cases where 'teams' and target SPMD clauses might be present.
+     case OMPD_teams_distribute_parallel_do:
+     case OMPD_teams_distribute_parallel_do_simd:
+       cp.processThreadLimit(stmtCtx, hostInfo.ops);
+@@ -575,18 +574,16 @@ static void processHostEvalClauses(lower::AbstractConverter &converter,
+       cp.processCollapse(loc, eval, hostInfo.ops, hostInfo.iv);
+       break;
+ 
+-    // Cases where 'teams' clauses might be present, and target SPMD is
+-    // possible by looking at nested evaluations.
+     case OMPD_teams:
+       cp.processThreadLimit(stmtCtx, hostInfo.ops);
+       [[fallthrough]];
+     case OMPD_target_teams:
+       cp.processNumTeams(stmtCtx, hostInfo.ops);
+-      processSingleNestedIf(
+-          [](Directive nestedDir) { return topDistributeSet.test(nestedDir); });
++      processSingleNestedIf([](Directive nestedDir) {
++        return topDistributeSet.test(nestedDir) || topLoopSet.test(nestedDir);
++      });
+       break;
+ 
+-    // Cases where only 'teams' host-evaluated clauses might be present.
+     case OMPD_teams_distribute:
+     case OMPD_teams_distribute_simd:
+       cp.processThreadLimit(stmtCtx, hostInfo.ops);
+@@ -597,6 +594,16 @@ static void processHostEvalClauses(lower::AbstractConverter &converter,
+       cp.processNumTeams(stmtCtx, hostInfo.ops);
+       break;
+ 
++    case OMPD_teams_loop:
++      cp.processThreadLimit(stmtCtx, hostInfo.ops);
++      [[fallthrough]];
++    case OMPD_target_teams_loop:
++      cp.processNumTeams(stmtCtx, hostInfo.ops);
++      [[fallthrough]];
++    case OMPD_loop:
++      cp.processCollapse(loc, eval, hostInfo.ops, hostInfo.iv);
++      break;
++
+     // Standalone 'target' case.
+     case OMPD_target: {
+       processSingleNestedIf(
+diff --git a/flang/test/Lower/OpenMP/generic-loop-rewriting.f90 b/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
+index e1adf5afb0eba..eaf31e3ffb779 100644
+--- a/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
++++ b/flang/test/Lower/OpenMP/generic-loop-rewriting.f90
+@@ -11,7 +11,7 @@ subroutine target_teams_loop
+     implicit none
+     integer :: x, i
+ 
+-    !$omp target teams loop
++    !$omp teams loop
+     do i = 0, 10
+       x = x + i
+     end do
+@@ -22,19 +22,15 @@ subroutine target_teams_loop
+     implicit none
+     integer :: x, i
+ 
+-    !$omp target teams loop bind(teams)
++    !$omp teams loop bind(teams)
+     do i = 0, 10
+       x = x + i
+     end do
+ end subroutine target_teams_loop
+ 
+ !CHECK-LABEL: func.func @_QPtarget_teams_loop
+-!CHECK:         omp.target map_entries(
+-!CHECK-SAME:      %{{.*}} -> %[[I_ARG:[^[:space:]]+]],
+-!CHECK-SAME:      %{{.*}} -> %[[X_ARG:[^[:space:]]+]] : {{.*}}) {
+-
+-!CHECK:           %[[I_DECL:.*]]:2 = hlfir.declare %[[I_ARG]]
+-!CHECK:           %[[X_DECL:.*]]:2 = hlfir.declare %[[X_ARG]]
++!CHECK:           %[[I_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "{{.*}}i"}
++!CHECK:           %[[X_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "{{.*}}x"}
+ 
+ !CHECK:           omp.teams {
+ 
+@@ -51,6 +47,7 @@ end subroutine target_teams_loop
+ !CHECK-SAME:                (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
+ !CHECK:                     %[[I_PRIV_DECL:.*]]:2 = hlfir.declare %[[I_PRIV_ARG]]
+ !CHECK:                     hlfir.assign %{{.*}} to %[[I_PRIV_DECL]]#0 : i32, !fir.ref<i32>
++!CHECK:                     hlfir.assign %{{.*}} to %[[X_DECL]]#0 : i32, !fir.ref<i32>
+ !CHECK:                   }
+ !CHECK:                 }
+ !CHECK:               }
+diff --git a/flang/test/Lower/OpenMP/host-eval.f90 b/flang/test/Lower/OpenMP/host-eval.f90
+index 65258c91e5daf..fe5b9597f8620 100644
+--- a/flang/test/Lower/OpenMP/host-eval.f90
++++ b/flang/test/Lower/OpenMP/host-eval.f90
+@@ -258,3 +258,28 @@ subroutine distribute_simd()
+   !$omp end distribute simd
+   !$omp end teams
+ end subroutine distribute_simd
++
++! BOTH-LABEL: func.func @_QPloop
++subroutine loop()
++  ! BOTH: omp.target
++  
++  ! HOST-SAME: host_eval(%{{.*}} -> %[[LB:.*]], %{{.*}} -> %[[UB:.*]], %{{.*}} -> %[[STEP:.*]] : i32, i32, i32)
++  
++  ! DEVICE-NOT: host_eval({{.*}})
++  ! DEVICE-SAME: {
++
++  ! BOTH: omp.teams
++  !$omp target teams
++
++  ! BOTH: omp.parallel
++
++  ! BOTH: omp.distribute
++  ! BOTH-NEXT: omp.wsloop
++  ! BOTH-NEXT: omp.loop_nest
++
++  ! HOST-SAME: (%{{.*}}) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]])
++  !$omp loop
++  do i=1,10
++  end do
++  !$omp end target teams
++end subroutine loop
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 882bc4071482f..4ac9f49f12161 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2058,8 +2058,9 @@ TargetOp::getKernelExecFlags(Operation *capturedOp) {
+   long numWrappers = std::distance(innermostWrapper, wrappers.end());
+ 
+   // Detect Generic-SPMD: target-teams-distribute[-simd].
++  // Detect SPMD:         target-teams-loop.
+   if (numWrappers == 1) {
+-    if (!isa<DistributeOp>(innermostWrapper))
++    if (!isa<DistributeOp, LoopOp>(innermostWrapper))
+       return OMP_TGT_EXEC_MODE_GENERIC;
+ 
+     Operation *teamsOp = (*innermostWrapper)->getParentOp();
+@@ -2067,7 +2068,9 @@ TargetOp::getKernelExecFlags(Operation *capturedOp) {
+       return OMP_TGT_EXEC_MODE_GENERIC;
+ 
+     if (teamsOp->getParentOp() == targetOp.getOperation())
+-      return OMP_TGT_EXEC_MODE_GENERIC_SPMD;
++      return isa<DistributeOp>(innermostWrapper)
++                 ? OMP_TGT_EXEC_MODE_GENERIC_SPMD
++                 : OMP_TGT_EXEC_MODE_SPMD;
+   }
+ 
+   // Detect SPMD: target-teams-distribute-parallel-wsloop[-simd].
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index a5cf789402726..0a10626cd4877 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -2879,6 +2879,22 @@ func.func @omp_target_host_eval(%x : i32) {
+     }
+     omp.terminator
+   }
++
++  // CHECK: omp.target host_eval(%{{.*}} -> %[[HOST_ARG:.*]] : i32) {
++  // CHECK: omp.teams {
++  // CHECK: omp.loop {
++  // CHECK: omp.loop_nest (%{{.*}}) : i32 = (%[[HOST_ARG]]) to (%[[HOST_ARG]]) step (%[[HOST_ARG]]) {
++  omp.target host_eval(%x -> %arg0 : i32) {
++    omp.teams {
++      omp.loop {
++        omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++          omp.yield
++        }
++      }
++      omp.terminator
++    }
++    omp.terminator
++  }
+   return
+ }
+ 

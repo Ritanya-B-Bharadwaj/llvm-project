@@ -1,0 +1,376 @@
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 7df3905c29990..c1d4c089df3b2 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -139,7 +139,6 @@ void DataSharingProcessor::collectOmpObjectListSymbol(
+ }
+ 
+ void DataSharingProcessor::collectSymbolsForPrivatization() {
+-  bool hasCollapse = false;
+   for (const omp::Clause &clause : clauses) {
+     if (const auto &privateClause =
+             std::get_if<omp::clause::Private>(&clause.u)) {
+@@ -153,16 +152,11 @@ void DataSharingProcessor::collectSymbolsForPrivatization() {
+       const ObjectList &objects = std::get<ObjectList>(lastPrivateClause->t);
+       collectOmpObjectListSymbol(objects, explicitlyPrivatizedSymbols);
+       hasLastPrivateOp = true;
+-    } else if (std::get_if<omp::clause::Collapse>(&clause.u)) {
+-      hasCollapse = true;
+     }
+   }
+ 
+   for (auto *sym : explicitlyPrivatizedSymbols)
+     allPrivatizedSymbols.insert(sym);
+-
+-  if (hasCollapse && hasLastPrivateOp)
+-    TODO(converter.getCurrentLocation(), "Collapse clause with lastprivate");
+ }
+ 
+ bool DataSharingProcessor::needBarrier() {
+@@ -225,28 +219,39 @@ void DataSharingProcessor::insertLastPrivateCompare(mlir::Operation *op) {
+       mlir::Operation *lastOper = loopOp.getRegion().back().getTerminator();
+       firOpBuilder.setInsertionPoint(lastOper);
+ 
+-      mlir::Value iv = loopOp.getIVs()[0];
+-      mlir::Value ub = loopOp.getUpperBound()[0];
+-      mlir::Value step = loopOp.getStep()[0];
+-
+-      // v = iv + step
+-      // cmp = step < 0 ? v < ub : v > ub
+-      mlir::Value v = firOpBuilder.create<mlir::arith::AddIOp>(loc, iv, step);
+-      mlir::Value zero =
+-          firOpBuilder.createIntegerConstant(loc, step.getType(), 0);
+-      mlir::Value negativeStep = firOpBuilder.create<mlir::arith::CmpIOp>(
+-          loc, mlir::arith::CmpIPredicate::slt, step, zero);
+-      mlir::Value vLT = firOpBuilder.create<mlir::arith::CmpIOp>(
+-          loc, mlir::arith::CmpIPredicate::slt, v, ub);
+-      mlir::Value vGT = firOpBuilder.create<mlir::arith::CmpIOp>(
+-          loc, mlir::arith::CmpIPredicate::sgt, v, ub);
+-      mlir::Value cmpOp = firOpBuilder.create<mlir::arith::SelectOp>(
+-          loc, negativeStep, vLT, vGT);
++      mlir::Value cmpOp;
++      llvm::SmallVector<mlir::Value> vs;
++      vs.reserve(loopOp.getIVs().size());
++      for (auto [iv, ub, step] : llvm::zip_equal(
++               loopOp.getIVs(), loopOp.getUpperBound(), loopOp.getStep())) {
++        // v = iv + step
++        // cmp = step < 0 ? v < ub : v > ub
++        mlir::Value v = firOpBuilder.create<mlir::arith::AddIOp>(loc, iv, step);
++        vs.push_back(v);
++        mlir::Value zero =
++            firOpBuilder.createIntegerConstant(loc, step.getType(), 0);
++        mlir::Value negativeStep = firOpBuilder.create<mlir::arith::CmpIOp>(
++            loc, mlir::arith::CmpIPredicate::slt, step, zero);
++        mlir::Value vLT = firOpBuilder.create<mlir::arith::CmpIOp>(
++            loc, mlir::arith::CmpIPredicate::slt, v, ub);
++        mlir::Value vGT = firOpBuilder.create<mlir::arith::CmpIOp>(
++            loc, mlir::arith::CmpIPredicate::sgt, v, ub);
++        mlir::Value icmpOp = firOpBuilder.create<mlir::arith::SelectOp>(
++            loc, negativeStep, vLT, vGT);
++
++        if (cmpOp) {
++          cmpOp = firOpBuilder.create<mlir::arith::AndIOp>(loc, cmpOp, icmpOp);
++        } else {
++          cmpOp = icmpOp;
++        }
++      }
+ 
+       auto ifOp = firOpBuilder.create<fir::IfOp>(loc, cmpOp, /*else*/ false);
+       firOpBuilder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+-      assert(loopIV && "loopIV was not set");
+-      firOpBuilder.createStoreWithConvert(loc, v, loopIV);
++      for (auto [v, loopIV] : llvm::zip_equal(vs, loopIVs)) {
++        assert(loopIV && "loopIV was not set");
++        firOpBuilder.createStoreWithConvert(loc, v, loopIV);
++      }
+       lastPrivIP = firOpBuilder.saveInsertionPoint();
+     } else if (mlir::isa<mlir::omp::SectionsOp>(op)) {
+       // Already handled by genOMP()
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.h b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+index 7c0c831ed43a8..1e9d07ec13857 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.h
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+@@ -71,7 +71,7 @@ class DataSharingProcessor {
+   bool hasLastPrivateOp;
+   mlir::OpBuilder::InsertPoint lastPrivIP;
+   mlir::OpBuilder::InsertPoint insPt;
+-  mlir::Value loopIV;
++  llvm::SmallVector<mlir::Value> loopIVs;
+   // Symbols in private, firstprivate, and/or lastprivate clauses.
+   llvm::SetVector<const semantics::Symbol *> explicitlyPrivatizedSymbols;
+   llvm::SetVector<const semantics::Symbol *> defaultSymbols;
+@@ -147,10 +147,7 @@ class DataSharingProcessor {
+   void processStep1(mlir::omp::PrivateClauseOps *clauseOps = nullptr);
+   void processStep2(mlir::Operation *op, bool isLoop);
+ 
+-  void setLoopIV(mlir::Value iv) {
+-    assert(!loopIV && "Loop iteration variable already set");
+-    loopIV = iv;
+-  }
++  void pushLoopIV(mlir::Value iv) { loopIVs.push_back(iv); }
+ 
+   const llvm::SetVector<const semantics::Symbol *> &
+   getAllSymbolsToPrivatize() const {
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 47ce2d8c8db87..625a8c83c369b 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -677,8 +677,11 @@ static void createBodyOfOp(mlir::Operation &op, const OpWithBodyGenInfo &info,
+         assert(tempDsp.has_value());
+         tempDsp->processStep2(privatizationTopLevelOp, isLoop);
+       } else {
+-        if (isLoop && regionArgs.size() > 0)
+-          info.dsp->setLoopIV(info.converter.getSymbolAddress(*regionArgs[0]));
++        if (isLoop && regionArgs.size() > 0) {
++          for (const auto &regionArg : regionArgs) {
++            info.dsp->pushLoopIV(info.converter.getSymbolAddress(*regionArg));
++          }
++        }
+         info.dsp->processStep2(privatizationTopLevelOp, isLoop);
+       }
+     }
+diff --git a/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90 b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+new file mode 100644
+index 0000000000000..9b90ac28f693c
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/parallel-wsloop-lastpriv.f90
+@@ -0,0 +1,239 @@
++! This test checks lowering of OpenMP parallel DO, with the loop bound being
++! a lastprivate variable
++
++! RUN: bbc -fopenmp -emit-hlfir %s -o - | FileCheck %s
++
++! CHECK: func @_QPomp_do_lastprivate(%[[ARG0:.*]]: !fir.ref<i32> {fir.bindc_name = "a"})
++subroutine omp_do_lastprivate(a)
++  ! CHECK: %[[ARG0_DECL:.*]]:2 = hlfir.declare %[[ARG0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFomp_do_lastprivateEa"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer::a
++  integer::n
++  n = a+1
++  !$omp parallel do lastprivate(a)
++  ! CHECK:  omp.parallel {
++
++  ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, uniq_name = "_QFomp_do_lastprivateEa"}
++  ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_lastprivateEa"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
++  ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivateEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[LB:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG1:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
++  ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP]] : i32
++  ! CHECK:      %[[ZERO:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP_DIR:.*]] = arith.cmpi slt, %[[STEP]], %[[ZERO]] : i32
++  ! CHECK:      %[[LT_UB:.*]] = arith.cmpi slt, %[[NEXT_ARG1]], %[[UB]] : i32
++  ! CHECK:      %[[GT_UB:.*]] = arith.cmpi sgt, %[[NEXT_ARG1]], %[[UB]] : i32
++  ! CHECK:      %[[SEL:.*]] = arith.select %[[STEP_DIR]], %[[LT_UB]], %[[GT_UB]] : i1
++  ! CHECK:      fir.if %[[SEL]] {
++  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:      }
++
++  ! CHECK-NEXT: omp.yield
++  ! CHECK-NEXT: }
++  ! CHECK-NEXT: omp.terminator
++  ! CHECK-NEXT: }
++    do i=1, a
++      call foo(i, a)
++    end do
++  !$omp end parallel do
++  !CHECK: fir.call @_QPbar(%[[ARG0_DECL]]#1) {{.*}}: (!fir.ref<i32>) -> ()
++  call bar(a)
++end subroutine omp_do_lastprivate
++
++! CHECK: func @_QPomp_do_lastprivate2(%[[ARG0:.*]]: !fir.ref<i32> {fir.bindc_name = "a"}, %[[ARG1:.*]]: !fir.ref<i32> {fir.bindc_name = "n"})
++subroutine omp_do_lastprivate2(a, n)
++  ! CHECK:  %[[ARG0_DECL:.*]]:2 = hlfir.declare %[[ARG0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFomp_do_lastprivate2Ea"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
++  ! CHECK:  %[[ARG1_DECL:.*]]:2 = hlfir.declare %[[ARG1]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFomp_do_lastprivate2En"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer::a
++  integer::n
++  n = a+1
++  !$omp parallel do lastprivate(a, n)
++  ! CHECK:  omp.parallel {
++
++  ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, {{.*}}}
++  ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate2Ea"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[N_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "n", pinned, uniq_name = "_QFomp_do_lastprivate2En"}
++  ! CHECK: %[[N_PVT_DECL:.*]]:2 = hlfir.declare %[[N_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate2En"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
++  ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[LB:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK: %[[UB:.*]] = fir.load %[[N_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK: %[[STEP:.*]] = arith.constant 1 : i32
++  ! CHECK: omp.wsloop {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG2:.*]]) : i32 = (%[[LB]]) to (%[[UB]]) inclusive step (%[[STEP]]) {
++  ! CHECK: fir.store %[[ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
++  ! CHECK: %[[NEXT_ARG2:.*]] = arith.addi %[[ARG2]], %[[STEP]] : i32
++  ! CHECK: %[[ZERO:.*]] = arith.constant 0 : i32
++  ! CHECK: %[[STEP_DIR:.*]] = arith.cmpi slt, %[[STEP]], %[[ZERO]] : i32
++  ! CHECK: %[[LT_UB:.*]] = arith.cmpi slt, %[[NEXT_ARG2]], %[[UB]] : i32
++  ! CHECK: %[[GT_UB:.*]] = arith.cmpi sgt, %[[NEXT_ARG2]], %[[UB]] : i32
++  ! CHECK: %[[SEL:.*]] = arith.select %[[STEP_DIR]], %[[LT_UB]], %[[GT_UB]] : i1
++  ! CHECK: fir.if %[[SEL]] {
++  ! CHECK:   fir.store %[[NEXT_ARG2]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:   %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK:   hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:   %[[N_PVT_LOAD:.*]] = fir.load %[[N_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK:   hlfir.assign %[[N_PVT_LOAD]] to %[[ARG1_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK: }
++
++  ! CHECK: omp.yield
++  ! CHECK: omp.terminator
++    do i= a, n
++      call foo(i, a)
++    end do
++  !$omp end parallel do
++  !CHECK: fir.call @_QPbar(%[[ARG1_DECL]]#1) {{.*}}: (!fir.ref<i32>) -> ()
++  call bar(n)
++end subroutine omp_do_lastprivate2
++
++! CHECK: func @_QPomp_do_lastprivate_collapse2(%[[ARG0:.*]]: !fir.ref<i32> {fir.bindc_name = "a"})
++subroutine omp_do_lastprivate_collapse2(a)
++  ! CHECK: %[[ARG0_DECL:.*]]:2 = hlfir.declare %[[ARG0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFomp_do_lastprivate_collapse2Ea"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer::a
++  !$omp parallel do lastprivate(a) collapse(2)
++  ! CHECK:  omp.parallel {
++
++  ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, uniq_name = "_QFomp_do_lastprivate_collapse2Ea"}
++  ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse2Ea"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
++  ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse2Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++  !
++  ! CHECK: %[[J_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "j", pinned, {{.*}}}
++  ! CHECK: %[[J_PVT_DECL:.*]]:2 = hlfir.declare %[[J_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse2Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[LB1:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB1:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP1:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[LB2:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB2:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP2:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG1:.*]], %[[ARG2:.*]]) : i32 = (%[[LB1]], %[[LB2]]) to (%[[UB1]], %[[UB2]]) inclusive step (%[[STEP1]], %[[STEP2]]) {
++  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.store %[[ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
++  ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP1]] : i32
++  ! CHECK:      %[[ZERO1:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP1_END:.*]] = arith.cmpi slt, %[[STEP1]], %[[ZERO1]] : i32
++  ! CHECK:      %[[LT_UB1:.*]] = arith.cmpi slt, %[[NEXT_ARG1]], %[[UB1]] : i32
++  ! CHECK:      %[[GT_UB1:.*]] = arith.cmpi sgt, %[[NEXT_ARG1]], %[[UB1]] : i32
++  ! CHECK:      %[[SEL1:.*]] = arith.select %[[STEP1_END]], %[[LT_UB1]], %[[GT_UB1]] : i1
++  ! CHECK:      %[[NEXT_ARG2:.*]] = arith.addi %[[ARG2]], %[[STEP2]] : i32
++  ! CHECK:      %[[ZERO2:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP2_END:.*]] = arith.cmpi slt, %[[STEP2]], %[[ZERO2]] : i32
++  ! CHECK:      %[[LT_UB2:.*]] = arith.cmpi slt, %[[NEXT_ARG2]], %[[UB2]] : i32
++  ! CHECK:      %[[GT_UB2:.*]] = arith.cmpi sgt, %[[NEXT_ARG2]], %[[UB2]] : i32
++  ! CHECK:      %[[SEL2:.*]] = arith.select %[[STEP2_END]], %[[LT_UB2]], %[[GT_UB2]] : i1
++  ! CHECK:      %[[AND:.*]] = arith.andi %[[SEL1]], %[[SEL2]] : i1
++  ! CHECK:      fir.if %[[AND]] {
++  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:      }
++
++  ! CHECK-NEXT: omp.yield
++  ! CHECK-NEXT: }
++  ! CHECK-NEXT: omp.terminator
++  ! CHECK-NEXT: }
++    do i=1, a
++      do j=1, a
++        call foo(i, a)
++      end do
++    end do
++  !$omp end parallel do
++  !CHECK: fir.call @_QPbar(%[[ARG0_DECL]]#1) {{.*}}: (!fir.ref<i32>) -> ()
++  call bar(a)
++end subroutine omp_do_lastprivate_collapse2
++
++! CHECK: func @_QPomp_do_lastprivate_collapse3(%[[ARG0:.*]]: !fir.ref<i32> {fir.bindc_name = "a"})
++subroutine omp_do_lastprivate_collapse3(a)
++  ! CHECK: %[[ARG0_DECL:.*]]:2 = hlfir.declare %[[ARG0]] dummy_scope %{{[0-9]+}} {uniq_name = "_QFomp_do_lastprivate_collapse3Ea"} : (!fir.ref<i32>, !fir.dscope) -> (!fir.ref<i32>, !fir.ref<i32>)
++  integer::a
++  !$omp parallel do lastprivate(a) collapse(3)
++  ! CHECK:  omp.parallel {
++
++  ! CHECK: %[[A_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "a", pinned, uniq_name = "_QFomp_do_lastprivate_collapse3Ea"}
++  ! CHECK: %[[A_PVT_DECL:.*]]:2 = hlfir.declare %[[A_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ea"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[I_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "i", pinned, {{.*}}}
++  ! CHECK: %[[I_PVT_DECL:.*]]:2 = hlfir.declare %[[I_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ei"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[J_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "j", pinned, {{.*}}}
++  ! CHECK: %[[J_PVT_DECL:.*]]:2 = hlfir.declare %[[J_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ej"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[K_PVT_REF:.*]] = fir.alloca i32 {bindc_name = "k", pinned, {{.*}}}
++  ! CHECK: %[[K_PVT_DECL:.*]]:2 = hlfir.declare %[[K_PVT_REF]] {uniq_name = "_QFomp_do_lastprivate_collapse3Ek"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++
++  ! CHECK: %[[LB1:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB1:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP1:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[LB2:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB2:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP2:.*]] = arith.constant 1 : i32
++  ! CHECK: %[[LB3:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: %[[UB3:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK-NEXT: %[[STEP3:.*]] = arith.constant 1 : i32
++  ! CHECK-NEXT: omp.wsloop {
++  ! CHECK-NEXT: omp.loop_nest (%[[ARG1:.*]], %[[ARG2:.*]], %[[ARG3:.*]]) : i32 = (%[[LB1]], %[[LB2]], %[[LB3]]) to (%[[UB1]], %[[UB2]], %[[UB3]]) inclusive step (%[[STEP1]], %[[STEP2]], %[[STEP3]]) {
++  ! CHECK-NEXT: fir.store %[[ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.store %[[ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.store %[[ARG3]] to %[[K_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK-NEXT: fir.call @_QPfoo(%[[I_PVT_DECL]]#1, %[[A_PVT_DECL]]#1) {{.*}}: (!fir.ref<i32>, !fir.ref<i32>) -> ()
++  ! CHECK:      %[[NEXT_ARG1:.*]] = arith.addi %[[ARG1]], %[[STEP1]] : i32
++  ! CHECK:      %[[ZERO1:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP1_END:.*]] = arith.cmpi slt, %[[STEP1]], %[[ZERO1]] : i32
++  ! CHECK:      %[[LT_UB1:.*]] = arith.cmpi slt, %[[NEXT_ARG1]], %[[UB1]] : i32
++  ! CHECK:      %[[GT_UB1:.*]] = arith.cmpi sgt, %[[NEXT_ARG1]], %[[UB1]] : i32
++  ! CHECK:      %[[SEL1:.*]] = arith.select %[[STEP1_END]], %[[LT_UB1]], %[[GT_UB1]] : i1
++  ! CHECK:      %[[NEXT_ARG2:.*]] = arith.addi %[[ARG2]], %[[STEP2]] : i32
++  ! CHECK:      %[[ZERO2:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP2_END:.*]] = arith.cmpi slt, %[[STEP2]], %[[ZERO2]] : i32
++  ! CHECK:      %[[LT_UB2:.*]] = arith.cmpi slt, %[[NEXT_ARG2]], %[[UB2]] : i32
++  ! CHECK:      %[[GT_UB2:.*]] = arith.cmpi sgt, %[[NEXT_ARG2]], %[[UB2]] : i32
++  ! CHECK:      %[[SEL2:.*]] = arith.select %[[STEP2_END]], %[[LT_UB2]], %[[GT_UB2]] : i1
++  ! CHECK:      %[[AND1:.*]] = arith.andi %[[SEL1]], %[[SEL2]] : i1
++  ! CHECK:      %[[NEXT_ARG3:.*]] = arith.addi %[[ARG3]], %[[STEP3]] : i32
++  ! CHECK:      %[[ZERO3:.*]] = arith.constant 0 : i32
++  ! CHECK:      %[[STEP3_END:.*]] = arith.cmpi slt, %[[STEP3]], %[[ZERO3]] : i32
++  ! CHECK:      %[[LT_UB3:.*]] = arith.cmpi slt, %[[NEXT_ARG3]], %[[UB3]] : i32
++  ! CHECK:      %[[GT_UB3:.*]] = arith.cmpi sgt, %[[NEXT_ARG3]], %[[UB3]] : i32
++  ! CHECK:      %[[SEL3:.*]] = arith.select %[[STEP3_END]], %[[LT_UB3]], %[[GT_UB3]] : i1
++  ! CHECK:      %[[AND2:.*]] = arith.andi %[[AND1]], %[[SEL3]] : i1
++  ! CHECK:      fir.if %[[AND2]] {
++  ! CHECK:        fir.store %[[NEXT_ARG1]] to %[[I_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        fir.store %[[NEXT_ARG2]] to %[[J_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        fir.store %[[NEXT_ARG3]] to %[[K_PVT_DECL]]#1 : !fir.ref<i32>
++  ! CHECK:        %[[A_PVT_LOAD:.*]] = fir.load %[[A_PVT_DECL]]#0 : !fir.ref<i32>
++  ! CHECK:        hlfir.assign %[[A_PVT_LOAD]] to %[[ARG0_DECL]]#0 temporary_lhs : i32, !fir.ref<i32>
++  ! CHECK:      }
++
++  ! CHECK-NEXT: omp.yield
++  ! CHECK-NEXT: }
++  ! CHECK-NEXT: omp.terminator
++  ! CHECK-NEXT: }
++    do i=1, a
++      do j=1, a
++        do k=1, a
++          call foo(i, a)
++        end do
++      end do
++    end do
++  !$omp end parallel do
++  !CHECK: fir.call @_QPbar(%[[ARG0_DECL]]#1) {{.*}}: (!fir.ref<i32>) -> ()
++  call bar(a)
++end subroutine omp_do_lastprivate_collapse3

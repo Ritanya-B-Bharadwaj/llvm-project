@@ -1,0 +1,1176 @@
+diff --git a/flang/include/flang/Evaluate/check-expression.h b/flang/include/flang/Evaluate/check-expression.h
+index b711d289ba524..49b64468ffaa7 100644
+--- a/flang/include/flang/Evaluate/check-expression.h
++++ b/flang/include/flang/Evaluate/check-expression.h
+@@ -115,6 +115,10 @@ extern template std::optional<bool> IsContiguous(
+     const CoarrayRef &, FoldingContext &);
+ extern template std::optional<bool> IsContiguous(
+     const Symbol &, FoldingContext &);
++static inline std::optional<bool> IsContiguous(
++    const SymbolRef &s, FoldingContext &c) {
++  return IsContiguous(s.get(), c);
++}
+ template <typename A>
+ bool IsSimplyContiguous(const A &x, FoldingContext &context) {
+   return IsContiguous(x, context).value_or(false);
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 67f7e1aac40ed..066ff2e7f8b16 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -524,6 +524,8 @@ class ParseTreeDumper {
+   NODE(parser, OmpEndCriticalDirective)
+   NODE(parser, OmpEndLoopDirective)
+   NODE(parser, OmpEndSectionsDirective)
++  NODE(parser, OmpFromClause)
++  NODE_ENUM(OmpFromClause, Expectation)
+   NODE(parser, OmpIfClause)
+   NODE_ENUM(OmpIfClause, DirectiveNameModifier)
+   NODE_ENUM(OmpLastprivateClause, LastprivateModifier)
+@@ -581,6 +583,9 @@ class ParseTreeDumper {
+   NODE(parser, OmpSectionBlocks)
+   NODE(parser, OmpSectionsDirective)
+   NODE(parser, OmpSimpleStandaloneDirective)
++  NODE(parser, OmpToClause)
++  // No NODE_ENUM for OmpToClause::Expectation, because it's an alias
++  // for OmpFromClause::Expectation.
+   NODE(parser, Only)
+   NODE(parser, OpenACCAtomicConstruct)
+   NODE(parser, OpenACCBlockConstruct)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 13c3353512208..4026594b99880 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3582,6 +3582,26 @@ struct OmpDeviceTypeClause {
+   WRAPPER_CLASS_BOILERPLATE(OmpDeviceTypeClause, Type);
+ };
+ 
++// Ref: [4.5:107-109], [5.0:176-180], [5.1:205-210], [5.2:167-168]
++//
++// from-clause ->
++//    FROM(locator-list) |
++//    FROM(mapper-modifier: locator-list) |             // since 5.0
++//    FROM(motion-modifier[,] ...: locator-list)        // since 5.1
++//  motion-modifier ->
++//    PRESENT | mapper-modifier | iterator-modifier
++struct OmpFromClause {
++  ENUM_CLASS(Expectation, Present);
++  TUPLE_CLASS_BOILERPLATE(OmpFromClause);
++
++  // As in the case of MAP, modifiers are parsed as lists, even if they
++  // are unique. These restrictions will be checked in semantic checks.
++  std::tuple<std::optional<std::list<Expectation>>,
++      std::optional<std::list<OmpIteratorModifier>>, OmpObjectList,
++      bool> // were the modifiers comma-separated?
++      t;
++};
++
+ // OMP 5.2 12.6.1 grainsize-clause -> grainsize ([prescriptiveness :] value)
+ struct OmpGrainsizeClause {
+   TUPLE_CLASS_BOILERPLATE(OmpGrainsizeClause);
+@@ -3718,6 +3738,28 @@ struct OmpScheduleClause {
+       t;
+ };
+ 
++// Ref: [4.5:107-109], [5.0:176-180], [5.1:205-210], [5.2:167-168]
++//
++// to-clause (in DECLARE TARGET) ->
++//    TO(extended-list) |                               // until 5.1
++// to-clause (in TARGET UPDATE) ->
++//    TO(locator-list) |
++//    TO(mapper-modifier: locator-list) |               // since 5.0
++//    TO(motion-modifier[,] ...: locator-list)          // since 5.1
++//  motion-modifier ->
++//    PRESENT | mapper-modifier | iterator-modifier
++struct OmpToClause {
++  using Expectation = OmpFromClause::Expectation;
++  TUPLE_CLASS_BOILERPLATE(OmpToClause);
++
++  // As in the case of MAP, modifiers are parsed as lists, even if they
++  // are unique. These restrictions will be checked in semantic checks.
++  std::tuple<std::optional<std::list<Expectation>>,
++      std::optional<std::list<OmpIteratorModifier>>, OmpObjectList,
++      bool> // were the modifiers comma-separated?
++      t;
++};
++
+ // OMP 5.2 12.6.2 num_tasks-clause -> num_tasks ([prescriptiveness :] value)
+ struct OmpNumTasksClause {
+   TUPLE_CLASS_BOILERPLATE(OmpNumTasksClause);
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 8eb1fdb470917..213b6501c077f 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1019,16 +1019,22 @@ bool ClauseProcessor::processMotionClauses(lower::StatementContext &stmtCtx,
+ 
+   auto callbackFn = [&](const auto &clause, const parser::CharBlock &source) {
+     mlir::Location clauseLocation = converter.genLocation(source);
+-
++    const auto &[expectation, mapper, iterator, objects] = clause.t;
+     // TODO Support motion modifiers: present, mapper, iterator.
++    if (expectation) {
++      TODO(clauseLocation, "PRESENT modifier is not supported yet");
++    } else if (mapper) {
++      TODO(clauseLocation, "Mapper modifier is not supported yet");
++    } else if (iterator) {
++      TODO(clauseLocation, "Iterator modifier is not supported yet");
++    }
+     constexpr llvm::omp::OpenMPOffloadMappingFlags mapTypeBits =
+         std::is_same_v<llvm::remove_cvref_t<decltype(clause)>, omp::clause::To>
+             ? llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_TO
+             : llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_FROM;
+ 
+-    processMapObjects(stmtCtx, clauseLocation, std::get<ObjectList>(clause.t),
+-                      mapTypeBits, parentMemberIndices, result.mapVars,
+-                      mapSymbols);
++    processMapObjects(stmtCtx, clauseLocation, objects, mapTypeBits,
++                      parentMemberIndices, result.mapVars, mapSymbols);
+   };
+ 
+   bool clauseFound = findRepeatableClause<omp::clause::To>(callbackFn);
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 45b89de023a4b..c6cdd1dd0ca6b 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -728,21 +728,51 @@ Firstprivate make(const parser::OmpClause::Firstprivate &inp,
+ 
+ From make(const parser::OmpClause::From &inp,
+           semantics::SemanticsContext &semaCtx) {
+-  // inp.v -> parser::OmpObjectList
+-  return From{{/*Expectation=*/std::nullopt, /*Mapper=*/std::nullopt,
+-               /*Iterator=*/std::nullopt,
+-               /*LocatorList=*/makeObjects(inp.v, semaCtx)}};
++  // inp.v -> parser::OmpFromClause
++  using wrapped = parser::OmpFromClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert, parser::OmpFromClause::Expectation, From::Expectation,
++      // clang-format off
++      MS(Present, Present)
++      // clang-format on
++  );
++
++  auto &t0 = std::get<std::optional<std::list<wrapped::Expectation>>>(inp.v.t);
++  auto &t1 =
++      std::get<std::optional<std::list<parser::OmpIteratorModifier>>>(inp.v.t);
++  auto &t2 = std::get<parser::OmpObjectList>(inp.v.t);
++
++  assert((!t0 || t0->size() == 1) && "Only one expectation modifier allowed");
++  assert((!t1 || t1->size() == 1) && "Only one iterator modifier allowed");
++
++  auto expectation = [&]() -> std::optional<From::Expectation> {
++    if (t0)
++      return convert(t0->front());
++    return std::nullopt;
++  }();
++
++  auto iterator = [&]() -> std::optional<Iterator> {
++    if (t1)
++      return makeIterator(t1->front(), semaCtx);
++    return std::nullopt;
++  }();
++
++  return From{{/*Expectation=*/std::move(expectation), /*Mapper=*/std::nullopt,
++               /*Iterator=*/std::move(iterator),
++               /*LocatorList=*/makeObjects(t2, semaCtx)}};
+ }
+ 
+ // Full: empty
+ 
+ Grainsize make(const parser::OmpClause::Grainsize &inp,
+-            semantics::SemanticsContext &semaCtx) {
++               semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpGrainsizeClause
+   using wrapped = parser::OmpGrainsizeClause;
+ 
+   CLAUSET_ENUM_CONVERT( //
+-      convert, parser::OmpGrainsizeClause::Prescriptiveness, Grainsize::Prescriptiveness,
++      convert, parser::OmpGrainsizeClause::Prescriptiveness,
++      Grainsize::Prescriptiveness,
+       // clang-format off
+       MS(Strict,   Strict)
+       // clang-format on
+@@ -1274,10 +1304,39 @@ ThreadLimit make(const parser::OmpClause::ThreadLimit &inp,
+ 
+ To make(const parser::OmpClause::To &inp,
+         semantics::SemanticsContext &semaCtx) {
+-  // inp.v -> parser::OmpObjectList
+-  return To{{/*Expectation=*/std::nullopt, /*Mapper=*/std::nullopt,
+-             /*Iterator=*/std::nullopt,
+-             /*LocatorList=*/makeObjects(inp.v, semaCtx)}};
++  // inp.v -> parser::OmpToClause
++  using wrapped = parser::OmpToClause;
++
++  CLAUSET_ENUM_CONVERT( //
++      convert, parser::OmpToClause::Expectation, To::Expectation,
++      // clang-format off
++      MS(Present, Present)
++      // clang-format on
++  );
++
++  auto &t0 = std::get<std::optional<std::list<wrapped::Expectation>>>(inp.v.t);
++  auto &t1 =
++      std::get<std::optional<std::list<parser::OmpIteratorModifier>>>(inp.v.t);
++  auto &t2 = std::get<parser::OmpObjectList>(inp.v.t);
++
++  assert((!t0 || t0->size() == 1) && "Only one expectation modifier allowed");
++  assert((!t1 || t1->size() == 1) && "Only one iterator modifier allowed");
++
++  auto expectation = [&]() -> std::optional<To::Expectation> {
++    if (t0)
++      return convert(t0->front());
++    return std::nullopt;
++  }();
++
++  auto iterator = [&]() -> std::optional<Iterator> {
++    if (t1)
++      return makeIterator(t1->front(), semaCtx);
++    return std::nullopt;
++  }();
++
++  return To{{/*Expectation=*/std::move(expectation), /*Mapper=*/std::nullopt,
++             /*Iterator=*/std::move(iterator),
++             /*LocatorList=*/makeObjects(t2, semaCtx)}};
+ }
+ 
+ // UnifiedAddress: empty
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 6fde70fc5c387..be8cc517647ea 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -122,6 +122,40 @@ template <typename Separator> struct MapModifiers {
+   const Separator sep_;
+ };
+ 
++// This is almost exactly the same thing as MapModifiers. It has the same
++// issue (it expects modifiers in a specific order), and the fix for that
++// will change how modifiers are parsed. Instead of making this code more
++// generic, make it simple, and generalize after the fix is in place.
++template <typename Separator> struct MotionModifiers {
++  constexpr MotionModifiers(Separator sep) : sep_(sep) {}
++  constexpr MotionModifiers(const MotionModifiers &) = default;
++  constexpr MotionModifiers(MotionModifiers &&) = default;
++
++  // Parsing of mappers if not implemented yet.
++  using ExpParser = Parser<OmpFromClause::Expectation>;
++  using IterParser = Parser<OmpIteratorModifier>;
++  using ModParser = ConcatSeparated<Separator, ExpParser, IterParser>;
++
++  using resultType = typename ModParser::resultType;
++
++  std::optional<resultType> Parse(ParseState &state) const {
++    auto mp{ModParser(sep_, ExpParser{}, IterParser{})};
++    auto mods{mp.Parse(state)};
++    // The ModParser always "succeeds", i.e. even if the input is junk, it
++    // will return a tuple filled with nullopts. If any of the components
++    // is not a nullopt, expect a ":".
++    if (std::apply([](auto &&...opts) { return (... || !!opts); }, *mods)) {
++      if (!attempt(":"_tok).Parse(state)) {
++        return std::nullopt;
++      }
++    }
++    return std::move(mods);
++  }
++
++private:
++  const Separator sep_;
++};
++
+ // OpenMP Clauses
+ 
+ // [5.0] 2.1.6 iterator-specifier -> type-declaration-stmt = subscript-triple |
+@@ -382,6 +416,31 @@ TYPE_CONTEXT_PARSER("Omp Depend clause"_en_US,
+             maybe(Parser<OmpIteratorModifier>{} / ","_tok),
+             Parser<OmpTaskDependenceType>{} / ":", Parser<OmpObjectList>{})))
+ 
++TYPE_PARSER(construct<OmpFromClause::Expectation>(
++    "PRESENT" >> pure(OmpFromClause::Expectation::Present)))
++
++template <typename MotionClause, bool CommasEverywhere>
++static inline MotionClause makeMotionClause(
++    std::tuple<std::optional<std::list<typename MotionClause::Expectation>>,
++        std::optional<std::list<OmpIteratorModifier>>> &&mods,
++    OmpObjectList &&objs) {
++  auto &&[exp, iter] = std::move(mods);
++  return MotionClause(
++      std::move(exp), std::move(iter), std::move(objs), CommasEverywhere);
++}
++
++TYPE_PARSER(construct<OmpFromClause>(
++    applyFunction<OmpFromClause>(makeMotionClause<OmpFromClause, true>,
++        MotionModifiers(","_tok), Parser<OmpObjectList>{}) ||
++    applyFunction<OmpFromClause>(makeMotionClause<OmpFromClause, false>,
++        MotionModifiers(maybe(","_tok)), Parser<OmpObjectList>{})))
++
++TYPE_PARSER(construct<OmpToClause>(
++    applyFunction<OmpToClause>(makeMotionClause<OmpToClause, true>,
++        MotionModifiers(","_tok), Parser<OmpObjectList>{}) ||
++    applyFunction<OmpToClause>(makeMotionClause<OmpToClause, false>,
++        MotionModifiers(maybe(","_tok)), Parser<OmpObjectList>{})))
++
+ // 2.15.3.7 LINEAR (linear-list: linear-step)
+ //          linear-list -> list | modifier(list)
+ //          linear-modifier -> REF | VAL | UVAL
+@@ -475,11 +534,11 @@ TYPE_PARSER(
+                     parenthesized(scalarIntExpr))) ||
+     "FINAL" >> construct<OmpClause>(construct<OmpClause::Final>(
+                    parenthesized(scalarLogicalExpr))) ||
+-    "FULL" >> construct<OmpClause>(construct<OmpClause::Full>()) ||
+     "FIRSTPRIVATE" >> construct<OmpClause>(construct<OmpClause::Firstprivate>(
+                           parenthesized(Parser<OmpObjectList>{}))) ||
+     "FROM" >> construct<OmpClause>(construct<OmpClause::From>(
+-                  parenthesized(Parser<OmpObjectList>{}))) ||
++                  parenthesized(Parser<OmpFromClause>{}))) ||
++    "FULL" >> construct<OmpClause>(construct<OmpClause::Full>()) ||
+     "GRAINSIZE" >> construct<OmpClause>(construct<OmpClause::Grainsize>(
+                        parenthesized(Parser<OmpGrainsizeClause>{}))) ||
+     "HAS_DEVICE_ADDR" >>
+@@ -554,7 +613,7 @@ TYPE_PARSER(
+     "THREAD_LIMIT" >> construct<OmpClause>(construct<OmpClause::ThreadLimit>(
+                           parenthesized(scalarIntExpr))) ||
+     "TO" >> construct<OmpClause>(construct<OmpClause::To>(
+-                parenthesized(Parser<OmpObjectList>{}))) ||
++                parenthesized(Parser<OmpToClause>{}))) ||
+     "USE_DEVICE_PTR" >> construct<OmpClause>(construct<OmpClause::UseDevicePtr>(
+                             parenthesized(Parser<OmpObjectList>{}))) ||
+     "USE_DEVICE_ADDR" >>
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 3b0824f80161f..8215945e3c63b 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2138,6 +2138,27 @@ class UnparseVisitor {
+     Put(",");
+     Walk(std::get<std::optional<ScalarIntConstantExpr>>(x.t));
+   }
++  void Unparse(const OmpFromClause &x) {
++    auto &expect{
++        std::get<std::optional<std::list<OmpFromClause::Expectation>>>(x.t)};
++    auto &iter{std::get<std::optional<std::list<OmpIteratorModifier>>>(x.t)};
++    bool needComma{false};
++    if (expect) {
++      Walk(*expect);
++      needComma = true;
++    }
++    if (iter) {
++      if (needComma) {
++        Put(", ");
++      }
++      Walk(*iter);
++      needComma = true;
++    }
++    if (needComma) {
++      Put(": ");
++    }
++    Walk(std::get<OmpObjectList>(x.t));
++  }
+   void Unparse(const OmpIfClause &x) {
+     Walk(std::get<std::optional<OmpIfClause::DirectiveNameModifier>>(x.t), ":");
+     Walk(std::get<ScalarLogicalExpr>(x.t));
+@@ -2241,6 +2262,27 @@ class UnparseVisitor {
+     Walk(":",
+         std::get<std::optional<OmpDefaultmapClause::VariableCategory>>(x.t));
+   }
++  void Unparse(const OmpToClause &x) {
++    auto &expect{
++        std::get<std::optional<std::list<OmpToClause::Expectation>>>(x.t)};
++    auto &iter{std::get<std::optional<std::list<OmpIteratorModifier>>>(x.t)};
++    bool needComma{false};
++    if (expect) {
++      Walk(*expect);
++      needComma = true;
++    }
++    if (iter) {
++      if (needComma) {
++        Put(", ");
++      }
++      Walk(*iter);
++      needComma = true;
++    }
++    if (needComma) {
++      Put(": ");
++    }
++    Walk(std::get<OmpObjectList>(x.t));
++  }
+ #define GEN_FLANG_CLAUSE_UNPARSE
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+   void Unparse(const OmpLoopDirective &x) {
+@@ -2858,6 +2900,7 @@ class UnparseVisitor {
+   WALK_NESTED_ENUM(OmpDeviceTypeClause, Type) // OMP DEVICE_TYPE
+   WALK_NESTED_ENUM(
+       OmpReductionClause, ReductionModifier) // OMP reduction-modifier
++  WALK_NESTED_ENUM(OmpFromClause, Expectation) // OMP motion-expectation
+   WALK_NESTED_ENUM(OmpIfClause, DirectiveNameModifier) // OMP directive-modifier
+   WALK_NESTED_ENUM(OmpCancelType, Type) // OMP cancel-type
+   WALK_NESTED_ENUM(OmpOrderClause, Type) // OMP order-type
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index c813100b4b16c..5aca7a3ea851d 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "check-omp-structure.h"
+ #include "definable.h"
++#include "flang/Evaluate/check-expression.h"
+ #include "flang/Parser/parse-tree.h"
+ #include "flang/Semantics/expression.h"
+ #include "flang/Semantics/tools.h"
+@@ -268,6 +269,57 @@ bool OmpStructureChecker::IsCloselyNestedRegion(const OmpDirectiveSet &set) {
+   return false;
+ }
+ 
++namespace {
++struct ContiguousHelper {
++  ContiguousHelper(SemanticsContext &context)
++      : sctx_(context), fctx_(context.foldingContext()) {}
++
++  template <typename Contained>
++  std::optional<bool> Visit(const common::Indirection<Contained> &x) {
++    return Visit(x.value());
++  }
++  template <typename Contained>
++  std::optional<bool> Visit(const common::Reference<Contained> &x) {
++    return Visit(x.get());
++  }
++  template <typename T> std::optional<bool> Visit(const evaluate::Expr<T> &x) {
++    return common::visit([this](auto &&s) { return Visit(s); }, x.u);
++  }
++  template <typename T>
++  std::optional<bool> Visit(const evaluate::Designator<T> &x) {
++    return common::visit(
++        [this](auto &&s) { return evaluate::IsContiguous(s, fctx_); }, x.u);
++  }
++  template <typename T> std::optional<bool> Visit(const T &) {
++    // Everything else.
++    return std::nullopt;
++  }
++
++private:
++  SemanticsContext &sctx_;
++  evaluate::FoldingContext &fctx_;
++};
++} // namespace
++
++std::optional<bool> OmpStructureChecker::IsContiguous(
++    const parser::OmpObject &object) {
++  return common::visit(common::visitors{
++                           [&](const parser::Name &x) {
++                             // Any member of a common block must be contiguous.
++                             return std::optional<bool>{true};
++                           },
++                           [&](const parser::Designator &x) {
++                             evaluate::ExpressionAnalyzer ea{context_};
++                             if (MaybeExpr maybeExpr{ea.Analyze(x)}) {
++                               return ContiguousHelper{context_}.Visit(
++                                   *maybeExpr);
++                             }
++                             return std::optional<bool>{};
++                           },
++                       },
++      object.u);
++}
++
+ void OmpStructureChecker::CheckMultipleOccurrence(
+     semantics::UnorderedSymbolSet &listVars,
+     const std::list<parser::Name> &nameList, const parser::CharBlock &item,
+@@ -1466,9 +1518,10 @@ void OmpStructureChecker::Leave(const parser::OpenMPDeclareTargetConstruct &x) {
+           common::visitors{
+               [&](const parser::OmpClause::To &toClause) {
+                 toClauseFound = true;
+-                CheckSymbolNames(dir.source, toClause.v);
+-                CheckIsVarPartOfAnotherVar(dir.source, toClause.v);
+-                CheckThreadprivateOrDeclareTargetVar(toClause.v);
++                auto &objList{std::get<parser::OmpObjectList>(toClause.v.t)};
++                CheckSymbolNames(dir.source, objList);
++                CheckIsVarPartOfAnotherVar(dir.source, objList);
++                CheckThreadprivateOrDeclareTargetVar(objList);
+               },
+               [&](const parser::OmpClause::Link &linkClause) {
+                 CheckSymbolNames(dir.source, linkClause.v);
+@@ -1647,21 +1700,25 @@ void OmpStructureChecker::CheckOrderedDependClause(
+ }
+ 
+ void OmpStructureChecker::CheckTargetUpdate() {
+-  const parser::OmpClause *toClause = FindClause(llvm::omp::Clause::OMPC_to);
+-  const parser::OmpClause *fromClause =
+-      FindClause(llvm::omp::Clause::OMPC_from);
+-  if (!toClause && !fromClause) {
++  const parser::OmpClause *toWrapper{FindClause(llvm::omp::Clause::OMPC_to)};
++  const parser::OmpClause *fromWrapper{
++      FindClause(llvm::omp::Clause::OMPC_from)};
++  if (!toWrapper && !fromWrapper) {
+     context_.Say(GetContext().directiveSource,
+-        "At least one motion-clause (TO/FROM) must be specified on TARGET UPDATE construct."_err_en_US);
++        "At least one motion-clause (TO/FROM) must be specified on "
++        "TARGET UPDATE construct."_err_en_US);
+   }
+-  if (toClause && fromClause) {
++  if (toWrapper && fromWrapper) {
+     SymbolSourceMap toSymbols, fromSymbols;
++    auto &fromClause{std::get<parser::OmpClause::From>(fromWrapper->u).v};
++    auto &toClause{std::get<parser::OmpClause::To>(toWrapper->u).v};
+     GetSymbolsInObjectList(
+-        std::get<parser::OmpClause::To>(toClause->u).v, toSymbols);
++        std::get<parser::OmpObjectList>(fromClause.t), fromSymbols);
+     GetSymbolsInObjectList(
+-        std::get<parser::OmpClause::From>(fromClause->u).v, fromSymbols);
++        std::get<parser::OmpObjectList>(toClause.t), toSymbols);
++
+     for (auto &[symbol, source] : toSymbols) {
+-      auto fromSymbol = fromSymbols.find(symbol);
++      auto fromSymbol{fromSymbols.find(symbol)};
+       if (fromSymbol != fromSymbols.end()) {
+         context_.Say(source,
+             "A list item ('%s') can only appear in a TO or FROM clause, but not in both."_err_en_US,
+@@ -2515,7 +2572,6 @@ CHECK_SIMPLE_CLAUSE(DistSchedule, OMPC_dist_schedule)
+ CHECK_SIMPLE_CLAUSE(Exclusive, OMPC_exclusive)
+ CHECK_SIMPLE_CLAUSE(Final, OMPC_final)
+ CHECK_SIMPLE_CLAUSE(Flush, OMPC_flush)
+-CHECK_SIMPLE_CLAUSE(From, OMPC_from)
+ CHECK_SIMPLE_CLAUSE(Full, OMPC_full)
+ CHECK_SIMPLE_CLAUSE(Grainsize, OMPC_grainsize)
+ CHECK_SIMPLE_CLAUSE(Hint, OMPC_hint)
+@@ -3689,11 +3745,62 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Enter &x) {
+   }
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OmpClause::From &x) {
++  CheckAllowedClause(llvm::omp::Clause::OMPC_from);
++  unsigned version{context_.langOptions().OpenMPVersion};
++  using ExpMod = parser::OmpFromClause::Expectation;
++  using IterMod = parser::OmpIteratorModifier;
++
++  if (auto &expMod{std::get<std::optional<std::list<ExpMod>>>(x.v.t)}) {
++    unsigned allowedInVersion{51};
++    if (version < allowedInVersion) {
++      context_.Say(GetContext().clauseSource,
++          "The PRESENT modifier is not supported in %s, %s"_warn_en_US,
++          ThisVersion(version), TryVersion(allowedInVersion));
++    }
++    if (expMod->size() != 1) {
++      context_.Say(GetContext().clauseSource,
++          "Only one PRESENT modifier is allowed"_err_en_US);
++    }
++  }
++
++  if (auto &iterMod{std::get<std::optional<std::list<IterMod>>>(x.v.t)}) {
++    unsigned allowedInVersion{51};
++    if (version < allowedInVersion) {
++      context_.Say(GetContext().clauseSource,
++          "Iterator modifiers are not supported in %s, %s"_warn_en_US,
++          ThisVersion(version), TryVersion(allowedInVersion));
++    }
++    if (iterMod->size() != 1) {
++      context_.Say(GetContext().clauseSource,
++          "Only one iterator-modifier is allowed"_err_en_US);
++    }
++    CheckIteratorModifier(iterMod->front());
++  }
++
++  const auto &objList{std::get<parser::OmpObjectList>(x.v.t)};
++  SymbolSourceMap symbols;
++  GetSymbolsInObjectList(objList, symbols);
++  for (const auto &[sym, source] : symbols) {
++    if (!IsVariableListItem(*sym)) {
++      context_.SayWithDecl(
++          *sym, source, "'%s' must be a variable"_err_en_US, sym->name());
++    }
++  }
++
++  // Ref: [4.5:109:19]
++  // If a list item is an array section it must specify contiguous storage.
++  if (version <= 45) {
++    for (const parser::OmpObject &object : objList.v) {
++      CheckIfContiguous(object);
++    }
++  }
++}
++
+ void OmpStructureChecker::Enter(const parser::OmpClause::To &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_to);
+-  if (dirContext_.empty()) {
+-    return;
+-  }
++  unsigned version{context_.langOptions().OpenMPVersion};
++
+   // The "to" clause is only allowed on "declare target" (pre-5.1), and
+   // "target update". In the former case it can take an extended list item,
+   // in the latter a variable (a locator).
+@@ -3705,8 +3812,37 @@ void OmpStructureChecker::Enter(const parser::OmpClause::To &x) {
+     return;
+   }
+   assert(GetContext().directive == llvm::omp::OMPD_target_update);
++  using ExpMod = parser::OmpFromClause::Expectation;
++  using IterMod = parser::OmpIteratorModifier;
+ 
+-  const parser::OmpObjectList &objList{x.v};
++  if (auto &expMod{std::get<std::optional<std::list<ExpMod>>>(x.v.t)}) {
++    unsigned allowedInVersion{51};
++    if (version < allowedInVersion) {
++      context_.Say(GetContext().clauseSource,
++          "The PRESENT modifier is not supported in %s, %s"_warn_en_US,
++          ThisVersion(version), TryVersion(allowedInVersion));
++    }
++    if (expMod->size() != 1) {
++      context_.Say(GetContext().clauseSource,
++          "Only one PRESENT modifier is allowed"_err_en_US);
++    }
++  }
++
++  if (auto &iterMod{std::get<std::optional<std::list<IterMod>>>(x.v.t)}) {
++    unsigned allowedInVersion{51};
++    if (version < allowedInVersion) {
++      context_.Say(GetContext().clauseSource,
++          "Iterator modifiers are not supported in %s, %s"_warn_en_US,
++          ThisVersion(version), TryVersion(allowedInVersion));
++    }
++    if (iterMod->size() != 1) {
++      context_.Say(GetContext().clauseSource,
++          "Only one iterator-modifier is allowed"_err_en_US);
++    }
++    CheckIteratorModifier(iterMod->front());
++  }
++
++  const auto &objList{std::get<parser::OmpObjectList>(x.v.t)};
+   SymbolSourceMap symbols;
+   GetSymbolsInObjectList(objList, symbols);
+   for (const auto &[sym, source] : symbols) {
+@@ -3715,6 +3851,14 @@ void OmpStructureChecker::Enter(const parser::OmpClause::To &x) {
+           *sym, source, "'%s' must be a variable"_err_en_US, sym->name());
+     }
+   }
++
++  // Ref: [4.5:109:19]
++  // If a list item is an array section it must specify contiguous storage.
++  if (version <= 45) {
++    for (const parser::OmpObject &object : objList.v) {
++      CheckIfContiguous(object);
++    }
++  }
+ }
+ 
+ llvm::StringRef OmpStructureChecker::getClauseName(llvm::omp::Clause clause) {
+@@ -3981,21 +4125,64 @@ void OmpStructureChecker::CheckWorkshareBlockStmts(
+   }
+ }
+ 
++void OmpStructureChecker::CheckIfContiguous(const parser::OmpObject &object) {
++  if (auto contig{IsContiguous(object)}; contig && !*contig) {
++    const parser::Name *name{GetObjectName(object)};
++    assert(name && "Expecting name component");
++    context_.Say(name->source,
++        "Reference to %s must be a contiguous object"_err_en_US,
++        name->ToString());
++  }
++}
++
++namespace {
++struct NameHelper {
++  template <typename T>
++  static const parser::Name *Visit(const common::Indirection<T> &x) {
++    return Visit(x.value());
++  }
++  static const parser::Name *Visit(const parser::Substring &x) {
++    return Visit(std::get<parser::DataRef>(x.t));
++  }
++  static const parser::Name *Visit(const parser::ArrayElement &x) {
++    return Visit(x.base);
++  }
++  static const parser::Name *Visit(const parser::Designator &x) {
++    return common::visit([](auto &&s) { return Visit(s); }, x.u);
++  }
++  static const parser::Name *Visit(const parser::DataRef &x) {
++    return common::visit([](auto &&s) { return Visit(s); }, x.u);
++  }
++  static const parser::Name *Visit(const parser::OmpObject &x) {
++    return common::visit([](auto &&s) { return Visit(s); }, x.u);
++  }
++  template <typename T> static const parser::Name *Visit(T &&) {
++    return nullptr;
++  }
++  static const parser::Name *Visit(const parser::Name &x) { return &x; }
++};
++} // namespace
++
++const parser::Name *OmpStructureChecker::GetObjectName(
++    const parser::OmpObject &object) {
++  return NameHelper::Visit(object);
++}
++
+ const parser::OmpObjectList *OmpStructureChecker::GetOmpObjectList(
+     const parser::OmpClause &clause) {
+ 
+   // Clauses with OmpObjectList as its data member
+   using MemberObjectListClauses = std::tuple<parser::OmpClause::Copyprivate,
+-      parser::OmpClause::Copyin, parser::OmpClause::Firstprivate,
+-      parser::OmpClause::From, parser::OmpClause::Link,
++      parser::OmpClause::Copyin, parser::OmpClause::Enter,
++      parser::OmpClause::Firstprivate, parser::OmpClause::Link,
+       parser::OmpClause::Private, parser::OmpClause::Shared,
+-      parser::OmpClause::To, parser::OmpClause::Enter,
+       parser::OmpClause::UseDevicePtr, parser::OmpClause::UseDeviceAddr>;
+ 
+   // Clauses with OmpObjectList in the tuple
+-  using TupleObjectListClauses = std::tuple<parser::OmpClause::Allocate,
++  using TupleObjectListClauses = std::tuple<parser::OmpClause::Aligned,
++      parser::OmpClause::Allocate, parser::OmpClause::From,
+       parser::OmpClause::Lastprivate, parser::OmpClause::Map,
+-      parser::OmpClause::Reduction, parser::OmpClause::Aligned>;
++      parser::OmpClause::Reduction, parser::OmpClause::To>;
+ 
+   // TODO:: Generate the tuples using TableGen.
+   // Handle other constructs with OmpObjectList such as OpenMPThreadprivate.
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index d5fd558cea237..5e26827934796 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -138,6 +138,7 @@ class OmpStructureChecker
+   bool CheckAllowedClause(llvmOmpClause clause);
+   bool IsVariableListItem(const Symbol &sym);
+   bool IsExtendedListItem(const Symbol &sym);
++  std::optional<bool> IsContiguous(const parser::OmpObject &object);
+   void CheckMultipleOccurrence(semantics::UnorderedSymbolSet &listVars,
+       const std::list<parser::Name> &nameList, const parser::CharBlock &item,
+       const std::string &clauseName);
+@@ -221,6 +222,8 @@ class OmpStructureChecker
+       const parser::Name &name, const llvm::omp::Clause clause);
+   void CheckSharedBindingInOuterContext(
+       const parser::OmpObjectList &ompObjectList);
++  void CheckIfContiguous(const parser::OmpObject &object);
++  const parser::Name *GetObjectName(const parser::OmpObject &object);
+   const parser::OmpObjectList *GetOmpObjectList(const parser::OmpClause &);
+   void CheckPredefinedAllocatorRestriction(const parser::CharBlock &source,
+       const parser::OmpObjectList &ompObjectList);
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 359dac911b8c7..c2b5b9673239b 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -1930,7 +1930,8 @@ bool OmpAttributeVisitor::Pre(const parser::OpenMPDeclareTargetConstruct &x) {
+                  parser::Unwrap<parser::OmpClauseList>(spec.u)}) {
+     for (const auto &clause : clauseList->v) {
+       if (const auto *toClause{std::get_if<parser::OmpClause::To>(&clause.u)}) {
+-        ResolveOmpObjectList(toClause->v, Symbol::Flag::OmpDeclareTarget);
++        auto &objList{std::get<parser::OmpObjectList>(toClause->v.t)};
++        ResolveOmpObjectList(objList, Symbol::Flag::OmpDeclareTarget);
+       } else if (const auto *linkClause{
+                      std::get_if<parser::OmpClause::Link>(&clause.u)}) {
+         ResolveOmpObjectList(linkClause->v, Symbol::Flag::OmpDeclareTarget);
+diff --git a/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90 b/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90
+new file mode 100644
+index 0000000000000..7be70ba9102e1
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/from-expectation-modifier.f90
+@@ -0,0 +1,8 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: PRESENT modifier is not supported yet
++subroutine f00(x)
++  integer :: x
++  !$omp target update from(present: x)
++end
+diff --git a/flang/test/Lower/OpenMP/Todo/from-iterator-modifier.f90 b/flang/test/Lower/OpenMP/Todo/from-iterator-modifier.f90
+new file mode 100644
+index 0000000000000..973d1d1d76ba4
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/from-iterator-modifier.f90
+@@ -0,0 +1,8 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: Iterator modifier is not supported yet
++subroutine f00(x)
++  integer :: x(10)
++  !$omp target update from(iterator(i = 1:2): x(i))
++end
+diff --git a/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90 b/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90
+new file mode 100644
+index 0000000000000..f29fb8fffb1eb
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/to-expectation-modifier.f90
+@@ -0,0 +1,8 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: PRESENT modifier is not supported yet
++subroutine f00(x)
++  integer :: x
++  !$omp target update to(present: x)
++end
+diff --git a/flang/test/Lower/OpenMP/Todo/to-iterator-modifier.f90 b/flang/test/Lower/OpenMP/Todo/to-iterator-modifier.f90
+new file mode 100644
+index 0000000000000..a587373bf183a
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/to-iterator-modifier.f90
+@@ -0,0 +1,8 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: Iterator modifier is not supported yet
++subroutine f00(x)
++  integer :: x(10)
++  !$omp target update to(iterator(i = 1:2): x(i))
++end
+diff --git a/flang/test/Parser/OpenMP/declare-target-to-clause.f90 b/flang/test/Parser/OpenMP/declare-target-to-clause.f90
+new file mode 100644
+index 0000000000000..bcb23f821e403
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/declare-target-to-clause.f90
+@@ -0,0 +1,19 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++module m
++  integer :: x, y
++
++  !$omp declare target to(x, y)
++end
++
++!UNPARSE: MODULE m
++!UNPARSE:  INTEGER x, y
++!UNPARSE: !$OMP DECLARE TARGET  TO(x,y)
++!UNPARSE: END MODULE
++
++!PARSE-TREE: OmpDeclareTargetSpecifier -> OmpDeclareTargetWithClause -> OmpClauseList -> OmpClause -> To -> OmpToClause
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpObject -> Designator -> DataRef -> Name = 'y'
++!PARSE-TREE: | bool = 'true'
++
+diff --git a/flang/test/Parser/OpenMP/from-clause.f90 b/flang/test/Parser/OpenMP/from-clause.f90
+new file mode 100644
+index 0000000000000..1dcca0b611dfb
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/from-clause.f90
+@@ -0,0 +1,91 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x
++  !$omp target update from(x)
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET UPDATE  FROM(x)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> From -> OmpFromClause
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | bool = 'true'
++
++subroutine f01(x)
++  integer :: x
++  !$omp target update from(present: x)
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET UPDATE  FROM(PRESENT: x)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> From -> OmpFromClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | bool = 'true'
++
++subroutine f02(x)
++  integer :: x(10)
++  !$omp target update from(present iterator(i = 1:10): x(i))
++end
++
++!UNPARSE: SUBROUTINE f02 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TARGET UPDATE  FROM(PRESENT, ITERATOR(INTEGER i = 1_4:10_4): x(i))
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> From -> OmpFromClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpIteratorModifier -> OmpIteratorSpecifier
++!PARSE-TREE: | | TypeDeclarationStmt
++!PARSE-TREE: | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | EntityDecl
++!PARSE-TREE: | | | | Name = 'i'
++!PARSE-TREE: | | SubscriptTriplet
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '10_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '10'
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | DataRef -> Name = 'x'
++!PARSE-TREE: | | SectionSubscript -> Integer -> Expr = 'i'
++!PARSE-TREE: | | | Designator -> DataRef -> Name = 'i'
++!PARSE-TREE: | bool = 'false'
++
++subroutine f03(x)
++  integer :: x(10)
++  !$omp target update from(present, iterator(i = 1:10): x(i))
++end
++
++!UNPARSE: SUBROUTINE f03 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TARGET UPDATE  FROM(PRESENT, ITERATOR(INTEGER i = 1_4:10_4): x(i))
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> From -> OmpFromClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpIteratorModifier -> OmpIteratorSpecifier
++!PARSE-TREE: | | TypeDeclarationStmt
++!PARSE-TREE: | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | EntityDecl
++!PARSE-TREE: | | | | Name = 'i'
++!PARSE-TREE: | | SubscriptTriplet
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '10_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '10'
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | DataRef -> Name = 'x'
++!PARSE-TREE: | | SectionSubscript -> Integer -> Expr = 'i'
++!PARSE-TREE: | | | Designator -> DataRef -> Name = 'i'
++!PARSE-TREE: | bool = 'true'
+diff --git a/flang/test/Parser/OpenMP/target-update-to-clause.f90 b/flang/test/Parser/OpenMP/target-update-to-clause.f90
+new file mode 100644
+index 0000000000000..2702575847924
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/target-update-to-clause.f90
+@@ -0,0 +1,91 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00(x)
++  integer :: x
++  !$omp target update to(x)
++end
++
++!UNPARSE: SUBROUTINE f00 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET UPDATE  TO(x)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> To -> OmpToClause
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | bool = 'true'
++
++subroutine f01(x)
++  integer :: x
++  !$omp target update to(present: x)
++end
++
++!UNPARSE: SUBROUTINE f01 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP TARGET UPDATE  TO(PRESENT: x)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> To -> OmpToClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | bool = 'true'
++
++subroutine f02(x)
++  integer :: x(10)
++  !$omp target update to(present iterator(i = 1:10): x(i))
++end
++
++!UNPARSE: SUBROUTINE f02 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TARGET UPDATE  TO(PRESENT, ITERATOR(INTEGER i = 1_4:10_4): x(i))
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> To -> OmpToClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpIteratorModifier -> OmpIteratorSpecifier
++!PARSE-TREE: | | TypeDeclarationStmt
++!PARSE-TREE: | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | EntityDecl
++!PARSE-TREE: | | | | Name = 'i'
++!PARSE-TREE: | | SubscriptTriplet
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '10_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '10'
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | DataRef -> Name = 'x'
++!PARSE-TREE: | | SectionSubscript -> Integer -> Expr = 'i'
++!PARSE-TREE: | | | Designator -> DataRef -> Name = 'i'
++!PARSE-TREE: | bool = 'false'
++
++subroutine f03(x)
++  integer :: x(10)
++  !$omp target update to(present, iterator(i = 1:10): x(i))
++end
++
++!UNPARSE: SUBROUTINE f03 (x)
++!UNPARSE:  INTEGER x(10_4)
++!UNPARSE: !$OMP TARGET UPDATE  TO(PRESENT, ITERATOR(INTEGER i = 1_4:10_4): x(i))
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpSimpleStandaloneDirective -> llvm::omp::Directive = target update
++!PARSE-TREE: OmpClauseList -> OmpClause -> To -> OmpToClause
++!PARSE-TREE: | Expectation = Present
++!PARSE-TREE: | OmpIteratorModifier -> OmpIteratorSpecifier
++!PARSE-TREE: | | TypeDeclarationStmt
++!PARSE-TREE: | | | DeclarationTypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
++!PARSE-TREE: | | | EntityDecl
++!PARSE-TREE: | | | | Name = 'i'
++!PARSE-TREE: | | SubscriptTriplet
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '1_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | Scalar -> Integer -> Expr = '10_4'
++!PARSE-TREE: | | | | LiteralConstant -> IntLiteralConstant = '10'
++!PARSE-TREE: | OmpObjectList -> OmpObject -> Designator -> DataRef -> ArrayElement
++!PARSE-TREE: | | DataRef -> Name = 'x'
++!PARSE-TREE: | | SectionSubscript -> Integer -> Expr = 'i'
++!PARSE-TREE: | | | Designator -> DataRef -> Name = 'i'
++!PARSE-TREE: | bool = 'true'
+diff --git a/flang/test/Semantics/OpenMP/from-clause-v45.f90 b/flang/test/Semantics/OpenMP/from-clause-v45.f90
+new file mode 100644
+index 0000000000000..9c418a400e548
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/from-clause-v45.f90
+@@ -0,0 +1,32 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=45
++
++subroutine f00(x)
++  integer :: x(10)
++!ERROR: Reference to x must be a contiguous object
++  !$omp target update from(x(1:10:2))
++end
++
++subroutine f01(x)
++  integer :: x(10)
++!WARNING: Iterator modifiers are not supported in OpenMP v4.5, try -fopenmp-version=51
++  !$omp target update from(iterator(i = 1:5): x(i))
++end
++
++subroutine f02(x)
++  integer :: x(10)
++!WARNING: The PRESENT modifier is not supported in OpenMP v4.5, try -fopenmp-version=51
++!WARNING: Iterator modifiers are not supported in OpenMP v4.5, try -fopenmp-version=51
++  !$omp target update from(present, iterator(i = 1:5): x(i))
++end
++
++subroutine f03(x)
++  integer :: x(10)
++!WARNING: The PRESENT modifier is not supported in OpenMP v4.5, try -fopenmp-version=51
++!ERROR: Only one PRESENT modifier is allowed
++  !$omp target update from(present, present: x)
++end
++
++subroutine f04
++!ERROR: 'f04' must be a variable
++  !$omp target update from(f04)
++end
+diff --git a/flang/test/Semantics/OpenMP/from-clause-v51.f90 b/flang/test/Semantics/OpenMP/from-clause-v51.f90
+new file mode 100644
+index 0000000000000..18139f04c35cf
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/from-clause-v51.f90
+@@ -0,0 +1,18 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=51
++
++subroutine f01(x)
++  integer :: x(10)
++!ERROR: Only one iterator-modifier is allowed
++  !$omp target update from(iterator(i = 1:5), iterator(j = 1:5): x(i + j))
++end
++
++subroutine f03(x)
++  integer :: x(10)
++!ERROR: Only one PRESENT modifier is allowed
++  !$omp target update from(present, present: x)
++end
++
++subroutine f04
++!ERROR: 'f04' must be a variable
++  !$omp target update from(f04)
++end
+diff --git a/flang/test/Semantics/OpenMP/to-clause-v45.f90 b/flang/test/Semantics/OpenMP/to-clause-v45.f90
+new file mode 100644
+index 0000000000000..39e842492ef08
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/to-clause-v45.f90
+@@ -0,0 +1,32 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=45
++
++subroutine f00(x)
++  integer :: x(10)
++!ERROR: Reference to x must be a contiguous object
++  !$omp target update to(x(1:10:2))
++end
++
++subroutine f01(x)
++  integer :: x(10)
++!WARNING: Iterator modifiers are not supported in OpenMP v4.5, try -fopenmp-version=51
++  !$omp target update to(iterator(i = 1:5): x(i))
++end
++
++subroutine f02(x)
++  integer :: x(10)
++!WARNING: The PRESENT modifier is not supported in OpenMP v4.5, try -fopenmp-version=51
++!WARNING: Iterator modifiers are not supported in OpenMP v4.5, try -fopenmp-version=51
++  !$omp target update to(present, iterator(i = 1:5): x(i))
++end
++
++subroutine f03(x)
++  integer :: x(10)
++!WARNING: The PRESENT modifier is not supported in OpenMP v4.5, try -fopenmp-version=51
++!ERROR: Only one PRESENT modifier is allowed
++  !$omp target update to(present, present: x)
++end
++
++subroutine f04
++!ERROR: 'f04' must be a variable
++  !$omp target update to(f04)
++end
+diff --git a/flang/test/Semantics/OpenMP/to-clause-v51.f90 b/flang/test/Semantics/OpenMP/to-clause-v51.f90
+new file mode 100644
+index 0000000000000..d4f5f15efeb97
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/to-clause-v51.f90
+@@ -0,0 +1,18 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=51
++
++subroutine f01(x)
++  integer :: x(10)
++!ERROR: Only one iterator-modifier is allowed
++  !$omp target update to(iterator(i = 1:5), iterator(j = 1:5): x(i + j))
++end
++
++subroutine f03(x)
++  integer :: x(10)
++!ERROR: Only one PRESENT modifier is allowed
++  !$omp target update to(present, present: x)
++end
++
++subroutine f04
++!ERROR: 'f04' must be a variable
++  !$omp target update to(f04)
++end
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 97496d4aae5ae..741a68b8e50e8 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -181,7 +181,7 @@ def OMPC_Flush : Clause<"flush"> {
+ }
+ def OMPC_From : Clause<"from"> {
+   let clangClass = "OMPFromClause";
+-  let flangClass = "OmpObjectList";
++  let flangClass = "OmpFromClause";
+ }
+ def OMPC_Full: Clause<"full"> {
+   let clangClass = "OMPFullClause";
+@@ -462,7 +462,7 @@ def OMPC_Threads : Clause<"threads"> {
+ }
+ def OMPC_To : Clause<"to"> {
+   let clangClass = "OMPToClause";
+-  let flangClass = "OmpObjectList";
++  let flangClass = "OmpToClause";
+ }
+ def OMPC_UnifiedAddress : Clause<"unified_address"> {
+   let clangClass = "OMPUnifiedAddressClause";

@@ -1,0 +1,111 @@
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index c1d4c089df3b2..7e76a81e0df92 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -17,6 +17,7 @@
+ #include "flang/Lower/SymbolMap.h"
+ #include "flang/Optimizer/Builder/HLFIRTools.h"
+ #include "flang/Optimizer/Builder/Todo.h"
++#include "flang/Optimizer/HLFIR/HLFIROps.h"
+ #include "flang/Semantics/tools.h"
+ 
+ namespace Fortran {
+@@ -127,8 +128,52 @@ void DataSharingProcessor::copyFirstPrivateSymbol(
+ void DataSharingProcessor::copyLastPrivateSymbol(
+     const semantics::Symbol *sym,
+     [[maybe_unused]] mlir::OpBuilder::InsertPoint *lastPrivIP) {
+-  if (sym->test(semantics::Symbol::Flag::OmpLastPrivate))
+-    converter.copyHostAssociateVar(*sym, lastPrivIP);
++  if (sym->test(semantics::Symbol::Flag::OmpLastPrivate)) {
++    bool allocatable = semantics::IsAllocatable(sym->GetUltimate());
++    if (!allocatable) {
++      converter.copyHostAssociateVar(*sym, lastPrivIP);
++      return;
++    }
++
++    // copyHostAssociateVar doesn't work properly if the privatised copy was
++    // reallocated (e.g. by assignment): it will only copy if the ultimate
++    // symbol was already allocated, and it only copies data so any reallocated
++    // lengths etc are lost
++
++    // 1) Fetch the original copy of the variable.
++    assert(sym->has<Fortran::semantics::HostAssocDetails>() &&
++           "No host-association found");
++    const Fortran::semantics::Symbol &hsym = sym->GetUltimate();
++    Fortran::lower::SymbolBox hsb = symTable->lookupOneLevelUpSymbol(hsym);
++    assert(hsb && "Host symbol box not found");
++
++    // 2) Fetch the copied one that will mask the original.
++    Fortran::lower::SymbolBox sb = symTable->shallowLookupSymbol(sym);
++    assert(sb && "Host-associated symbol box not found");
++    assert(hsb.getAddr() != sb.getAddr() &&
++           "Host and associated symbol boxes are the same");
++
++    // 3) Perform the assignment.
++    fir::FirOpBuilder &builder = converter.getFirOpBuilder();
++    mlir::Location loc = converter.genLocation(sym->name());
++    mlir::OpBuilder::InsertPoint insPt = builder.saveInsertionPoint();
++    if (lastPrivIP && lastPrivIP->isSet())
++      builder.restoreInsertionPoint(*lastPrivIP);
++    else
++      builder.setInsertionPointAfter(sb.getAddr().getDefiningOp());
++
++    hlfir::Entity dst{hsb.getAddr()};
++    hlfir::Entity src{sb.getAddr()};
++    builder.create<hlfir::AssignOp>(
++        loc, src, dst, /*isWholeAllocatableAssignment=*/allocatable,
++        /*keepLhsLengthInAllocatableAssignment=*/false,
++        /*temporary_lhs=*/false);
++
++    if (lastPrivIP && lastPrivIP->isSet() &&
++        sym->test(Fortran::semantics::Symbol::Flag::OmpLastPrivate)) {
++      builder.restoreInsertionPoint(insPt);
++    }
++  }
+ }
+ 
+ void DataSharingProcessor::collectOmpObjectListSymbol(
+diff --git a/flang/test/Lower/OpenMP/lastprivate-allocatable.f90 b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+new file mode 100644
+index 0000000000000..41bbb182aade2
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/lastprivate-allocatable.f90
+@@ -0,0 +1,38 @@
++! RUN: %flang_fc1 -emit-hlfir -o - -fopenmp %s | FileCheck %s
++! RUN: bbc -emit-hlfir -o - -fopenmp %s | FileCheck %s
++
++program lastprivate_allocatable
++  integer, allocatable :: a
++  integer :: i
++  ! a is unallocated here
++  !$omp parallel do lastprivate(a)
++  do i=1,1
++    a = 42
++  enddo
++  !$omp end parallel do
++  ! a should be allocated here
++end program
++
++! CHECK-LABEL:   func.func @_QQmain()
++! CHECK:           %[[VAL_0:.*]] = fir.alloca !fir.box<!fir.heap<i32>> {bindc_name = "a", uniq_name = "_QFEa"}
++! CHECK:           %[[VAL_1:.*]] = fir.zero_bits !fir.heap<i32>
++! CHECK:           %[[VAL_2:.*]] = fir.embox %[[VAL_1]] : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++! CHECK:           fir.store %[[VAL_2]] to %[[VAL_0]] : !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK:           %[[VAL_3:.*]]:2 = hlfir.declare %[[VAL_0]] {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEa"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
++! CHECK:           omp.parallel {
++!                    create original copy of private variable
++! CHECK:             %[[VAL_16:.*]]:2 = hlfir.declare %{{.*}} {fortran_attrs = {{.*}}<allocatable>, uniq_name = "_QFEa"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
++! CHECK:             %[[VAL_17:.*]] = fir.alloca i32 {bindc_name = "i", pinned, uniq_name = "_QFEi"}
++! CHECK:             %[[VAL_18:.*]]:2 = hlfir.declare %[[VAL_17]] {uniq_name = "_QFEi"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
++! CHECK:             omp.wsloop {
++! CHECK:               omp.loop_nest
++!                        [...]
++!                        if this is the last iteration
++! CHECK:                 fir.if %{{.*}} {
++!                          store loop IV
++! CHECK:                   fir.store %{{.*}} to %[[VAL_18]]#1 : !fir.ref<i32>
++!                          assign private variable to original copy: realloc
++! CHECK:                   hlfir.assign %[[VAL_16]]#0 to %[[VAL_3]]#0 realloc : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>
++! CHECK-NEXT:            }
++! CHECK-NEXT:            omp.yield
++! CHECK-NEXT:          }

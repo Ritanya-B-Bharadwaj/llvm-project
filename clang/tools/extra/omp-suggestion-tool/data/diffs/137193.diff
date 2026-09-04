@@ -1,0 +1,211 @@
+diff --git a/clang/lib/CodeGen/CGStmtOpenMP.cpp b/clang/lib/CodeGen/CGStmtOpenMP.cpp
+index 156f64bb5f508..cd3ded088ee27 100644
+--- a/clang/lib/CodeGen/CGStmtOpenMP.cpp
++++ b/clang/lib/CodeGen/CGStmtOpenMP.cpp
+@@ -4345,8 +4345,9 @@ void CodeGenFunction::EmitOMPSectionsDirective(const OMPSectionsDirective &S) {
+     using InsertPointTy = llvm::OpenMPIRBuilder::InsertPointTy;
+     using BodyGenCallbackTy = llvm::OpenMPIRBuilder::StorableBodyGenCallbackTy;
+ 
+-    auto FiniCB = [this](InsertPointTy IP) {
+-      OMPBuilderCBHelpers::FinalizeOMPRegion(*this, IP);
++    auto FiniCB = [](InsertPointTy IP) {
++      // Don't FinalizeOMPRegion because this is done inside of OMPIRBuilder for
++      // sections.
+       return llvm::Error::success();
+     };
+ 
+diff --git a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+index a693a3cf05d8b..1c96be056aad1 100644
+--- a/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMPIRBuilder.cpp
+@@ -2172,6 +2172,9 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createSections(
+   if (!updateToLocation(Loc))
+     return Loc.IP;
+ 
++  // FiniCBWrapper needs to create a branch to the loop finalization block, but
++  // this has not been created yet at some times when this callback runs.
++  SmallVector<BranchInst *> CancellationBranches;
+   auto FiniCBWrapper = [&](InsertPointTy IP) {
+     if (IP.getBlock()->end() != IP.getPoint())
+       return FiniCB(IP);
+@@ -2179,16 +2182,9 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createSections(
+     // will fail because that function requires the Finalization Basic Block to
+     // have a terminator, which is already removed by EmitOMPRegionBody.
+     // IP is currently at cancelation block.
+-    // We need to backtrack to the condition block to fetch
+-    // the exit block and create a branch from cancelation
+-    // to exit block.
+-    IRBuilder<>::InsertPointGuard IPG(Builder);
+-    Builder.restoreIP(IP);
+-    auto *CaseBB = IP.getBlock()->getSinglePredecessor();
+-    auto *CondBB = CaseBB->getSinglePredecessor()->getSinglePredecessor();
+-    auto *ExitBB = CondBB->getTerminator()->getSuccessor(1);
+-    Instruction *I = Builder.CreateBr(ExitBB);
+-    IP = InsertPointTy(I->getParent(), I->getIterator());
++    BranchInst *DummyBranch = Builder.CreateBr(IP.getBlock());
++    IP = InsertPointTy(DummyBranch->getParent(), DummyBranch->getIterator());
++    CancellationBranches.push_back(DummyBranch);
+     return FiniCB(IP);
+   };
+ 
+@@ -2251,6 +2247,9 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createSections(
+     return WsloopIP.takeError();
+   InsertPointTy AfterIP = *WsloopIP;
+ 
++  BasicBlock *LoopFini = AfterIP.getBlock()->getSinglePredecessor();
++  assert(LoopFini && "Bad structure of static workshare loop finalization");
++
+   // Apply the finalization callback in LoopAfterBB
+   auto FiniInfo = FinalizationStack.pop_back_val();
+   assert(FiniInfo.DK == OMPD_sections &&
+@@ -2264,6 +2263,12 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createSections(
+     AfterIP = {FiniBB, FiniBB->begin()};
+   }
+ 
++  // Now we can fix the dummy branch to point to the right place
++  for (BranchInst *DummyBranch : CancellationBranches) {
++    assert(DummyBranch->getNumSuccessors() == 1);
++    DummyBranch->setSuccessor(0, LoopFini);
++  }
++
+   return AfterIP;
+ }
+ 
+diff --git a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+index b7f63d1b00d37..e172b003176a5 100644
+--- a/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
++++ b/mlir/lib/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.cpp
+@@ -161,7 +161,8 @@ static LogicalResult checkImplementationStatus(Operation &op) {
+   auto checkCancelDirective = [&todo](auto op, LogicalResult &result) {
+     omp::ClauseCancellationConstructType cancelledDirective =
+         op.getCancelDirective();
+-    if (cancelledDirective != omp::ClauseCancellationConstructType::Parallel)
++    if (cancelledDirective != omp::ClauseCancellationConstructType::Parallel &&
++        cancelledDirective != omp::ClauseCancellationConstructType::Sections)
+       result = todo("cancel directive construct type not yet supported");
+   };
+   auto checkDepend = [&todo](auto op, LogicalResult &result) {
+@@ -1688,10 +1689,11 @@ convertOmpSections(Operation &opInst, llvm::IRBuilderBase &builder,
+   auto finiCB = [&](InsertPointTy codeGenIP) { return llvm::Error::success(); };
+ 
+   allocaIP = findAllocaInsertPoint(builder, moduleTranslation);
++  bool isCancellable = constructIsCancellable(sectionsOp);
+   llvm::OpenMPIRBuilder::LocationDescription ompLoc(builder);
+   llvm::OpenMPIRBuilder::InsertPointOrErrorTy afterIP =
+       moduleTranslation.getOpenMPBuilder()->createSections(
+-          ompLoc, allocaIP, sectionCBs, privCB, finiCB, false,
++          ompLoc, allocaIP, sectionCBs, privCB, finiCB, isCancellable,
+           sectionsOp.getNowait());
+ 
+   if (failed(handleError(afterIP, opInst)))
+diff --git a/mlir/test/Target/LLVMIR/openmp-cancel.mlir b/mlir/test/Target/LLVMIR/openmp-cancel.mlir
+index 1f67d6ceb34af..fca16b936fc85 100644
+--- a/mlir/test/Target/LLVMIR/openmp-cancel.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-cancel.mlir
+@@ -80,3 +80,79 @@ llvm.func @cancel_parallel_if(%arg0 : i1) {
+ // CHECK:         br label %[[VAL_23]]
+ // CHECK:       omp.par.exit.exitStub:                            ; preds = %[[VAL_31]], %[[VAL_26]]
+ // CHECK:         ret void
++
++llvm.func @cancel_sections_if(%cond : i1) {
++  omp.sections {
++    omp.section {
++      omp.cancel cancellation_construct_type(sections) if(%cond)
++      omp.terminator
++    }
++    omp.terminator
++  }
++  llvm.return
++}
++// CHECK-LABEL: define void @cancel_sections_if
++// CHECK:         %[[VAL_0:.*]] = alloca i32, align 4
++// CHECK:         %[[VAL_1:.*]] = alloca i32, align 4
++// CHECK:         %[[VAL_2:.*]] = alloca i32, align 4
++// CHECK:         %[[VAL_3:.*]] = alloca i32, align 4
++// CHECK:         br label %[[VAL_4:.*]]
++// CHECK:       entry:                                            ; preds = %[[VAL_5:.*]]
++// CHECK:         br label %[[VAL_6:.*]]
++// CHECK:       omp_section_loop.preheader:                       ; preds = %[[VAL_4]]
++// CHECK:         store i32 0, ptr %[[VAL_1]], align 4
++// CHECK:         store i32 0, ptr %[[VAL_2]], align 4
++// CHECK:         store i32 1, ptr %[[VAL_3]], align 4
++// CHECK:         %[[VAL_7:.*]] = call i32 @__kmpc_global_thread_num(ptr @1)
++// CHECK:         call void @__kmpc_for_static_init_4u(ptr @1, i32 %[[VAL_7]], i32 34, ptr %[[VAL_0]], ptr %[[VAL_1]], ptr %[[VAL_2]], ptr %[[VAL_3]], i32 1, i32 0)
++// CHECK:         %[[VAL_8:.*]] = load i32, ptr %[[VAL_1]], align 4
++// CHECK:         %[[VAL_9:.*]] = load i32, ptr %[[VAL_2]], align 4
++// CHECK:         %[[VAL_10:.*]] = sub i32 %[[VAL_9]], %[[VAL_8]]
++// CHECK:         %[[VAL_11:.*]] = add i32 %[[VAL_10]], 1
++// CHECK:         br label %[[VAL_12:.*]]
++// CHECK:       omp_section_loop.header:                          ; preds = %[[VAL_13:.*]], %[[VAL_6]]
++// CHECK:         %[[VAL_14:.*]] = phi i32 [ 0, %[[VAL_6]] ], [ %[[VAL_15:.*]], %[[VAL_13]] ]
++// CHECK:         br label %[[VAL_16:.*]]
++// CHECK:       omp_section_loop.cond:                            ; preds = %[[VAL_12]]
++// CHECK:         %[[VAL_17:.*]] = icmp ult i32 %[[VAL_14]], %[[VAL_11]]
++// CHECK:         br i1 %[[VAL_17]], label %[[VAL_18:.*]], label %[[VAL_19:.*]]
++// CHECK:       omp_section_loop.body:                            ; preds = %[[VAL_16]]
++// CHECK:         %[[VAL_20:.*]] = add i32 %[[VAL_14]], %[[VAL_8]]
++// CHECK:         %[[VAL_21:.*]] = mul i32 %[[VAL_20]], 1
++// CHECK:         %[[VAL_22:.*]] = add i32 %[[VAL_21]], 0
++// CHECK:         switch i32 %[[VAL_22]], label %[[VAL_23:.*]] [
++// CHECK:           i32 0, label %[[VAL_24:.*]]
++// CHECK:         ]
++// CHECK:       omp_section_loop.body.case:                       ; preds = %[[VAL_18]]
++// CHECK:         br label %[[VAL_25:.*]]
++// CHECK:       omp.section.region:                               ; preds = %[[VAL_24]]
++// CHECK:         br i1 %[[VAL_26:.*]], label %[[VAL_27:.*]], label %[[VAL_28:.*]]
++// CHECK:       9:                                                ; preds = %[[VAL_25]]
++// CHECK:         %[[VAL_29:.*]] = call i32 @__kmpc_global_thread_num(ptr @1)
++// CHECK:         %[[VAL_30:.*]] = call i32 @__kmpc_cancel(ptr @1, i32 %[[VAL_29]], i32 3)
++// CHECK:         %[[VAL_31:.*]] = icmp eq i32 %[[VAL_30]], 0
++// CHECK:         br i1 %[[VAL_31]], label %[[VAL_32:.*]], label %[[VAL_33:.*]]
++// CHECK:       .split:                                           ; preds = %[[VAL_27]]
++// CHECK:         br label %[[VAL_34:.*]]
++// CHECK:       12:                                               ; preds = %[[VAL_25]]
++// CHECK:         br label %[[VAL_34]]
++// CHECK:       13:                                               ; preds = %[[VAL_28]], %[[VAL_32]]
++// CHECK:         br label %[[VAL_35:.*]]
++// CHECK:       omp.region.cont:                                  ; preds = %[[VAL_34]]
++// CHECK:         br label %[[VAL_23]]
++// CHECK:       omp_section_loop.body.sections.after:             ; preds = %[[VAL_35]], %[[VAL_18]]
++// CHECK:         br label %[[VAL_13]]
++// CHECK:       omp_section_loop.inc:                             ; preds = %[[VAL_23]]
++// CHECK:         %[[VAL_15]] = add nuw i32 %[[VAL_14]], 1
++// CHECK:         br label %[[VAL_12]]
++// CHECK:       omp_section_loop.exit:                            ; preds = %[[VAL_33]], %[[VAL_16]]
++// CHECK:         call void @__kmpc_for_static_fini(ptr @1, i32 %[[VAL_7]])
++// CHECK:         %[[VAL_36:.*]] = call i32 @__kmpc_global_thread_num(ptr @1)
++// CHECK:         call void @__kmpc_barrier(ptr @2, i32 %[[VAL_36]])
++// CHECK:         br label %[[VAL_37:.*]]
++// CHECK:       omp_section_loop.after:                           ; preds = %[[VAL_19]]
++// CHECK:         br label %[[VAL_38:.*]]
++// CHECK:       omp_section_loop.aftersections.fini:              ; preds = %[[VAL_37]]
++// CHECK:         ret void
++// CHECK:       .cncl:                                            ; preds = %[[VAL_27]]
++// CHECK:         br label %[[VAL_19]]
+diff --git a/mlir/test/Target/LLVMIR/openmp-todo.mlir b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+index a408a5a9c8682..0cc96deacd954 100644
+--- a/mlir/test/Target/LLVMIR/openmp-todo.mlir
++++ b/mlir/test/Target/LLVMIR/openmp-todo.mlir
+@@ -42,22 +42,6 @@ llvm.func @cancel_wsloop(%lb : i32, %ub : i32, %step: i32) {
+ 
+ // -----
+ 
+-llvm.func @cancel_sections() {
+-  // expected-error@below {{LLVM Translation failed for operation: omp.sections}}
+-  omp.sections {
+-    omp.section {
+-      // expected-error@below {{not yet implemented: Unhandled clause cancel directive construct type not yet supported in omp.cancel operation}}
+-      // expected-error@below {{LLVM Translation failed for operation: omp.cancel}}
+-      omp.cancel cancellation_construct_type(sections)
+-      omp.terminator
+-    }
+-    omp.terminator
+-  }
+-  llvm.return
+-}
+-
+-// -----
+-
+ llvm.func @cancel_taskgroup() {
+   // expected-error@below {{LLVM Translation failed for operation: omp.taskgroup}}
+   omp.taskgroup {

@@ -1,0 +1,199 @@
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.h b/llvm/include/llvm/Frontend/OpenMP/OMP.h
+index ec8ae68f1c2ca..6f7a39acac1d3 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.h
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.h
+@@ -16,9 +16,15 @@
+ #include "llvm/Frontend/OpenMP/OMP.h.inc"
+ 
+ #include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/SmallVector.h"
+ 
+ namespace llvm::omp {
+ ArrayRef<Directive> getLeafConstructs(Directive D);
++ArrayRef<Directive> getLeafConstructsOrSelf(Directive D);
++
++ArrayRef<Directive>
++getLeafOrCompositeConstructs(Directive D, SmallVectorImpl<Directive> &Output);
++
+ Directive getCompoundConstruct(ArrayRef<Directive> Parts);
+ 
+ bool isLeafConstruct(Directive D);
+diff --git a/llvm/lib/Frontend/OpenMP/OMP.cpp b/llvm/lib/Frontend/OpenMP/OMP.cpp
+index 1ffc38b63b0a5..c1556ff3c74d7 100644
+--- a/llvm/lib/Frontend/OpenMP/OMP.cpp
++++ b/llvm/lib/Frontend/OpenMP/OMP.cpp
+@@ -25,6 +25,54 @@ using namespace llvm::omp;
+ #define GEN_DIRECTIVES_IMPL
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+ 
++static iterator_range<ArrayRef<Directive>::iterator>
++getFirstCompositeRange(iterator_range<ArrayRef<Directive>::iterator> Leafs) {
++  // OpenMP Spec 5.2: [17.3, 8-9]
++  // If directive-name-A and directive-name-B both correspond to loop-
++  // associated constructs then directive-name is a composite construct
++  // otherwise directive-name is a combined construct.
++  //
++  // In the list of leaf constructs, find the first loop-associated construct,
++  // this is the beginning of the returned range. Then, starting from the
++  // immediately following leaf construct, find the first sequence of adjacent
++  // loop-associated constructs. The last of those is the last one of the
++  // range, that is, the end of the range is one past that element.
++  // If such a sequence of adjacent loop-associated directives does not exist,
++  // return an empty range.
++  //
++  // The end of the returned range (including empty range) is intended to be
++  // a point from which the search for the next range could resume.
++  //
++  // Consequently, this function can't return a range with a single leaf
++  // construct in it.
++
++  auto firstLoopAssociated =
++      [](iterator_range<ArrayRef<Directive>::iterator> List) {
++        for (auto It = List.begin(), End = List.end(); It != End; ++It) {
++          if (getDirectiveAssociation(*It) == Association::Loop)
++            return It;
++        }
++        return List.end();
++      };
++
++  auto Empty = llvm::make_range(Leafs.end(), Leafs.end());
++
++  auto Begin = firstLoopAssociated(Leafs);
++  if (Begin == Leafs.end())
++    return Empty;
++
++  auto End =
++      firstLoopAssociated(llvm::make_range(std::next(Begin), Leafs.end()));
++  if (End == Leafs.end())
++    return Empty;
++
++  for (; End != Leafs.end(); ++End) {
++    if (getDirectiveAssociation(*End) != Association::Loop)
++      break;
++  }
++  return llvm::make_range(Begin, End);
++}
++
+ namespace llvm::omp {
+ ArrayRef<Directive> getLeafConstructs(Directive D) {
+   auto Idx = static_cast<std::size_t>(D);
+@@ -34,6 +82,44 @@ ArrayRef<Directive> getLeafConstructs(Directive D) {
+   return ArrayRef(&Row[2], static_cast<int>(Row[1]));
+ }
+ 
++ArrayRef<Directive> getLeafConstructsOrSelf(Directive D) {
++  if (auto Leafs = getLeafConstructs(D); !Leafs.empty())
++    return Leafs;
++  auto Idx = static_cast<size_t>(D);
++  assert(Idx < Directive_enumSize && "Invalid directive");
++  const auto *Row = LeafConstructTable[LeafConstructTableOrdering[Idx]];
++  // The first entry in the row is the directive itself.
++  return ArrayRef(&Row[0], &Row[0] + 1);
++}
++
++ArrayRef<Directive>
++getLeafOrCompositeConstructs(Directive D, SmallVectorImpl<Directive> &Output) {
++  using ArrayTy = ArrayRef<Directive>;
++  using IteratorTy = ArrayTy::iterator;
++  ArrayRef<Directive> Leafs = getLeafConstructsOrSelf(D);
++
++  IteratorTy Iter = Leafs.begin();
++  do {
++    auto Range = getFirstCompositeRange(llvm::make_range(Iter, Leafs.end()));
++    // All directives before the range are leaf constructs.
++    for (; Iter != Range.begin(); ++Iter)
++      Output.push_back(*Iter);
++    if (!Range.empty()) {
++      Directive Comp =
++          getCompoundConstruct(ArrayTy(Range.begin(), Range.end()));
++      assert(Comp != OMPD_unknown);
++      Output.push_back(Comp);
++      Iter = Range.end();
++      // As of now, a composite construct must contain all constituent leaf
++      // constructs from some point until the end of all constituent leaf
++      // constructs.
++      assert(Iter == Leafs.end() && "Malformed directive");
++    }
++  } while (Iter != Leafs.end());
++
++  return Output;
++}
++
+ Directive getCompoundConstruct(ArrayRef<Directive> Parts) {
+   if (Parts.empty())
+     return OMPD_unknown;
+@@ -88,20 +174,11 @@ Directive getCompoundConstruct(ArrayRef<Directive> Parts) {
+ bool isLeafConstruct(Directive D) { return getLeafConstructs(D).empty(); }
+ 
+ bool isCompositeConstruct(Directive D) {
+-  // OpenMP Spec 5.2: [17.3, 8-9]
+-  // If directive-name-A and directive-name-B both correspond to loop-
+-  // associated constructs then directive-name is a composite construct
+-  llvm::ArrayRef<Directive> Leafs{getLeafConstructs(D)};
+-  if (Leafs.empty())
+-    return false;
+-  if (getDirectiveAssociation(Leafs.front()) != Association::Loop)
++  ArrayRef<Directive> Leafs = getLeafConstructsOrSelf(D);
++  if (Leafs.size() <= 1)
+     return false;
+-
+-  size_t numLoopConstructs =
+-      llvm::count_if(Leafs.drop_front(), [](Directive L) {
+-        return getDirectiveAssociation(L) == Association::Loop;
+-      });
+-  return numLoopConstructs != 0;
++  auto Range = getFirstCompositeRange(Leafs);
++  return Range.begin() == Leafs.begin() && Range.end() == Leafs.end();
+ }
+ 
+ bool isCombinedConstruct(Directive D) {
+diff --git a/llvm/unittests/Frontend/OpenMPCompositionTest.cpp b/llvm/unittests/Frontend/OpenMPCompositionTest.cpp
+index 8a5117226d5a8..920b445427e7e 100644
+--- a/llvm/unittests/Frontend/OpenMPCompositionTest.cpp
++++ b/llvm/unittests/Frontend/OpenMPCompositionTest.cpp
+@@ -7,6 +7,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/Frontend/OpenMP/OMP.h"
+ #include "gtest/gtest.h"
+ 
+@@ -40,6 +41,37 @@ TEST(Composition, GetCompoundConstruct) {
+   ASSERT_EQ(C7, OMPD_do_simd); // Make sure it's not OMPD_end_do_simd
+ }
+ 
++TEST(Composition, GetLeafOrCompositeConstructs) {
++  SmallVector<Directive> Out1;
++  auto Ret1 = getLeafOrCompositeConstructs(
++      OMPD_target_teams_distribute_parallel_for, Out1);
++  ASSERT_EQ(Ret1, ArrayRef<Directive>(Out1));
++  ASSERT_EQ((ArrayRef<Directive>(Out1)),
++            (ArrayRef<Directive>{OMPD_target, OMPD_teams,
++                                 OMPD_distribute_parallel_for}));
++
++  SmallVector<Directive> Out2;
++  auto Ret2 =
++      getLeafOrCompositeConstructs(OMPD_parallel_masked_taskloop_simd, Out2);
++  ASSERT_EQ(Ret2, ArrayRef<Directive>(Out2));
++  ASSERT_EQ(
++      (ArrayRef<Directive>(Out2)),
++      (ArrayRef<Directive>{OMPD_parallel, OMPD_masked, OMPD_taskloop_simd}));
++
++  SmallVector<Directive> Out3;
++  auto Ret3 =
++      getLeafOrCompositeConstructs(OMPD_distribute_parallel_do_simd, Out3);
++  ASSERT_EQ(Ret3, ArrayRef<Directive>(Out3));
++  ASSERT_EQ((ArrayRef<Directive>(Out3)),
++            (ArrayRef<Directive>{OMPD_distribute_parallel_do_simd}));
++
++  SmallVector<Directive> Out4;
++  auto Ret4 = getLeafOrCompositeConstructs(OMPD_target_parallel_loop, Out4);
++  ASSERT_EQ(Ret4, ArrayRef<Directive>(Out4));
++  ASSERT_EQ((ArrayRef<Directive>(Out4)),
++            (ArrayRef<Directive>{OMPD_target, OMPD_parallel, OMPD_loop}));
++}
++
+ TEST(Composition, IsLeafConstruct) {
+   ASSERT_TRUE(isLeafConstruct(OMPD_loop));
+   ASSERT_TRUE(isLeafConstruct(OMPD_teams));

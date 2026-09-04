@@ -1,0 +1,146 @@
+diff --git a/flang/include/flang/Lower/AbstractConverter.h b/flang/include/flang/Lower/AbstractConverter.h
+index 607aff41f6459..c24f43737df50 100644
+--- a/flang/include/flang/Lower/AbstractConverter.h
++++ b/flang/include/flang/Lower/AbstractConverter.h
+@@ -130,9 +130,18 @@ class AbstractConverter {
+   virtual void
+   createHostAssociateVarCloneDealloc(const Fortran::semantics::Symbol &sym) = 0;
+ 
+-  virtual void copyHostAssociateVar(
+-      const Fortran::semantics::Symbol &sym,
+-      mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr) = 0;
++  /// For a host-associated symbol (a symbol associated with another symbol from
++  /// an enclosing scope), either:
++  ///
++  /// * if \p hostIsSource == true: copy \p sym's value *from* its corresponding
++  /// host symbol,
++  ///
++  /// * if \p hostIsSource == false: copy \p sym's value *to* its corresponding
++  /// host symbol.
++  virtual void
++  copyHostAssociateVar(const Fortran::semantics::Symbol &sym,
++                       mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr,
++                       bool hostIsSource = true) = 0;
+ 
+   virtual void copyVar(mlir::Location loc, mlir::Value dst, mlir::Value src,
+                        fir::FortranVariableFlagsEnum attrs) = 0;
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index 37f51d74d23f8..700ca56141a32 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -891,9 +891,10 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+                  isPointer, Fortran::semantics::Symbol::Flags());
+   }
+ 
+-  void copyHostAssociateVar(
+-      const Fortran::semantics::Symbol &sym,
+-      mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr) override final {
++  void
++  copyHostAssociateVar(const Fortran::semantics::Symbol &sym,
++                       mlir::OpBuilder::InsertPoint *copyAssignIP = nullptr,
++                       bool hostIsSource = true) override final {
+     // 1) Fetch the original copy of the variable.
+     assert(sym.has<Fortran::semantics::HostAssocDetails>() &&
+            "No host-association found");
+@@ -908,16 +909,14 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+            "Host and associated symbol boxes are the same");
+ 
+     // 3) Perform the assignment.
+-    mlir::OpBuilder::InsertPoint insPt = builder->saveInsertionPoint();
++    mlir::OpBuilder::InsertionGuard guard(*builder);
+     if (copyAssignIP && copyAssignIP->isSet())
+       builder->restoreInsertionPoint(*copyAssignIP);
+     else
+       builder->setInsertionPointAfter(sb.getAddr().getDefiningOp());
+ 
+     Fortran::lower::SymbolBox *lhs_sb, *rhs_sb;
+-    if (copyAssignIP && copyAssignIP->isSet() &&
+-        sym.test(Fortran::semantics::Symbol::Flag::OmpLastPrivate)) {
+-      // lastprivate case
++    if (!hostIsSource) {
+       lhs_sb = &hsb;
+       rhs_sb = &sb;
+     } else {
+@@ -926,11 +925,6 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+     }
+ 
+     copyVar(sym, *lhs_sb, *rhs_sb, sym.flags());
+-
+-    if (copyAssignIP && copyAssignIP->isSet() &&
+-        sym.test(Fortran::semantics::Symbol::Flag::OmpLastPrivate)) {
+-      builder->restoreInsertionPoint(insPt);
+-    }
+   }
+ 
+   void genEval(Fortran::lower::pft::Evaluation &eval,
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 9dfdbd8337ae9..5b89816850bed 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -145,7 +145,7 @@ void DataSharingProcessor::copyFirstPrivateSymbol(
+ void DataSharingProcessor::copyLastPrivateSymbol(
+     const semantics::Symbol *sym, mlir::OpBuilder::InsertPoint *lastPrivIP) {
+   if (sym->test(semantics::Symbol::Flag::OmpLastPrivate))
+-    converter.copyHostAssociateVar(*sym, lastPrivIP);
++    converter.copyHostAssociateVar(*sym, lastPrivIP, /*hostIsSource=*/false);
+ }
+ 
+ void DataSharingProcessor::collectOmpObjectListSymbol(
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index a02ad27d33e06..52541bb91481d 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2082,7 +2082,7 @@ genSectionsOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       const auto &objList = std::get<ObjectList>(lastp->t);
+       for (const Object &object : objList) {
+         semantics::Symbol *sym = object.sym();
+-        converter.copyHostAssociateVar(*sym, &insp);
++        converter.copyHostAssociateVar(*sym, &insp, /*hostIsSource=*/false);
+       }
+     }
+   }
+diff --git a/flang/test/Lower/OpenMP/same_var_first_lastprivate.f90 b/flang/test/Lower/OpenMP/same_var_first_lastprivate.f90
+new file mode 100644
+index 0000000000000..c49a0908b721e
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/same_var_first_lastprivate.f90
+@@ -0,0 +1,39 @@
++! RUN: %flang_fc1 -fopenmp -emit-hlfir %s -o - | FileCheck %s
++
++subroutine first_and_lastprivate
++  integer i
++  integer :: var = 1
++
++  !$omp parallel do firstprivate(var) lastprivate(var)
++  do i=1,1
++  end do
++  !$omp end parallel do
++end subroutine
++
++! CHECK:  omp.private {type = firstprivate} @{{.*}}Evar_firstprivate_ref_i32 : {{.*}} alloc {
++! CHECK:    %[[ALLOC:.*]] = fir.alloca i32 {{.*}}
++! CHECK:    %[[ALLOC_DECL:.*]]:2 = hlfir.declare %[[ALLOC]]
++! CHECK:    omp.yield(%[[ALLOC_DECL]]#0 : !fir.ref<i32>)
++! CHECK:  } copy {
++! CHECK: ^{{.*}}(%[[ORIG_REF:.*]]: {{.*}}, %[[PRIV_REF:.*]]: {{.*}}):
++! CHECK:    %[[ORIG_VAL:.*]] = fir.load %[[ORIG_REF]]
++! CHECK:    hlfir.assign %[[ORIG_VAL]] to %[[PRIV_REF]]
++! CHECK:    omp.yield(%[[PRIV_REF]] : !fir.ref<i32>)
++! CHECK:  }
++
++! CHECK:  func.func @{{.*}}first_and_lastprivate()
++! CHECK:    %[[ORIG_VAR_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "{{.*}}Evar"}
++! CHECK:    omp.parallel {
++! CHECK:      omp.barrier
++! CHECK:      omp.wsloop private(@{{.*}}var_firstprivate_ref_i32 {{.*}}) {
++! CHECK:        omp.loop_nest {{.*}} {
++! CHECK:          %[[PRIV_VAR_DECL:.*]]:2 = hlfir.declare %{{.*}} {uniq_name = "{{.*}}Evar"}
++! CHECK:          fir.if %{{.*}} {
++! CHECK:            %[[PRIV_VAR_VAL:.*]] = fir.load %[[PRIV_VAR_DECL]]#0 : !fir.ref<i32>
++! CHECK:            hlfir.assign %[[PRIV_VAR_VAL]] to %[[ORIG_VAR_DECL]]#0
++! CHECK:          }
++! CHECK:          omp.yield
++! CHECK:        }
++! CHECK:      }
++! CHECK:      omp.terminator
++! CHECK:    }

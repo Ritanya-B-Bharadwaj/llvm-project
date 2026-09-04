@@ -1,0 +1,411 @@
+diff --git a/flang/include/flang/Lower/AbstractConverter.h b/flang/include/flang/Lower/AbstractConverter.h
+index 307ba6a918777..8f026ac3280bf 100644
+--- a/flang/include/flang/Lower/AbstractConverter.h
++++ b/flang/include/flang/Lower/AbstractConverter.h
+@@ -88,6 +88,9 @@ class AbstractConverter {
+   /// Get the mlir instance of a symbol.
+   virtual mlir::Value getSymbolAddress(SymbolRef sym) = 0;
+ 
++  virtual fir::ExtendedValue
++  symBoxToExtendedValue(const Fortran::lower::SymbolBox &symBox) = 0;
++
+   virtual fir::ExtendedValue
+   getSymbolExtendedValue(const Fortran::semantics::Symbol &sym,
+                          Fortran::lower::SymMap *symMap = nullptr) = 0;
+diff --git a/flang/include/flang/Lower/ConvertVariable.h b/flang/include/flang/Lower/ConvertVariable.h
+index de394a39e112e..b9d7f89138032 100644
+--- a/flang/include/flang/Lower/ConvertVariable.h
++++ b/flang/include/flang/Lower/ConvertVariable.h
+@@ -70,6 +70,11 @@ void defaultInitializeAtRuntime(Fortran::lower::AbstractConverter &converter,
+                                 const Fortran::semantics::Symbol &sym,
+                                 Fortran::lower::SymMap &symMap);
+ 
++/// Call clone initialization runtime routine to initialize \p sym's value.
++void initializeCloneAtRuntime(Fortran::lower::AbstractConverter &converter,
++                              const Fortran::semantics::Symbol &sym,
++                              Fortran::lower::SymMap &symMap);
++
+ /// Create a fir::GlobalOp given a module variable definition. This is intended
+ /// to be used when lowering a module definition, not when lowering variables
+ /// used from a module. For used variables instantiateVariable must directly be
+diff --git a/flang/include/flang/Optimizer/Builder/Runtime/Derived.h b/flang/include/flang/Optimizer/Builder/Runtime/Derived.h
+index d8b06f35b1da8..21a9a56c7ddc3 100644
+--- a/flang/include/flang/Optimizer/Builder/Runtime/Derived.h
++++ b/flang/include/flang/Optimizer/Builder/Runtime/Derived.h
+@@ -26,6 +26,12 @@ namespace fir::runtime {
+ void genDerivedTypeInitialize(fir::FirOpBuilder &builder, mlir::Location loc,
+                               mlir::Value box);
+ 
++/// Generate call to derived type clone initialization runtime routine to
++/// initialize \p newBox from \p box.
++void genDerivedTypeInitializeClone(fir::FirOpBuilder &builder,
++                                   mlir::Location loc, mlir::Value newBox,
++                                   mlir::Value box);
++
+ /// Generate call to derived type destruction runtime routine to
+ /// destroy \p box.
+ void genDerivedTypeDestroy(fir::FirOpBuilder &builder, mlir::Location loc,
+diff --git a/flang/include/flang/Runtime/derived-api.h b/flang/include/flang/Runtime/derived-api.h
+index 79aa7d82de881..96374c5a3c234 100644
+--- a/flang/include/flang/Runtime/derived-api.h
++++ b/flang/include/flang/Runtime/derived-api.h
+@@ -32,6 +32,13 @@ extern "C" {
+ void RTDECL(Initialize)(
+     const Descriptor &, const char *sourceFile = nullptr, int sourceLine = 0);
+ 
++// Initializes an object clone from the original object.
++// Each allocatable member of the clone is allocated with the same bounds as
++// in the original object, if it is also allocated in it.
++// The descriptor must be initialized and non-null.
++void RTDECL(InitializeClone)(const Descriptor &, const Descriptor &,
++    const char *sourceFile = nullptr, int sourceLine = 0);
++
+ // Finalizes an object and its components.  Deallocates any
+ // allocatable/automatic components.  Does not deallocate the descriptor's
+ // storage.
+diff --git a/flang/lib/Lower/Bridge.cpp b/flang/lib/Lower/Bridge.cpp
+index de2b941b688be..2ab29c2a2a1dd 100644
+--- a/flang/lib/Lower/Bridge.cpp
++++ b/flang/lib/Lower/Bridge.cpp
+@@ -556,8 +556,8 @@ class FirConverter : public Fortran::lower::AbstractConverter {
+     return lookupSymbol(sym).getAddr();
+   }
+ 
+-  fir::ExtendedValue
+-  symBoxToExtendedValue(const Fortran::lower::SymbolBox &symBox) {
++  fir::ExtendedValue symBoxToExtendedValue(
++      const Fortran::lower::SymbolBox &symBox) override final {
+     return symBox.match(
+         [](const Fortran::lower::SymbolBox::Intrinsic &box)
+             -> fir::ExtendedValue { return box.getAddr(); },
+diff --git a/flang/lib/Lower/ConvertVariable.cpp b/flang/lib/Lower/ConvertVariable.cpp
+index ff122c21e37ad..9ee42d5cd8800 100644
+--- a/flang/lib/Lower/ConvertVariable.cpp
++++ b/flang/lib/Lower/ConvertVariable.cpp
+@@ -798,6 +798,20 @@ void Fortran::lower::defaultInitializeAtRuntime(
+   }
+ }
+ 
++/// Call clone initialization runtime routine to initialize \p sym's value.
++void Fortran::lower::initializeCloneAtRuntime(
++    Fortran::lower::AbstractConverter &converter,
++    const Fortran::semantics::Symbol &sym, Fortran::lower::SymMap &symMap) {
++  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
++  mlir::Location loc = converter.getCurrentLocation();
++  fir::ExtendedValue exv = converter.getSymbolExtendedValue(sym, &symMap);
++  mlir::Value newBox = builder.createBox(loc, exv);
++  lower::SymbolBox hsb = converter.lookupOneLevelUpSymbol(sym);
++  fir::ExtendedValue hexv = converter.symBoxToExtendedValue(hsb);
++  mlir::Value box = builder.createBox(loc, hexv);
++  fir::runtime::genDerivedTypeInitializeClone(builder, loc, newBox, box);
++}
++
+ enum class VariableCleanUp { Finalize, Deallocate };
+ /// Check whether a local variable needs to be finalized according to clause
+ /// 7.5.6.3 point 3 or if it is an allocatable that must be deallocated. Note
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+index 99835c515463b..cd312537551ea 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.cpp
+@@ -116,6 +116,23 @@ void DataSharingProcessor::cloneSymbol(const semantics::Symbol *sym) {
+       *sym, /*skipDefaultInit=*/isFirstPrivate);
+   (void)success;
+   assert(success && "Privatization failed due to existing binding");
++
++  // Initialize clone from original object if it has any allocatable member.
++  auto needInitClone = [&] {
++    if (isFirstPrivate)
++      return false;
++
++    SymbolBox sb = symTable.lookupSymbol(sym);
++    assert(sb);
++    mlir::Value addr = sb.getAddr();
++    assert(addr);
++    return hlfir::mayHaveAllocatableComponent(addr.getType());
++  };
++
++  if (needInitClone()) {
++    Fortran::lower::initializeCloneAtRuntime(converter, *sym, symTable);
++    callsInitClone = true;
++  }
+ }
+ 
+ void DataSharingProcessor::copyFirstPrivateSymbol(
+@@ -165,8 +182,8 @@ bool DataSharingProcessor::needBarrier() {
+   // variables.
+   // Emit implicit barrier for linear clause. Maybe on somewhere else.
+   for (const semantics::Symbol *sym : allPrivatizedSymbols) {
+-    if (sym->test(semantics::Symbol::Flag::OmpFirstPrivate) &&
+-        sym->test(semantics::Symbol::Flag::OmpLastPrivate))
++    if (sym->test(semantics::Symbol::Flag::OmpLastPrivate) &&
++        (sym->test(semantics::Symbol::Flag::OmpFirstPrivate) || callsInitClone))
+       return true;
+   }
+   return false;
+diff --git a/flang/lib/Lower/OpenMP/DataSharingProcessor.h b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+index 2f5c69cc264ce..8c7a222ec939f 100644
+--- a/flang/lib/Lower/OpenMP/DataSharingProcessor.h
++++ b/flang/lib/Lower/OpenMP/DataSharingProcessor.h
+@@ -86,6 +86,7 @@ class DataSharingProcessor {
+   lower::pft::Evaluation &eval;
+   bool shouldCollectPreDeterminedSymbols;
+   bool useDelayedPrivatization;
++  bool callsInitClone = false;
+   lower::SymMap &symTable;
+   OMPConstructSymbolVisitor visitor;
+ 
+diff --git a/flang/lib/Optimizer/Builder/Runtime/Derived.cpp b/flang/lib/Optimizer/Builder/Runtime/Derived.cpp
+index fe7e2d157ad9a..25b41518a90e5 100644
+--- a/flang/lib/Optimizer/Builder/Runtime/Derived.cpp
++++ b/flang/lib/Optimizer/Builder/Runtime/Derived.cpp
+@@ -29,6 +29,21 @@ void fir::runtime::genDerivedTypeInitialize(fir::FirOpBuilder &builder,
+   builder.create<fir::CallOp>(loc, func, args);
+ }
+ 
++void fir::runtime::genDerivedTypeInitializeClone(fir::FirOpBuilder &builder,
++                                                 mlir::Location loc,
++                                                 mlir::Value newBox,
++                                                 mlir::Value box) {
++  auto func =
++      fir::runtime::getRuntimeFunc<mkRTKey(InitializeClone)>(loc, builder);
++  auto fTy = func.getFunctionType();
++  auto sourceFile = fir::factory::locationToFilename(builder, loc);
++  auto sourceLine =
++      fir::factory::locationToLineNo(builder, loc, fTy.getInput(3));
++  auto args = fir::runtime::createArguments(builder, loc, fTy, newBox, box,
++                                            sourceFile, sourceLine);
++  builder.create<fir::CallOp>(loc, func, args);
++}
++
+ void fir::runtime::genDerivedTypeDestroy(fir::FirOpBuilder &builder,
+                                          mlir::Location loc, mlir::Value box) {
+   auto func = fir::runtime::getRuntimeFunc<mkRTKey(Destroy)>(loc, builder);
+diff --git a/flang/runtime/derived-api.cpp b/flang/runtime/derived-api.cpp
+index eca784be208d1..c8ffd8e3bb67c 100644
+--- a/flang/runtime/derived-api.cpp
++++ b/flang/runtime/derived-api.cpp
+@@ -31,6 +31,16 @@ void RTDEF(Initialize)(
+   }
+ }
+ 
++void RTDEF(InitializeClone)(const Descriptor &clone, const Descriptor &orig,
++    const char *sourceFile, int sourceLine) {
++  if (const DescriptorAddendum * addendum{clone.Addendum()}) {
++    if (const auto *derived{addendum->derivedType()}) {
++      Terminator terminator{sourceFile, sourceLine};
++      InitializeClone(clone, orig, *derived, terminator);
++    }
++  }
++}
++
+ void RTDEF(Destroy)(const Descriptor &descriptor) {
+   if (const DescriptorAddendum * addendum{descriptor.Addendum()}) {
+     if (const auto *derived{addendum->derivedType()}) {
+diff --git a/flang/runtime/derived.cpp b/flang/runtime/derived.cpp
+index 659f54fa344bb..7c164ff890452 100644
+--- a/flang/runtime/derived.cpp
++++ b/flang/runtime/derived.cpp
+@@ -122,6 +122,84 @@ RT_API_ATTRS int Initialize(const Descriptor &instance,
+   return stat;
+ }
+ 
++RT_API_ATTRS int InitializeClone(const Descriptor &clone,
++    const Descriptor &orig, const typeInfo::DerivedType &derived,
++    Terminator &terminator, bool hasStat, const Descriptor *errMsg) {
++  const Descriptor &componentDesc{derived.component()};
++  std::size_t elements{orig.Elements()};
++  int stat{StatOk};
++
++  // Initialize each data component.
++  std::size_t components{componentDesc.Elements()};
++  for (std::size_t i{0}; i < components; ++i) {
++    const typeInfo::Component &comp{
++        *componentDesc.ZeroBasedIndexedElement<typeInfo::Component>(i)};
++    SubscriptValue at[maxRank];
++    orig.GetLowerBounds(at);
++    // Allocate allocatable components that are also allocated in the original
++    // object.
++    if (comp.genre() == typeInfo::Component::Genre::Allocatable) {
++      // Initialize each element.
++      for (std::size_t j{0}; j < elements; ++j, orig.IncrementSubscripts(at)) {
++        Descriptor &origDesc{
++            *orig.ElementComponent<Descriptor>(at, comp.offset())};
++        Descriptor &cloneDesc{
++            *clone.ElementComponent<Descriptor>(at, comp.offset())};
++        if (origDesc.IsAllocated()) {
++          cloneDesc.ApplyMold(origDesc, origDesc.rank());
++          stat = ReturnError(terminator, cloneDesc.Allocate(), errMsg, hasStat);
++          if (stat == StatOk) {
++            if (const DescriptorAddendum * addendum{cloneDesc.Addendum()}) {
++              if (const typeInfo::DerivedType *
++                  derived{addendum->derivedType()}) {
++                if (!derived->noInitializationNeeded()) {
++                  // Perform default initialization for the allocated element.
++                  stat = Initialize(
++                      cloneDesc, *derived, terminator, hasStat, errMsg);
++                }
++                // Initialize derived type's allocatables.
++                if (stat == StatOk) {
++                  stat = InitializeClone(cloneDesc, origDesc, *derived,
++                      terminator, hasStat, errMsg);
++                }
++              }
++            }
++          }
++        }
++        if (stat != StatOk) {
++          break;
++        }
++      }
++    } else if (comp.genre() == typeInfo::Component::Genre::Data &&
++        comp.derivedType()) {
++      // Handle nested derived types.
++      const typeInfo::DerivedType &compType{*comp.derivedType()};
++      SubscriptValue extents[maxRank];
++      GetComponentExtents(extents, comp, orig);
++      // Data components don't have descriptors, allocate them.
++      StaticDescriptor<maxRank, true, 0> origStaticDesc;
++      StaticDescriptor<maxRank, true, 0> cloneStaticDesc;
++      Descriptor &origDesc{origStaticDesc.descriptor()};
++      Descriptor &cloneDesc{cloneStaticDesc.descriptor()};
++      // Initialize each element.
++      for (std::size_t j{0}; j < elements; ++j, orig.IncrementSubscripts(at)) {
++        origDesc.Establish(compType,
++            orig.ElementComponent<char>(at, comp.offset()), comp.rank(),
++            extents);
++        cloneDesc.Establish(compType,
++            clone.ElementComponent<char>(at, comp.offset()), comp.rank(),
++            extents);
++        stat = InitializeClone(
++            cloneDesc, origDesc, compType, terminator, hasStat, errMsg);
++        if (stat != StatOk) {
++          break;
++        }
++      }
++    }
++  }
++  return stat;
++}
++
+ static RT_API_ATTRS const typeInfo::SpecialBinding *FindFinal(
+     const typeInfo::DerivedType &derived, int rank) {
+   if (const auto *ranked{derived.FindSpecialBinding(
+diff --git a/flang/runtime/derived.h b/flang/runtime/derived.h
+index b4863df8db417..f5a1e219b848c 100644
+--- a/flang/runtime/derived.h
++++ b/flang/runtime/derived.h
+@@ -26,6 +26,14 @@ class Terminator;
+ RT_API_ATTRS int Initialize(const Descriptor &, const typeInfo::DerivedType &,
+     Terminator &, bool hasStat = false, const Descriptor *errMsg = nullptr);
+ 
++// Initializes an object clone from the original object.
++// Each allocatable member of the clone is allocated with the same bounds as
++// in the original object, if it is also allocated in it.
++// Returns a STAT= code (0 when all's well).
++RT_API_ATTRS int InitializeClone(const Descriptor &, const Descriptor &,
++    const typeInfo::DerivedType &, Terminator &, bool hasStat = false,
++    const Descriptor *errMsg = nullptr);
++
+ // Call FINAL subroutines, if any
+ RT_API_ATTRS void Finalize(
+     const Descriptor &, const typeInfo::DerivedType &derived, Terminator *);
+diff --git a/flang/test/Lower/OpenMP/derived-type-allocatable.f90 b/flang/test/Lower/OpenMP/derived-type-allocatable.f90
+new file mode 100644
+index 0000000000000..d265954ef1ce1
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/derived-type-allocatable.f90
+@@ -0,0 +1,94 @@
++! Test that derived type allocatable members of private copies are properly
++! initialized.
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++module m1
++  type x
++     integer, allocatable :: x1(:)
++  end type
++
++  type y
++     integer :: y1(10)
++  end type
++
++contains
++
++!CHECK-LABEL: omp.private {type = private} @_QMm1Ftest_nested
++!CHECK:       fir.call @_FortranAInitializeClone
++!CHECK-NEXT:  omp.yield
++
++!CHECK-LABEL: omp.private {type = private} @_QMm1Ftest_array_of_allocs
++!CHECK:       fir.call @_FortranAInitializeClone
++!CHECK-NEXT:  omp.yield
++
++!CHECK-LABEL: omp.private {type = firstprivate} @_QMm1Ftest_array
++!CHECK-NOT:   fir.call @_FortranAInitializeClone
++!CHECK:       omp.yield
++
++!CHECK-LABEL: omp.private {type = private} @_QMm1Ftest_array
++!CHECK:       fir.call @_FortranAInitializeClone
++!CHECK-NEXT:  omp.yield
++
++!CHECK-LABEL: omp.private {type = private} @_QMm1Ftest_scalar
++!CHECK:       fir.call @_FortranAInitializeClone
++!CHECK-NEXT:  omp.yield
++
++  subroutine test_scalar()
++    type(x) :: v
++    allocate(v%x1(5))
++
++    !$omp parallel private(v)
++    !$omp end parallel
++  end subroutine
++
++! Test omp sections lastprivate(v, v2)
++! - InitializeClone must not be called for v2, that doesn't have an
++!   allocatable member.
++! - InitializeClone must be called for v, that has an allocatable member.
++! - To avoid race conditions between InitializeClone and lastprivate, a
++!   barrier must be present after the initializations.
++!CHECK-LABEL: func @_QMm1Ptest_array
++!CHECK:       fir.call @_FortranAInitializeClone
++!CHECK-NEXT:  omp.barrier
++  subroutine test_array()
++    type(x) :: v(10)
++    type(y) :: v2(10)
++    allocate(v(1)%x1(5))
++
++    !$omp parallel private(v)
++    !$omp end parallel
++
++    !$omp parallel
++      !$omp sections lastprivate(v2, v)
++      !$omp end sections
++    !$omp end parallel
++
++    !$omp parallel firstprivate(v)
++    !$omp end parallel
++  end subroutine
++
++  subroutine test_array_of_allocs()
++    type(x), allocatable  :: v(:)
++    allocate(v(10))
++    allocate(v(1)%x1(5))
++
++    !$omp parallel private(v)
++    !$omp end parallel
++  end subroutine
++
++  subroutine test_nested()
++    type dt1
++      integer, allocatable :: a(:)
++    end type
++
++    type dt2
++      type(dt1) :: d1
++    end type
++
++    type(dt2) :: d2
++    allocate(d2%d1%a(10))
++
++    !$omp parallel private(d2)
++    !$omp end parallel
++  end subroutine
++end module

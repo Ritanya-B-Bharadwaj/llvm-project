@@ -1,0 +1,178 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index ded97c3fb02f9..aeec2d593d4c1 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -491,6 +491,7 @@ class ParseTreeDumper {
+   NODE(OmpWhenClause, Modifier)
+   NODE(parser, OmpDirectiveName)
+   NODE(parser, OmpDirectiveSpecification)
++  NODE_ENUM(OmpDirectiveSpecification, Flags)
+   NODE(parser, OmpTraitPropertyName)
+   NODE(parser, OmpTraitScore)
+   NODE(parser, OmpTraitPropertyExtension)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index cd0be4453ac33..e8bb525348a50 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4502,15 +4502,16 @@ struct OmpClauseList {
+ // --- Directives and constructs
+ 
+ struct OmpDirectiveSpecification {
+-  CharBlock source;
++  ENUM_CLASS(Flags, None, DeprecatedSyntax);
+   TUPLE_CLASS_BOILERPLATE(OmpDirectiveSpecification);
+   llvm::omp::Directive DirId() const { //
+     return std::get<OmpDirectiveName>(t).v;
+   }
+   const OmpClauseList &Clauses() const;
+ 
++  CharBlock source;
+   std::tuple<OmpDirectiveName, std::optional<std::list<OmpArgument>>,
+-      std::optional<OmpClauseList>>
++      std::optional<OmpClauseList>, Flags>
+       t;
+ };
+ 
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index dd43ede796b98..2fe319b288dff 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -996,10 +996,33 @@ TYPE_PARSER(sourced(construct<OmpErrorDirective>(
+ 
+ // --- Parsers for directives and constructs --------------------------
+ 
+-TYPE_PARSER(sourced(construct<OmpDirectiveSpecification>( //
+-    sourced(OmpDirectiveNameParser{}),
+-    maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
+-    maybe(Parser<OmpClauseList>{}))))
++OmpDirectiveSpecification static makeFlushFromOldSyntax1(Verbatim &&text,
++    std::optional<OmpClauseList> &&clauses,
++    std::optional<std::list<OmpArgument>> &&args,
++    OmpDirectiveSpecification::Flags &&flags) {
++  return OmpDirectiveSpecification{OmpDirectiveName(text), std::move(args),
++      std::move(clauses), std::move(flags)};
++}
++
++TYPE_PARSER(sourced(
++    // Parse the old syntax: FLUSH [clauses] [(objects)]
++    construct<OmpDirectiveSpecification>(
++        // Force this old-syntax parser to fail for FLUSH followed by '('.
++        // Otherwise it could succeed on the new syntax but have one of
++        // lists absent in the parsed result.
++        // E.g. for FLUSH(x) SEQ_CST it would find no clauses following
++        // the directive name, parse the argument list "(x)" and stop.
++        applyFunction<OmpDirectiveSpecification>(makeFlushFromOldSyntax1,
++            verbatim("FLUSH"_tok) / !lookAhead("("_tok),
++            maybe(Parser<OmpClauseList>{}),
++            maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
++            pure(OmpDirectiveSpecification::Flags::DeprecatedSyntax))) ||
++    // Parse the standard syntax: directive [(arguments)] [clauses]
++    construct<OmpDirectiveSpecification>( //
++        sourced(OmpDirectiveNameParser{}),
++        maybe(parenthesized(nonemptyList(Parser<OmpArgument>{}))),
++        maybe(Parser<OmpClauseList>{}),
++        pure(OmpDirectiveSpecification::Flags::None))))
+ 
+ TYPE_PARSER(sourced(construct<OmpNothingDirective>("NOTHING" >> ok)))
+ 
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 4f5c05dc2aa25..12d86653a2b95 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2094,14 +2094,30 @@ class UnparseVisitor {
+     Word(llvm::omp::getOpenMPDirectiveName(x).str());
+   }
+   void Unparse(const OmpDirectiveSpecification &x) {
+-    using ArgList = std::list<parser::OmpArgument>;
++    auto unparseArgs{[&]() {
++      using ArgList = std::list<parser::OmpArgument>;
++      if (auto &args{std::get<std::optional<ArgList>>(x.t)}) {
++        Put("(");
++        Walk(*args);
++        Put(")");
++      }
++    }};
++    auto unparseClauses{[&]() { //
++      Walk(std::get<std::optional<OmpClauseList>>(x.t));
++    }};
++
+     Walk(std::get<OmpDirectiveName>(x.t));
+-    if (auto &args{std::get<std::optional<ArgList>>(x.t)}) {
+-      Put("(");
+-      Walk(*args);
+-      Put(")");
++    auto flags{std::get<OmpDirectiveSpecification::Flags>(x.t)};
++    if (flags == OmpDirectiveSpecification::Flags::DeprecatedSyntax) {
++      if (x.DirId() == llvm::omp::Directive::OMPD_flush) {
++        // FLUSH clause arglist
++        unparseClauses();
++        unparseArgs();
++      }
++    } else {
++      unparseArgs();
++      unparseClauses();
+     }
+-    Walk(std::get<std::optional<OmpClauseList>>(x.t));
+   }
+   void Unparse(const OmpTraitScore &x) {
+     Word("SCORE(");
+diff --git a/flang/test/Parser/OpenMP/metadirective-flush.f90 b/flang/test/Parser/OpenMP/metadirective-flush.f90
+new file mode 100644
+index 0000000000000..8403663200f93
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/metadirective-flush.f90
+@@ -0,0 +1,54 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00()
++  integer :: x
++  !$omp metadirective when(user={condition(.true.)}: flush seq_cst (x))
++end
++
++!UNPARSE: SUBROUTINE f00
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(.true._4)}: FLUSH SEQ_CST(x))
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = User
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Condition
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '.true._4'
++!PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
++!PARSE-TREE: | | | | | | | bool = 'true'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
++!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpClauseList -> OmpClause -> SeqCst
++!PARSE-TREE: | | | Flags = DeprecatedSyntax
++
++subroutine f01()
++  integer :: x
++  !$omp metadirective when(user={condition(.true.)}: flush(x) seq_cst)
++end
++
++!UNPARSE: SUBROUTINE f01
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(.true._4)}: FLUSH(x) SEQ_CST)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = User
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Condition
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '.true._4'
++!PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
++!PARSE-TREE: | | | | | | | bool = 'true'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = flush
++!PARSE-TREE: | | | OmpArgument -> OmpLocator -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | | | OmpClauseList -> OmpClause -> SeqCst
++!PARSE-TREE: | | | Flags = None

@@ -1,0 +1,425 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 254236b510544..c99006f0c1c22 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3540,7 +3540,7 @@ WRAPPER_CLASS(OmpLocatorList, std::list<OmpLocator>);
+ struct OmpMapperSpecifier {
+   // Absent mapper-identifier is equivalent to DEFAULT.
+   TUPLE_CLASS_BOILERPLATE(OmpMapperSpecifier);
+-  std::tuple<std::optional<Name>, TypeSpec, Name> t;
++  std::tuple<std::string, TypeSpec, Name> t;
+ };
+ 
+ // Ref: [4.5:222:1-5], [5.0:305:20-27], [5.1:337:11-19], [5.2:139:18-23],
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 02454543d0a60..8dcc8be9be5bf 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -1114,9 +1114,9 @@ void ClauseProcessor::processMapObjects(
+         typeSpec = &object.sym()->GetType()->derivedTypeSpec();
+ 
+       if (typeSpec) {
+-        mapperIdName = typeSpec->name().ToString() + ".default";
+-        mapperIdName =
+-            converter.mangleName(mapperIdName, *typeSpec->GetScope());
++        mapperIdName = typeSpec->name().ToString() + ".omp.default.mapper";
++        if (auto *sym = converter.getCurrentScope().FindSymbol(mapperIdName))
++          mapperIdName = converter.mangleName(mapperIdName, sym->owner());
+       }
+     }
+   };
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 61bbc709872fd..cfcba0159db8d 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -2422,8 +2422,10 @@ genTargetOp(lower::AbstractConverter &converter, lower::SymMap &symTable,
+       mlir::FlatSymbolRefAttr mapperId;
+       if (sym.GetType()->category() == semantics::DeclTypeSpec::TypeDerived) {
+         auto &typeSpec = sym.GetType()->derivedTypeSpec();
+-        std::string mapperIdName = typeSpec.name().ToString() + ".default";
+-        mapperIdName = converter.mangleName(mapperIdName, *typeSpec.GetScope());
++        std::string mapperIdName =
++            typeSpec.name().ToString() + ".omp.default.mapper";
++        if (auto *sym = converter.getCurrentScope().FindSymbol(mapperIdName))
++          mapperIdName = converter.mangleName(mapperIdName, sym->owner());
+         if (converter.getModuleOp().lookupSymbol(mapperIdName))
+           mapperId = mlir::FlatSymbolRefAttr::get(&converter.getMLIRContext(),
+                                                   mapperIdName);
+@@ -4005,24 +4007,16 @@ genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   lower::StatementContext stmtCtx;
+   const auto &spec =
+       std::get<parser::OmpMapperSpecifier>(declareMapperConstruct.t);
+-  const auto &mapperName{std::get<std::optional<parser::Name>>(spec.t)};
++  const auto &mapperName{std::get<std::string>(spec.t)};
+   const auto &varType{std::get<parser::TypeSpec>(spec.t)};
+   const auto &varName{std::get<parser::Name>(spec.t)};
+   assert(varType.declTypeSpec->category() ==
+              semantics::DeclTypeSpec::Category::TypeDerived &&
+          "Expected derived type");
+ 
+-  std::string mapperNameStr;
+-  if (mapperName.has_value()) {
+-    mapperNameStr = mapperName->ToString();
+-    mapperNameStr =
+-        converter.mangleName(mapperNameStr, mapperName->symbol->owner());
+-  } else {
+-    mapperNameStr =
+-        varType.declTypeSpec->derivedTypeSpec().name().ToString() + ".default";
+-    mapperNameStr = converter.mangleName(
+-        mapperNameStr, *varType.declTypeSpec->derivedTypeSpec().GetScope());
+-  }
++  std::string mapperNameStr = mapperName;
++  if (auto *sym = converter.getCurrentScope().FindSymbol(mapperNameStr))
++    mapperNameStr = converter.mangleName(mapperNameStr, sym->owner());
+ 
+   // Save current insertion point before moving to the module scope to create
+   // the DeclareMapperOp
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 52d3a5844c969..c08cd1ab80559 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -1389,8 +1389,28 @@ TYPE_PARSER(
+ TYPE_PARSER(sourced(construct<OpenMPDeclareTargetConstruct>(
+     verbatim("DECLARE TARGET"_tok), Parser<OmpDeclareTargetSpecifier>{})))
+ 
++static OmpMapperSpecifier ConstructOmpMapperSpecifier(
++    std::optional<Name> &&mapperName, TypeSpec &&typeSpec, Name &&varName) {
++  // If a name is present, parse: name ":" typeSpec "::" name
++  // This matches the syntax: <mapper-name> : <type-spec> :: <variable-name>
++  if (mapperName.has_value() && mapperName->ToString() != "default") {
++    return OmpMapperSpecifier{
++        mapperName->ToString(), std::move(typeSpec), std::move(varName)};
++  }
++  // If the name is missing, use the DerivedTypeSpec name to construct the
++  // default mapper name.
++  // This matches the syntax: <type-spec> :: <variable-name>
++  if (DerivedTypeSpec * derived{std::get_if<DerivedTypeSpec>(&typeSpec.u)}) {
++    return OmpMapperSpecifier{
++        std::get<Name>(derived->t).ToString() + ".omp.default.mapper",
++        std::move(typeSpec), std::move(varName)};
++  }
++  return OmpMapperSpecifier{std::string("omp.default.mapper"),
++      std::move(typeSpec), std::move(varName)};
++}
++
+ // mapper-specifier
+-TYPE_PARSER(construct<OmpMapperSpecifier>(
++TYPE_PARSER(applyFunction<OmpMapperSpecifier>(ConstructOmpMapperSpecifier,
+     maybe(name / ":" / !":"_tok), typeSpec / "::", name))
+ 
+ // OpenMP 5.2: 5.8.8 Declare Mapper Construct
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index a626888b7dfe5..0784a6703bbde 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2093,7 +2093,11 @@ class UnparseVisitor {
+     Walk(x.v, ",");
+   }
+   void Unparse(const OmpMapperSpecifier &x) {
+-    Walk(std::get<std::optional<Name>>(x.t), ":");
++    const auto &mapperName{std::get<std::string>(x.t)};
++    if (mapperName.find("omp.default.mapper") == std::string::npos) {
++      Walk(mapperName);
++      Put(":");
++    }
+     Walk(std::get<TypeSpec>(x.t));
+     Put("::");
+     Walk(std::get<Name>(x.t));
+@@ -2796,8 +2800,9 @@ class UnparseVisitor {
+     BeginOpenMP();
+     Word("!$OMP DECLARE MAPPER (");
+     const auto &spec{std::get<OmpMapperSpecifier>(z.t)};
+-    if (auto mapname{std::get<std::optional<Name>>(spec.t)}) {
+-      Walk(mapname);
++    const auto &mapperName{std::get<std::string>(spec.t)};
++    if (mapperName.find("omp.default.mapper") == std::string::npos) {
++      Walk(mapperName);
+       Put(":");
+     }
+     Walk(std::get<TypeSpec>(spec.t));
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index bdafc03ad2c05..57a307f01b24b 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -1766,15 +1766,9 @@ void OmpVisitor::ProcessMapperSpecifier(const parser::OmpMapperSpecifier &spec,
+   // just following the natural flow, the map clauses gets processed before
+   // the type has been fully processed.
+   BeginDeclTypeSpec();
+-  if (auto &mapperName{std::get<std::optional<parser::Name>>(spec.t)}) {
+-    mapperName->symbol =
+-        &MakeSymbol(*mapperName, MiscDetails{MiscDetails::Kind::ConstructName});
+-  } else {
+-    const parser::CharBlock defaultName{"default", 7};
+-    MakeSymbol(
+-        defaultName, Attrs{}, MiscDetails{MiscDetails::Kind::ConstructName});
+-  }
+-
++  auto &mapperName{std::get<std::string>(spec.t)};
++  MakeSymbol(parser::CharBlock(mapperName), Attrs{},
++      MiscDetails{MiscDetails::Kind::ConstructName});
+   PushScope(Scope::Kind::OtherConstruct, nullptr);
+   Walk(std::get<parser::TypeSpec>(spec.t));
+   auto &varName{std::get<parser::Name>(spec.t)};
+diff --git a/flang/test/Lower/OpenMP/declare-mapper.f90 b/flang/test/Lower/OpenMP/declare-mapper.f90
+index 867b850317e66..8a98c68a8d582 100644
+--- a/flang/test/Lower/OpenMP/declare-mapper.f90
++++ b/flang/test/Lower/OpenMP/declare-mapper.f90
+@@ -5,6 +5,7 @@
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-2.f90 -o - | FileCheck %t/omp-declare-mapper-2.f90
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-3.f90 -o - | FileCheck %t/omp-declare-mapper-3.f90
+ ! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-4.f90 -o - | FileCheck %t/omp-declare-mapper-4.f90
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=50 %t/omp-declare-mapper-5.f90 -o - | FileCheck %t/omp-declare-mapper-5.f90
+ 
+ !--- omp-declare-mapper-1.f90
+ subroutine declare_mapper_1
+@@ -22,7 +23,7 @@ subroutine declare_mapper_1
+    end type
+    type(my_type2)        :: t
+    real                   :: x, y(nvals)
+-   !CHECK:omp.declare_mapper @[[MY_TYPE_MAPPER:_QQFdeclare_mapper_1my_type\.default]] : [[MY_TYPE:!fir\.type<_QFdeclare_mapper_1Tmy_type\{num_vals:i32,values:!fir\.box<!fir\.heap<!fir\.array<\?xi32>>>\}>]] {
++   !CHECK:omp.declare_mapper @[[MY_TYPE_MAPPER:_QQFdeclare_mapper_1my_type\.omp\.default\.mapper]] : [[MY_TYPE:!fir\.type<_QFdeclare_mapper_1Tmy_type\{num_vals:i32,values:!fir\.box<!fir\.heap<!fir\.array<\?xi32>>>\}>]] {
+    !CHECK:      ^bb0(%[[VAL_0:.*]]: !fir.ref<[[MY_TYPE]]>):
+    !CHECK:        %[[VAL_1:.*]]:2 = hlfir.declare %[[VAL_0]] {uniq_name = "_QFdeclare_mapper_1Evar"} : (!fir.ref<[[MY_TYPE]]>) -> (!fir.ref<[[MY_TYPE]]>, !fir.ref<[[MY_TYPE]]>)
+    !CHECK:        %[[VAL_2:.*]] = hlfir.designate %[[VAL_1]]#0{"values"}   {fortran_attrs = #fir.var_attrs<allocatable>} : (!fir.ref<[[MY_TYPE]]>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+@@ -149,7 +150,7 @@ subroutine declare_mapper_4
+       integer              :: num
+    end type
+ 
+-   !CHECK: omp.declare_mapper @[[MY_TYPE_MAPPER:_QQFdeclare_mapper_4my_type.default]] : [[MY_TYPE:!fir\.type<_QFdeclare_mapper_4Tmy_type\{num:i32\}>]]
++   !CHECK: omp.declare_mapper @[[MY_TYPE_MAPPER:_QQFdeclare_mapper_4my_type.omp.default.mapper]] : [[MY_TYPE:!fir\.type<_QFdeclare_mapper_4Tmy_type\{num:i32\}>]]
+    !$omp declare mapper (my_type :: var) map (var%num)
+ 
+    type(my_type) :: a
+@@ -171,3 +172,93 @@ subroutine declare_mapper_4
+    a%num = 40
+    !$omp end target
+ end subroutine declare_mapper_4
++
++!--- omp-declare-mapper-5.f90
++program declare_mapper_5
++   implicit none
++
++   type :: mytype
++      integer :: x, y
++   end type
++
++   !CHECK: omp.declare_mapper @[[INNER_MAPPER_NAMED:_QQFFuse_innermy_mapper]] : [[MY_TYPE:!fir\.type<_QFTmytype\{x:i32,y:i32\}>]]
++   !CHECK: omp.declare_mapper @[[INNER_MAPPER_DEFAULT:_QQFFuse_innermytype.omp.default.mapper]] : [[MY_TYPE]]
++   !CHECK: omp.declare_mapper @[[OUTER_MAPPER_NAMED:_QQFmy_mapper]] : [[MY_TYPE]]
++   !CHECK: omp.declare_mapper @[[OUTER_MAPPER_DEFAULT:_QQFmytype.omp.default.mapper]] : [[MY_TYPE]]
++   !$omp declare mapper(mytype :: var) map(tofrom: var%x)
++   !$omp declare mapper(my_mapper : mytype :: var) map(tofrom: var%y)
++
++   type(mytype) :: a
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(implicit, tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !$omp target
++   a%x = 10
++   !$omp end target
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !$omp target map(a)
++   a%x = 10
++   !$omp end target
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !$omp target map(mapper(default) : a)
++   a%x = 10
++   !$omp end target
++
++   !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_NAMED]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++   !$omp target map(mapper(my_mapper) : a)
++   a%y = 10
++   !$omp end target
++
++contains
++   subroutine use_outer()
++      type(mytype) :: a
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(implicit, tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(a)
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(mapper(default) : a)
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[OUTER_MAPPER_NAMED]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(mapper(my_mapper) : a)
++      a%y = 10
++      !$omp end target
++   end subroutine
++
++   subroutine use_inner()
++      !$omp declare mapper(mytype :: var) map(tofrom: var%x)
++      !$omp declare mapper(my_mapper : mytype :: var) map(tofrom: var%y)
++
++      type(mytype) :: a
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(implicit, tofrom) capture(ByRef) mapper(@[[INNER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[INNER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(a)
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[INNER_MAPPER_DEFAULT]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(mapper(default) : a)
++      a%x = 10
++      !$omp end target
++
++      !CHECK: %{{.*}} = omp.map.info var_ptr(%{{.*}}#1 : !fir.ref<[[MY_TYPE]]>, [[MY_TYPE]]) map_clauses(tofrom) capture(ByRef) mapper(@[[INNER_MAPPER_NAMED]]) -> !fir.ref<[[MY_TYPE]]> {name = "a"}
++      !$omp target map(mapper(my_mapper) : a)
++      a%y = 10
++      !$omp end target
++   end subroutine
++end program declare_mapper_5
+diff --git a/flang/test/Lower/OpenMP/map-mapper.f90 b/flang/test/Lower/OpenMP/map-mapper.f90
+index a511110cb5d18..91564bfc7bc46 100644
+--- a/flang/test/Lower/OpenMP/map-mapper.f90
++++ b/flang/test/Lower/OpenMP/map-mapper.f90
+@@ -8,7 +8,7 @@ program p
+    !$omp declare mapper(xx : t1 :: nn) map(to: nn, nn%x)
+    !$omp declare mapper(t1 :: nn) map(from: nn)
+ 
+-   !CHECK-LABEL: omp.declare_mapper @_QQFt1.default : !fir.type<_QFTt1{x:!fir.array<256xi32>}>
++   !CHECK-LABEL: omp.declare_mapper @_QQFt1.omp.default.mapper : !fir.type<_QFTt1{x:!fir.array<256xi32>}>
+    !CHECK-LABEL: omp.declare_mapper @_QQFxx : !fir.type<_QFTt1{x:!fir.array<256xi32>}>
+ 
+    type(t1) :: a, b
+@@ -20,7 +20,7 @@ program p
+    end do
+    !$omp end target
+ 
+-   !CHECK: %[[MAP_B:.*]] = omp.map.info var_ptr(%{{.*}} : {{.*}}, {{.*}}) map_clauses(tofrom) capture(ByRef) mapper(@_QQFt1.default) -> {{.*}} {name = "b"}
++   !CHECK: %[[MAP_B:.*]] = omp.map.info var_ptr(%{{.*}} : {{.*}}, {{.*}}) map_clauses(tofrom) capture(ByRef) mapper(@_QQFt1.omp.default.mapper) -> {{.*}} {name = "b"}
+    !CHECK: omp.target map_entries(%[[MAP_B]] -> %{{.*}}, %{{.*}} -> %{{.*}} : {{.*}}, {{.*}}) {
+    !$omp target map(mapper(default) : b)
+    do i = 1, n
+diff --git a/flang/test/Parser/OpenMP/declare-mapper-unparse.f90 b/flang/test/Parser/OpenMP/declare-mapper-unparse.f90
+index 407bfd29153fa..30d75d02736f3 100644
+--- a/flang/test/Parser/OpenMP/declare-mapper-unparse.f90
++++ b/flang/test/Parser/OpenMP/declare-mapper-unparse.f90
+@@ -7,36 +7,37 @@ program main
+   type ty
+      integer :: x
+   end type ty
+-  
++
+ 
+ !CHECK: !$OMP DECLARE MAPPER (mymapper:ty::mapped) MAP(mapped,mapped%x)
+   !$omp declare mapper(mymapper : ty :: mapped) map(mapped, mapped%x)
+ 
+ !PARSE-TREE:      OpenMPDeclareMapperConstruct
+ !PARSE-TREE:        OmpMapperSpecifier
+-!PARSE-TREE:         Name = 'mymapper'
++!PARSE-TREE:         string = 'mymapper'
+ !PARSE-TREE:         TypeSpec -> DerivedTypeSpec
+ !PARSE-TREE:           Name = 'ty'
+-!PARSE-TREE:         Name = 'mapped'    
++!PARSE-TREE:         Name = 'mapped'
+ !PARSE-TREE:        OmpMapClause
+ !PARSE-TREE:          OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'mapped'
+ !PARSE-TREE:          OmpObject -> Designator -> DataRef -> StructureComponent
+ !PARSE-TREE:           DataRef -> Name = 'mapped'
+-!PARSE-TREE:           Name = 'x'  
++!PARSE-TREE:           Name = 'x'
+ 
+ !CHECK: !$OMP DECLARE MAPPER (ty::mapped) MAP(mapped,mapped%x)
+   !$omp declare mapper(ty :: mapped) map(mapped, mapped%x)
+-  
++
+ !PARSE-TREE:      OpenMPDeclareMapperConstruct
+ !PARSE-TREE:        OmpMapperSpecifier
++!PARSE-TREE:         string = 'ty.omp.default.mapper'
+ !PARSE-TREE:         TypeSpec -> DerivedTypeSpec
+ !PARSE-TREE:           Name = 'ty'
+-!PARSE-TREE:         Name = 'mapped'    
++!PARSE-TREE:         Name = 'mapped'
+ !PARSE-TREE:        OmpMapClause
+ !PARSE-TREE:          OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'mapped'
+ !PARSE-TREE:          OmpObject -> Designator -> DataRef -> StructureComponent
+ !PARSE-TREE:           DataRef -> Name = 'mapped'
+ !PARSE-TREE:           Name = 'x'
+-  
++
+ end program main
+ !CHECK-LABEL: end program main
+diff --git a/flang/test/Parser/OpenMP/metadirective-dirspec.f90 b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+index b6c9c58948fec..baa8b2e08c539 100644
+--- a/flang/test/Parser/OpenMP/metadirective-dirspec.f90
++++ b/flang/test/Parser/OpenMP/metadirective-dirspec.f90
+@@ -78,7 +78,7 @@ subroutine f02
+ !PARSE-TREE: | | OmpDirectiveSpecification
+ !PARSE-TREE: | | | OmpDirectiveName -> llvm::omp::Directive = declare mapper
+ !PARSE-TREE: | | | OmpArgumentList -> OmpArgument -> OmpMapperSpecifier
+-!PARSE-TREE: | | | | Name = 'mymapper'
++!PARSE-TREE: | | | | string = 'mymapper'
+ !PARSE-TREE: | | | | TypeSpec -> IntrinsicTypeSpec -> IntegerTypeSpec ->
+ !PARSE-TREE: | | | | Name = 'v'
+ !PARSE-TREE: | | | OmpClauseList -> OmpClause -> Map -> OmpMapClause
+diff --git a/flang/test/Semantics/OpenMP/declare-mapper-symbols.f90 b/flang/test/Semantics/OpenMP/declare-mapper-symbols.f90
+index b4e03bd1632e5..06f41ab8ce76f 100644
+--- a/flang/test/Semantics/OpenMP/declare-mapper-symbols.f90
++++ b/flang/test/Semantics/OpenMP/declare-mapper-symbols.f90
+@@ -2,23 +2,23 @@
+ 
+ program main
+ !CHECK-LABEL: MainProgram scope: main
+-  implicit none
++   implicit none
+ 
+-  type ty
+-     integer :: x
+-  end type ty
+-  !$omp declare mapper(mymapper : ty :: mapped) map(mapped, mapped%x)
+-  !$omp declare mapper(ty :: maptwo) map(maptwo, maptwo%x)
++   type ty
++      integer :: x
++   end type ty
++   !$omp declare mapper(mymapper : ty :: mapped) map(mapped, mapped%x)
++   !$omp declare mapper(ty :: maptwo) map(maptwo, maptwo%x)
+ 
+ !! Note, symbols come out in their respective scope, but not in declaration order.
+-!CHECK: default: Misc ConstructName
+ !CHECK: mymapper: Misc ConstructName
+ !CHECK: ty: DerivedType components: x
++!CHECK: ty.omp.default.mapper: Misc ConstructName
+ !CHECK: DerivedType scope: ty
+ !CHECK: OtherConstruct scope:
+ !CHECK: mapped (OmpMapToFrom) {{.*}} ObjectEntity type: TYPE(ty)
+-!CHECK: OtherConstruct scope:  
++!CHECK: OtherConstruct scope:
+ !CHECK: maptwo (OmpMapToFrom) {{.*}} ObjectEntity type: TYPE(ty)
+-  
++
+ end program main
+ 
+diff --git a/flang/test/Semantics/OpenMP/declare-mapper03.f90 b/flang/test/Semantics/OpenMP/declare-mapper03.f90
+index b70b8a67f33e0..84fc3efafb3ad 100644
+--- a/flang/test/Semantics/OpenMP/declare-mapper03.f90
++++ b/flang/test/Semantics/OpenMP/declare-mapper03.f90
+@@ -5,12 +5,8 @@
+    integer :: y
+ end type t1
+ 
+-type :: t2
+-   real :: y, z
+-end type t2
+-
+ !error: 'default' is already declared in this scoping unit
+ 
+ !$omp declare mapper(t1::x) map(x, x%y)
+-!$omp declare mapper(t2::w) map(w, w%y, w%z)
++!$omp declare mapper(t1::x) map(x)
+ end

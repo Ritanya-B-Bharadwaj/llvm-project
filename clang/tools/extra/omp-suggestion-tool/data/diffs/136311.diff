@@ -1,0 +1,318 @@
+diff --git a/flang/include/flang/Lower/DirectivesCommon.h b/flang/include/flang/Lower/DirectivesCommon.h
+index 6e24343cebd3a..b37097289eb83 100644
+--- a/flang/include/flang/Lower/DirectivesCommon.h
++++ b/flang/include/flang/Lower/DirectivesCommon.h
+@@ -55,14 +55,11 @@ static inline void genOmpAtomicHintAndMemoryOrderClauses(
+     mlir::omp::ClauseMemoryOrderKindAttr &memoryOrder) {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+   for (const Fortran::parser::OmpAtomicClause &clause : clauseList.v) {
+-    if (const auto *ompClause =
+-            std::get_if<Fortran::parser::OmpClause>(&clause.u)) {
+-      if (const auto *hintClause =
+-              std::get_if<Fortran::parser::OmpClause::Hint>(&ompClause->u)) {
+-        const auto *expr = Fortran::semantics::GetExpr(hintClause->v);
+-        uint64_t hintExprValue = *Fortran::evaluate::ToInt64(*expr);
+-        hint = firOpBuilder.getI64IntegerAttr(hintExprValue);
+-      }
++    if (const auto *hintClause =
++            std::get_if<Fortran::parser::OmpHintClause>(&clause.u)) {
++      const auto *expr = Fortran::semantics::GetExpr(hintClause->v);
++      uint64_t hintExprValue = *Fortran::evaluate::ToInt64(*expr);
++      hint = firOpBuilder.getI64IntegerAttr(hintExprValue);
+     } else if (const auto *ompMemoryOrderClause =
+                    std::get_if<Fortran::parser::OmpMemoryOrderClause>(
+                        &clause.u)) {
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index c66f0735f33f0..42f2ff376c650 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -591,6 +591,7 @@ class ParseTreeDumper {
+   NODE(OmpFromClause, Modifier)
+   NODE(parser, OmpExpectation)
+   NODE_ENUM(OmpExpectation, Value)
++  NODE(parser, OmpHintClause)
+   NODE(parser, OmpHoldsClause)
+   NODE(parser, OmpIfClause)
+   NODE(OmpIfClause, Modifier)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 0c2a5de3b71d2..2f45faec42c8f 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4272,6 +4272,11 @@ struct OmpGrainsizeClause {
+   std::tuple<MODIFIERS(), ScalarIntExpr> t;
+ };
+ 
++// Ref: [5.0:234-242], [5.1:266-275], [5.2:299], [6.0:472-473]
++struct OmpHintClause {
++  WRAPPER_CLASS_BOILERPLATE(OmpHintClause, ScalarIntConstantExpr);
++};
++
+ // Ref: [5.2: 214]
+ //
+ // holds-clause ->
+@@ -4832,7 +4837,7 @@ struct OmpMemoryOrderClause {
+ struct OmpAtomicClause {
+   UNION_CLASS_BOILERPLATE(OmpAtomicClause);
+   CharBlock source;
+-  std::variant<OmpMemoryOrderClause, OmpFailClause, OmpClause> u;
++  std::variant<OmpMemoryOrderClause, OmpFailClause, OmpHintClause> u;
+ };
+ 
+ // atomic-clause-list -> [atomic-clause, [atomic-clause], ...]
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 3ffdf7138b035..3f0748382116b 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -863,8 +863,8 @@ HasDeviceAddr make(const parser::OmpClause::HasDeviceAddr &inp,
+ 
+ Hint make(const parser::OmpClause::Hint &inp,
+           semantics::SemanticsContext &semaCtx) {
+-  // inp.v -> parser::ConstantExpr
+-  return Hint{/*HintExpr=*/makeExpr(inp.v, semaCtx)};
++  // inp.v -> parser::OmpHintClause
++  return Hint{/*HintExpr=*/makeExpr(inp.v.v, semaCtx)};
+ }
+ 
+ Holds make(const parser::OmpClause::Holds &inp,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index e84abf87c1cb6..57324810eac1e 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -804,6 +804,8 @@ TYPE_PARSER(
+ // OpenMPv5.2 12.5.2 detach-clause -> DETACH (event-handle)
+ TYPE_PARSER(construct<OmpDetachClause>(Parser<OmpObject>{}))
+ 
++TYPE_PARSER(construct<OmpHintClause>(scalarIntConstantExpr))
++
+ // init clause
+ TYPE_PARSER(construct<OmpInitClause>(
+     maybe(nonemptyList(Parser<OmpInitClause::Modifier>{}) / ":"),
+@@ -941,8 +943,8 @@ TYPE_PARSER( //
+     "HAS_DEVICE_ADDR" >>
+         construct<OmpClause>(construct<OmpClause::HasDeviceAddr>(
+             parenthesized(Parser<OmpObjectList>{}))) ||
+-    "HINT" >> construct<OmpClause>(
+-                  construct<OmpClause::Hint>(parenthesized(constantExpr))) ||
++    "HINT" >> construct<OmpClause>(construct<OmpClause::Hint>(
++                  parenthesized(Parser<OmpHintClause>{}))) ||
+     "HOLDS" >> construct<OmpClause>(construct<OmpClause::Holds>(
+                    parenthesized(Parser<OmpHoldsClause>{}))) ||
+     "IF" >> construct<OmpClause>(construct<OmpClause::If>(
+@@ -1217,9 +1219,8 @@ TYPE_PARSER(construct<OmpAtomicDefaultMemOrderClause>(
+ TYPE_PARSER(sourced(construct<OmpAtomicClause>(
+     construct<OmpAtomicClause>(Parser<OmpMemoryOrderClause>{}) ||
+     construct<OmpAtomicClause>("FAIL" >> Parser<OmpFailClause>{}) ||
+-    construct<OmpAtomicClause>("HINT" >>
+-        sourced(construct<OmpClause>(
+-            construct<OmpClause::Hint>(parenthesized(constantExpr))))))))
++    construct<OmpAtomicClause>(
++        "HINT" >> parenthesized(Parser<OmpHintClause>{})))))
+ 
+ // atomic-clause-list -> [atomic-clause, [atomic-clause], ...]
+ TYPE_PARSER(sourced(construct<OmpAtomicClauseList>(
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 47dae0ae753d2..d18f3e43d27d2 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2890,12 +2890,17 @@ class UnparseVisitor {
+     Walk(x.v);
+     Put(")");
+   }
++  void Unparse(const OmpHintClause &x) {
++    Word("HINT(");
++    Walk(x.v);
++    Put(")");
++  }
+   void Unparse(const OmpMemoryOrderClause &x) { Walk(x.v); }
+   void Unparse(const OmpAtomicClause &x) {
+     common::visit(common::visitors{
+                       [&](const OmpMemoryOrderClause &y) { Walk(y); },
+                       [&](const OmpFailClause &y) { Walk(y); },
+-                      [&](const OmpClause &z) { Walk(z); },
++                      [&](const OmpHintClause &y) { Walk(y); },
+                   },
+         x.u);
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index bc4651584b9a8..c8a905451cd03 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -586,33 +586,40 @@ void OmpStructureChecker::CheckPredefinedAllocatorRestriction(
+ 
+ template <class D>
+ void OmpStructureChecker::CheckHintClause(
+-    D *leftOmpClauseList, D *rightOmpClauseList) {
++    D *leftOmpClauseList, D *rightOmpClauseList, std::string_view dirName) {
++  bool foundHint{false};
++
+   auto checkForValidHintClause = [&](const D *clauseList) {
+     for (const auto &clause : clauseList->v) {
+-      const parser::OmpClause *ompClause = nullptr;
++      const parser::OmpHintClause *ompHintClause = nullptr;
+       if constexpr (std::is_same_v<D, const parser::OmpAtomicClauseList>) {
+-        ompClause = std::get_if<parser::OmpClause>(&clause.u);
+-        if (!ompClause)
+-          continue;
++        ompHintClause = std::get_if<parser::OmpHintClause>(&clause.u);
+       } else if constexpr (std::is_same_v<D, const parser::OmpClauseList>) {
+-        ompClause = &clause;
++        if (auto *hint{std::get_if<parser::OmpClause::Hint>(&clause.u)}) {
++          ompHintClause = &hint->v;
++        }
+       }
+-      if (const parser::OmpClause::Hint *hintClause{
+-              std::get_if<parser::OmpClause::Hint>(&ompClause->u)}) {
+-        std::optional<std::int64_t> hintValue = GetIntValue(hintClause->v);
+-        if (hintValue && *hintValue >= 0) {
+-          /*`omp_sync_hint_nonspeculative` and `omp_lock_hint_speculative`*/
+-          if ((*hintValue & 0xC) == 0xC
+-              /*`omp_sync_hint_uncontended` and omp_sync_hint_contended*/
+-              || (*hintValue & 0x3) == 0x3)
+-            context_.Say(clause.source,
+-                "Hint clause value "
+-                "is not a valid OpenMP synchronization value"_err_en_US);
+-        } else {
++      if (!ompHintClause)
++        continue;
++      if (foundHint) {
++        context_.Say(clause.source,
++            "At most one HINT clause can appear on the %s directive"_err_en_US,
++            parser::ToUpperCaseLetters(dirName));
++      }
++      foundHint = true;
++      std::optional<std::int64_t> hintValue = GetIntValue(ompHintClause->v);
++      if (hintValue && *hintValue >= 0) {
++        /*`omp_sync_hint_nonspeculative` and `omp_lock_hint_speculative`*/
++        if ((*hintValue & 0xC) == 0xC
++            /*`omp_sync_hint_uncontended` and omp_sync_hint_contended*/
++            || (*hintValue & 0x3) == 0x3)
+           context_.Say(clause.source,
+-              "Hint clause must have non-negative constant "
+-              "integer expression"_err_en_US);
+-        }
++              "Hint clause value "
++              "is not a valid OpenMP synchronization value"_err_en_US);
++      } else {
++        context_.Say(clause.source,
++            "Hint clause must have non-negative constant "
++            "integer expression"_err_en_US);
+       }
+     }
+   };
+@@ -2375,7 +2382,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPCriticalConstruct &x) {
+             "Hint clause other than omp_sync_hint_none cannot be specified for "
+             "an unnamed CRITICAL directive"_err_en_US});
+   }
+-  CheckHintClause<const parser::OmpClauseList>(&ompClause, nullptr);
++  CheckHintClause<const parser::OmpClauseList>(&ompClause, nullptr, "CRITICAL");
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OpenMPCriticalConstruct &) {
+@@ -2950,7 +2957,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+                 nullptr);
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+                 &std::get<parser::OmpAtomicClauseList>(atomicConstruct.t),
+-                nullptr);
++                nullptr, "ATOMIC");
+           },
+           [&](const parser::OmpAtomicUpdate &atomicUpdate) {
+             const auto &dir{std::get<parser::Verbatim>(atomicUpdate.t)};
+@@ -2963,7 +2970,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+             CheckAtomicMemoryOrderClause(
+                 &std::get<0>(atomicUpdate.t), &std::get<2>(atomicUpdate.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicUpdate.t), &std::get<2>(atomicUpdate.t));
++                &std::get<0>(atomicUpdate.t), &std::get<2>(atomicUpdate.t),
++                "UPDATE");
+           },
+           [&](const parser::OmpAtomicRead &atomicRead) {
+             const auto &dir{std::get<parser::Verbatim>(atomicRead.t)};
+@@ -2972,7 +2980,7 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+             CheckAtomicMemoryOrderClause(
+                 &std::get<0>(atomicRead.t), &std::get<2>(atomicRead.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicRead.t), &std::get<2>(atomicRead.t));
++                &std::get<0>(atomicRead.t), &std::get<2>(atomicRead.t), "READ");
+             CheckAtomicCaptureStmt(
+                 std::get<parser::Statement<parser::AssignmentStmt>>(
+                     atomicRead.t)
+@@ -2985,7 +2993,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+             CheckAtomicMemoryOrderClause(
+                 &std::get<0>(atomicWrite.t), &std::get<2>(atomicWrite.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicWrite.t), &std::get<2>(atomicWrite.t));
++                &std::get<0>(atomicWrite.t), &std::get<2>(atomicWrite.t),
++                "WRITE");
+             CheckAtomicWriteStmt(
+                 std::get<parser::Statement<parser::AssignmentStmt>>(
+                     atomicWrite.t)
+@@ -2998,7 +3007,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+             CheckAtomicMemoryOrderClause(
+                 &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t));
++                &std::get<0>(atomicCapture.t), &std::get<2>(atomicCapture.t),
++                "CAPTURE");
+             CheckAtomicCaptureConstruct(atomicCapture);
+           },
+           [&](const parser::OmpAtomicCompare &atomicCompare) {
+@@ -3008,7 +3018,8 @@ void OmpStructureChecker::Enter(const parser::OpenMPAtomicConstruct &x) {
+             CheckAtomicMemoryOrderClause(
+                 &std::get<0>(atomicCompare.t), &std::get<2>(atomicCompare.t));
+             CheckHintClause<const parser::OmpAtomicClauseList>(
+-                &std::get<0>(atomicCompare.t), &std::get<2>(atomicCompare.t));
++                &std::get<0>(atomicCompare.t), &std::get<2>(atomicCompare.t),
++                "CAPTURE");
+             CheckAtomicCompareConstruct(atomicCompare);
+           },
+       },
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 5af3b505937c1..87130f51b85f6 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -323,7 +323,7 @@ class OmpStructureChecker
+   void EnterDirectiveNest(const int index) { directiveNest_[index]++; }
+   void ExitDirectiveNest(const int index) { directiveNest_[index]--; }
+   int GetDirectiveNest(const int index) { return directiveNest_[index]; }
+-  template <typename D> void CheckHintClause(D *, D *);
++  template <typename D> void CheckHintClause(D *, D *, std::string_view);
+   inline void ErrIfAllocatableVariable(const parser::Variable &);
+   inline void ErrIfLHSAndRHSSymbolsMatch(
+       const parser::Variable &, const parser::Expr &);
+diff --git a/flang/test/Semantics/OpenMP/atomic-hint-clause.f90 b/flang/test/Semantics/OpenMP/atomic-hint-clause.f90
+index f724a69345f6e..c13a11a8dd5dc 100644
+--- a/flang/test/Semantics/OpenMP/atomic-hint-clause.f90
++++ b/flang/test/Semantics/OpenMP/atomic-hint-clause.f90
+@@ -78,6 +78,7 @@ program sample
+         y = y * 9
+ 
+     !ERROR: Hint clause must have non-negative constant integer expression
++    !ERROR: Must have INTEGER type, but is REAL(4)
+     !$omp atomic hint(1.0) read
+         y = x
+ 
+diff --git a/flang/test/Semantics/OpenMP/critical-hint-clause.f90 b/flang/test/Semantics/OpenMP/critical-hint-clause.f90
+index 419187fa3bbfb..7ca8c858239f7 100644
+--- a/flang/test/Semantics/OpenMP/critical-hint-clause.f90
++++ b/flang/test/Semantics/OpenMP/critical-hint-clause.f90
+@@ -95,6 +95,7 @@ program sample
+     !$omp end critical (name)
+ 
+     !ERROR: Hint clause must have non-negative constant integer expression
++    !ERROR: Must have INTEGER type, but is REAL(4)
+     !$omp critical (name) hint(1.0) 
+         y = 2
+     !$omp end critical (name)
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index e2a1449d8cc76..6e0fb10fabe29 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -224,7 +224,7 @@ def OMPC_HasDeviceAddr : Clause<"has_device_addr"> {
+ }
+ def OMPC_Hint : Clause<"hint"> {
+   let clangClass = "OMPHintClause";
+-  let flangClass = "ConstantExpr";
++  let flangClass = "OmpHintClause";
+ }
+ def OMPC_Holds : Clause<"holds"> {
+   let clangClass = "OMPHoldsClause";

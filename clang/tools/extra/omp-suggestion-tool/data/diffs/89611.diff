@@ -1,0 +1,342 @@
+diff --git a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+index 23fabaf34abac..895340549f7c6 100644
+--- a/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ReductionProcessor.cpp
+@@ -295,6 +295,33 @@ mlir::Value ReductionProcessor::createScalarCombiner(
+   return reductionOp;
+ }
+ 
++/// Generate a fir::ShapeShift op describing the provided boxed array.
++static fir::ShapeShiftOp getShapeShift(fir::FirOpBuilder &builder,
++                                       mlir::Location loc, mlir::Value box) {
++  fir::SequenceType sequenceType = mlir::cast<fir::SequenceType>(
++      hlfir::getFortranElementOrSequenceType(box.getType()));
++  const unsigned rank = sequenceType.getDimension();
++  llvm::SmallVector<mlir::Value> lbAndExtents;
++  lbAndExtents.reserve(rank * 2);
++
++  mlir::Type idxTy = builder.getIndexType();
++  for (unsigned i = 0; i < rank; ++i) {
++    // TODO: ideally we want to hoist box reads out of the critical section.
++    // We could do this by having box dimensions in block arguments like
++    // OpenACC does
++    mlir::Value dim = builder.createIntegerConstant(loc, idxTy, i);
++    auto dimInfo =
++        builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy, box, dim);
++    lbAndExtents.push_back(dimInfo.getLowerBound());
++    lbAndExtents.push_back(dimInfo.getExtent());
++  }
++
++  auto shapeShiftTy = fir::ShapeShiftType::get(builder.getContext(), rank);
++  auto shapeShift =
++      builder.create<fir::ShapeShiftOp>(loc, shapeShiftTy, lbAndExtents);
++  return shapeShift;
++}
++
+ /// Create reduction combiner region for reduction variables which are boxed
+ /// arrays
+ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
+@@ -330,29 +357,7 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
+     return;
+   }
+ 
+-  const unsigned rank = seqTy.getDimension();
+-  llvm::SmallVector<mlir::Value> extents;
+-  extents.reserve(rank);
+-  llvm::SmallVector<mlir::Value> lbAndExtents;
+-  lbAndExtents.reserve(rank * 2);
+-
+-  // Get box lowerbounds and extents:
+-  mlir::Type idxTy = builder.getIndexType();
+-  for (unsigned i = 0; i < rank; ++i) {
+-    // TODO: ideally we want to hoist box reads out of the critical section.
+-    // We could do this by having box dimensions in block arguments like
+-    // OpenACC does
+-    mlir::Value dim = builder.createIntegerConstant(loc, idxTy, i);
+-    auto dimInfo =
+-        builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy, lhs, dim);
+-    extents.push_back(dimInfo.getExtent());
+-    lbAndExtents.push_back(dimInfo.getLowerBound());
+-    lbAndExtents.push_back(dimInfo.getExtent());
+-  }
+-
+-  auto shapeShiftTy = fir::ShapeShiftType::get(builder.getContext(), rank);
+-  auto shapeShift =
+-      builder.create<fir::ShapeShiftOp>(loc, shapeShiftTy, lbAndExtents);
++  fir::ShapeShiftOp shapeShift = getShapeShift(builder, loc, lhs);
+ 
+   // Iterate over array elements, applying the equivalent scalar reduction:
+ 
+@@ -364,8 +369,8 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
+   // loop nest directly.
+   // This function already controls all of the code in this region so we
+   // know this won't miss any opportuinties for clever elemental inlining
+-  hlfir::LoopNest nest =
+-      hlfir::genLoopNest(loc, builder, extents, /*isUnordered=*/true);
++  hlfir::LoopNest nest = hlfir::genLoopNest(
++      loc, builder, shapeShift.getExtents(), /*isUnordered=*/true);
+   builder.setInsertionPointToStart(nest.innerLoop.getBody());
+   mlir::Type refTy = fir::ReferenceType::get(seqTy.getEleTy());
+   auto lhsEleAddr = builder.create<fir::ArrayCoorOp>(
+@@ -561,7 +566,8 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+     }
+ 
+     // Create the private copy from the initial fir.box:
+-    hlfir::Entity source = hlfir::Entity{blockArg};
++    mlir::Value loadedBox = builder.loadIfRef(loc, blockArg);
++    hlfir::Entity source = hlfir::Entity{loadedBox};
+ 
+     // Allocating on the heap in case the whole reduction is nested inside of a
+     // loop
+@@ -585,11 +591,23 @@ createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
+     }
+ 
+     // Put the temporary inside of a box:
+-    hlfir::Entity box = hlfir::genVariableBox(loc, builder, temp);
+-    // hlfir::genVariableBox removes fir.heap<> around the element type
+-    mlir::Value convertedBox = builder.createConvert(loc, ty, box.getBase());
+-    builder.create<hlfir::AssignOp>(loc, initValue, convertedBox);
+-    builder.create<fir::StoreOp>(loc, convertedBox, boxAlloca);
++    // hlfir::genVariableBox doesn't handle non-default lower bounds
++    mlir::Value box;
++    fir::ShapeShiftOp shapeShift = getShapeShift(builder, loc, loadedBox);
++    mlir::Type boxType = loadedBox.getType();
++    if (mlir::isa<fir::BaseBoxType>(temp.getType()))
++      // the box created by the declare form createTempFromMold is missing lower
++      // bounds info
++      box = builder.create<fir::ReboxOp>(loc, boxType, temp, shapeShift,
++                                         /*shift=*/mlir::Value{});
++    else
++      box = builder.create<fir::EmboxOp>(
++          loc, boxType, temp, shapeShift,
++          /*slice=*/mlir::Value{},
++          /*typeParams=*/llvm::ArrayRef<mlir::Value>{});
++
++    builder.create<hlfir::AssignOp>(loc, initValue, box);
++    builder.create<fir::StoreOp>(loc, box, boxAlloca);
+     if (ifUnallocated)
+       builder.setInsertionPointAfter(ifUnallocated);
+     return boxAlloca;
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+index 890ae48ce0fc2..20c262f8fa0e2 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-allocatable-array.f90
+@@ -37,9 +37,12 @@ program reduce
+ ! CHECK:             %[[VAL_6:.*]] = fir.allocmem !fir.array<?xi32>, %[[VAL_4]]#1 {bindc_name = ".tmp", uniq_name = ""}
+ ! CHECK:             %[[VAL_7:.*]] = arith.constant true
+ ! CHECK:             %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_6]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> (!fir.box<!fir.array<?xi32>>, !fir.heap<!fir.array<?xi32>>)
+-! CHECK:             %[[VAL_9:.*]] = fir.convert %[[VAL_8]]#0 : (!fir.box<!fir.array<?xi32>>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             hlfir.assign %[[VAL_1]] to %[[VAL_9]] : i32, !fir.box<!fir.heap<!fir.array<?xi32>>>
+-! CHECK:             fir.store %[[VAL_9]] to %[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
++! CHECK:             %[[C0:.*]] = arith.constant 0 : index
++! CHECK:             %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_2]], %[[C0]] : (!fir.box<!fir.heap<!fir.array<?xi32>>>, index) -> (index, index, index)
++! CHECK:             %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:             %[[REBOX:.*]] = fir.rebox %[[VAL_8]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.heap<!fir.array<?xi32>>>
++! CHECK:             hlfir.assign %[[VAL_1]] to %[[REBOX]] : i32, !fir.box<!fir.heap<!fir.array<?xi32>>>
++! CHECK:             fir.store %[[REBOX]] to %[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ ! CHECK:           }
+ ! CHECK:           omp.yield(%[[VAL_10]] : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>)
+ ! CHECK:         } combiner {
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+new file mode 100644
+index 0000000000000..8202e6d897157
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array-lb.f90
+@@ -0,0 +1,90 @@
++! RUN: bbc -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -o - %s 2>&1 | FileCheck %s
++
++program reduce
++integer, dimension(2:4, 2) :: i = 0
++
++!$omp parallel reduction(+:i)
++i(3, 1) = 3
++!$omp end parallel
++
++print *,i
++
++end program
++
++! CHECK-LABEL:   omp.declare_reduction @add_reduction_byref_box_3x2xi32 : !fir.ref<!fir.box<!fir.array<3x2xi32>>> init {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
++! CHECK:           %[[VAL_1:.*]] = arith.constant 0 : i32
++! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           %[[VAL_15:.*]] = fir.alloca !fir.box<!fir.array<3x2xi32>>
++! CHECK:           %[[VAL_3:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_4:.*]] = arith.constant 2 : index
++! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_3]], %[[VAL_4]] : (index, index) -> !fir.shape<2>
++! CHECK:           %[[VAL_6:.*]] = fir.allocmem !fir.array<3x2xi32> {bindc_name = ".tmp", uniq_name = ""}
++! CHECK:           %[[VAL_7:.*]] = arith.constant true
++! CHECK:           %[[VAL_8:.*]]:2 = hlfir.declare %[[VAL_6]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<3x2xi32>>, !fir.shape<2>) -> (!fir.heap<!fir.array<3x2xi32>>, !fir.heap<!fir.array<3x2xi32>>)
++! CHECK:           %[[VAL_9:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_10:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_9]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_11:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_12:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_11]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_13:.*]] = fir.shape_shift %[[VAL_10]]#0, %[[VAL_10]]#1, %[[VAL_12]]#0, %[[VAL_12]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[VAL_14:.*]] = fir.embox %[[VAL_8]]#0(%[[VAL_13]]) : (!fir.heap<!fir.array<3x2xi32>>, !fir.shapeshift<2>) -> !fir.box<!fir.array<3x2xi32>>
++! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_14]] : i32, !fir.box<!fir.array<3x2xi32>>
++! CHECK:           fir.store %[[VAL_14]] to %[[VAL_15]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           omp.yield(%[[VAL_15]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
++! CHECK:         } combiner {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
++! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           %[[VAL_3:.*]] = fir.load %[[VAL_1]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : index
++! CHECK:           %[[VAL_5:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_4]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_6:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_7:.*]]:3 = fir.box_dims %[[VAL_2]], %[[VAL_6]] : (!fir.box<!fir.array<3x2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[VAL_8:.*]] = fir.shape_shift %[[VAL_5]]#0, %[[VAL_5]]#1, %[[VAL_7]]#0, %[[VAL_7]]#1 : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[VAL_9:.*]] = arith.constant 1 : index
++! CHECK:           fir.do_loop %[[VAL_10:.*]] = %[[VAL_9]] to %[[VAL_7]]#1 step %[[VAL_9]] unordered {
++! CHECK:             fir.do_loop %[[VAL_11:.*]] = %[[VAL_9]] to %[[VAL_5]]#1 step %[[VAL_9]] unordered {
++! CHECK:               %[[VAL_12:.*]] = fir.array_coor %[[VAL_2]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
++! CHECK:               %[[VAL_13:.*]] = fir.array_coor %[[VAL_3]](%[[VAL_8]]) %[[VAL_11]], %[[VAL_10]] : (!fir.box<!fir.array<3x2xi32>>, !fir.shapeshift<2>, index, index) -> !fir.ref<i32>
++! CHECK:               %[[VAL_14:.*]] = fir.load %[[VAL_12]] : !fir.ref<i32>
++! CHECK:               %[[VAL_15:.*]] = fir.load %[[VAL_13]] : !fir.ref<i32>
++! CHECK:               %[[VAL_16:.*]] = arith.addi %[[VAL_14]], %[[VAL_15]] : i32
++! CHECK:               fir.store %[[VAL_16]] to %[[VAL_12]] : !fir.ref<i32>
++! CHECK:             }
++! CHECK:           }
++! CHECK:           omp.yield(%[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
++! CHECK:         }  cleanup {
++! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<3x2xi32>>>):
++! CHECK:           %[[VAL_1:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           %[[VAL_2:.*]] = fir.box_addr %[[VAL_1]] : (!fir.box<!fir.array<3x2xi32>>) -> !fir.ref<!fir.array<3x2xi32>>
++! CHECK:           %[[VAL_3:.*]] = fir.convert %[[VAL_2]] : (!fir.ref<!fir.array<3x2xi32>>) -> i64
++! CHECK:           %[[VAL_4:.*]] = arith.constant 0 : i64
++! CHECK:           %[[VAL_5:.*]] = arith.cmpi ne, %[[VAL_3]], %[[VAL_4]] : i64
++! CHECK:           fir.if %[[VAL_5]] {
++! CHECK:             %[[VAL_6:.*]] = fir.convert %[[VAL_2]] : (!fir.ref<!fir.array<3x2xi32>>) -> !fir.heap<!fir.array<3x2xi32>>
++! CHECK:             fir.freemem %[[VAL_6]] : !fir.heap<!fir.array<3x2xi32>>
++! CHECK:           }
++! CHECK:           omp.yield
++! CHECK:         }
++
++! CHECK-LABEL:   func.func @_QQmain() attributes {fir.bindc_name = "reduce"} {
++! CHECK:           %[[VAL_0:.*]] = fir.address_of(@_QFEi) : !fir.ref<!fir.array<3x2xi32>>
++! CHECK:           %[[VAL_1:.*]] = arith.constant 2 : index
++! CHECK:           %[[VAL_2:.*]] = arith.constant 3 : index
++! CHECK:           %[[VAL_3:.*]] = arith.constant 1 : index
++! CHECK:           %[[VAL_4:.*]] = arith.constant 2 : index
++! CHECK:           %[[VAL_5:.*]] = fir.shape_shift %[[VAL_1]], %[[VAL_2]], %[[VAL_3]], %[[VAL_4]] : (index, index, index, index) -> !fir.shapeshift<2>
++! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_0]](%[[VAL_5]]) {uniq_name = "_QFEi"} : (!fir.ref<!fir.array<3x2xi32>>, !fir.shapeshift<2>) -> (!fir.box<!fir.array<3x2xi32>>, !fir.ref<!fir.array<3x2xi32>>)
++! CHECK:           %[[VAL_7:.*]] = fir.alloca !fir.box<!fir.array<3x2xi32>>
++! CHECK:           fir.store %[[VAL_6]]#0 to %[[VAL_7]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:           omp.parallel byref reduction(@add_reduction_byref_box_3x2xi32 %[[VAL_7]] -> %[[VAL_8:.*]] : !fir.ref<!fir.box<!fir.array<3x2xi32>>>) {
++! CHECK:             %[[VAL_9:.*]]:2 = hlfir.declare %[[VAL_8]] {uniq_name = "_QFEi"} : (!fir.ref<!fir.box<!fir.array<3x2xi32>>>) -> (!fir.ref<!fir.box<!fir.array<3x2xi32>>>, !fir.ref<!fir.box<!fir.array<3x2xi32>>>)
++! CHECK:             %[[VAL_10:.*]] = arith.constant 3 : i32
++! CHECK:             %[[VAL_11:.*]] = fir.load %[[VAL_9]]#0 : !fir.ref<!fir.box<!fir.array<3x2xi32>>>
++! CHECK:             %[[VAL_12:.*]] = arith.constant 3 : index
++! CHECK:             %[[VAL_13:.*]] = arith.constant 1 : index
++! CHECK:             %[[VAL_14:.*]] = hlfir.designate %[[VAL_11]] (%[[VAL_12]], %[[VAL_13]])  : (!fir.box<!fir.array<3x2xi32>>, index, index) -> !fir.ref<i32>
++! CHECK:             hlfir.assign %[[VAL_10]] to %[[VAL_14]] : i32, !fir.ref<i32>
++! CHECK:             omp.terminator
++! CHECK:           }
++
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+index 32f77e66d17ad..34f4ee0a9eb3a 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array.f90
+@@ -24,7 +24,10 @@ program reduce
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+ ! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_1]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<3xi32>>,
+ !fir.shape<1>) -> (!fir.heap<!fir.array<3xi32>>, !fir.heap<!fir.array<3xi32>>)
+-! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[VAL_5]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_3]], %[[C0]] : (!fir.box<!fir.array<3xi32>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90 b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+index 28914e78bf388..aa14092554eda 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction-array2.f90
+@@ -22,9 +22,11 @@ program reduce
+ ! CHECK:           %[[VAL_5:.*]] = fir.shape %[[VAL_4]] : (index) -> !fir.shape<1>
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<3xi32>
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+-! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_1]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<3xi32>>,
+-!fir.shape<1>) -> (!fir.heap<!fir.array<3xi32>>, !fir.heap<!fir.array<3xi32>>)
+-! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[VAL_5]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<3xi32>>
++! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_1]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<3xi32>>, !fir.shape<1>) -> (!fir.heap<!fir.array<3xi32>>, !fir.heap<!fir.array<3xi32>>)
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_3]], %[[C0]] : (!fir.box<!fir.array<3xi32>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<3xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<3xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<3xi32>>
+ ! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<3xi32>>>)
+diff --git a/flang/test/Lower/OpenMP/parallel-reduction3.f90 b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+index 4d25a4c34bd9a..e24a16733f392 100644
+--- a/flang/test/Lower/OpenMP/parallel-reduction3.f90
++++ b/flang/test/Lower/OpenMP/parallel-reduction3.f90
+@@ -12,8 +12,12 @@
+ ! CHECK:           %[[VAL_6:.*]] = fir.allocmem !fir.array<?xi32>, %[[VAL_4]]#1 {bindc_name = ".tmp", uniq_name = ""}
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+ ! CHECK:           %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<?xi32>>, !fir.shape<1>) -> (!fir.box<!fir.array<?xi32>>, !fir.heap<!fir.array<?xi32>>)
+-! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_7]]#0 : i32, !fir.box<!fir.array<?xi32>>
+-! CHECK:           fir.store %[[VAL_7]]#0 to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_2]], %[[C0]] : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[REBOX:.*]] = fir.rebox %[[VAL_7]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<?xi32>>
++! CHECK:           hlfir.assign %[[VAL_1]] to %[[REBOX]] : i32, !fir.box<!fir.array<?xi32>>
++! CHECK:           fir.store %[[REBOX]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xi32>>>)
+ ! CHECK:         } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<?xi32>>>):
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+index c22407cd35ad0..f8bdfb349ba5a 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array-assumed-shape.f90
+@@ -33,10 +33,13 @@ subroutine reduce(r)
+ ! CHECK:           %[[VAL_6:.*]] = fir.allocmem !fir.array<?xf64>, %[[VAL_4]]#1 {bindc_name = ".tmp", uniq_name = ""}
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+ ! CHECK:           %[[VAL_7:.*]]:2 = hlfir.declare %[[VAL_6]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<?xf64>>, !fir.shape<1>) -> (!fir.box<!fir.array<?xf64>>, !fir.heap<!fir.array<?xf64>>)
+-! CHECK:           hlfir.assign %[[VAL_1]] to %[[VAL_7]]#0 : f64, !fir.box<!fir.array<?xf64>>
+-! CHECK:           fir.store %[[VAL_7]]#0 to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_2]], %[[C0]] : (!fir.box<!fir.array<?xf64>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[REBOX:.*]] = fir.rebox %[[VAL_7]]#0(%[[SHIFT]]) : (!fir.box<!fir.array<?xf64>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<?xf64>
++! CHECK:           hlfir.assign %[[VAL_1]] to %[[REBOX]] : f64, !fir.box<!fir.array<?xf64>>
++! CHECK:           fir.store %[[REBOX]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<?xf64>>>)
+-
+ ! CHECK-LABEL:   } combiner {
+ ! CHECK:         ^bb0(%[[VAL_0:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>, %[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.array<?xf64>>>):
+ ! CHECK:           %[[VAL_2:.*]] = fir.load %[[VAL_0]] : !fir.ref<!fir.box<!fir.array<?xf64>>>
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+index ef122e81d3927..a193bd1a31e9f 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array.f90
+@@ -24,7 +24,10 @@ program reduce
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<2xi32> {bindc_name = ".tmp", uniq_name = ""}
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+ ! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_1]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.heap<!fir.array<2xi32>>, !fir.heap<!fir.array<2xi32>>)
+-! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[VAL_5]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_3]], %[[C0]] : (!fir.box<!fir.array<2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<2xi32>>
+ ! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)
+diff --git a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90 b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+index 6de8c8eb2e48d..0afb2af0c1c50 100644
+--- a/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
++++ b/flang/test/Lower/OpenMP/wsloop-reduction-array2.f90
+@@ -24,7 +24,10 @@ program reduce
+ ! CHECK:           %[[VAL_1:.*]] = fir.allocmem !fir.array<2xi32> {bindc_name = ".tmp", uniq_name = ""}
+ ! CHECK:           %[[TRUE:.*]]  = arith.constant true
+ ! CHECK:           %[[VAL_6:.*]]:2 = hlfir.declare %[[VAL_1]](%[[VAL_5]]) {uniq_name = ".tmp"} : (!fir.heap<!fir.array<2xi32>>, !fir.shape<1>) -> (!fir.heap<!fir.array<2xi32>>, !fir.heap<!fir.array<2xi32>>)
+-! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[VAL_5]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shape<1>) -> !fir.box<!fir.array<2xi32>>
++! CHECK:           %[[C0:.*]] = arith.constant 0 : index
++! CHECK:           %[[DIMS:.*]]:3 = fir.box_dims %[[VAL_3]], %[[C0]] : (!fir.box<!fir.array<2xi32>>, index) -> (index, index, index)
++! CHECK:           %[[SHIFT:.*]] = fir.shape_shift %[[DIMS]]#0, %[[DIMS]]#1 : (index, index) -> !fir.shapeshift<1>
++! CHECK:           %[[VAL_7:.*]] = fir.embox %[[VAL_6]]#0(%[[SHIFT]]) : (!fir.heap<!fir.array<2xi32>>, !fir.shapeshift<1>) -> !fir.box<!fir.array<2xi32>>
+ ! CHECK:           hlfir.assign %[[VAL_2]] to %[[VAL_7]] : i32, !fir.box<!fir.array<2xi32>>
+ ! CHECK:           fir.store %[[VAL_7]] to %[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>
+ ! CHECK:           omp.yield(%[[VAL_8]] : !fir.ref<!fir.box<!fir.array<2xi32>>>)

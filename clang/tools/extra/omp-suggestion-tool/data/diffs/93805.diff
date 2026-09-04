@@ -1,0 +1,348 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+index de7959db489e9..c604531fd8bcc 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPClauseOperands.h
+@@ -147,6 +147,7 @@ struct NumThreadsClauseOps {
+ 
+ struct OrderClauseOps {
+   ClauseOrderKindAttr orderAttr;
++  OrderModifierAttr orderModAttr;
+ };
+ 
+ struct OrderedClauseOps {
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPEnums.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPEnums.td
+index bf3d33819e9a9..b1a9e3330522b 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPEnums.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPEnums.td
+@@ -163,6 +163,21 @@ def DeclareTargetDeviceTypeAttr : OpenMP_EnumAttr<DeclareTargetDeviceType,
+   let assemblyFormat = "`(` $value `)`";
+ }
+ 
++//===----------------------------------------------------------------------===//
++// order_modifer enum.
++//===----------------------------------------------------------------------===//
++
++def OMP_OrderModReproducible       : I32EnumAttrCase<"reproducible", 0>;
++def OMP_OrderModUnconstrained      : I32EnumAttrCase<"unconstrained", 1>;
++def OrderModifier
++    : I32EnumAttr<"OrderModifier", "OpenMP Order Modifier",
++                  [OMP_OrderModReproducible, OMP_OrderModUnconstrained]> {
++  let genSpecializedAttr = 0;
++  let cppNamespace = "::mlir::omp";
++}
++def OrderModifierAttr : EnumAttr<OpenMP_Dialect, OrderModifier,
++                                    "order_mod">;
++
+ //===----------------------------------------------------------------------===//
+ // sched_mod enum.
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index dc9ac2b9de22f..7e0fa046aa6ee 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -539,7 +539,8 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+              UnitAttr:$simd_modifier,
+              UnitAttr:$nowait,
+              ConfinedAttr<OptionalAttr<I64Attr>, [IntMinValue<0>]>:$ordered_val,
+-             OptionalAttr<OrderKindAttr>:$order_val);
++             OptionalAttr<OrderKindAttr>:$order_val,
++             OptionalAttr<OrderModifierAttr>:$order_mod);
+ 
+   let builders = [
+     OpBuilder<(ins CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>,
+@@ -563,7 +564,7 @@ def WsloopOp : OpenMP_Op<"wsloop", [AttrSizedOperandSegments,
+                 $schedule_chunk_var, type($schedule_chunk_var)) `)`
+           |`nowait` $nowait
+           |`ordered` `(` $ordered_val `)`
+-          |`order` `(` custom<ClauseAttr>($order_val) `)`
++          |`order` `(` custom<OrderClause>($order_val, $order_mod) `)`
+     ) custom<Wsloop>($region, $reduction_vars, type($reduction_vars),
+                      $reduction_vars_byref, $reductions) attr-dict
+   }];
+@@ -629,6 +630,7 @@ def SimdOp : OpenMP_Op<"simd", [AttrSizedOperandSegments,
+              Optional<I1>:$if_expr,
+              Variadic<OpenMP_PointerLikeType>:$nontemporal_vars,
+              OptionalAttr<OrderKindAttr>:$order_val,
++             OptionalAttr<OrderModifierAttr>:$order_mod,
+              ConfinedAttr<OptionalAttr<I64Attr>, [IntPositive]>:$simdlen,
+              ConfinedAttr<OptionalAttr<I64Attr>, [IntPositive]>:$safelen
+      );
+@@ -645,7 +647,7 @@ def SimdOp : OpenMP_Op<"simd", [AttrSizedOperandSegments,
+                                    $alignment_values) `)`
+           |`if` `(` $if_expr `)`
+           |`nontemporal` `(`  $nontemporal_vars `:` type($nontemporal_vars) `)`
+-          |`order` `(` custom<ClauseAttr>($order_val) `)`
++          |`order` `(` custom<OrderClause>($order_val, $order_mod) `)`
+           |`simdlen` `(` $simdlen  `)`
+           |`safelen` `(` $safelen  `)`
+     ) $region attr-dict
+@@ -727,7 +729,8 @@ def DistributeOp : OpenMP_Op<"distribute", [AttrSizedOperandSegments,
+              Optional<IntLikeType>:$chunk_size,
+              Variadic<AnyType>:$allocate_vars,
+              Variadic<AnyType>:$allocators_vars,
+-             OptionalAttr<OrderKindAttr>:$order_val);
++             OptionalAttr<OrderKindAttr>:$order_val,
++             OptionalAttr<OrderModifierAttr>:$order_mod);
+ 
+   let regions = (region AnyRegion:$region);
+ 
+@@ -738,7 +741,7 @@ def DistributeOp : OpenMP_Op<"distribute", [AttrSizedOperandSegments,
+   let assemblyFormat = [{
+     oilist(`dist_schedule_static` $dist_schedule_static
+           |`chunk_size` `(` $chunk_size `:` type($chunk_size) `)`
+-          |`order` `(` custom<ClauseAttr>($order_val) `)`
++          |`order` `(` custom<OrderClause>($order_val, $order_mod) `)`
+           |`allocate` `(`
+              custom<AllocateAndAllocator>(
+                $allocate_vars, type($allocate_vars),
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 110873011fe35..fbad80a2480bf 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -433,6 +433,45 @@ static void printScheduleClause(OpAsmPrinter &p, Operation *op,
+     p << ", simd";
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Parser and printer for Order Clause
++//===----------------------------------------------------------------------===//
++
++// order ::= `order` `(` [order-modiﬁer ':'] concurrent `)`
++// order-modiﬁer ::= reproducible | unconstrained
++static ParseResult parseOrderClause(OpAsmParser &parser,
++                                    ClauseOrderKindAttr &kindAttr,
++                                    OrderModifierAttr &modifierAttr) {
++  StringRef enumStr;
++  SMLoc loc = parser.getCurrentLocation();
++  if (parser.parseKeyword(&enumStr))
++    return failure();
++  if (std::optional<OrderModifier> enumValue =
++          symbolizeOrderModifier(enumStr)) {
++    modifierAttr = OrderModifierAttr::get(parser.getContext(), *enumValue);
++    if (parser.parseOptionalColon())
++      return failure();
++    loc = parser.getCurrentLocation();
++    if (parser.parseKeyword(&enumStr))
++      return failure();
++  }
++  if (std::optional<ClauseOrderKind> enumValue =
++          symbolizeClauseOrderKind(enumStr)) {
++    kindAttr = ClauseOrderKindAttr::get(parser.getContext(), *enumValue);
++    return success();
++  }
++  return parser.emitError(loc, "invalid clause value: '") << enumStr << "'";
++}
++
++static void printOrderClause(OpAsmPrinter &p, Operation *op,
++                             ClauseOrderKindAttr kindAttr,
++                             OrderModifierAttr modifierAttr) {
++  if (modifierAttr)
++    p << stringifyOrderModifier(modifierAttr.getValue()) << ":";
++  if (kindAttr)
++    p << stringifyClauseOrderKind(kindAttr.getValue());
++}
++
+ //===----------------------------------------------------------------------===//
+ // Parser, printer and verifier for ReductionVarList
+ //===----------------------------------------------------------------------===//
+@@ -1682,7 +1721,8 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+         /*reductions=*/nullptr, /*schedule_val=*/nullptr,
+         /*schedule_chunk_var=*/nullptr, /*schedule_modifier=*/nullptr,
+         /*simd_modifier=*/false, /*nowait=*/false,
+-        /*ordered_val=*/nullptr, /*order_val=*/nullptr);
++        /*ordered_val=*/nullptr, /*order_val=*/nullptr,
++        /*order_modifier=*/nullptr);
+   state.addAttributes(attributes);
+ }
+ 
+@@ -1697,7 +1737,8 @@ void WsloopOp::build(OpBuilder &builder, OperationState &state,
+                   makeArrayAttr(ctx, clauses.reductionDeclSymbols),
+                   clauses.scheduleValAttr, clauses.scheduleChunkVar,
+                   clauses.scheduleModAttr, clauses.scheduleSimdAttr,
+-                  clauses.nowaitAttr, clauses.orderedAttr, clauses.orderAttr);
++                  clauses.nowaitAttr, clauses.orderedAttr, clauses.orderAttr,
++                  clauses.orderModAttr);
+ }
+ 
+ LogicalResult WsloopOp::verify() {
+@@ -1726,8 +1767,8 @@ void SimdOp::build(OpBuilder &builder, OperationState &state,
+   // privatizers, reductionDeclSymbols.
+   SimdOp::build(builder, state, clauses.alignedVars,
+                 makeArrayAttr(ctx, clauses.alignmentAttrs), clauses.ifVar,
+-                clauses.nontemporalVars, clauses.orderAttr, clauses.simdlenAttr,
+-                clauses.safelenAttr);
++                clauses.nontemporalVars, clauses.orderAttr,
++                clauses.orderModAttr, clauses.simdlenAttr, clauses.safelenAttr);
+ }
+ 
+ LogicalResult SimdOp::verify() {
+@@ -1762,7 +1803,8 @@ void DistributeOp::build(OpBuilder &builder, OperationState &state,
+   // TODO Store clauses in op: privateVars, privatizers.
+   DistributeOp::build(builder, state, clauses.distScheduleStaticAttr,
+                       clauses.distScheduleChunkSizeVar, clauses.allocateVars,
+-                      clauses.allocatorVars, clauses.orderAttr);
++                      clauses.allocatorVars, clauses.orderAttr,
++                      clauses.orderModAttr);
+ }
+ 
+ LogicalResult DistributeOp::verify() {
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index 115d164b6cc7e..98284822f90a4 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -250,6 +250,26 @@ func.func @order_value(%lb : index, %ub : index, %step : index) {
+   }
+ }
+ 
++// -----
++func.func @reproducible_order(%lb : index, %ub : index, %step : index) {
++  // expected-error @below {{invalid clause value: 'default'}}
++  omp.wsloop order(reproducible:default) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  }
++}
++// -----
++func.func @unconstrained_order(%lb : index, %ub : index, %step : index) {
++  // expected-error @below {{invalid clause value: 'default'}}
++  omp.wsloop order(unconstrained:default) {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  }
++}
+ // -----
+ 
+ func.func @if_not_allowed(%lb : index, %ub : index, %step : index, %bool_var : i1) {
+@@ -485,6 +505,26 @@ func.func @omp_simd_order_value(%lb : index, %ub : index, %step : index) {
+ 
+ // -----
+ 
++func.func @omp_simd_reproducible_order(%lb : index, %ub : index, %step : index) {
++  // expected-error @below {{invalid clause value: 'default'}}
++  omp.simd order(reproducible:default) {
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }
++  return
++}
++// -----
++func.func @omp_simd_unconstrained_order(%lb : index, %ub : index, %step : index) {
++  // expected-error @below {{invalid clause value: 'default'}}
++  omp.simd order(unconstrained:default) {
++    omp.loop_nest (%iv) : index = (%arg0) to (%arg1) step (%arg2) {
++      omp.yield
++    }
++  }
++  return
++}
++// -----
+ func.func @omp_simd_pretty_simdlen(%lb : index, %ub : index, %step : index) -> () {
+   // expected-error @below {{op attribute 'simdlen' failed to satisfy constraint: 64-bit signless integer attribute whose value is positive}}
+   omp.simd simdlen(0) {
+@@ -2131,6 +2171,36 @@ func.func @omp_distribute_nested_wrapper(%data_var : memref<i32>) -> () {
+ 
+ // -----
+ 
++func.func @omp_distribute_order() -> () {
++// expected-error @below {{invalid clause value: 'default'}}
++  omp.distribute order(default) {
++    omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++      omp.yield
++    }
++  }
++  return
++}
++// -----
++func.func @omp_distribute_reproducible_order() -> () {
++// expected-error @below {{invalid clause value: 'default'}}
++  omp.distribute order(reproducible:default) {
++    omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++      omp.yield
++    }
++  }
++  return
++}
++// -----
++func.func @omp_distribute_unconstrained_order() -> () {
++// expected-error @below {{invalid clause value: 'default'}}
++  omp.distribute order(unconstrained:default) {
++    omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++      omp.yield
++    }
++  }
++  return
++}
++// -----
+ omp.private {type = private} @x.privatizer : i32 alloc {
+ ^bb0(%arg0: i32):
+   %0 = arith.constant 0.0 : f32
+diff --git a/mlir/test/Dialect/OpenMP/ops.mlir b/mlir/test/Dialect/OpenMP/ops.mlir
+index caf25a3cb59f0..c8e78cd6099fe 100644
+--- a/mlir/test/Dialect/OpenMP/ops.mlir
++++ b/mlir/test/Dialect/OpenMP/ops.mlir
+@@ -502,6 +502,22 @@ func.func @omp_wsloop_pretty(%lb : index, %ub : index, %step : index, %data_var
+     omp.terminator
+   }
+ 
++  // CHECK: omp.wsloop nowait order(reproducible:concurrent) {
++  // CHECK-NEXT: omp.loop_nest
++  omp.wsloop order(reproducible:concurrent) nowait {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  }
++  // CHECK: omp.wsloop nowait order(unconstrained:concurrent) {
++  // CHECK-NEXT: omp.loop_nest
++  omp.wsloop order(unconstrained:concurrent) nowait {
++    omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++    omp.terminator
++  }
+   // CHECK: omp.wsloop {
+   // CHECK-NEXT: omp.simd
+   // CHECK-NEXT: omp.loop_nest
+@@ -652,6 +668,18 @@ func.func @omp_simd_pretty_order(%lb : index, %ub : index, %step : index) -> ()
+       omp.yield
+     }
+   }
++  // CHECK: omp.simd order(reproducible:concurrent)
++  omp.simd order(reproducible:concurrent) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
++  // CHECK: omp.simd order(unconstrained:concurrent)
++  omp.simd order(unconstrained:concurrent) {
++    omp.loop_nest (%iv): index = (%lb) to (%ub) step (%step) {
++      omp.yield
++    }
++  }
+   return
+ }
+ 
+@@ -711,6 +739,18 @@ func.func @omp_distribute(%chunk_size : i32, %data_var : memref<i32>, %arg0 : i3
+       omp.yield
+     }
+   }
++  // CHECK: omp.distribute order(reproducible:concurrent)
++  omp.distribute order(reproducible:concurrent) {
++    omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++      omp.yield
++    }
++  }
++  // CHECK: omp.distribute order(unconstrained:concurrent)
++  omp.distribute order(unconstrained:concurrent) {
++    omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {
++      omp.yield
++    }
++  }
+   // CHECK: omp.distribute allocate(%{{.+}} : memref<i32> -> %{{.+}} : memref<i32>)
+   omp.distribute allocate(%data_var : memref<i32> -> %data_var : memref<i32>) {
+     omp.loop_nest (%iv) : i32 = (%arg0) to (%arg0) step (%arg0) {

@@ -1,0 +1,363 @@
+diff --git a/flang/include/flang/Frontend/LangOptions.h b/flang/include/flang/Frontend/LangOptions.h
+index 7ab2195818863..57d86d46df5ab 100644
+--- a/flang/include/flang/Frontend/LangOptions.h
++++ b/flang/include/flang/Frontend/LangOptions.h
+@@ -16,6 +16,9 @@
+ #define FORTRAN_FRONTEND_LANGOPTIONS_H
+ 
+ #include <string>
++#include <vector>
++
++#include "llvm/TargetParser/Triple.h"
+ 
+ namespace Fortran::frontend {
+ 
+@@ -58,6 +61,9 @@ class LangOptions : public LangOptionsBase {
+   /// host code generation.
+   std::string OMPHostIRFile;
+ 
++  /// List of triples passed in using -fopenmp-targets.
++  std::vector<llvm::Triple> OMPTargetTriples;
++
+   LangOptions();
+ };
+ 
+diff --git a/flang/include/flang/Tools/CrossToolHelpers.h b/flang/include/flang/Tools/CrossToolHelpers.h
+index 1d890fd8e1f6f..75fd783af237d 100644
+--- a/flang/include/flang/Tools/CrossToolHelpers.h
++++ b/flang/include/flang/Tools/CrossToolHelpers.h
+@@ -131,7 +131,9 @@ struct OffloadModuleOpts {
+       bool OpenMPThreadSubscription, bool OpenMPNoThreadState,
+       bool OpenMPNoNestedParallelism, bool OpenMPIsTargetDevice,
+       bool OpenMPIsGPU, bool OpenMPForceUSM, uint32_t OpenMPVersion,
+-      std::string OMPHostIRFile = {}, bool NoGPULib = false)
++      std::string OMPHostIRFile = {},
++      const std::vector<llvm::Triple> &OMPTargetTriples = {},
++      bool NoGPULib = false)
+       : OpenMPTargetDebug(OpenMPTargetDebug),
+         OpenMPTeamSubscription(OpenMPTeamSubscription),
+         OpenMPThreadSubscription(OpenMPThreadSubscription),
+@@ -139,7 +141,9 @@ struct OffloadModuleOpts {
+         OpenMPNoNestedParallelism(OpenMPNoNestedParallelism),
+         OpenMPIsTargetDevice(OpenMPIsTargetDevice), OpenMPIsGPU(OpenMPIsGPU),
+         OpenMPForceUSM(OpenMPForceUSM), OpenMPVersion(OpenMPVersion),
+-        OMPHostIRFile(OMPHostIRFile), NoGPULib(NoGPULib) {}
++        OMPHostIRFile(OMPHostIRFile),
++        OMPTargetTriples(OMPTargetTriples.begin(), OMPTargetTriples.end()),
++        NoGPULib(NoGPULib) {}
+ 
+   OffloadModuleOpts(Fortran::frontend::LangOptions &Opts)
+       : OpenMPTargetDebug(Opts.OpenMPTargetDebug),
+@@ -150,7 +154,7 @@ struct OffloadModuleOpts {
+         OpenMPIsTargetDevice(Opts.OpenMPIsTargetDevice),
+         OpenMPIsGPU(Opts.OpenMPIsGPU), OpenMPForceUSM(Opts.OpenMPForceUSM),
+         OpenMPVersion(Opts.OpenMPVersion), OMPHostIRFile(Opts.OMPHostIRFile),
+-        NoGPULib(Opts.NoGPULib) {}
++        OMPTargetTriples(Opts.OMPTargetTriples), NoGPULib(Opts.NoGPULib) {}
+ 
+   uint32_t OpenMPTargetDebug = 0;
+   bool OpenMPTeamSubscription = false;
+@@ -162,6 +166,7 @@ struct OffloadModuleOpts {
+   bool OpenMPForceUSM = false;
+   uint32_t OpenMPVersion = 11;
+   std::string OMPHostIRFile = {};
++  std::vector<llvm::Triple> OMPTargetTriples = {};
+   bool NoGPULib = false;
+ };
+ 
+@@ -185,6 +190,9 @@ struct OffloadModuleOpts {
+       if (!Opts.OMPHostIRFile.empty())
+         offloadMod.setHostIRFilePath(Opts.OMPHostIRFile);
+     }
++    auto strTriples = llvm::to_vector(llvm::map_range(Opts.OMPTargetTriples,
++        [](llvm::Triple triple) { return triple.normalize(); }));
++    offloadMod.setTargetTriples(strTriples);
+   }
+ }
+ 
+diff --git a/flang/lib/Frontend/CompilerInvocation.cpp b/flang/lib/Frontend/CompilerInvocation.cpp
+index 7c7f003cf731c..1d73397d33017 100644
+--- a/flang/lib/Frontend/CompilerInvocation.cpp
++++ b/flang/lib/Frontend/CompilerInvocation.cpp
+@@ -929,90 +929,11 @@ static bool parseDialectArgs(CompilerInvocation &res, llvm::opt::ArgList &args,
+         Fortran::common::LanguageFeature::CUDA);
+   }
+ 
+-  // -fopenmp and -fopenacc
++  // -fopenacc
+   if (args.hasArg(clang::driver::options::OPT_fopenacc)) {
+     res.getFrontendOpts().features.Enable(
+         Fortran::common::LanguageFeature::OpenACC);
+   }
+-  if (args.hasArg(clang::driver::options::OPT_fopenmp)) {
+-    // By default OpenMP is set to 1.1 version
+-    res.getLangOpts().OpenMPVersion = 11;
+-    res.getFrontendOpts().features.Enable(
+-        Fortran::common::LanguageFeature::OpenMP);
+-    if (int Version = getLastArgIntValue(
+-            args, clang::driver::options::OPT_fopenmp_version_EQ,
+-            res.getLangOpts().OpenMPVersion, diags)) {
+-      res.getLangOpts().OpenMPVersion = Version;
+-    }
+-    if (args.hasArg(clang::driver::options::OPT_fopenmp_force_usm)) {
+-      res.getLangOpts().OpenMPForceUSM = 1;
+-    }
+-    if (args.hasArg(clang::driver::options::OPT_fopenmp_is_target_device)) {
+-      res.getLangOpts().OpenMPIsTargetDevice = 1;
+-
+-      // Get OpenMP host file path if any and report if a non existent file is
+-      // found
+-      if (auto *arg = args.getLastArg(
+-              clang::driver::options::OPT_fopenmp_host_ir_file_path)) {
+-        res.getLangOpts().OMPHostIRFile = arg->getValue();
+-        if (!llvm::sys::fs::exists(res.getLangOpts().OMPHostIRFile))
+-          diags.Report(clang::diag::err_drv_omp_host_ir_file_not_found)
+-              << res.getLangOpts().OMPHostIRFile;
+-      }
+-
+-      if (args.hasFlag(
+-              clang::driver::options::OPT_fopenmp_assume_teams_oversubscription,
+-              clang::driver::options::
+-                  OPT_fno_openmp_assume_teams_oversubscription,
+-              /*Default=*/false))
+-        res.getLangOpts().OpenMPTeamSubscription = true;
+-
+-      if (args.hasArg(
+-              clang::driver::options::OPT_fopenmp_assume_no_thread_state))
+-        res.getLangOpts().OpenMPNoThreadState = 1;
+-
+-      if (args.hasArg(
+-              clang::driver::options::OPT_fopenmp_assume_no_nested_parallelism))
+-        res.getLangOpts().OpenMPNoNestedParallelism = 1;
+-
+-      if (args.hasFlag(clang::driver::options::
+-                           OPT_fopenmp_assume_threads_oversubscription,
+-                       clang::driver::options::
+-                           OPT_fno_openmp_assume_threads_oversubscription,
+-                       /*Default=*/false))
+-        res.getLangOpts().OpenMPThreadSubscription = true;
+-
+-      if ((args.hasArg(clang::driver::options::OPT_fopenmp_target_debug) ||
+-           args.hasArg(clang::driver::options::OPT_fopenmp_target_debug_EQ))) {
+-        res.getLangOpts().OpenMPTargetDebug = getLastArgIntValue(
+-            args, clang::driver::options::OPT_fopenmp_target_debug_EQ,
+-            res.getLangOpts().OpenMPTargetDebug, diags);
+-
+-        if (!res.getLangOpts().OpenMPTargetDebug &&
+-            args.hasArg(clang::driver::options::OPT_fopenmp_target_debug))
+-          res.getLangOpts().OpenMPTargetDebug = 1;
+-      }
+-      if (args.hasArg(clang::driver::options::OPT_nogpulib))
+-        res.getLangOpts().NoGPULib = 1;
+-    }
+-
+-    switch (llvm::Triple(res.getTargetOpts().triple).getArch()) {
+-    case llvm::Triple::nvptx:
+-    case llvm::Triple::nvptx64:
+-    case llvm::Triple::amdgcn:
+-      if (!res.getLangOpts().OpenMPIsTargetDevice) {
+-        const unsigned diagID = diags.getCustomDiagID(
+-            clang::DiagnosticsEngine::Error,
+-            "OpenMP AMDGPU/NVPTX is only prepared to deal with device code.");
+-        diags.Report(diagID);
+-      }
+-      res.getLangOpts().OpenMPIsGPU = 1;
+-      break;
+-    default:
+-      res.getLangOpts().OpenMPIsGPU = 0;
+-      break;
+-    }
+-  }
+ 
+   // -pedantic
+   if (args.hasArg(clang::driver::options::OPT_pedantic)) {
+@@ -1042,6 +963,130 @@ static bool parseDialectArgs(CompilerInvocation &res, llvm::opt::ArgList &args,
+   return diags.getNumErrors() == numErrorsBefore;
+ }
+ 
++/// Parses all OpenMP related arguments if the -fopenmp option is present,
++/// populating the \c res object accordingly. Returns false if new errors are
++/// generated.
++static bool parseOpenMPArgs(CompilerInvocation &res, llvm::opt::ArgList &args,
++                            clang::DiagnosticsEngine &diags) {
++  if (!args.hasArg(clang::driver::options::OPT_fopenmp))
++    return true;
++
++  unsigned numErrorsBefore = diags.getNumErrors();
++  llvm::Triple t(res.getTargetOpts().triple);
++
++  // By default OpenMP is set to 1.1 version
++  res.getLangOpts().OpenMPVersion = 11;
++  res.getFrontendOpts().features.Enable(
++      Fortran::common::LanguageFeature::OpenMP);
++  if (int Version = getLastArgIntValue(
++          args, clang::driver::options::OPT_fopenmp_version_EQ,
++          res.getLangOpts().OpenMPVersion, diags)) {
++    res.getLangOpts().OpenMPVersion = Version;
++  }
++  if (args.hasArg(clang::driver::options::OPT_fopenmp_force_usm)) {
++    res.getLangOpts().OpenMPForceUSM = 1;
++  }
++  if (args.hasArg(clang::driver::options::OPT_fopenmp_is_target_device)) {
++    res.getLangOpts().OpenMPIsTargetDevice = 1;
++
++    // Get OpenMP host file path if any and report if a non existent file is
++    // found
++    if (auto *arg = args.getLastArg(
++            clang::driver::options::OPT_fopenmp_host_ir_file_path)) {
++      res.getLangOpts().OMPHostIRFile = arg->getValue();
++      if (!llvm::sys::fs::exists(res.getLangOpts().OMPHostIRFile))
++        diags.Report(clang::diag::err_drv_omp_host_ir_file_not_found)
++            << res.getLangOpts().OMPHostIRFile;
++    }
++
++    if (args.hasFlag(
++            clang::driver::options::OPT_fopenmp_assume_teams_oversubscription,
++            clang::driver::options::
++                OPT_fno_openmp_assume_teams_oversubscription,
++            /*Default=*/false))
++      res.getLangOpts().OpenMPTeamSubscription = true;
++
++    if (args.hasArg(clang::driver::options::OPT_fopenmp_assume_no_thread_state))
++      res.getLangOpts().OpenMPNoThreadState = 1;
++
++    if (args.hasArg(
++            clang::driver::options::OPT_fopenmp_assume_no_nested_parallelism))
++      res.getLangOpts().OpenMPNoNestedParallelism = 1;
++
++    if (args.hasFlag(
++            clang::driver::options::OPT_fopenmp_assume_threads_oversubscription,
++            clang::driver::options::
++                OPT_fno_openmp_assume_threads_oversubscription,
++            /*Default=*/false))
++      res.getLangOpts().OpenMPThreadSubscription = true;
++
++    if ((args.hasArg(clang::driver::options::OPT_fopenmp_target_debug) ||
++         args.hasArg(clang::driver::options::OPT_fopenmp_target_debug_EQ))) {
++      res.getLangOpts().OpenMPTargetDebug = getLastArgIntValue(
++          args, clang::driver::options::OPT_fopenmp_target_debug_EQ,
++          res.getLangOpts().OpenMPTargetDebug, diags);
++
++      if (!res.getLangOpts().OpenMPTargetDebug &&
++          args.hasArg(clang::driver::options::OPT_fopenmp_target_debug))
++        res.getLangOpts().OpenMPTargetDebug = 1;
++    }
++    if (args.hasArg(clang::driver::options::OPT_nogpulib))
++      res.getLangOpts().NoGPULib = 1;
++  }
++
++  switch (llvm::Triple(res.getTargetOpts().triple).getArch()) {
++  case llvm::Triple::nvptx:
++  case llvm::Triple::nvptx64:
++  case llvm::Triple::amdgcn:
++    if (!res.getLangOpts().OpenMPIsTargetDevice) {
++      const unsigned diagID = diags.getCustomDiagID(
++          clang::DiagnosticsEngine::Error,
++          "OpenMP AMDGPU/NVPTX is only prepared to deal with device code.");
++      diags.Report(diagID);
++    }
++    res.getLangOpts().OpenMPIsGPU = 1;
++    break;
++  default:
++    res.getLangOpts().OpenMPIsGPU = 0;
++    break;
++  }
++
++  // Get the OpenMP target triples if any.
++  if (auto *arg =
++          args.getLastArg(clang::driver::options::OPT_fopenmp_targets_EQ)) {
++    enum ArchPtrSize { Arch16Bit, Arch32Bit, Arch64Bit };
++    auto getArchPtrSize = [](const llvm::Triple &triple) {
++      if (triple.isArch16Bit())
++        return Arch16Bit;
++      if (triple.isArch32Bit())
++        return Arch32Bit;
++      assert(triple.isArch64Bit() && "Expected 64-bit architecture");
++      return Arch64Bit;
++    };
++
++    for (unsigned i = 0; i < arg->getNumValues(); ++i) {
++      llvm::Triple tt(arg->getValue(i));
++
++      if (tt.getArch() == llvm::Triple::UnknownArch ||
++          !(tt.getArch() == llvm::Triple::aarch64 || tt.isPPC() ||
++            tt.getArch() == llvm::Triple::systemz ||
++            tt.getArch() == llvm::Triple::nvptx ||
++            tt.getArch() == llvm::Triple::nvptx64 ||
++            tt.getArch() == llvm::Triple::amdgcn ||
++            tt.getArch() == llvm::Triple::x86 ||
++            tt.getArch() == llvm::Triple::x86_64))
++        diags.Report(clang::diag::err_drv_invalid_omp_target)
++            << arg->getValue(i);
++      else if (getArchPtrSize(t) != getArchPtrSize(tt))
++        diags.Report(clang::diag::err_drv_incompatible_omp_arch)
++            << arg->getValue(i) << t.str();
++      else
++        res.getLangOpts().OMPTargetTriples.push_back(tt);
++    }
++  }
++  return diags.getNumErrors() == numErrorsBefore;
++}
++
+ /// Parses all floating point related arguments and populates the
+ /// CompilerInvocation accordingly.
+ /// Returns false if new errors are generated.
+@@ -1277,6 +1322,7 @@ bool CompilerInvocation::createFromArgs(
+   success &= parseVectorLibArg(invoc.getCodeGenOpts(), args, diags);
+   success &= parseSemaArgs(invoc, args, diags);
+   success &= parseDialectArgs(invoc, args, diags);
++  success &= parseOpenMPArgs(invoc, args, diags);
+   success &= parseDiagArgs(invoc, args, diags);
+ 
+   // Collect LLVM (-mllvm) and MLIR (-mmlir) options.
+diff --git a/flang/test/Lower/OpenMP/offload-targets.f90 b/flang/test/Lower/OpenMP/offload-targets.f90
+new file mode 100644
+index 0000000000000..9d0bb2b2946c5
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/offload-targets.f90
+@@ -0,0 +1,10 @@
++! RUN: %flang_fc1 -emit-hlfir -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa,nvptx64-nvidia-cuda %s -o - | FileCheck %s
++! RUN: bbc -emit-hlfir -fopenmp -fopenmp-targets=amdgcn-amd-amdhsa,nvptx64-nvidia-cuda %s -o - | FileCheck %s
++
++! This test checks the addition of the omp.target_triples attribute when the
++! -fopenmp-targets option is set
++
++!CHECK:      module attributes {
++!CHECK-SAME: omp.target_triples = ["amdgcn-amd-amdhsa", "nvptx64-nvidia-cuda"]
++program targets
++end program targets
+diff --git a/flang/tools/bbc/bbc.cpp b/flang/tools/bbc/bbc.cpp
+index 07eef065daf6f..736d68219581d 100644
+--- a/flang/tools/bbc/bbc.cpp
++++ b/flang/tools/bbc/bbc.cpp
+@@ -149,6 +149,11 @@ static llvm::cl::opt<bool> enableOpenMPForceUSM(
+     llvm::cl::desc("force openmp unified shared memory mode"),
+     llvm::cl::init(false));
+ 
++static llvm::cl::list<std::string> targetTriplesOpenMP(
++    "fopenmp-targets",
++    llvm::cl::desc("comma-separated list of OpenMP offloading triples"),
++    llvm::cl::CommaSeparated);
++
+ // A simplified subset of the OpenMP RTL Flags from Flang, only the primary
+ // positive options are available, no negative options e.g. fopen_assume* vs
+ // fno_open_assume*
+@@ -380,11 +385,17 @@ static llvm::LogicalResult convertFortranSourceToMLIR(
+                       "-fopenmp-is-target-device is also set";
+       return mlir::failure();
+     }
++    // Construct offloading target triples vector.
++    std::vector<llvm::Triple> targetTriples;
++    targetTriples.reserve(targetTriplesOpenMP.size());
++    for (llvm::StringRef s : targetTriplesOpenMP)
++      targetTriples.emplace_back(s);
++
+     auto offloadModuleOpts = OffloadModuleOpts(
+         setOpenMPTargetDebug, setOpenMPTeamSubscription,
+         setOpenMPThreadSubscription, setOpenMPNoThreadState,
+         setOpenMPNoNestedParallelism, enableOpenMPDevice, enableOpenMPGPU,
+-        enableOpenMPForceUSM, setOpenMPVersion, "", setNoGPULib);
++        enableOpenMPForceUSM, setOpenMPVersion, "", targetTriples, setNoGPULib);
+     setOffloadModuleInterfaceAttributes(mlirModule, offloadModuleOpts);
+     setOpenMPVersionAttribute(mlirModule, setOpenMPVersion);
+   }

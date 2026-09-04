@@ -1,0 +1,130 @@
+diff --git a/openmp/runtime/src/include/omp.h.var b/openmp/runtime/src/include/omp.h.var
+index eb3ab7778606a..dee46e51d6b34 100644
+--- a/openmp/runtime/src/include/omp.h.var
++++ b/openmp/runtime/src/include/omp.h.var
+@@ -476,7 +476,8 @@
+     typedef enum omp_pause_resource_t {
+       omp_pause_resume = 0,
+       omp_pause_soft = 1,
+-      omp_pause_hard = 2
++      omp_pause_hard = 2,
++      omp_pause_stop_tool = 3
+     } omp_pause_resource_t;
+     extern int __KAI_KMPC_CONVENTION omp_pause_resource(omp_pause_resource_t, int);
+     extern int __KAI_KMPC_CONVENTION omp_pause_resource_all(omp_pause_resource_t);
+diff --git a/openmp/runtime/src/include/omp_lib.F90.var b/openmp/runtime/src/include/omp_lib.F90.var
+index 63a3c93b8d929..5133915c7d8cb 100644
+--- a/openmp/runtime/src/include/omp_lib.F90.var
++++ b/openmp/runtime/src/include/omp_lib.F90.var
+@@ -192,6 +192,7 @@
+         integer (kind=omp_pause_resource_kind), parameter, public :: omp_pause_resume = 0
+         integer (kind=omp_pause_resource_kind), parameter, public :: omp_pause_soft = 1
+         integer (kind=omp_pause_resource_kind), parameter, public :: omp_pause_hard = 2
++        integer (kind=omp_pause_resource_kind), parameter, public :: omp_pause_stop_tool = 3
+ 
+         integer (kind=omp_interop_fr_kind), parameter, public :: omp_ifr_cuda = 1
+         integer (kind=omp_interop_fr_kind), parameter, public :: omp_ifr_cuda_driver = 2
+diff --git a/openmp/runtime/src/include/omp_lib.h.var b/openmp/runtime/src/include/omp_lib.h.var
+index a709a2f298f8c..db1dc889d1299 100644
+--- a/openmp/runtime/src/include/omp_lib.h.var
++++ b/openmp/runtime/src/include/omp_lib.h.var
+@@ -248,6 +248,8 @@
+       parameter(omp_pause_soft=1)
+       integer(kind=omp_pause_resource_kind)omp_pause_hard
+       parameter(omp_pause_hard=2)
++      integer(kind=omp_pause_resource_kind)omp_pause_stop_tool
++      parameter(omp_pause_stop_tool=3)
+ 
+       integer(kind=omp_interop_fr_kind)omp_ifr_cuda
+       parameter(omp_ifr_cuda=1)
+diff --git a/openmp/runtime/src/kmp.h b/openmp/runtime/src/kmp.h
+index c8d821b12ff0c..80b757f267a6e 100644
+--- a/openmp/runtime/src/kmp.h
++++ b/openmp/runtime/src/kmp.h
+@@ -4550,7 +4550,8 @@ extern int __kmpc_get_target_offload();
+ typedef enum kmp_pause_status_t {
+   kmp_not_paused = 0, // status is not paused, or, requesting resume
+   kmp_soft_paused = 1, // status is soft-paused, or, requesting soft pause
+-  kmp_hard_paused = 2 // status is hard-paused, or, requesting hard pause
++  kmp_hard_paused = 2, // status is hard-paused, or, requesting hard pause
++  kmp_stop_tool_paused = 3 // requesting stop_tool pause
+ } kmp_pause_status_t;
+ 
+ // This stores the pause state of the runtime
+diff --git a/openmp/runtime/src/kmp_ftn_entry.h b/openmp/runtime/src/kmp_ftn_entry.h
+index 713561734c481..9bd3ac973b352 100644
+--- a/openmp/runtime/src/kmp_ftn_entry.h
++++ b/openmp/runtime/src/kmp_ftn_entry.h
+@@ -1427,6 +1427,8 @@ int FTN_STDCALL KMP_EXPAND_NAME(FTN_PAUSE_RESOURCE)(kmp_pause_status_t kind,
+ #ifdef KMP_STUB
+   return 1; // just fail
+ #else
++  if (kind == kmp_stop_tool_paused)
++    return 1; // stop_tool must not be specified
+   if (device_num == KMP_EXPAND_NAME(FTN_GET_INITIAL_DEVICE)())
+     return __kmpc_pause_resource(kind);
+   else {
+diff --git a/openmp/runtime/src/kmp_runtime.cpp b/openmp/runtime/src/kmp_runtime.cpp
+index b49c44f348d6b..110b3f5cee22c 100644
+--- a/openmp/runtime/src/kmp_runtime.cpp
++++ b/openmp/runtime/src/kmp_runtime.cpp
+@@ -9129,7 +9129,8 @@ int __kmp_pause_resource(kmp_pause_status_t level) {
+       __kmp_soft_pause();
+       return 0;
+     }
+-  } else if (level == kmp_hard_paused) { // requesting hard pause
++  } else if (level == kmp_hard_paused || level == kmp_stop_tool_paused) {
++    // requesting hard pause or stop_tool pause
+     if (__kmp_pause_status != kmp_not_paused) {
+       // error message about already being paused
+       return 1;
+diff --git a/openmp/runtime/test/ompt/misc/pause_stop_tool.c b/openmp/runtime/test/ompt/misc/pause_stop_tool.c
+new file mode 100644
+index 0000000000000..c939137932445
+--- /dev/null
++++ b/openmp/runtime/test/ompt/misc/pause_stop_tool.c
+@@ -0,0 +1,44 @@
++// RUN: %libomp-compile-and-run | FileCheck %s
++// REQUIRES: ompt
++#include "callback.h"
++#include <omp.h>
++int main() {
++  int x = 0;
++  int ret = 0;
++#pragma omp parallel
++#pragma omp single
++  x++;
++  // Expected to fail; omp_pause_stop_tool must not be specified
++  ret = omp_pause_resource(omp_pause_stop_tool, omp_get_initial_device());
++  printf("omp_pause_resource %s\n", ret ? "failed" : "succeeded");
++#pragma omp parallel
++#pragma omp single
++  x++;
++  // Expected to succeed
++  ret = omp_pause_resource_all(omp_pause_stop_tool);
++  printf("omp_pause_resource_all %s\n", ret ? "failed" : "succeeded");
++#pragma omp parallel
++#pragma omp single
++  x++;
++  printf("x = %d\n", x);
++  return 0;
++
++  // Check if
++  // -- omp_pause_resource/resource_all returns expected code
++  // -- OMPT interface is shut down as expected
++
++  // CHECK-NOT: {{^}}0: Could not register callback
++  // CHECK: 0: NULL_POINTER=[[NULL:.*$]]
++
++  // CHECK: ompt_event_parallel_begin
++  // CHECK: ompt_event_parallel_end
++
++  // CHECK: omp_pause_resource failed
++
++  // CHECK: ompt_event_parallel_begin
++  // CHECK: ompt_event_parallel_end
++
++  // CHECK: omp_pause_resource_all succeeded
++
++  // CHECK-NOT: ompt_event
++}

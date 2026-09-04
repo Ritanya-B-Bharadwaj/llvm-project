@@ -1,0 +1,253 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index 11530c0fa3620..971428bac92fa 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -396,6 +396,7 @@ def WorkshareLoopWrapperOp : OpenMP_Op<"workshare.loop_wrapper", traits = [
+   ];
+   let assemblyFormat = "$region attr-dict";
+   let hasVerifier = 1;
++  let hasRegionVerifier = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+index b375756bcf2ae..92bf34ef3145f 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpsInterfaces.td
+@@ -222,6 +222,15 @@ def LoopWrapperInterface : OpInterface<"LoopWrapperInterface"> {
+     single region with a single block in which there's a single operation and a
+     terminator. That nested operation must be another loop wrapper or an
+     `omp.loop_nest`.
++
++    Operation-specific verifiers should make the following checks in their
++    verifier, additionally to what the interface itself checks:
++      - If `getNestedWrapper() != nullptr`, is the type of the nested wrapper
++      allowed in that context? This check might require looking at the parent as
++      well.
++      - If the operation is a `ComposableOpInterface`, check that it is
++      consistent with the potential existence of a `LoopWrapperInterface` parent
++      and whether `getNestedWrapper() != nullptr`.
+   }];
+ 
+   let cppNamespace = "::mlir::omp";
+@@ -255,7 +264,7 @@ def LoopWrapperInterface : OpInterface<"LoopWrapperInterface"> {
+   ];
+ 
+   let extraClassDeclaration = [{
+-    /// Interface verifier imlementation.
++    /// Interface verifier implementation.
+     llvm::LogicalResult verifyImpl();
+   }];
+ 
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index ecadf16e1e9f6..cf0b4bf6e95ed 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -2222,21 +2222,27 @@ LogicalResult ParallelOp::verify() {
+ }
+ 
+ LogicalResult ParallelOp::verifyRegions() {
+-  auto distributeChildOps = getOps<DistributeOp>();
+-  if (!distributeChildOps.empty()) {
++  auto distChildOps = getOps<DistributeOp>();
++  int numDistChildOps = std::distance(distChildOps.begin(), distChildOps.end());
++  if (numDistChildOps > 1)
++    return emitError()
++           << "multiple 'omp.distribute' nested inside of 'omp.parallel'";
++
++  if (numDistChildOps == 1) {
+     if (!isComposite())
+       return emitError()
+              << "'omp.composite' attribute missing from composite operation";
+ 
+     auto *ompDialect = getContext()->getLoadedDialect<OpenMPDialect>();
+-    Operation &distributeOp = **distributeChildOps.begin();
++    Operation &distributeOp = **distChildOps.begin();
+     for (Operation &childOp : getOps()) {
+       if (&childOp == &distributeOp || ompDialect != childOp.getDialect())
+         continue;
+ 
+       if (!childOp.hasTrait<OpTrait::IsTerminator>())
+         return emitError() << "unexpected OpenMP operation inside of composite "
+-                              "'omp.parallel'";
++                              "'omp.parallel': "
++                           << childOp.getName();
+     }
+   } else if (isComposite()) {
+     return emitError()
+@@ -2388,9 +2394,15 @@ void WorkshareOp::build(OpBuilder &builder, OperationState &state,
+ 
+ LogicalResult WorkshareLoopWrapperOp::verify() {
+   if (!(*this)->getParentOfType<WorkshareOp>())
+-    return emitError() << "must be nested in an omp.workshare";
+-  if (getNestedWrapper())
+-    return emitError() << "cannot be composite";
++    return emitOpError() << "must be nested in an omp.workshare";
++  return success();
++}
++
++LogicalResult WorkshareLoopWrapperOp::verifyRegions() {
++  if (isa_and_nonnull<LoopWrapperInterface>((*this)->getParentOp()) ||
++      getNestedWrapper())
++    return emitOpError() << "expected to be a standalone loop wrapper";
++
+   return success();
+ }
+ 
+@@ -2415,7 +2427,7 @@ LogicalResult LoopWrapperInterface::verifyImpl() {
+ 
+   Operation &firstOp = *region.op_begin();
+   if (!isa<LoopNestOp, LoopWrapperInterface>(firstOp))
+-    return emitOpError() << "op nested in loop wrapper is not another loop "
++    return emitOpError() << "nested in loop wrapper is not another loop "
+                             "wrapper or `omp.loop_nest`";
+ 
+   return success();
+@@ -2444,7 +2456,7 @@ LogicalResult LoopOp::verify() {
+ LogicalResult LoopOp::verifyRegions() {
+   if (llvm::isa_and_nonnull<LoopWrapperInterface>((*this)->getParentOp()) ||
+       getNestedWrapper())
+-    return emitError() << "`omp.loop` expected to be a standalone loop wrapper";
++    return emitOpError() << "expected to be a standalone loop wrapper";
+ 
+   return success();
+ }
+@@ -2601,9 +2613,13 @@ LogicalResult DistributeOp::verifyRegions() {
+     // Check for the allowed leaf constructs that may appear in a composite
+     // construct directly after DISTRIBUTE.
+     if (isa<WsloopOp>(nested)) {
+-      if (!llvm::dyn_cast_if_present<ParallelOp>((*this)->getParentOp()))
++      Operation *parentOp = (*this)->getParentOp();
++      if (!llvm::dyn_cast_if_present<ParallelOp>(parentOp) ||
++          !cast<ComposableOpInterface>(parentOp).isComposite()) {
+         return emitError() << "an 'omp.wsloop' nested wrapper is only allowed "
+-                              "when 'omp.parallel' is the direct parent";
++                              "when a composite 'omp.parallel' is the direct "
++                              "parent";
++      }
+     } else if (!isa<SimdOp>(nested))
+       return emitError() << "only supported nested wrappers are 'omp.simd' and "
+                             "'omp.wsloop'";
+diff --git a/mlir/test/Dialect/OpenMP/invalid.mlir b/mlir/test/Dialect/OpenMP/invalid.mlir
+index bd0541987339a..e08adb08f7e99 100644
+--- a/mlir/test/Dialect/OpenMP/invalid.mlir
++++ b/mlir/test/Dialect/OpenMP/invalid.mlir
+@@ -2391,7 +2391,7 @@ func.func @omp_distribute_allocate(%data_var : memref<i32>, %lb : i32, %ub : i32
+ // -----
+ 
+ func.func @omp_distribute_nested_wrapper(%lb: index, %ub: index, %step: index) -> () {
+-  // expected-error @below {{an 'omp.wsloop' nested wrapper is only allowed when 'omp.parallel' is the direct parent}}
++  // expected-error @below {{an 'omp.wsloop' nested wrapper is only allowed when a composite 'omp.parallel' is the direct parent}}
+   omp.distribute {
+     "omp.wsloop"() ({
+       omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+@@ -2429,6 +2429,22 @@ func.func @omp_distribute_nested_wrapper3(%lb: index, %ub: index, %step: index)
+ 
+ // -----
+ 
++func.func @omp_distribute_nested_wrapper4(%lb: index, %ub: index, %step: index) -> () {
++  omp.parallel {
++    // expected-error @below {{an 'omp.wsloop' nested wrapper is only allowed when a composite 'omp.parallel' is the direct parent}}
++    omp.distribute {
++      "omp.wsloop"() ({
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          "omp.yield"() : () -> ()
++        }
++      }) {omp.composite} : () -> ()
++    } {omp.composite}
++    omp.terminator
++  }
++}
++
++// -----
++
+ func.func @omp_distribute_order() -> () {
+ // expected-error @below {{invalid clause value: 'default'}}
+   omp.distribute order(default) {
+@@ -2623,15 +2639,13 @@ func.func @masked_arg_count_mismatch(%arg0: i32, %arg1: i32) {
+ 
+ // -----
+ func.func @omp_parallel_missing_composite(%lb: index, %ub: index, %step: index) -> () {
+-  // expected-error@+1 {{'omp.composite' attribute missing from composite operation}}
++  // expected-error @below {{'omp.composite' attribute missing from composite operation}}
+   omp.parallel {
+     omp.distribute {
+-      omp.wsloop {
+-        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+-          omp.yield
+-        }
+-      } {omp.composite}
+-    } {omp.composite}
++      omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++        omp.yield
++      }
++    }
+     omp.terminator
+   }
+   return
+@@ -2653,7 +2667,7 @@ func.func @omp_parallel_invalid_composite(%lb: index, %ub: index, %step: index)
+ 
+ // -----
+ func.func @omp_parallel_invalid_composite2(%lb: index, %ub: index, %step: index) -> () {
+-  // expected-error @below {{unexpected OpenMP operation inside of composite 'omp.parallel'}}
++  // expected-error @below {{unexpected OpenMP operation inside of composite 'omp.parallel': omp.barrier}}
+   omp.parallel {
+     omp.barrier
+     omp.distribute {
+@@ -2668,6 +2682,29 @@ func.func @omp_parallel_invalid_composite2(%lb: index, %ub: index, %step: index)
+   return
+ }
+ 
++// -----
++func.func @omp_parallel_invalid_composite3(%lb: index, %ub: index, %step: index) -> () {
++  // expected-error @below {{multiple 'omp.distribute' nested inside of 'omp.parallel'}}
++  omp.parallel {
++    omp.distribute {
++      omp.wsloop {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++      } {omp.composite}
++    } {omp.composite}
++    omp.distribute {
++      omp.wsloop {
++        omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
++          omp.yield
++        }
++      } {omp.composite}
++    } {omp.composite}
++    omp.terminator
++  } {omp.composite}
++  return
++}
++
+ // -----
+ func.func @omp_wsloop_missing_composite(%lb: index, %ub: index, %step: index) -> () {
+   // expected-error @below {{'omp.composite' attribute missing from composite wrapper}}
+@@ -2787,7 +2824,7 @@ func.func @omp_taskloop_invalid_composite(%lb: index, %ub: index, %step: index)
+ 
+ func.func @omp_loop_invalid_nesting(%lb : index, %ub : index, %step : index) {
+ 
+-  // expected-error @below {{`omp.loop` expected to be a standalone loop wrapper}}
++  // expected-error @below {{'omp.loop' op expected to be a standalone loop wrapper}}
+   omp.loop {
+     omp.simd {
+       omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+@@ -2804,7 +2841,7 @@ func.func @omp_loop_invalid_nesting(%lb : index, %ub : index, %step : index) {
+ func.func @omp_loop_invalid_nesting2(%lb : index, %ub : index, %step : index) {
+ 
+   omp.simd {
+-    // expected-error @below {{`omp.loop` expected to be a standalone loop wrapper}}
++    // expected-error @below {{'omp.loop' op expected to be a standalone loop wrapper}}
+     omp.loop {
+       omp.loop_nest (%iv) : index = (%lb) to (%ub) step (%step) {
+         omp.yield
+@@ -2831,7 +2868,7 @@ func.func @omp_loop_invalid_binding(%lb : index, %ub : index, %step : index) {
+ // -----
+ func.func @nested_wrapper(%idx : index) {
+   omp.workshare {
+-    // expected-error @below {{cannot be composite}}
++    // expected-error @below {{'omp.workshare.loop_wrapper' op expected to be a standalone loop wrapper}}
+     omp.workshare.loop_wrapper {
+       omp.simd {
+         omp.loop_nest (%iv) : index = (%idx) to (%idx) step (%idx) {

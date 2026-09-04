@@ -1,0 +1,325 @@
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 1d6fe6c8d4249..a30b39b42cac5 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1203,6 +1203,64 @@ void OmpStructureChecker::Enter(const parser::OpenMPBlockConstruct &x) {
+     deviceConstructFound_ = true;
+   }
+ 
++  if (GetContext().directive == llvm::omp::Directive::OMPD_single) {
++    std::set<Symbol *> singleCopyprivateSyms;
++    std::set<Symbol *> endSingleCopyprivateSyms;
++    bool foundNowait{false};
++    parser::CharBlock NowaitSource;
++
++    auto catchCopyPrivateNowaitClauses = [&](const auto &dir, bool endDir) {
++      for (auto &clause : std::get<parser::OmpClauseList>(dir.t).v) {
++        if (clause.Id() == llvm::omp::Clause::OMPC_copyprivate) {
++          for (const auto &ompObject : GetOmpObjectList(clause)->v) {
++            const auto *name{parser::Unwrap<parser::Name>(ompObject)};
++            if (Symbol * symbol{name->symbol}) {
++              if (singleCopyprivateSyms.count(symbol)) {
++                if (endDir) {
++                  context_.Warn(common::UsageWarning::OpenMPUsage, name->source,
++                      "The COPYPRIVATE clause with '%s' is already used on the SINGLE directive"_warn_en_US,
++                      name->ToString());
++                } else {
++                  context_.Say(name->source,
++                      "'%s' appears in more than one COPYPRIVATE clause on the SINGLE directive"_err_en_US,
++                      name->ToString());
++                }
++              } else if (endSingleCopyprivateSyms.count(symbol)) {
++                context_.Say(name->source,
++                    "'%s' appears in more than one COPYPRIVATE clause on the END SINGLE directive"_err_en_US,
++                    name->ToString());
++              } else {
++                if (endDir) {
++                  endSingleCopyprivateSyms.insert(symbol);
++                } else {
++                  singleCopyprivateSyms.insert(symbol);
++                }
++              }
++            }
++          }
++        } else if (clause.Id() == llvm::omp::Clause::OMPC_nowait) {
++          if (foundNowait) {
++            context_.Say(clause.source,
++                "At most one NOWAIT clause can appear on the SINGLE directive"_err_en_US);
++          } else {
++            foundNowait = !endDir;
++          }
++          if (!NowaitSource.ToString().size()) {
++            NowaitSource = clause.source;
++          }
++        }
++      }
++    };
++    catchCopyPrivateNowaitClauses(beginBlockDir, false);
++    catchCopyPrivateNowaitClauses(endBlockDir, true);
++    unsigned version{context_.langOptions().OpenMPVersion};
++    if (version <= 52 && NowaitSource.ToString().size() &&
++        (singleCopyprivateSyms.size() || endSingleCopyprivateSyms.size())) {
++      context_.Say(NowaitSource,
++          "NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive"_err_en_US);
++    }
++  }
++
+   switch (beginDir.v) {
+   case llvm::omp::Directive::OMPD_target:
+     if (CheckTargetBlockOnlyTeams(block)) {
+@@ -2852,12 +2910,6 @@ void OmpStructureChecker::Leave(const parser::OmpClauseList &) {
+   // clause
+   CheckMultListItems();
+ 
+-  // 2.7.3 Single Construct Restriction
+-  if (GetContext().directive == llvm::omp::Directive::OMPD_end_single) {
+-    CheckNotAllowedIfClause(
+-        llvm::omp::Clause::OMPC_copyprivate, {llvm::omp::Clause::OMPC_nowait});
+-  }
+-
+   auto testThreadprivateVarErr = [&](Symbol sym, parser::Name name,
+                                      llvmOmpClause clauseTy) {
+     if (sym.test(Symbol::Flag::OmpThreadprivate))
+@@ -3481,15 +3533,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Private &x) {
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Nowait &x) {
+   CheckAllowedClause(llvm::omp::Clause::OMPC_nowait);
+-  if (llvm::omp::noWaitClauseNotAllowedSet.test(GetContext().directive)) {
+-    context_.Say(GetContext().clauseSource,
+-        "%s clause is not allowed on the OMP %s directive,"
+-        " use it on OMP END %s directive "_err_en_US,
+-        parser::ToUpperCaseLetters(
+-            getClauseName(llvm::omp::Clause::OMPC_nowait).str()),
+-        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()),
+-        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()));
+-  }
+ }
+ 
+ bool OmpStructureChecker::IsDataRefTypeParamInquiry(
+@@ -4220,15 +4263,6 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Copyprivate &x) {
+   CheckIntentInPointer(symbols, llvm::omp::Clause::OMPC_copyprivate);
+   CheckCopyingPolymorphicAllocatable(
+       symbols, llvm::omp::Clause::OMPC_copyprivate);
+-  if (GetContext().directive == llvm::omp::Directive::OMPD_single) {
+-    context_.Say(GetContext().clauseSource,
+-        "%s clause is not allowed on the OMP %s directive,"
+-        " use it on OMP END %s directive "_err_en_US,
+-        parser::ToUpperCaseLetters(
+-            getClauseName(llvm::omp::Clause::OMPC_copyprivate).str()),
+-        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()),
+-        parser::ToUpperCaseLetters(GetContext().directiveSource.ToString()));
+-  }
+ }
+ 
+ void OmpStructureChecker::Enter(const parser::OmpClause::Lastprivate &x) {
+diff --git a/flang/test/Semantics/OpenMP/clause-validity01.f90 b/flang/test/Semantics/OpenMP/clause-validity01.f90
+index e8114154a809b..5e0d91914c441 100644
+--- a/flang/test/Semantics/OpenMP/clause-validity01.f90
++++ b/flang/test/Semantics/OpenMP/clause-validity01.f90
+@@ -330,11 +330,12 @@
+   !$omp parallel
+   b = 1
+   !ERROR: LASTPRIVATE clause is not allowed on the SINGLE directive
+-  !ERROR: NOWAIT clause is not allowed on the OMP SINGLE directive, use it on OMP END SINGLE directive 
++  !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
+   !$omp single private(a) lastprivate(c) nowait
+   a = 3.14
+-  !ERROR: Clause NOWAIT is not allowed if clause COPYPRIVATE appears on the END SINGLE directive
+   !ERROR: COPYPRIVATE variable 'a' may not appear on a PRIVATE or FIRSTPRIVATE clause on a SINGLE construct
++  !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++  !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
+   !ERROR: At most one NOWAIT clause can appear on the END SINGLE directive
+   !$omp end single copyprivate(a) nowait nowait
+   c = 2
+@@ -351,7 +352,6 @@
+   a = 1.0
+   !ERROR: COPYPRIVATE clause is not allowed on the END WORKSHARE directive
+   !$omp end workshare nowait copyprivate(a)
+-  !ERROR: NOWAIT clause is not allowed on the OMP WORKSHARE directive, use it on OMP END WORKSHARE directive 
+   !$omp workshare nowait
+   !$omp end workshare
+   !$omp end parallel
+@@ -420,7 +420,6 @@
+   !$omp parallel
+   !ERROR: No ORDERED clause with a parameter can be specified on the DO SIMD directive
+   !ERROR: NOGROUP clause is not allowed on the DO SIMD directive
+-  !ERROR: NOWAIT clause is not allowed on the OMP DO SIMD directive, use it on OMP END DO SIMD directive 
+   !$omp do simd ordered(2) NOGROUP nowait
+   do i = 1, N
+      do j = 1, N
+diff --git a/flang/test/Semantics/OpenMP/single03.f90 b/flang/test/Semantics/OpenMP/single03.f90
+new file mode 100644
+index 0000000000000..dc2c2fd27eb04
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/single03.f90
+@@ -0,0 +1,54 @@
++! RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=52
++!
++! OpenMP Version 5.2
++!
++! 2.10.2 single Construct
++! Copyprivate and Nowait clauses are allowed in both clause and end clause
++
++subroutine omp_single
++    integer, save :: i
++    integer       :: j
++    i = 10; j = 11
++
++    !ERROR: COPYPRIVATE variable 'i' is not PRIVATE or THREADPRIVATE in outer context
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp single copyprivate(i) nowait
++        print *, "omp single", i
++    !$omp end single
++
++    !$omp parallel private(i)
++        !$omp single copyprivate(i)
++            print *, "omp single", i
++        !$omp end single
++    !$omp end parallel
++
++    !$omp parallel
++        !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++        !$omp single nowait
++            print *, "omp single", i
++        !ERROR: COPYPRIVATE variable 'i' is not PRIVATE or THREADPRIVATE in outer context
++        !$omp end single copyprivate(i)
++
++        !ERROR: COPYPRIVATE variable 'i' is not PRIVATE or THREADPRIVATE in outer context
++        !$omp single copyprivate(i)
++            print *, "omp single", i
++        !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++        !$omp end single nowait
++
++        !ERROR: COPYPRIVATE variable 'j' may not appear on a PRIVATE or FIRSTPRIVATE clause on a SINGLE construct
++        !$omp single private(j) copyprivate(j)
++            print *, "omp single", j
++        !ERROR: COPYPRIVATE variable 'j' may not appear on a PRIVATE or FIRSTPRIVATE clause on a SINGLE construct
++        !WARNING: The COPYPRIVATE clause with 'j' is already used on the SINGLE directive
++        !$omp end single copyprivate(j)
++
++        !$omp single nowait
++            print *, "omp single", j
++        !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++        !$omp end single nowait
++    !$omp end parallel
++
++    !$omp single nowait
++        print *, "omp single", i
++    !$omp end single
++end subroutine omp_single
+diff --git a/flang/test/Semantics/OpenMP/single04.f90 b/flang/test/Semantics/OpenMP/single04.f90
+new file mode 100644
+index 0000000000000..9505745c600e9
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/single04.f90
+@@ -0,0 +1,81 @@
++! RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=52
++!
++! OpenMP Version 5.2
++!
++! 2.10.2 single Construct
++! Valid and invalid testcases for copyprivate and nowait clause on the single directive
++
++program single
++    ! Valid testcases
++    !$omp single
++        print *, x
++    !$omp end single
++
++    !$omp single nowait
++        print *, x
++    !$omp end single
++
++    !$omp single copyprivate(x, y, z)
++        print *, x
++    !$omp end single
++
++    !$omp single
++        print *, x
++    !$omp end single copyprivate(x)
++
++    ! Invalid testcases
++    !$omp single
++        print *, x
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp end single copyprivate(x) nowait
++
++    !ERROR: 'x' appears in more than one COPYPRIVATE clause on the SINGLE directive
++    !$omp single copyprivate(x) copyprivate(x)
++        print *, x
++    !$omp end single
++
++    !$omp single
++        print *, x
++    !ERROR: 'x' appears in more than one COPYPRIVATE clause on the END SINGLE directive
++    !$omp end single copyprivate(x) copyprivate(x)
++
++    !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++    !$omp single nowait nowait
++        print *, x
++    !$omp end single
++
++    !$omp single
++        print *, x
++    !ERROR: At most one NOWAIT clause can appear on the END SINGLE directive
++    !$omp end single nowait nowait
++
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp single copyprivate(x) nowait
++        print *, x
++    !WARNING: The COPYPRIVATE clause with 'x' is already used on the SINGLE directive
++    !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++    !$omp end single copyprivate(x) nowait
++
++    !$omp single copyprivate(x)
++        print *, x
++    !WARNING: The COPYPRIVATE clause with 'x' is already used on the SINGLE directive
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp end single copyprivate(x) nowait
++
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp single copyprivate(x, y) nowait
++        print *, x
++    !WARNING: The COPYPRIVATE clause with 'x' is already used on the SINGLE directive
++    !ERROR: 'z' appears in more than one COPYPRIVATE clause on the END SINGLE directive
++    !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++    !$omp end single copyprivate(x, z) copyprivate(z) nowait
++
++    !ERROR: NOWAIT clause must not be used with COPYPRIVATE clause on the SINGLE directive
++    !$omp single copyprivate(x) nowait copyprivate(y) copyprivate(z)
++        print *, x
++    !WARNING: The COPYPRIVATE clause with 'x' is already used on the SINGLE directive
++    !WARNING: The COPYPRIVATE clause with 'y' is already used on the SINGLE directive
++    !WARNING: The COPYPRIVATE clause with 'z' is already used on the SINGLE directive
++    !ERROR: At most one NOWAIT clause can appear on the SINGLE directive
++    !$omp end single copyprivate(x, y, z) nowait
++end program
+diff --git a/flang/test/Semantics/OpenMP/threadprivate04.f90 b/flang/test/Semantics/OpenMP/threadprivate04.f90
+index 3d8c7fb8de8fa..d261f33b4dbd7 100644
+--- a/flang/test/Semantics/OpenMP/threadprivate04.f90
++++ b/flang/test/Semantics/OpenMP/threadprivate04.f90
+@@ -14,7 +14,6 @@ program main
+   !$omp parallel num_threads(x1)
+   !$omp end parallel
+ 
+-  !ERROR: COPYPRIVATE clause is not allowed on the OMP SINGLE directive, use it on OMP END SINGLE directive 
+   !$omp single copyprivate(x2, /blk1/)
+   !$omp end single
+ 
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index 210acbff5af20..11c3c3379925f 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -998,9 +998,11 @@ def OMP_Single : Directive<"single"> {
+     VersionedClause<OMPC_Allocate>,
+     VersionedClause<OMPC_CopyPrivate>,
+     VersionedClause<OMPC_FirstPrivate>,
+-    VersionedClause<OMPC_NoWait>,
+     VersionedClause<OMPC_Private>,
+   ];
++  let allowedOnceClauses = [
++    VersionedClause<OMPC_NoWait>,
++  ];
+   let association = AS_Block;
+   let category = CA_Executable;
+ }

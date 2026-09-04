@@ -1,0 +1,869 @@
+diff --git a/flang/include/flang/Parser/dump-parse-tree.h b/flang/include/flang/Parser/dump-parse-tree.h
+index 1ff006e36334c..87bb65fa5c466 100644
+--- a/flang/include/flang/Parser/dump-parse-tree.h
++++ b/flang/include/flang/Parser/dump-parse-tree.h
+@@ -477,6 +477,12 @@ class ParseTreeDumper {
+   NODE(parser, NullInit)
+   NODE(parser, ObjectDecl)
+   NODE(parser, OldParameterStmt)
++  NODE(parser, OmpMetadirectiveDirective)
++  NODE(parser, OmpMatchClause)
++  NODE(parser, OmpOtherwiseClause)
++  NODE(parser, OmpWhenClause)
++  NODE(OmpWhenClause, Modifier)
++  NODE(parser, OmpDirectiveSpecification)
+   NODE(parser, OmpTraitPropertyName)
+   NODE(parser, OmpTraitScore)
+   NODE(parser, OmpTraitPropertyExtension)
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 4eac8bca48978..be3b1fbde8c3c 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3459,6 +3459,14 @@ WRAPPER_CLASS(PauseStmt, std::optional<StopCode>);
+ struct OmpClause;
+ struct OmpClauseList;
+ 
++struct OmpDirectiveSpecification {
++  TUPLE_CLASS_BOILERPLATE(OmpDirectiveSpecification);
++  std::tuple<llvm::omp::Directive,
++      std::optional<common::Indirection<OmpClauseList>>>
++      t;
++  CharBlock source;
++};
++
+ // 2.1 Directives or clauses may accept a list or extended-list.
+ //     A list item is a variable, array section or common block name (enclosed
+ //     in slashes). An extended list item is a list item or a procedure Name.
+@@ -3962,14 +3970,21 @@ struct OmpBindClause {
+ 
+ // Ref: [4.5:46-50], [5.0:74-78], [5.1:92-96], [5.2:109]
+ //
++// When used as a data-sharing clause:
+ // default-clause ->
+ //    DEFAULT(data-sharing-attribute)               // since 4.5
+ // data-sharing-attribute ->
+ //    SHARED | NONE |                               // since 4.5
+ //    PRIVATE | FIRSTPRIVATE                        // since 5.0
++//
++// When used in METADIRECTIVE:
++// default-clause ->
++//    DEFAULT(directive-specification)              // since 5.0, until 5.1
++// See also otherwise-clause.
+ struct OmpDefaultClause {
+   ENUM_CLASS(DataSharingAttribute, Private, Firstprivate, Shared, None)
+-  WRAPPER_CLASS_BOILERPLATE(OmpDefaultClause, DataSharingAttribute);
++  UNION_CLASS_BOILERPLATE(OmpDefaultClause);
++  std::variant<DataSharingAttribute, OmpDirectiveSpecification> u;
+ };
+ 
+ // Ref: [4.5:103-107], [5.0:324-325], [5.1:357-358], [5.2:161-162]
+@@ -4187,6 +4202,16 @@ struct OmpMapClause {
+   std::tuple<MODIFIERS(), OmpObjectList, /*CommaSeparated=*/bool> t;
+ };
+ 
++// Ref: [5.0:58-60], [5.1:63-68], [5.2:194-195]
++//
++// match-clause ->
++//    MATCH (context-selector-specification)        // since 5.0
++struct OmpMatchClause {
++  // The context-selector is an argument.
++  WRAPPER_CLASS_BOILERPLATE(
++      OmpMatchClause, traits::OmpContextSelectorSpecification);
++};
++
+ // Ref: [5.2:217-218]
+ // message-clause ->
+ //    MESSAGE("message-text")
+@@ -4217,6 +4242,17 @@ struct OmpOrderClause {
+   std::tuple<MODIFIERS(), Ordering> t;
+ };
+ 
++// Ref: [5.0:56-57], [5.1:60-62], [5.2:191]
++//
++// otherwise-clause ->
++//    DEFAULT ([directive-specification])           // since 5.0, until 5.1
++// otherwise-clause ->
++//    OTHERWISE ([directive-specification])]        // since 5.2
++struct OmpOtherwiseClause {
++  WRAPPER_CLASS_BOILERPLATE(
++      OmpOtherwiseClause, std::optional<OmpDirectiveSpecification>);
++};
++
+ // Ref: [4.5:46-50], [5.0:74-78], [5.1:92-96], [5.2:229-230]
+ //
+ // proc-bind-clause ->
+@@ -4302,6 +4338,17 @@ struct OmpUpdateClause {
+   std::variant<OmpDependenceType, OmpTaskDependenceType> u;
+ };
+ 
++// Ref: [5.0:56-57], [5.1:60-62], [5.2:190-191]
++//
++// when-clause ->
++//    WHEN (context-selector :
++//        [directive-specification])                // since 5.0
++struct OmpWhenClause {
++  TUPLE_CLASS_BOILERPLATE(OmpWhenClause);
++  MODIFIER_BOILERPLATE(OmpContextSelector);
++  std::tuple<MODIFIERS(), std::optional<OmpDirectiveSpecification>> t;
++};
++
+ // OpenMP Clauses
+ struct OmpClause {
+   UNION_CLASS_BOILERPLATE(OmpClause);
+@@ -4326,6 +4373,12 @@ struct OmpClauseList {
+ 
+ // --- Directives and constructs
+ 
++struct OmpMetadirectiveDirective {
++  TUPLE_CLASS_BOILERPLATE(OmpMetadirectiveDirective);
++  std::tuple<OmpClauseList> t;
++  CharBlock source;
++};
++
+ // Ref: [5.1:89-90], [5.2:216]
+ //
+ // nothing-directive ->
+@@ -4724,7 +4777,7 @@ struct OpenMPStandaloneConstruct {
+   CharBlock source;
+   std::variant<OpenMPSimpleStandaloneConstruct, OpenMPFlushConstruct,
+       OpenMPCancelConstruct, OpenMPCancellationPointConstruct,
+-      OpenMPDepobjConstruct>
++      OpenMPDepobjConstruct, OmpMetadirectiveDirective>
+       u;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index b424e209d56da..db6486abc7ea1 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -230,9 +230,6 @@ MAKE_EMPTY_CLASS(Threadprivate, Threadprivate);
+ 
+ MAKE_INCOMPLETE_CLASS(AdjustArgs, AdjustArgs);
+ MAKE_INCOMPLETE_CLASS(AppendArgs, AppendArgs);
+-MAKE_INCOMPLETE_CLASS(Match, Match);
+-// MAKE_INCOMPLETE_CLASS(Otherwise, );   // missing-in-parser
+-MAKE_INCOMPLETE_CLASS(When, When);
+ 
+ List<IteratorSpecifier>
+ makeIteratorSpecifiers(const parser::OmpIteratorSpecifier &inp,
+@@ -528,8 +525,13 @@ Copyprivate make(const parser::OmpClause::Copyprivate &inp,
+   return Copyprivate{/*List=*/makeObjects(inp.v, semaCtx)};
+ }
+ 
+-Default make(const parser::OmpClause::Default &inp,
+-             semantics::SemanticsContext &semaCtx) {
++// The Default clause is overloaded in OpenMP 5.0 and 5.1: it can be either
++// a data-sharing clause, or a METADIRECTIVE clause. In the latter case, it
++// has been superseded by the OTHERWISE clause.
++// Disambiguate this in this representation: for the DSA case, create Default,
++// and in the other case create Otherwise.
++Default makeDefault(const parser::OmpClause::Default &inp,
++                    semantics::SemanticsContext &semaCtx) {
+   // inp.v -> parser::OmpDefaultClause
+   using wrapped = parser::OmpDefaultClause;
+ 
+@@ -543,7 +545,13 @@ Default make(const parser::OmpClause::Default &inp,
+       // clang-format on
+   );
+ 
+-  return Default{/*DataSharingAttribute=*/convert(inp.v.v)};
++  auto dsa = std::get<wrapped::DataSharingAttribute>(inp.v.u);
++  return Default{/*DataSharingAttribute=*/convert(dsa)};
++}
++
++Otherwise makeOtherwise(const parser::OmpClause::Default &inp,
++                        semantics::SemanticsContext &semaCtx) {
++  return Otherwise{};
+ }
+ 
+ Defaultmap make(const parser::OmpClause::Defaultmap &inp,
+@@ -997,7 +1005,11 @@ Map make(const parser::OmpClause::Map &inp,
+               /*LocatorList=*/makeObjects(t4, semaCtx)}};
+ }
+ 
+-// Match: incomplete
++Match make(const parser::OmpClause::Match &inp,
++           semantics::SemanticsContext &semaCtx) {
++  return Match{};
++}
++
+ // MemoryOrder: empty
+ // Mergeable: empty
+ 
+@@ -1101,7 +1113,11 @@ Ordered make(const parser::OmpClause::Ordered &inp,
+   return Ordered{/*N=*/maybeApply(makeExprFn(semaCtx), inp.v)};
+ }
+ 
+-// Otherwise: incomplete, missing-in-parser
++// See also Default.
++Otherwise make(const parser::OmpClause::Otherwise &inp,
++               semantics::SemanticsContext &semaCtx) {
++  return Otherwise{};
++}
+ 
+ Partial make(const parser::OmpClause::Partial &inp,
+              semantics::SemanticsContext &semaCtx) {
+@@ -1356,15 +1372,32 @@ UsesAllocators make(const parser::OmpClause::UsesAllocators &inp,
+ }
+ 
+ // Weak: empty
+-// When: incomplete
++
++When make(const parser::OmpClause::When &inp,
++          semantics::SemanticsContext &semaCtx) {
++  return When{};
++}
++
+ // Write: empty
+ } // namespace clause
+ 
+ Clause makeClause(const parser::OmpClause &cls,
+                   semantics::SemanticsContext &semaCtx) {
+-  return Fortran::common::visit(
+-      [&](auto &&s) {
+-        return makeClause(cls.Id(), clause::make(s, semaCtx), cls.source);
++  return Fortran::common::visit( //
++      common::visitors{
++          [&](const parser::OmpClause::Default &s) {
++            using DSA = parser::OmpDefaultClause::DataSharingAttribute;
++            if (std::holds_alternative<DSA>(s.v.u)) {
++              return makeClause(llvm::omp::Clause::OMPC_default,
++                                clause::makeDefault(s, semaCtx), cls.source);
++            } else {
++              return makeClause(llvm::omp::Clause::OMPC_otherwise,
++                                clause::makeOtherwise(s, semaCtx), cls.source);
++            }
++          },
++          [&](auto &&s) {
++            return makeClause(cls.Id(), clause::make(s, semaCtx), cls.source);
++          },
+       },
+       cls.u);
+ }
+diff --git a/flang/lib/Lower/OpenMP/Clauses.h b/flang/lib/Lower/OpenMP/Clauses.h
+index 65282d243d87a..aea317b5907ff 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.h
++++ b/flang/lib/Lower/OpenMP/Clauses.h
+@@ -257,6 +257,7 @@ using OmpxBare = tomp::clause::OmpxBareT<TypeTy, IdTy, ExprTy>;
+ using OmpxDynCgroupMem = tomp::clause::OmpxDynCgroupMemT<TypeTy, IdTy, ExprTy>;
+ using Ordered = tomp::clause::OrderedT<TypeTy, IdTy, ExprTy>;
+ using Order = tomp::clause::OrderT<TypeTy, IdTy, ExprTy>;
++using Otherwise = tomp::clause::OtherwiseT<TypeTy, IdTy, ExprTy>;
+ using Partial = tomp::clause::PartialT<TypeTy, IdTy, ExprTy>;
+ using Priority = tomp::clause::PriorityT<TypeTy, IdTy, ExprTy>;
+ using Private = tomp::clause::PrivateT<TypeTy, IdTy, ExprTy>;
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 7c8d292e90f01..25595d2ea6c7d 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -416,6 +416,9 @@ extractOmpDirective(const parser::OpenMPConstruct &ompConstruct) {
+                     [](const parser::OpenMPCancellationPointConstruct &c) {
+                       return llvm::omp::OMPD_cancellation_point;
+                     },
++                    [](const parser::OmpMetadirectiveDirective &c) {
++                      return llvm::omp::OMPD_metadirective;
++                    },
+                     [](const parser::OpenMPDepobjConstruct &c) {
+                       return llvm::omp::OMPD_depobj;
+                     }},
+@@ -3231,6 +3234,11 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   TODO(converter.getCurrentLocation(), "OpenMPDepobjConstruct");
+ }
+ 
++static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
++                   semantics::SemanticsContext &semaCtx,
++                   lower::pft::Evaluation &eval,
++                   const parser::OmpMetadirectiveDirective &construct) {}
++
+ static void
+ genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+        semantics::SemanticsContext &semaCtx, lower::pft::Evaluation &eval,
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index f5cafe71acf4e..43b4e9df97dbc 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -153,6 +153,9 @@ static TypeDeclarationStmt makeIterSpecDecl(std::list<ObjectName> &&names) {
+       makeEntityList(std::move(names)));
+ }
+ 
++TYPE_PARSER(sourced(construct<OmpDirectiveSpecification>(
++    OmpDirectiveNameParser{}, maybe(indirect(Parser<OmpClauseList>{})))))
++
+ // --- Parsers for context traits -------------------------------------
+ 
+ static std::string nameToString(Name &&name) { return name.ToString(); }
+@@ -501,6 +504,9 @@ TYPE_PARSER(sourced(construct<OmpToClause::Modifier>(
+         construct<OmpToClause::Modifier>(Parser<OmpMapper>{}) ||
+         construct<OmpToClause::Modifier>(Parser<OmpIterator>{})))))
+ 
++TYPE_PARSER(sourced(construct<OmpWhenClause::Modifier>( //
++    Parser<OmpContextSelector>{})))
++
+ // --- Parsers for clauses --------------------------------------------
+ 
+ /// `MOBClause` is a clause that has a
+@@ -527,13 +533,18 @@ TYPE_PARSER(construct<OmpAffinityClause>(
+     Parser<OmpObjectList>{}))
+ 
+ // 2.15.3.1 DEFAULT (PRIVATE | FIRSTPRIVATE | SHARED | NONE)
+-TYPE_PARSER(construct<OmpDefaultClause>(
++TYPE_PARSER(construct<OmpDefaultClause::DataSharingAttribute>(
+     "PRIVATE" >> pure(OmpDefaultClause::DataSharingAttribute::Private) ||
+     "FIRSTPRIVATE" >>
+         pure(OmpDefaultClause::DataSharingAttribute::Firstprivate) ||
+     "SHARED" >> pure(OmpDefaultClause::DataSharingAttribute::Shared) ||
+     "NONE" >> pure(OmpDefaultClause::DataSharingAttribute::None)))
+ 
++TYPE_PARSER(construct<OmpDefaultClause>(
++    construct<OmpDefaultClause>(
++        Parser<OmpDefaultClause::DataSharingAttribute>{}) ||
++    construct<OmpDefaultClause>(Parser<OmpDirectiveSpecification>{})))
++
+ // 2.5 PROC_BIND (MASTER | CLOSE | PRIMARY | SPREAD)
+ TYPE_PARSER(construct<OmpProcBindClause>(
+     "CLOSE" >> pure(OmpProcBindClause::AffinityPolicy::Close) ||
+@@ -698,6 +709,16 @@ TYPE_PARSER(construct<OmpOrderClause>(
+     maybe(nonemptyList(Parser<OmpOrderClause::Modifier>{}) / ":"),
+     "CONCURRENT" >> pure(OmpOrderClause::Ordering::Concurrent)))
+ 
++TYPE_PARSER(construct<OmpMatchClause>(
++    Parser<traits::OmpContextSelectorSpecification>{}))
++
++TYPE_PARSER(construct<OmpOtherwiseClause>(
++    maybe(sourced(Parser<OmpDirectiveSpecification>{}))))
++
++TYPE_PARSER(construct<OmpWhenClause>(
++    maybe(nonemptyList(Parser<OmpWhenClause::Modifier>{}) / ":"),
++    maybe(sourced(Parser<OmpDirectiveSpecification>{}))))
++
+ // OMP 5.2 12.6.1 grainsize([ prescriptiveness :] scalar-integer-expression)
+ TYPE_PARSER(construct<OmpGrainsizeClause>(
+     maybe(nonemptyList(Parser<OmpGrainsizeClause::Modifier>{}) / ":"),
+@@ -815,6 +836,8 @@ TYPE_PARSER(
+                   parenthesized(Parser<OmpObjectList>{}))) ||
+     "MAP" >> construct<OmpClause>(construct<OmpClause::Map>(
+                  parenthesized(Parser<OmpMapClause>{}))) ||
++    "MATCH" >> construct<OmpClause>(construct<OmpClause::Match>(
++                   parenthesized(Parser<OmpMatchClause>{}))) ||
+     "MERGEABLE" >> construct<OmpClause>(construct<OmpClause::Mergeable>()) ||
+     "MESSAGE" >> construct<OmpClause>(construct<OmpClause::Message>(
+                      parenthesized(Parser<OmpMessageClause>{}))) ||
+@@ -839,6 +862,8 @@ TYPE_PARSER(
+                    parenthesized(Parser<OmpOrderClause>{}))) ||
+     "ORDERED" >> construct<OmpClause>(construct<OmpClause::Ordered>(
+                      maybe(parenthesized(scalarIntConstantExpr)))) ||
++    "OTHERWISE" >> construct<OmpClause>(construct<OmpClause::Otherwise>(
++                       maybe(parenthesized(Parser<OmpOtherwiseClause>{})))) ||
+     "PARTIAL" >> construct<OmpClause>(construct<OmpClause::Partial>(
+                      maybe(parenthesized(scalarIntConstantExpr)))) ||
+     "PRIORITY" >> construct<OmpClause>(construct<OmpClause::Priority>(
+@@ -894,7 +919,9 @@ TYPE_PARSER(
+                      parenthesized(nonemptyList(name)))) ||
+     "UNTIED" >> construct<OmpClause>(construct<OmpClause::Untied>()) ||
+     "UPDATE" >> construct<OmpClause>(construct<OmpClause::Update>(
+-                    parenthesized(Parser<OmpUpdateClause>{}))))
++                    parenthesized(Parser<OmpUpdateClause>{}))) ||
++    "WHEN" >> construct<OmpClause>(construct<OmpClause::When>(
++                  parenthesized(Parser<OmpWhenClause>{}))))
+ 
+ // [Clause, [Clause], ...]
+ TYPE_PARSER(sourced(construct<OmpClauseList>(
+@@ -914,6 +941,9 @@ TYPE_PARSER(sourced(construct<OpenMPUtilityConstruct>(
+     sourced(construct<OpenMPUtilityConstruct>(
+         sourced(Parser<OmpNothingDirective>{}))))))
+ 
++TYPE_PARSER(sourced(construct<OmpMetadirectiveDirective>(
++    "METADIRECTIVE" >> Parser<OmpClauseList>{})))
++
+ // Omp directives enclosing do loop
+ TYPE_PARSER(sourced(construct<OmpLoopDirective>(first(
+     "DISTRIBUTE PARALLEL DO SIMD" >>
+@@ -1059,6 +1089,8 @@ TYPE_PARSER(
+         construct<OpenMPStandaloneConstruct>(Parser<OpenMPCancelConstruct>{}) ||
+         construct<OpenMPStandaloneConstruct>(
+             Parser<OpenMPCancellationPointConstruct>{}) ||
++        construct<OpenMPStandaloneConstruct>(
++            Parser<OmpMetadirectiveDirective>{}) ||
+         construct<OpenMPStandaloneConstruct>(Parser<OpenMPDepobjConstruct>{})) /
+     endOfLine)
+ 
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 5946aca5718f2..813dd652e1e9f 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2074,6 +2074,10 @@ class UnparseVisitor {
+   void Unparse(const llvm::omp::Directive &x) {
+     Word(llvm::omp::getOpenMPDirectiveName(x).str());
+   }
++  void Unparse(const OmpDirectiveSpecification &x) {
++    Walk(std::get<llvm::omp::Directive>(x.t));
++    Walk(std::get<std::optional<common::Indirection<OmpClauseList>>>(x.t));
++  }
+   void Unparse(const OmpTraitScore &x) {
+     Word("SCORE(");
+     Walk(x.v);
+@@ -2295,6 +2299,11 @@ class UnparseVisitor {
+     Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ": ");
+     Walk(std::get<OmpObjectList>(x.t));
+   }
++  void Unparse(const OmpWhenClause &x) {
++    using Modifier = OmpWhenClause::Modifier;
++    Walk(std::get<std::optional<std::list<Modifier>>>(x.t), ": ");
++    Walk(std::get<std::optional<OmpDirectiveSpecification>>(x.t));
++  }
+ #define GEN_FLANG_CLAUSE_UNPARSE
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+   void Unparse(const OmpLoopDirective &x) {
+@@ -2813,6 +2822,13 @@ class UnparseVisitor {
+                   },
+         x.u);
+   }
++  void Unparse(const OmpMetadirectiveDirective &x) {
++    BeginOpenMP();
++    Word("!$OMP METADIRECTIVE ");
++    Walk(std::get<OmpClauseList>(x.t));
++    Put("\n");
++    EndOpenMP();
++  }
+   void Unparse(const OpenMPDepobjConstruct &x) {
+     BeginOpenMP();
+     Word("!$OMP DEPOBJ");
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 00a031e0dcad7..035064ecf3a46 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -238,6 +238,16 @@ class OmpUnitedTaskDesignatorChecker {
+ };
+ 
+ bool OmpStructureChecker::CheckAllowedClause(llvmOmpClause clause) {
++  // Do not do clause checks while processing METADIRECTIVE.
++  // Context selectors can contain clauses that are not given as a part
++  // of a construct, but as trait properties. Testing whether they are
++  // valid or not is deferred to the checks of the context selectors.
++  // As it stands now, these clauses would appear as if they were present
++  // on METADIRECTIVE, leading to incorrect diagnostics.
++  if (GetDirectiveNest(ContextSelectorNest) > 0) {
++    return true;
++  }
++
+   unsigned version{context_.langOptions().OpenMPVersion};
+   DirectiveContext &dirCtx = GetContext();
+   llvm::omp::Directive dir{dirCtx.directive};
+@@ -614,6 +624,22 @@ void OmpStructureChecker::CheckHintClause(
+   }
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OmpDirectiveSpecification &x) {
++  PushContextAndClauseSets(x.source, std::get<llvm::omp::Directive>(x.t));
++}
++
++void OmpStructureChecker::Leave(const parser::OmpDirectiveSpecification &) {
++  dirContext_.pop_back();
++}
++
++void OmpStructureChecker::Enter(const parser::OmpMetadirectiveDirective &x) {
++  PushContextAndClauseSets(x.source, llvm::omp::Directive::OMPD_metadirective);
++}
++
++void OmpStructureChecker::Leave(const parser::OmpMetadirectiveDirective &) {
++  dirContext_.pop_back();
++}
++
+ void OmpStructureChecker::Enter(const parser::OpenMPConstruct &x) {
+   // Simd Construct with Ordered Construct Nesting check
+   // We cannot use CurrentDirectiveIsNested() here because
+@@ -2958,6 +2984,7 @@ CHECK_SIMPLE_CLAUSE(Nocontext, OMPC_nocontext)
+ CHECK_SIMPLE_CLAUSE(Severity, OMPC_severity)
+ CHECK_SIMPLE_CLAUSE(Message, OMPC_message)
+ CHECK_SIMPLE_CLAUSE(Filter, OMPC_filter)
++CHECK_SIMPLE_CLAUSE(Otherwise, OMPC_otherwise)
+ CHECK_SIMPLE_CLAUSE(When, OMPC_when)
+ CHECK_SIMPLE_CLAUSE(AdjustArgs, OMPC_adjust_args)
+ CHECK_SIMPLE_CLAUSE(AppendArgs, OMPC_append_args)
+@@ -4510,6 +4537,14 @@ void OmpStructureChecker::Enter(const parser::OmpClause::OmpxBare &x) {
+   }
+ }
+ 
++void OmpStructureChecker::Enter(const parser::OmpContextSelector &ctxSel) {
++  EnterDirectiveNest(ContextSelectorNest);
++}
++
++void OmpStructureChecker::Leave(const parser::OmpContextSelector &) {
++  ExitDirectiveNest(ContextSelectorNest);
++}
++
+ llvm::StringRef OmpStructureChecker::getClauseName(llvm::omp::Clause clause) {
+   return llvm::omp::getOpenMPClauseName(clause);
+ }
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 51be9ba5f76bc..7412a2071d492 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -146,6 +146,15 @@ class OmpStructureChecker
+   void Enter(const parser::DoConstruct &);
+   void Leave(const parser::DoConstruct &);
+ 
++  void Enter(const parser::OmpDirectiveSpecification &);
++  void Leave(const parser::OmpDirectiveSpecification &);
++
++  void Enter(const parser::OmpMetadirectiveDirective &);
++  void Leave(const parser::OmpMetadirectiveDirective &);
++
++  void Enter(const parser::OmpContextSelector &);
++  void Leave(const parser::OmpContextSelector &);
++
+ #define GEN_FLANG_CLAUSE_CHECK_ENTER
+ #include "llvm/Frontend/OpenMP/OMP.inc"
+ 
+@@ -284,7 +293,8 @@ class OmpStructureChecker
+     TargetBlockOnlyTeams,
+     TargetNest,
+     DeclarativeNest,
+-    LastType = DeclarativeNest,
++    ContextSelectorNest,
++    LastType = ContextSelectorNest,
+   };
+   int directiveNest_[LastType + 1] = {0};
+ 
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 2bd70d7d2b935..91a1b3061e1f9 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -351,6 +351,17 @@ class OmpAttributeVisitor : DirectiveAttributeVisitor<llvm::omp::Directive> {
+     return true;
+   }
+ 
++  bool Pre(const parser::OmpDirectiveSpecification &x) {
++    PushContext(x.source, std::get<llvm::omp::Directive>(x.t));
++    return true;
++  }
++  void Post(const parser::OmpDirectiveSpecification &) { PopContext(); }
++  bool Pre(const parser::OmpMetadirectiveDirective &x) {
++    PushContext(x.source, llvm::omp::Directive::OMPD_metadirective);
++    return true;
++  }
++  void Post(const parser::OmpMetadirectiveDirective &) { PopContext(); }
++
+   bool Pre(const parser::OpenMPBlockConstruct &);
+   void Post(const parser::OpenMPBlockConstruct &);
+ 
+@@ -2007,20 +2018,25 @@ bool OmpAttributeVisitor::Pre(const parser::OpenMPAllocatorsConstruct &x) {
+ }
+ 
+ void OmpAttributeVisitor::Post(const parser::OmpDefaultClause &x) {
+-  if (!dirContext_.empty()) {
+-    switch (x.v) {
+-    case parser::OmpDefaultClause::DataSharingAttribute::Private:
+-      SetContextDefaultDSA(Symbol::Flag::OmpPrivate);
+-      break;
+-    case parser::OmpDefaultClause::DataSharingAttribute::Firstprivate:
+-      SetContextDefaultDSA(Symbol::Flag::OmpFirstPrivate);
+-      break;
+-    case parser::OmpDefaultClause::DataSharingAttribute::Shared:
+-      SetContextDefaultDSA(Symbol::Flag::OmpShared);
+-      break;
+-    case parser::OmpDefaultClause::DataSharingAttribute::None:
+-      SetContextDefaultDSA(Symbol::Flag::OmpNone);
+-      break;
++  // The DEFAULT clause may also be used on METADIRECTIVE. In that case
++  // there is nothing to do.
++  using DataSharingAttribute = parser::OmpDefaultClause::DataSharingAttribute;
++  if (auto *dsa{std::get_if<DataSharingAttribute>(&x.u)}) {
++    if (!dirContext_.empty()) {
++      switch (*dsa) {
++      case DataSharingAttribute::Private:
++        SetContextDefaultDSA(Symbol::Flag::OmpPrivate);
++        break;
++      case DataSharingAttribute::Firstprivate:
++        SetContextDefaultDSA(Symbol::Flag::OmpFirstPrivate);
++        break;
++      case DataSharingAttribute::Shared:
++        SetContextDefaultDSA(Symbol::Flag::OmpShared);
++        break;
++      case DataSharingAttribute::None:
++        SetContextDefaultDSA(Symbol::Flag::OmpNone);
++        break;
++      }
+     }
+   }
+ }
+diff --git a/flang/test/Parser/OpenMP/metadirective-v50.f90 b/flang/test/Parser/OpenMP/metadirective-v50.f90
+new file mode 100644
+index 0000000000000..73d5077da3d9f
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/metadirective-v50.f90
+@@ -0,0 +1,29 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=50 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=50 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f01
++  !$omp metadirective &
++  !$omp & when(user={condition(.true.)}: nothing) &
++  !$omp & default(nothing)
++end
++
++!UNPARSE: SUBROUTINE f01
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(.true._4)}: NOTHING) DEFAULT(NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = User
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Condition
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '.true._4'
++!PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
++!PARSE-TREE: | | | | | | | bool = 'true'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++!PARSE-TREE: | OmpClause -> Default -> OmpDefaultClause -> OmpDirectiveSpecification
++!PARSE-TREE: | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | OmpClauseList ->
+diff --git a/flang/test/Parser/OpenMP/metadirective.f90 b/flang/test/Parser/OpenMP/metadirective.f90
+new file mode 100644
+index 0000000000000..af6c3bbefacf2
+--- /dev/null
++++ b/flang/test/Parser/OpenMP/metadirective.f90
+@@ -0,0 +1,198 @@
++!RUN: %flang_fc1 -fdebug-unparse -fopenmp -fopenmp-version=52 %s | FileCheck --ignore-case --check-prefix="UNPARSE" %s
++!RUN: %flang_fc1 -fdebug-dump-parse-tree -fopenmp -fopenmp-version=52 %s | FileCheck --check-prefix="PARSE-TREE" %s
++
++subroutine f00
++  !$omp metadirective when(construct={target, parallel}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f00
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(CONSTRUCT={TARGET, PARALLEL}: NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Construct
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> llvm::omp::Directive = target
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> llvm::omp::Directive = parallel
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
++subroutine f01
++  !$omp metadirective when(device={kind(host), device_num(1)}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f01
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(DEVICE={KIND(host), DEVICE_NUM(1_4)}: NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Device
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Kind
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyName -> string = 'host'
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Device_Num
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '1_4'
++!PARSE-TREE: | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
++subroutine f02
++  !$omp metadirective when(target_device={kind(any), device_num(7)}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f02
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(TARGET_DEVICE={KIND(any), DEVICE_NUM(7_4)}: NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Target_Device
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Kind
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyName -> string = 'any'
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Device_Num
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '7_4'
++!PARSE-TREE: | | | | | | LiteralConstant -> IntLiteralConstant = '7'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
++subroutine f03
++  !$omp metadirective &
++  !$omp & when(implementation={atomic_default_mem_order(acq_rel)}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f03
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(IMPLEMENTATION={ATOMIC_DEFAULT_MEM_ORDER(ACQ_REL)}: &
++!UNPARSE: !$OMP&NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Implementation
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Atomic_Default_Mem_Order
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpClause -> AcqRel
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
++subroutine f04
++  !$omp metadirective &
++  !$omp & when(implementation={extension(haha(1), foo(baz, "bar"(1)))}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f04
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(IMPLEMENTATION={EXTENSION(haha(1_4), foo(baz,bar(1_4)))}: &
++!UNPARSE: !$OMP&NOTHING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Implementation
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Extension
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyExtension -> Complex
++!PARSE-TREE: | | | | | | OmpTraitPropertyName -> string = 'haha'
++!PARSE-TREE: | | | | | | OmpTraitPropertyExtension -> Scalar -> Expr = '1_4'
++!PARSE-TREE: | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyExtension
++!PARSE-TREE: | | | | | | OmpTraitPropertyName -> string = 'foo'
++!PARSE-TREE: | | | | | | OmpTraitPropertyExtension -> OmpTraitPropertyName -> string = 'baz'
++!PARSE-TREE: | | | | | | OmpTraitPropertyExtension -> Complex
++!PARSE-TREE: | | | | | | | OmpTraitPropertyName -> string = 'bar'
++!PARSE-TREE: | | | | | | | OmpTraitPropertyExtension -> Scalar -> Expr = '1_4'
++!PARSE-TREE: | | | | | | | | LiteralConstant -> IntLiteralConstant = '1'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
++subroutine f05(x)
++  integer :: x
++  !$omp metadirective &
++  !$omp & when(user={condition(score(100): .true.)}: &
++  !$omp &    parallel do reduction(+: x)) &
++  !$omp & otherwise(nothing)
++  do i = 1, 10
++  enddo
++end
++
++!UNPARSE: SUBROUTINE f05 (x)
++!UNPARSE:  INTEGER x
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(USER={CONDITION(SCORE(100_4): .true._4)}: PARALLEL DO REDUCTION(+&
++!UNPARSE: !$OMP&: x)) OTHERWISE(NOTHING)
++!UNPARSE:  DO i=1_4,10_4
++!UNPARSE:  END DO
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = User
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Condition
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitScore -> Scalar -> Integer -> Expr = '100_4'
++!PARSE-TREE: | | | | | | LiteralConstant -> IntLiteralConstant = '100'
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '.true._4'
++!PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
++!PARSE-TREE: | | | | | | | bool = 'true'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = parallel do
++!PARSE-TREE: | | | OmpClauseList -> OmpClause -> Reduction -> OmpReductionClause
++!PARSE-TREE: | | | | Modifier -> OmpReductionIdentifier -> DefinedOperator -> IntrinsicOperator = Add
++!PARSE-TREE: | | | | OmpObjectList -> OmpObject -> Designator -> DataRef -> Name = 'x'
++!PARSE-TREE: | OmpClause -> Otherwise -> OmpOtherwiseClause -> OmpDirectiveSpecification
++!PARSE-TREE: | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | OmpClauseList ->
++
++subroutine f06
++  ! Two trait set selectors
++  !$omp metadirective &
++  !$omp & when(implementation={vendor("amd")}, &
++  !$omp &      user={condition(.true.)}: nothing)
++end
++
++!UNPARSE: SUBROUTINE f06
++!UNPARSE: !$OMP METADIRECTIVE  WHEN(IMPLEMENTATION={VENDOR(amd)}, USER={CONDITION(.true._4)}: NO&
++!UNPARSE: !$OMP&THING)
++!UNPARSE: END SUBROUTINE
++
++!PARSE-TREE: ExecutionPartConstruct -> ExecutableConstruct -> OpenMPConstruct -> OpenMPStandaloneConstruct -> OmpMetadirectiveDirective
++!PARSE-TREE: | OmpClauseList -> OmpClause -> When -> OmpWhenClause
++!PARSE-TREE: | | Modifier -> OmpContextSelectorSpecification -> OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = Implementation
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Vendor
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> OmpTraitPropertyName -> string = 'amd'
++!PARSE-TREE: | | OmpTraitSetSelector
++!PARSE-TREE: | | | OmpTraitSetSelectorName -> Value = User
++!PARSE-TREE: | | | OmpTraitSelector
++!PARSE-TREE: | | | | OmpTraitSelectorName -> Value = Condition
++!PARSE-TREE: | | | | Properties
++!PARSE-TREE: | | | | | OmpTraitProperty -> Scalar -> Expr = '.true._4'
++!PARSE-TREE: | | | | | | LiteralConstant -> LogicalLiteralConstant
++!PARSE-TREE: | | | | | | | bool = 'true'
++!PARSE-TREE: | | OmpDirectiveSpecification
++!PARSE-TREE: | | | llvm::omp::Directive = nothing
++!PARSE-TREE: | | | OmpClauseList ->
++
+diff --git a/llvm/include/llvm/Frontend/OpenMP/OMP.td b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+index a4c1964c3e88f..1f2389987e18b 100644
+--- a/llvm/include/llvm/Frontend/OpenMP/OMP.td
++++ b/llvm/include/llvm/Frontend/OpenMP/OMP.td
+@@ -265,6 +265,7 @@ def OMPC_Map : Clause<"map"> {
+   let flangClass = "OmpMapClause";
+ }
+ def OMPC_Match : Clause<"match"> {
++  let flangClass = "OmpMatchClause";
+ }
+ def OMP_MEMORY_ORDER_SeqCst : ClauseVal<"seq_cst", 1, 1> {}
+ def OMP_MEMORY_ORDER_AcqRel : ClauseVal<"acq_rel", 2, 1> {}
+@@ -367,6 +368,10 @@ def OMPC_Ordered : Clause<"ordered"> {
+   let flangClass = "ScalarIntConstantExpr";
+   let isValueOptional = true;
+ }
++def OMPC_Otherwise : Clause<"otherwise"> {
++  let flangClass = "OmpOtherwiseClause";
++  let isValueOptional = true;
++}
+ def OMPC_Partial: Clause<"partial"> {
+   let clangClass = "OMPPartialClause";
+   let flangClass = "ScalarIntConstantExpr";
+@@ -524,6 +529,7 @@ def OMPC_Weak : Clause<"weak"> {
+   let clangClass = "OMPWeakClause";
+ }
+ def OMPC_When: Clause<"when"> {
++  let flangClass = "OmpWhenClause";
+ }
+ def OMPC_Write : Clause<"write"> {
+   let clangClass = "OMPWriteClause";
+@@ -845,7 +851,8 @@ def OMP_Metadirective : Directive<"metadirective"> {
+     VersionedClause<OMPC_When>,
+   ];
+   let allowedOnceClauses = [
+-    VersionedClause<OMPC_Default>,
++    VersionedClause<OMPC_Otherwise, 52>,
++    VersionedClause<OMPC_Default, 50, 51>,
+   ];
+   let association = AS_None;
+   let category = CA_Meta;

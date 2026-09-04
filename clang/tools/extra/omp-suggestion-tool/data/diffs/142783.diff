@@ -1,0 +1,291 @@
+diff --git a/flang/include/flang/Semantics/symbol.h b/flang/include/flang/Semantics/symbol.h
+index 4f58bdecc37cc..b319e2c7e5e74 100644
+--- a/flang/include/flang/Semantics/symbol.h
++++ b/flang/include/flang/Semantics/symbol.h
+@@ -792,6 +792,7 @@ class Symbol {
+       LocalityShared, // named in SHARED locality-spec
+       InDataStmt, // initialized in a DATA statement, =>object, or /init/
+       InNamelist, // in a Namelist group
++      InCommonBlock, // referenced in a common block
+       EntryDummyArgument,
+       CompilerCreated, // A compiler created symbol
+       // For compiler created symbols that are constant but cannot legally have
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index ec385b7baf8bd..65823adcef19d 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2217,6 +2217,20 @@ static bool IsPrivatizable(const Symbol *sym) {
+               misc->kind() != MiscDetails::Kind::ConstructName));
+ }
+ 
++static bool IsSymbolStaticStorageDuration(const Symbol &symbol) {
++  LLVM_DEBUG(llvm::dbgs() << "IsSymbolStaticStorageDuration(" << symbol.name()
++                          << "):\n");
++  auto ultSym = symbol.GetUltimate();
++  // Module-scope variable
++  return (ultSym.owner().kind() == Scope::Kind::Module) ||
++      // Data statement variable
++      (ultSym.flags().test(Symbol::Flag::InDataStmt)) ||
++      // Save attribute variable
++      (ultSym.attrs().test(Attr::SAVE)) ||
++      // Referenced in a common block
++      (ultSym.flags().test(Symbol::Flag::InCommonBlock));
++}
++
+ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
+   if (!IsPrivatizable(symbol)) {
+     return;
+@@ -2310,6 +2324,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
+     bool targetDir = llvm::omp::allTargetSet.test(dirContext.directive);
+     bool parallelDir = llvm::omp::allParallelSet.test(dirContext.directive);
+     bool teamsDir = llvm::omp::allTeamsSet.test(dirContext.directive);
++    bool isStaticStorageDuration = IsSymbolStaticStorageDuration(*symbol);
+ 
+     if (dsa.any()) {
+       if (parallelDir || taskGenDir || teamsDir) {
+@@ -2367,7 +2382,7 @@ void OmpAttributeVisitor::CreateImplicitSymbols(const Symbol *symbol) {
+       dsa = prevDSA;
+     } else if (taskGenDir) {
+       // TODO 5) dummy arg in orphaned taskgen construct -> firstprivate
+-      if (prevDSA.test(Symbol::Flag::OmpShared)) {
++      if (prevDSA.test(Symbol::Flag::OmpShared) || isStaticStorageDuration) {
+         // 6) shared in enclosing context -> shared
+         dsa = {Symbol::Flag::OmpShared};
+         makeSymbol(dsa);
+@@ -2886,20 +2901,6 @@ void ResolveOmpTopLevelParts(
+   });
+ }
+ 
+-static bool IsSymbolInCommonBlock(const Symbol &symbol) {
+-  // TODO Improve the performance of this predicate function.
+-  //      Going through all symbols sequentially, in all common blocks, can be
+-  //      slow when there are many symbols. A possible optimization is to add
+-  //      an OmpInCommonBlock flag to Symbol, to make it possible to quickly
+-  //      test if a given symbol is in a common block.
+-  for (const auto &cb : symbol.owner().commonBlocks()) {
+-    if (IsCommonBlockContaining(cb.second.get(), symbol)) {
+-      return true;
+-    }
+-  }
+-  return false;
+-}
+-
+ static bool IsSymbolThreadprivate(const Symbol &symbol) {
+   if (const auto *details{symbol.detailsIf<HostAssocDetails>()}) {
+     return details->symbol().test(Symbol::Flag::OmpThreadprivate);
+@@ -2928,7 +2929,7 @@ static bool IsSymbolPrivate(const Symbol &symbol) {
+     case Scope::Kind::BlockConstruct:
+       return !symbol.attrs().test(Attr::SAVE) &&
+           !symbol.attrs().test(Attr::PARAMETER) && !IsAssumedShape(symbol) &&
+-          !IsSymbolInCommonBlock(symbol);
++          !symbol.flags().test(Symbol::Flag::InCommonBlock);
+     default:
+       return false;
+     }
+diff --git a/flang/lib/Semantics/resolve-names.cpp b/flang/lib/Semantics/resolve-names.cpp
+index 724879f2bbb07..3e133b156a9f3 100644
+--- a/flang/lib/Semantics/resolve-names.cpp
++++ b/flang/lib/Semantics/resolve-names.cpp
+@@ -6920,6 +6920,9 @@ bool DeclarationVisitor::Pre(const parser::CommonBlockObject &) {
+ 
+ void DeclarationVisitor::Post(const parser::CommonBlockObject &x) {
+   const auto &name{std::get<parser::Name>(x.t)};
++  if (auto *symbol{FindSymbol(name)}) {
++    symbol->set(Symbol::Flag::InCommonBlock);
++  }
+   DeclareObjectEntity(name);
+   auto pair{specPartState_.commonBlockObjects.insert(name.source)};
+   if (!pair.second) {
+diff --git a/flang/test/Semantics/OpenMP/common-block.f90 b/flang/test/Semantics/OpenMP/common-block.f90
+index 93f29b12eacae..adf77b016ecd9 100644
+--- a/flang/test/Semantics/OpenMP/common-block.f90
++++ b/flang/test/Semantics/OpenMP/common-block.f90
+@@ -1,9 +1,9 @@
+ ! RUN: %flang_fc1 -fopenmp -fdebug-dump-symbols %s | FileCheck %s
+ 
+ program main
+-  !CHECK: a size=4 offset=0: ObjectEntity type: REAL(4)
+-  !CHECK: b size=8 offset=4: ObjectEntity type: INTEGER(4) shape: 1_8:2_8
+-  !CHECK: c size=4 offset=12: ObjectEntity type: REAL(4)
++  !CHECK: a (InCommonBlock) size=4 offset=0: ObjectEntity type: REAL(4)
++  !CHECK: b (InCommonBlock) size=8 offset=4: ObjectEntity type: INTEGER(4) shape: 1_8:2_8
++  !CHECK: c (InCommonBlock) size=4 offset=12: ObjectEntity type: REAL(4)
+   !CHECK: blk size=16 offset=0: CommonBlockDetails alignment=4: a b c
+   real :: a, c
+   integer :: b(2)
+diff --git a/flang/test/Semantics/OpenMP/declare-target-common-block.f90 b/flang/test/Semantics/OpenMP/declare-target-common-block.f90
+index 33a093a03a227..ccdedaa52848e 100644
+--- a/flang/test/Semantics/OpenMP/declare-target-common-block.f90
++++ b/flang/test/Semantics/OpenMP/declare-target-common-block.f90
+@@ -1,8 +1,8 @@
+ ! RUN: %flang_fc1 -fopenmp -fdebug-dump-symbols %s | FileCheck %s
+ 
+ PROGRAM main
+-    !CHECK: one (OmpDeclareTarget) size=4 offset=0: ObjectEntity type: REAL(4)
+-    !CHECK: two (OmpDeclareTarget) size=4 offset=4: ObjectEntity type: REAL(4)
++    !CHECK: one (InCommonBlock, OmpDeclareTarget) size=4 offset=0: ObjectEntity type: REAL(4)
++    !CHECK: two (InCommonBlock, OmpDeclareTarget) size=4 offset=4: ObjectEntity type: REAL(4)
+     !CHECK: numbers size=8 offset=0: CommonBlockDetails alignment=4: one two
+     REAL :: one, two
+     COMMON /numbers/ one, two
+diff --git a/flang/test/Semantics/OpenMP/implicit-dsa.f90 b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+index 7e38435274b7b..3e9348575597b 100644
+--- a/flang/test/Semantics/OpenMP/implicit-dsa.f90
++++ b/flang/test/Semantics/OpenMP/implicit-dsa.f90
+@@ -169,3 +169,78 @@ subroutine implicit_dsa_test8
+     end do
+   !$omp end task
+ end subroutine
++
++! Test variables defined in modules default to shared DSA
++!DEF: /implicit_dsa_test9_mod Module
++module implicit_dsa_test9_mod
++ !DEF: /implicit_dsa_test9_mod/tm3a PUBLIC (InDataStmt) ObjectEntity COMPLEX(4)
++  complex tm3a/(0,0)/
++ !DEF: /implicit_dsa_test9_mod/tm4a PUBLIC ObjectEntity COMPLEX(4)
++  complex tm4a
++contains
++ !DEF: /implicit_dsa_test9_mod/implict_dsa_test9 PUBLIC (Subroutine) Subprogram
++  subroutine implict_dsa_test9
++    !$omp task
++      !$omp task
++        !DEF: /implicit_dsa_test9_mod/implict_dsa_test9/OtherConstruct1/OtherConstruct1/tm3a (OmpShared) HostAssoc COMPLEX(4)
++        tm3a = (1, 2)
++        !DEF: /implicit_dsa_test9_mod/implict_dsa_test9/OtherConstruct1/OtherConstruct1/tm4a (OmpShared) HostAssoc COMPLEX(4)
++        tm4a = (3, 4)
++      !$omp end task
++    !$omp end task
++  !$omp taskwait
++  !REF: /implicit_dsa_test9_mod/tm3a
++  print *,tm3a
++  end subroutine
++end module
++
++! Test variables in data statement default to shared DSA
++!DEF: /implicit_dsa_test10 (Subroutine) Subprogram
++subroutine implicit_dsa_test10
++ !DEF: /implicit_dsa_test10/tm3a (Implicit, InDataStmt) ObjectEntity REAL(4)
++data tm3a /3/
++!$omp task
++  !$omp task
++ !DEF: /implicit_dsa_test10/OtherConstruct1/OtherConstruct1/tm3a (OmpShared) HostAssoc REAL(4)
++    tm3a = 5
++  !$omp end task
++!$omp end task
++!$omp taskwait
++ !REF: /implicit_dsa_test10/tm3a
++print *,tm3a
++end subroutine
++
++! Test variables with the SAVE attrtibute default to shared DSA
++!DEF: /implicit_dsa_test_11 (Subroutine) Subprogram
++subroutine implicit_dsa_test_11
++ !DEF: /implicit_dsa_test_11/tm3a SAVE ObjectEntity COMPLEX(4)
++complex, save :: tm3a
++!$omp task
++  !$omp task
++    !DEF: /implicit_dsa_test_11/OtherConstruct1/OtherConstruct1/tm3a (OmpShared) HostAssoc COMPLEX(4)
++    tm3a = (1, 2)
++  !$omp end task
++!$omp end task
++!$omp taskwait
++!REF: /implicit_dsa_test_11/tm3a
++print *,tm3a
++end subroutine
++
++! Test variables referenced in a common block default to shared DSA
++!DEF: /implicit_dsa_test_12 (Subroutine) Subprogram
++subroutine implicit_dsa_test_12
++ !DEF: /implicit_dsa_test_12/tm3a (InCommonBlock) ObjectEntity COMPLEX(4)
++complex tm3a
++ !DEF: /implicit_dsa_test_12/tcom CommonBlockDetails
++ !REF: /implicit_dsa_test_12/tm3a
++common /tcom/ tm3a
++!$omp task
++  !$omp task
++    !DEF: /implicit_dsa_test_12/OtherConstruct1/OtherConstruct1/tm3a (OmpShared) HostAssoc COMPLEX(4)
++    tm3a = (1, 2)
++  !$omp end task
++!$omp end task
++!$omp taskwait
++!REF: /implicit_dsa_test_12/tm3a
++print *,tm3a
++end subroutine
+diff --git a/flang/test/Semantics/OpenMP/symbol01.f90 b/flang/test/Semantics/OpenMP/symbol01.f90
+index 595b6b89c84fd..fbd9a0286c79b 100644
+--- a/flang/test/Semantics/OpenMP/symbol01.f90
++++ b/flang/test/Semantics/OpenMP/symbol01.f90
+@@ -21,8 +21,8 @@ program mm
+  !REF: /md
+  use :: md
+  !DEF: /mm/c CommonBlockDetails
+- !DEF: /mm/x ObjectEntity REAL(4)
+- !DEF: /mm/y ObjectEntity REAL(4)
++ !DEF: /mm/x (InCommonBlock) ObjectEntity REAL(4)
++ !DEF: /mm/y (InCommonBlock) ObjectEntity REAL(4)
+  common /c/x, y
+  !REF: /mm/x
+  !REF: /mm/y
+diff --git a/flang/test/Semantics/offsets03.f90 b/flang/test/Semantics/offsets03.f90
+index c8c1abebb5d3c..75bc43d9f4cca 100644
+--- a/flang/test/Semantics/offsets03.f90
++++ b/flang/test/Semantics/offsets03.f90
+@@ -30,10 +30,10 @@ subroutine mc         !CHECK: Subprogram scope: mc size=12 alignment=1
+ ! Common block: objects are in order from COMMON statement and not part of module
+ module md                   !CHECK: Module scope: md size=1 alignment=1
+   integer(1) :: i
+-  integer(2) :: d1          !CHECK: d1, PUBLIC size=2 offset=8:
+-  integer(4) :: d2          !CHECK: d2, PUBLIC size=4 offset=4:
+-  integer(1) :: d3          !CHECK: d3, PUBLIC size=1 offset=0:
+-  real(2) :: d4             !CHECK: d4, PUBLIC size=2 offset=0:
++  integer(2) :: d1          !CHECK: d1, PUBLIC (InCommonBlock) size=2 offset=8:
++  integer(4) :: d2          !CHECK: d2, PUBLIC (InCommonBlock) size=4 offset=4:
++  integer(1) :: d3          !CHECK: d3, PUBLIC (InCommonBlock) size=1 offset=0:
++  real(2) :: d4             !CHECK: d4, PUBLIC (InCommonBlock) size=2 offset=0:
+   common /common1/ d3,d2,d1 !CHECK: common1 size=10 offset=0: CommonBlockDetails alignment=4:
+   common /common2/ d4       !CHECK: common2 size=2 offset=0: CommonBlockDetails alignment=2:
+ end
+@@ -71,7 +71,7 @@ module me
+ subroutine host1
+  contains
+   subroutine internal
+-    common /b/ x(4)  ! CHECK: x (Implicit) size=16 offset=0: ObjectEntity type: REAL(4) shape: 1_8:4_8
++    common /b/ x(4)  ! CHECK: x (Implicit, InCommonBlock) size=16 offset=0: ObjectEntity type: REAL(4) shape: 1_8:4_8
+     equivalence(x,y) ! CHECK: y (Implicit) size=4 offset=0: ObjectEntity type: REAL(4)
+   end
+ end
+diff --git a/flang/test/Semantics/resolve121.f90 b/flang/test/Semantics/resolve121.f90
+index d84bc53a50f7c..fa54a0924ff7e 100644
+--- a/flang/test/Semantics/resolve121.f90
++++ b/flang/test/Semantics/resolve121.f90
+@@ -25,7 +25,7 @@ subroutine test3()
+   ! CHECK-LABEL: Subprogram scope: test3
+   ! CHECK: i1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4)
+   ! CHECK: j1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4)
+-  ! CHECK: k1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4)
++  ! CHECK: k1, SAVE (InCommonBlock) size=4 offset=0: ObjectEntity type: INTEGER(4)
+   integer :: i1
+   integer :: j1, k1
+   common /blk/ k1
+@@ -37,7 +37,7 @@ subroutine test4()
+   ! CHECK-LABEL: Subprogram scope: test4
+   ! CHECK: i1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4) init:1_4
+   ! CHECK: j1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4)
+-  ! CHECK: k1, SAVE size=4 offset=0: ObjectEntity type: INTEGER(4)
++  ! CHECK: k1, SAVE (InCommonBlock) size=4 offset=0: ObjectEntity type: INTEGER(4)
+   integer :: i1 = 1
+   integer :: j1, k1
+   common /blk/ k1
+diff --git a/flang/test/Semantics/symbol33.f90 b/flang/test/Semantics/symbol33.f90
+index fbb5321b8854d..ccc52b6ef5e68 100644
+--- a/flang/test/Semantics/symbol33.f90
++++ b/flang/test/Semantics/symbol33.f90
+@@ -3,7 +3,7 @@
+ ! array element reference still applies implicit typing, &c.
+ !DEF: /subr (Subroutine) Subprogram
+ subroutine subr
+-  !DEF: /subr/moo (Implicit) ObjectEntity INTEGER(4)
++  !DEF: /subr/moo (Implicit, InCommonBlock) ObjectEntity INTEGER(4)
+   common //moo(1)
+   !DEF: /subr/a ObjectEntity REAL(4)
+   !REF: /subr/moo

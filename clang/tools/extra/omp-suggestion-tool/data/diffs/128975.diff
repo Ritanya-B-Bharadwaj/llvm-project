@@ -1,0 +1,182 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index d3b3d69015bf3..e42c0c0923bc9 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -4888,12 +4888,23 @@ struct OpenMPDispatchConstruct {
+       t;
+ };
+ 
+-// 2.17.8 flush -> FLUSH [memory-order-clause] [(variable-name-list)]
++// [4.5:162-165], [5.0:242-246], [5.1:275-279], [5.2:315-316], [6.0:498-500]
++//
++// flush-construct ->
++//    FLUSH [(list)]                                // since 4.5, until 4.5
++// flush-construct ->
++//    FLUSH [memory-order-clause] [(list)]          // since 5.0, until 5.1
++// flush-construct ->
++//    FLUSH [(list)] [clause-list]                  // since 5.2
++//
++// memory-order-clause ->                           // since 5.0, until 5.1
++//    ACQ_REL | RELEASE | ACQUIRE |                 // since 5.0
++//    SEQ_CST                                       // since 5.1
+ struct OpenMPFlushConstruct {
+   TUPLE_CLASS_BOILERPLATE(OpenMPFlushConstruct);
+   CharBlock source;
+-  std::tuple<Verbatim, std::optional<std::list<OmpMemoryOrderClause>>,
+-      std::optional<OmpObjectList>>
++  std::tuple<Verbatim, std::optional<OmpObjectList>,
++      std::optional<OmpClauseList>, /*TrailingClauses=*/bool>
+       t;
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 97b4778d488fa..7970d77da8a6b 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -3275,13 +3275,12 @@ static void genOMP(lower::AbstractConverter &converter, lower::SymMap &symTable,
+   const auto &objectList =
+       std::get<std::optional<parser::OmpObjectList>>(flushConstruct.t);
+   const auto &clauseList =
+-      std::get<std::optional<std::list<parser::OmpMemoryOrderClause>>>(
+-          flushConstruct.t);
++      std::get<std::optional<parser::OmpClauseList>>(flushConstruct.t);
+   ObjectList objects =
+       objectList ? makeObjects(*objectList, semaCtx) : ObjectList{};
+   List<Clause> clauses =
+-      clauseList ? makeList(*clauseList,
+-                            [&](auto &&s) { return makeClause(s.v, semaCtx); })
++      clauseList ? makeList(clauseList->v,
++                            [&](auto &&s) { return makeClause(s, semaCtx); })
+                  : List<Clause>{};
+   mlir::Location currentLocation = converter.genLocation(verbatim.source);
+ 
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 014b4f8c69574..c05b420d56415 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -1104,9 +1104,25 @@ TYPE_PARSER(sourced(construct<OmpAtomicClauseList>(
+ TYPE_PARSER(sourced(construct<OpenMPDepobjConstruct>(verbatim("DEPOBJ"_tok),
+     parenthesized(Parser<OmpObject>{}), sourced(Parser<OmpClause>{}))))
+ 
+-TYPE_PARSER(sourced(construct<OpenMPFlushConstruct>(verbatim("FLUSH"_tok),
+-    many(maybe(","_tok) >> sourced(Parser<OmpMemoryOrderClause>{})),
+-    maybe(parenthesized(Parser<OmpObjectList>{})))))
++static OpenMPFlushConstruct makeFlushFromOldSyntax(Verbatim &&text,
++    std::optional<OmpClauseList> &&clauses,
++    std::optional<OmpObjectList> &&objects) {
++  bool oldSyntax{
++      clauses && !clauses->v.empty() && objects && !objects->v.empty()};
++  return OpenMPFlushConstruct{std::move(text), std::move(objects),
++      std::move(clauses),
++      /*TrailingClauses=*/!oldSyntax};
++}
++
++TYPE_PARSER(sourced( //
++    construct<OpenMPFlushConstruct>( //
++        applyFunction<OpenMPFlushConstruct>(makeFlushFromOldSyntax,
++            verbatim("FLUSH"_tok), maybe(Parser<OmpClauseList>{}),
++            maybe(parenthesized(Parser<OmpObjectList>{})))) ||
++
++    construct<OpenMPFlushConstruct>( //
++        verbatim("FLUSH"_tok), maybe(parenthesized(Parser<OmpObjectList>{})),
++        Parser<OmpClauseList>{}, pure(/*TrailingClauses=*/true))))
+ 
+ // Simple Standalone Directives
+ TYPE_PARSER(sourced(construct<OmpSimpleStandaloneDirective>(first(
+diff --git a/flang/lib/Parser/unparse.cpp b/flang/lib/Parser/unparse.cpp
+index 960337b8a91b5..7b0524771cdc4 100644
+--- a/flang/lib/Parser/unparse.cpp
++++ b/flang/lib/Parser/unparse.cpp
+@@ -2874,9 +2874,14 @@ class UnparseVisitor {
+   }
+   void Unparse(const OpenMPFlushConstruct &x) {
+     BeginOpenMP();
+-    Word("!$OMP FLUSH ");
+-    Walk(std::get<std::optional<std::list<OmpMemoryOrderClause>>>(x.t));
+-    Walk(" (", std::get<std::optional<OmpObjectList>>(x.t), ")");
++    Word("!$OMP FLUSH");
++    if (std::get</*ClausesTrailing=*/bool>(x.t)) {
++      Walk("(", std::get<std::optional<OmpObjectList>>(x.t), ")");
++      Walk(" ", std::get<std::optional<OmpClauseList>>(x.t));
++    } else {
++      Walk(" ", std::get<std::optional<OmpClauseList>>(x.t));
++      Walk(" (", std::get<std::optional<OmpObjectList>>(x.t), ")");
++    }
+     Put("\n");
+     EndOpenMP();
+   }
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index c95cf0d5921cf..6a50455b97170 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -2139,16 +2139,26 @@ void OmpStructureChecker::Enter(const parser::OpenMPFlushConstruct &x) {
+ }
+ 
+ void OmpStructureChecker::Leave(const parser::OpenMPFlushConstruct &x) {
++  auto &flushList{std::get<std::optional<parser::OmpObjectList>>(x.t)};
++
+   if (FindClause(llvm::omp::Clause::OMPC_acquire) ||
+       FindClause(llvm::omp::Clause::OMPC_release) ||
+       FindClause(llvm::omp::Clause::OMPC_acq_rel)) {
+-    if (const auto &flushList{
+-            std::get<std::optional<parser::OmpObjectList>>(x.t)}) {
++    if (flushList) {
+       context_.Say(parser::FindSourceLocation(flushList),
+           "If memory-order-clause is RELEASE, ACQUIRE, or ACQ_REL, list items "
+           "must not be specified on the FLUSH directive"_err_en_US);
+     }
+   }
++
++  unsigned version{context_.langOptions().OpenMPVersion};
++  if (version >= 52) {
++    if (!std::get</*TrailingClauses=*/bool>(x.t)) {
++      context_.Say(parser::FindSourceLocation(flushList),
++          "The syntax \"FLUSH clause (object, ...)\" has been deprecated, use \"FLUSH(object, ...) clause\" instead"_warn_en_US);
++    }
++  }
++
+   dirContext_.pop_back();
+ }
+ 
+diff --git a/flang/test/Semantics/OpenMP/flush01.f90 b/flang/test/Semantics/OpenMP/flush01.f90
+index 27324de4a8f7a..61eda3a1c6bb8 100644
+--- a/flang/test/Semantics/OpenMP/flush01.f90
++++ b/flang/test/Semantics/OpenMP/flush01.f90
+@@ -1,4 +1,6 @@
+-! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++! REQUIRES: openmp_runtime
++
++! RUN: %python %S/../test_errors.py %s %flang_fc1 %openmp_flags -fopenmp-version=50
+ 
+ ! 2.17.8 Flush construct [OpenMP 5.0]
+ !        memory-order-clause ->
+@@ -22,13 +24,13 @@
+     array = (/1, 2, 3, 4, 5, 6, 7, 8, 9, 10/)
+     !$omp flush acquire
+ 
+-    !ERROR: expected end of line
++    !ERROR: PRIVATE clause is not allowed on the FLUSH directive
+     !$omp flush private(array)
+-    !ERROR: expected end of line
++    !ERROR: NUM_THREADS clause is not allowed on the FLUSH directive
+     !$omp flush num_threads(4)
+ 
+     ! Mix allowed and not allowed clauses.
+-    !ERROR: expected end of line
++    !ERROR: NUM_THREADS clause is not allowed on the FLUSH directive
+     !$omp flush num_threads(4) acquire
+   end if
+   !$omp end parallel
+diff --git a/flang/test/Semantics/OpenMP/flush03.f90 b/flang/test/Semantics/OpenMP/flush03.f90
+new file mode 100644
+index 0000000000000..fda437ec5dc82
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/flush03.f90
+@@ -0,0 +1,7 @@
++! RUN: %python %S/../test_errors.py %s %flang_fc1 -fopenmp -fopenmp-version=52 -Werror
++
++subroutine f00(x)
++  integer :: x
++!ERROR: The syntax "FLUSH clause (object, ...)" has been deprecated, use "FLUSH(object, ...) clause" instead
++  !$omp flush seq_cst (x)
++end

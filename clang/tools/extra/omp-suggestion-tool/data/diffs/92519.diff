@@ -1,0 +1,604 @@
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpBase.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpBase.td
+index b98d87aa74a6f..d93abd63977ef 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOpBase.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOpBase.td
+@@ -42,7 +42,168 @@ def OpenMP_MapBoundsType : OpenMP_Type<"MapBounds", "map_bounds_ty"> {
+ // Base classes for OpenMP dialect operations.
+ //===----------------------------------------------------------------------===//
+ 
+-class OpenMP_Op<string mnemonic, list<Trait> traits = []> :
+-      Op<OpenMP_Dialect, mnemonic, traits>;
++// Base class for representing OpenMP clauses.
++//
++// Clauses are meant to be used in a mixin-style pattern to help define OpenMP
++// operations in a scalable way, since often the same clause can be applied to
++// multiple different operations.
++//
++// To keep the representation of clauses consistent across different operations,
++// each clause must define a set of arguments (values and attributes) which will
++// become input arguments of each OpenMP operation that accepts that clause.
++//
++// It is also recommended that an assembly format and description are defined
++// for each clause wherever posible, to make sure they are always printed,
++// parsed and described in the same way.
++//
++// Optionally, operation traits and extra class declarations might be attached
++// to clauses, which will be forwarded to all operations that include them.
++//
++// Each clause must specify whether it's required or optional. This impacts how
++// the `assemblyFormat` for operations including it get generated.
++//
++// An `OpenMP_Op` can inhibit the inheritance of `traits`, `arguments`,
++// `assemblyFormat`, `description` and `extraClassDeclaration` fields from any
++// given `OpenMP_Clause` by setting to 1 the corresponding "skip" template
++// argument bit.
++class OpenMP_Clause<bit isRequired, bit skipTraits, bit skipArguments,
++                    bit skipAssemblyFormat, bit skipDescription,
++                    bit skipExtraClassDeclaration> {
++  bit required = isRequired;
++
++  bit ignoreTraits = skipTraits;
++  list<Trait> traits = [];
++
++  bit ignoreArgs = skipArguments;
++  dag arguments;
++
++  bit ignoreAsmFormat = skipAssemblyFormat;
++  string assemblyFormat = "";
++
++  bit ignoreDesc = skipDescription;
++  string description = "";
++
++  bit ignoreExtraDecl = skipExtraClassDeclaration;
++  string extraClassDeclaration = "";
++}
++
++// Base class for representing OpenMP operations.
++//
++// This is a subclass of the builtin `Op` for the OpenMP dialect. By default,
++// some of its fields are initialized according to the list of OpenMP clauses
++// passed as template argument:
++//   - `traits`: It is a union of the traits list passed as template argument
++//     and those inherited from the `traits` field of all clauses.
++//   - `arguments`: They are a concatenation of clause-inherited arguments. They
++//     are saved to a `clausesArgs` field to allow overriding the arguments
++//     field in the definition of the operation and still being able to include
++//     those inherited from clauses.
++//   - `assemblyFormat`: It is a concatenation of the `assemblyFormat` of
++//     all required clauses followed by an `oilist()` containing the
++//     `assemblyFormat` of all optional clauses. The format string is completed
++//     with $region (if `singleRegion = true`) followed by attr-dict. This field
++//     remains uninitialized if no non-empty `assemblyFormat` strings are
++//     inherited from clauses. The `clausesAssemblyFormat` field holds
++//     all the format except for "$region attr-dict", so that an operation
++//     overriding `assemblyFormat` can still benefit from the auto-generated
++//     format for its clauses.
++//   - `description`: This is still required to be defined by the operation.
++//     However, a `clausesDescription` field is provided containing a
++//     concatenation of descriptions of all clauses, to be appended to the
++//     operation's `description` field.
++//   - `extraClassDeclaration`: It contains a concatenation of the
++//     `extraClassDeclaration` of all clauses. This string is also stored in
++//     `clausesExtraClassDeclaration`, so that an operation overriding this
++//     field can append the clause-inherited ones as well.
++//
++// The `regions` field will contain a single `AnyRegion:$region` element if the
++// `singleRegion` bit template argument is set to 1. Otherwise, it will be
++// empty.
++class OpenMP_Op<string mnemonic, list<Trait> traits = [],
++                list<OpenMP_Clause> clauses = [], bit singleRegion = false> :
++    Op<OpenMP_Dialect, mnemonic,
++    // The resulting operation's traits list will be the concatenation of
++    // explicit operation traits and all traits attached to the clauses of the
++    // operation. Repetitions are skipped.
++    !listconcat(traits,
++      !listremove(
++        !foldl([]<Trait>,
++               !foreach(clause,
++                        !filter(fClause, clauses, !not(fClause.ignoreTraits)),
++                        clause.traits),
++               acc, traitList, !listconcat(acc, !listremove(traitList, acc))),
++        traits
++      )
++    )> {
++  // Aggregate `arguments` fields of all clauses into a single dag, to be used
++  // by operations to populate their `arguments` field.
++  defvar argsFilteredClauses =
++    !filter(clause, clauses, !not(clause.ignoreArgs));
++
++  dag clausesArgs =
++    !foldl((ins), !foreach(clause, argsFilteredClauses, clause.arguments),
++           acc, argList, !con(acc, argList));
++
++  // Create assembly format string by concatenating format strings separately
++  // for required and optional clauses. Then, required clauses format strings
++  // are joined with spaces in between. Optional clauses format strings are
++  // wrapped into an unsorted list of optional values and separated by "|"
++  // characters.
++
++  // Required clauses.
++  defvar reqClauses = !filter(clause, clauses, clause.required);
++  defvar asmFormatFilteredReqClauses =
++    !filter(clause, reqClauses, !not(!or(clause.ignoreAsmFormat,
++                                     !empty(clause.assemblyFormat))));
++
++  defvar asmFormatReqClauseStrings =
++    !foreach(clause, asmFormatFilteredReqClauses, clause.assemblyFormat);
++
++  defvar asmFormatReqClauseBody = !interleave(asmFormatReqClauseStrings, " ");
++
++  // Optional clauses.
++  defvar optClauses = !filter(clause, clauses, !not(clause.required));
++  defvar asmFormatFilteredOptClauses =
++    !filter(clause, optClauses, !not(!or(clause.ignoreAsmFormat,
++                                     !empty(clause.assemblyFormat))));
++
++  defvar asmFormatOptClauseStrings =
++    !foreach(clause, asmFormatFilteredOptClauses, clause.assemblyFormat);
++
++  defvar asmFormatOptClauseBody = !interleave(asmFormatOptClauseStrings, "|");
++
++  string clausesAssemblyFormat =
++    !if(!empty(asmFormatReqClauseStrings), "", asmFormatReqClauseBody # " ") #
++    !if(!empty(asmFormatOptClauseStrings), "",
++        "oilist(" # asmFormatOptClauseBody # ")");
++
++  // Put together descriptions of all clauses into a single string.
++  defvar descFilteredClauses =
++    !filter(clause, clauses, !not(clause.ignoreDesc));
++
++  string clausesDescription =
++    !interleave(!foreach(clause, descFilteredClauses, clause.description), "");
++  
++  // Aggregate `extraClassDeclaration` of all clauses that define it.
++  defvar extraDeclFilteredClauses =
++    !filter(clause, clauses, !not(clause.ignoreExtraDecl));
++
++  string clausesExtraClassDeclaration =
++    !interleave(!foreach(clause, extraDeclFilteredClauses,
++                         clause.extraClassDeclaration), "\n");
++
++  // The default arguments, assembly format and extra class declarations for
++  // OpenMP operations are those defined by their args and clauses.
++  let arguments = clausesArgs;
++  let assemblyFormat =
++    !if(!empty(clausesAssemblyFormat), ?,
++        clausesAssemblyFormat # !if(singleRegion, " $region", "") #
++        " attr-dict");
++  let extraClassDeclaration = clausesExtraClassDeclaration;
++
++  // By default, the op will have zero regions. Setting `singleRegion = true`
++  // will result in a single region named `$region`.
++  let regions = !if(singleRegion, (region AnyRegion:$region), (region));
++}
+ 
+ #endif  // OPENMP_OP_BASE
+diff --git a/mlir/test/mlir-tblgen/openmp-ops.td b/mlir/test/mlir-tblgen/openmp-ops.td
+new file mode 100644
+index 0000000000000..83f267cb4ed08
+--- /dev/null
++++ b/mlir/test/mlir-tblgen/openmp-ops.td
+@@ -0,0 +1,423 @@
++// Tablegen tests for the automatic population of OpenMP dialect operation
++// fields from clauses. Arguments and extra class declarations are checked from
++// the output of tablegen declarations. Summary, description, assembly format
++// and traits are checked from the output of tablegen docs.
++
++// Run tablegen to generate OmpCommon.td in temp directory first.
++// RUN: mkdir -p %t/mlir/Dialect/OpenMP
++// RUN: mlir-tblgen --gen-directive-decl --directives-dialect=OpenMP \
++// RUN:   %S/../../../llvm/include/llvm/Frontend/OpenMP/OMP.td \
++// RUN:   -I %S/../../../llvm/include > %t/mlir/Dialect/OpenMP/OmpCommon.td
++
++// RUN: mlir-tblgen -gen-op-decls -I %S/../../include -I %t %s | FileCheck %s --check-prefix=DECL
++// RUN: mlir-tblgen -gen-op-doc -I %S/../../include -I %t %s | FileCheck %s --check-prefix=DOC
++
++include "mlir/Dialect/OpenMP/OpenMPOpBase.td"
++
++// Dummy traits.
++
++def TraitOne : NativeOpTrait<"TraitOne">;
++def TraitTwo : NativeOpTrait<"TraitTwo">;
++def TraitThree : NativeOpTrait<"TraitThree">;
++
++// Test clauses.
++
++class OptClauseSkip<
++    bit traits = false, bit arguments = false, bit assemblyFormat = false,
++    bit description = false, bit extraClassDeclaration = false
++  > : OpenMP_Clause</*isRequired=*/false, traits, arguments, assemblyFormat,
++                    description, extraClassDeclaration> {
++  let traits = [
++    TraitOne
++  ];
++
++  let arguments = (ins
++    Optional<AnyInteger>:$opt_simple_val
++  );
++
++  let assemblyFormat = [{
++    `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++  }];
++
++  let description = [{
++    Optional clause description.
++  }];
++
++  let extraClassDeclaration = [{
++    void optClauseExtraClassDecl();
++  }];
++}
++
++def OptClause : OptClauseSkip<>;
++
++def OptClauseTwo : OpenMP_Clause<
++    /*isRequired=*/false, /*skipTraits=*/false, /*skipArguments=*/false,
++    /*skipAssemblyFormat=*/false, /*skipDescription=*/false,
++    /*skipExtraClassDeclaration=*/false> {
++  let traits = [
++    TraitOne, TraitTwo
++  ];
++
++  let arguments = (ins
++    Optional<AnyInteger>:$opt_two_val
++  );
++
++  let assemblyFormat = [{
++    `opt_two` `(` $opt_two_val `:` type($opt_two_val) `)`
++  }];
++
++  let description = [{
++    Optional clause two description.
++  }];
++
++  let extraClassDeclaration = [{
++    void optClauseTwoExtraClassDecl();
++  }];
++}
++
++class ReqClauseSkip<
++    bit traits = false, bit arguments = false, bit assemblyFormat = false,
++    bit description = false, bit extraClassDeclaration = false
++  > : OpenMP_Clause</*isRequired=*/true, traits, arguments, assemblyFormat,
++                    description, extraClassDeclaration> {
++  let traits = [
++    TraitTwo
++  ];
++
++  let arguments = (ins
++    AnyInteger:$req_simple_val
++  );
++
++  let assemblyFormat = [{
++    `reqsimple` `(` $req_simple_val `:` type($req_simple_val) `)`
++  }];
++
++  let description = [{
++    Required clause description.
++  }];
++
++  let extraClassDeclaration = [{
++    void reqClauseExtraClassDecl();
++  }];
++}
++
++def ReqClause : ReqClauseSkip<>;
++
++def ReqClauseTwo : OpenMP_Clause<
++    /*isRequired=*/true, /*skipTraits=*/false, /*skipArguments=*/false,
++    /*skipAssemblyFormat=*/false, /*skipDescription=*/false,
++    /*skipExtraClassDeclaration=*/false> {
++  let traits = [
++    TraitTwo, TraitThree
++  ];
++
++  let arguments = (ins
++    AnyInteger:$req_two_val
++  );
++
++  let assemblyFormat = [{
++    `req_two` `(` $req_two_val `:` type($req_two_val) `)`
++  }];
++
++  let description = [{
++    Required clause two description.
++  }];
++
++  let extraClassDeclaration = [{
++    void reqClauseTwoExtraClassDecl();
++  }];
++}
++
++// Clause-based operation definitions.
++
++def OpOptClause : OpenMP_Op<"op_with_opt",
++    traits=[TraitThree], clauses=[OptClause]> {
++  let summary = "operation with optional clause";
++  let description = [{
++    Description of operation with optional clause.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpOptClause : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpOptClause
++// DOC: _Operation with optional clause_
++// DOC: operation ::= `omp.op_with_opt`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with optional clause.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`
++
++def OpReqClause : OpenMP_Op<"op_with_req",
++    traits=[TraitThree], clauses=[ReqClause]> {
++  let summary = "operation with required clause";
++  let description = [{
++    Description of operation with required clause.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpReqClause : public ::mlir::Op<
++// DECL: getReqSimpleVal() {
++// DECL: void reqClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpReqClause
++// DOC: _Operation with required clause_
++// DOC: operation ::= `omp.op_with_req`
++// DOC-NOT: oilist(
++// DOC: `reqsimple` `(` $req_simple_val `:` type($req_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with required clause.
++// DOC: Required clause description.
++// DOC: Traits: `TraitThree`, `TraitTwo`
++
++def OpReqOptClause : OpenMP_Op<"op_with_req_and_opt",
++    traits=[TraitThree], clauses=[ReqClause, OptClause]> {
++  let summary = "operation with required and optional clauses";
++  let description = [{
++    Description of operation with required and optional clauses.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpReqOptClause : public ::mlir::Op<
++// DECL: getReqSimpleVal() {
++// DECL: getOptSimpleVal() {
++// DECL: void reqClauseExtraClassDecl();
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpReqOptClause
++// DOC: _Operation with required and optional clauses_
++// DOC: operation ::= `omp.op_with_req_and_opt`
++// DOC: `reqsimple` `(` $req_simple_val `:` type($req_simple_val) `)`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with required and optional clauses.
++// DOC: Required clause description.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`, `TraitTwo`
++
++def OpSingleRegion : OpenMP_Op<"op_single_region",
++    clauses=[OptClause], singleRegion=true> {
++  let summary = "operation with a single region";
++  let description = [{
++    Description of operation with a single region.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpSingleRegion : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: getRegion() {
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSingleRegion
++// DOC: _Operation with a single region_
++// DOC: operation ::= `omp.op_single_region`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC: ) $region attr-dict
++// DOC: Description of operation with a single region.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`
++
++def OpSkipArguments : OpenMP_Op<"op_skip_arguments",
++    traits=[TraitThree], clauses=[OptClauseSkip<arguments=true>]> {
++  let summary = "operation with clause - arguments skipped";
++  let description = [{
++    Description of operation with clause - arguments skipped.
++  }] # clausesDescription;
++  let arguments = !con(clausesArgs, (ins Optional<AnyInteger>:$opt_simple_val));
++}
++
++// DECL-LABEL: class OpSkipArguments : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSkipArguments
++// DOC: _Operation with clause - arguments skipped_
++// DOC: operation ::= `omp.op_skip_arguments`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with clause - arguments skipped.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`
++
++def OpSkipAssemblyFormat : OpenMP_Op<"op_skip_assembly_format",
++    traits=[TraitThree], clauses=[ReqClauseSkip<assemblyFormat=true>,
++                                  OptClause]> {
++  let summary = "operation with clauses - assemblyFormat skipped";
++  let description = [{
++    Description of operation with clauses - assemblyFormat skipped.
++  }] # clausesDescription;
++  let assemblyFormat = [{
++    `alt_assembly_format` `(` $req_simple_val `:` type($req_simple_val) `)`
++  }] # clausesAssemblyFormat # "attr-dict";
++}
++
++// DECL-LABEL: class OpSkipAssemblyFormat : public ::mlir::Op<
++// DECL: getReqSimpleVal() {
++// DECL: getOptSimpleVal() {
++// DECL: void reqClauseExtraClassDecl();
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSkipAssemblyFormat
++// DOC: _Operation with clauses - assemblyFormat skipped_
++// DOC: operation ::= `omp.op_skip_assembly_format`
++// DOC: `alt_assembly_format` `(` $req_simple_val `:` type($req_simple_val) `)`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with clauses - assemblyFormat skipped.
++// DOC: Required clause description.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`
++
++def OpSkipDescription : OpenMP_Op<"op_skip_description",
++    traits=[TraitThree], clauses=[OptClauseSkip<description=true>]> {
++  let summary = "operation with clause - description skipped";
++  let description = [{
++    Description of operation with clause - description skipped.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpSkipDescription : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSkipDescription
++// DOC: _Operation with clause - description skipped_
++// DOC: operation ::= `omp.op_skip_description`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with clause - description skipped.
++// DOC-NOT: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`
++
++def OpSkipExtraClassDeclaration : OpenMP_Op<"op_skip_extra_class_declaration",
++    traits=[TraitThree], clauses=[OptClauseSkip<extraClassDeclaration=true>]> {
++  let summary = "operation with clause - extraClassDeclaration skipped";
++  let description = [{
++    Description of operation with clause - extraClassDeclaration skipped.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpSkipExtraClassDeclaration : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL-NOT: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSkipExtraClassDeclaration
++// DOC: _Operation with clause - extraClassDeclaration skipped_
++// DOC: operation ::= `omp.op_skip_extra_class_declaration`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with clause - extraClassDeclaration skipped.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitOne`, `TraitThree`
++
++def OpSkipTraits : OpenMP_Op<"op_skip_traits",
++    traits=[TraitThree], clauses=[OptClauseSkip<traits=true>]> {
++  let summary = "operation with clause - traits skipped";
++  let description = [{
++    Description of operation with clause - traits skipped.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpSkipTraits : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: void optClauseExtraClassDecl();
++
++// DOC-LABEL: omp::OpSkipTraits
++// DOC: _Operation with clause - traits skipped_
++// DOC: operation ::= `omp.op_skip_traits`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with clause - traits skipped.
++// DOC: Optional clause description.
++// DOC: Traits: `TraitThree`
++
++def OpTwoOptionalClauses : OpenMP_Op<"op_two_opt_clauses",
++    traits=[AttrSizedOperandSegments], clauses=[OptClause, OptClauseTwo]> {
++  let summary = "operation with two optional clauses";
++  let description = [{
++    Description of operation with two optional clauses.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpTwoOptionalClauses : public ::mlir::Op<
++// DECL: getOptSimpleVal() {
++// DECL: getOptTwoVal() {
++// DECL: void optClauseExtraClassDecl();
++// DECL: void optClauseTwoExtraClassDecl();
++
++// DOC-LABEL: omp::OpTwoOptionalClauses
++// DOC: _Operation with two optional clauses_
++// DOC: operation ::= `omp.op_two_opt_clauses`
++// DOC: oilist(
++// DOC: `optsimple` `(` $opt_simple_val `:` type($opt_simple_val) `)`
++// DOC: |
++// DOC: `opt_two` `(` $opt_two_val `:` type($opt_two_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with two optional clauses.
++// DOC: Optional clause description.
++// DOC: Optional clause two description.
++// DOC: Traits: `AttrSizedOperandSegments`, `TraitOne`, `TraitTwo`
++
++def OpTwoRequiredClauses : OpenMP_Op<"op_two_req_clauses",
++    clauses=[ReqClause, ReqClauseTwo]> {
++  let summary = "operation with two required clauses";
++  let description = [{
++    Description of operation with two required clauses.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpTwoRequiredClauses : public ::mlir::Op<
++// DECL: getReqSimpleVal() {
++// DECL: getReqTwoVal() {
++// DECL: void reqClauseExtraClassDecl();
++// DECL: void reqClauseTwoExtraClassDecl();
++
++// DOC-LABEL: omp::OpTwoRequiredClauses
++// DOC: _Operation with two required clauses_
++// DOC: operation ::= `omp.op_two_req_clauses`
++// DOC-NOT: oilist(
++// DOC: `reqsimple` `(` $req_simple_val `:` type($req_simple_val) `)`
++// DOC-NOT: |
++// DOC: `req_two` `(` $req_two_val `:` type($req_two_val) `)`
++// DOC-NOT: $region
++// DOC: attr-dict
++// DOC: Description of operation with two required clauses.
++// DOC: Required clause description.
++// DOC: Required clause two description.
++// DOC: Traits: `TraitThree`, `TraitTwo`
++
++def OpZeroClauses : OpenMP_Op<"op_zero_clauses"> {
++  let summary = "operation with no clauses";
++  let description = [{
++    Description of operation with no clauses.
++  }] # clausesDescription;
++}
++
++// DECL-LABEL: class OpZeroClauses : public ::mlir::Op<
++// DECL: static void build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState);
++
++// DOC-LABEL: omp::OpZeroClauses
++// DOC: _Operation with no clauses_
++// DOC-NOT: operation ::=
++// DOC: Description of operation with no clauses.
++// DOC-NOT: Traits:

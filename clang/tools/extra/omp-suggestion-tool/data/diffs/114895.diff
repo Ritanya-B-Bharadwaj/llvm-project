@@ -1,0 +1,253 @@
+diff --git a/flang/include/flang/Parser/parse-tree.h b/flang/include/flang/Parser/parse-tree.h
+index 2f66aade32ac6..d2c5b45d99581 100644
+--- a/flang/include/flang/Parser/parse-tree.h
++++ b/flang/include/flang/Parser/parse-tree.h
+@@ -3447,7 +3447,8 @@ WRAPPER_CLASS(OmpObjectList, std::list<OmpObject>);
+ //    MUTEXINOUTSET | DEPOBJ |  // since 5.0
+ //    INOUTSET                  // since 5.2
+ struct OmpTaskDependenceType {
+-  ENUM_CLASS(Type, In, Out, Inout, Source, Sink, Depobj)
++  ENUM_CLASS(
++      Type, In, Out, Inout, Inoutset, Mutexinoutset, Source, Sink, Depobj)
+   WRAPPER_CLASS_BOILERPLATE(OmpTaskDependenceType, Type);
+ };
+ 
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index 213b6501c077f..e768c1cbc0784 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -121,8 +121,11 @@ genProcBindKindAttr(fir::FirOpBuilder &firOpBuilder,
+ }
+ 
+ static mlir::omp::ClauseTaskDependAttr
+-genDependKindAttr(fir::FirOpBuilder &firOpBuilder,
++genDependKindAttr(lower::AbstractConverter &converter,
+                   const omp::clause::Depend::TaskDependenceType kind) {
++  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
++  mlir::Location currentLocation = converter.getCurrentLocation();
++
+   mlir::omp::ClauseTaskDepend pbKind;
+   switch (kind) {
+   case omp::clause::Depend::TaskDependenceType::In:
+@@ -136,6 +139,8 @@ genDependKindAttr(fir::FirOpBuilder &firOpBuilder,
+     break;
+   case omp::clause::Depend::TaskDependenceType::Mutexinoutset:
+   case omp::clause::Depend::TaskDependenceType::Inoutset:
++    TODO(currentLocation, "INOUTSET and MUTEXINOUTSET are not supported yet");
++    break;
+   case omp::clause::Depend::TaskDependenceType::Depobj:
+   case omp::clause::Depend::TaskDependenceType::Sink:
+   case omp::clause::Depend::TaskDependenceType::Source:
+@@ -795,8 +800,6 @@ bool ClauseProcessor::processCopyprivate(
+ }
+ 
+ bool ClauseProcessor::processDepend(mlir::omp::DependClauseOps &result) const {
+-  fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-
+   auto process = [&](const omp::clause::Depend &clause,
+                      const parser::CharBlock &) {
+     using Depend = omp::clause::Depend;
+@@ -813,7 +816,7 @@ bool ClauseProcessor::processDepend(mlir::omp::DependClauseOps &result) const {
+            "Support for iterator modifiers is not implemented yet");
+     }
+     mlir::omp::ClauseTaskDependAttr dependTypeOperand =
+-        genDependKindAttr(firOpBuilder, kind);
++        genDependKindAttr(converter, kind);
+     result.dependKinds.append(objects.size(), dependTypeOperand);
+ 
+     for (const omp::Object &object : objects) {
+diff --git a/flang/lib/Lower/OpenMP/Clauses.cpp b/flang/lib/Lower/OpenMP/Clauses.cpp
+index 936d0d21997d5..46caafeef8e4a 100644
+--- a/flang/lib/Lower/OpenMP/Clauses.cpp
++++ b/flang/lib/Lower/OpenMP/Clauses.cpp
+@@ -347,8 +347,10 @@ makeDepType(const parser::OmpTaskDependenceType &inp) {
+     return clause::TaskDependenceType::In;
+   case parser::OmpTaskDependenceType::Type::Inout:
+     return clause::TaskDependenceType::Inout;
+-  // Inoutset        // missing-in-parser
+-  // Mutexinoutset   // missing-in-parser
++  case parser::OmpTaskDependenceType::Type::Inoutset:
++    return clause::TaskDependenceType::Inoutset;
++  case parser::OmpTaskDependenceType::Type::Mutexinoutset:
++    return clause::TaskDependenceType::Mutexinoutset;
+   case parser::OmpTaskDependenceType::Type::Out:
+     return clause::TaskDependenceType::Out;
+   case parser::OmpTaskDependenceType::Type::Sink:
+diff --git a/flang/lib/Parser/openmp-parsers.cpp b/flang/lib/Parser/openmp-parsers.cpp
+index 0510b32a4c485..7a0ecc59a2c5c 100644
+--- a/flang/lib/Parser/openmp-parsers.cpp
++++ b/flang/lib/Parser/openmp-parsers.cpp
+@@ -402,7 +402,9 @@ TYPE_PARSER(
+ TYPE_PARSER(construct<OmpTaskDependenceType>(
+     "DEPOBJ" >> pure(OmpTaskDependenceType::Type::Depobj) ||
+     "IN"_id >> pure(OmpTaskDependenceType::Type::In) ||
+-    "INOUT" >> pure(OmpTaskDependenceType::Type::Inout) ||
++    "INOUT"_id >> pure(OmpTaskDependenceType::Type::Inout) ||
++    "INOUTSET"_id >> pure(OmpTaskDependenceType::Type::Inoutset) ||
++    "MUTEXINOUTSET" >> pure(OmpTaskDependenceType::Type::Mutexinoutset) ||
+     "OUT" >> pure(OmpTaskDependenceType::Type::Out) ||
+     "SINK" >> pure(OmpTaskDependenceType::Type::Sink) ||
+     "SOURCE" >> pure(OmpTaskDependenceType::Type::Source)))
+diff --git a/flang/lib/Semantics/check-omp-structure.cpp b/flang/lib/Semantics/check-omp-structure.cpp
+index 749d5887eaac0..cdbda1a86e1cb 100644
+--- a/flang/lib/Semantics/check-omp-structure.cpp
++++ b/flang/lib/Semantics/check-omp-structure.cpp
+@@ -1732,6 +1732,45 @@ void OmpStructureChecker::CheckTargetUpdate() {
+   }
+ }
+ 
++void OmpStructureChecker::CheckTaskDependenceType(
++    const parser::OmpTaskDependenceType::Type &x) {
++  // Common checks for task-dependence-type (DEPEND and UPDATE clauses).
++  unsigned version{context_.langOptions().OpenMPVersion};
++  unsigned since{0}, deprecatedIn{~0u};
++
++  switch (x) {
++  case parser::OmpTaskDependenceType::Type::In:
++  case parser::OmpTaskDependenceType::Type::Out:
++  case parser::OmpTaskDependenceType::Type::Inout:
++    break;
++  case parser::OmpTaskDependenceType::Type::Source:
++  case parser::OmpTaskDependenceType::Type::Sink:
++    deprecatedIn = 52;
++    break;
++  case parser::OmpTaskDependenceType::Type::Mutexinoutset:
++  case parser::OmpTaskDependenceType::Type::Depobj:
++    since = 50;
++    break;
++  case parser::OmpTaskDependenceType::Type::Inoutset:
++    since = 52;
++    break;
++  }
++
++  if (version >= deprecatedIn) {
++    context_.Say(GetContext().clauseSource,
++        "%s task-dependence-type is deprecated in %s"_warn_en_US,
++        parser::ToUpperCaseLetters(
++            parser::OmpTaskDependenceType::EnumToString(x)),
++        ThisVersion(deprecatedIn));
++  } else if (version < since) {
++    context_.Say(GetContext().clauseSource,
++        "%s task-dependence-type is not supported in %s, %s"_warn_en_US,
++        parser::ToUpperCaseLetters(
++            parser::OmpTaskDependenceType::EnumToString(x)),
++        ThisVersion(version), TryVersion(since));
++  }
++}
++
+ void OmpStructureChecker::Enter(
+     const parser::OpenMPSimpleStandaloneConstruct &x) {
+   const auto &dir{std::get<parser::OmpSimpleStandaloneDirective>(x.t)};
+@@ -3393,20 +3432,7 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Depend &x) {
+   using DepType = parser::OmpTaskDependenceType::Type;
+   DepType depType = x.v.GetDepType();
+ 
+-  if (version >= 52) {
+-    switch (depType) {
+-    case DepType::Sink:
+-    case DepType::Source:
+-      context_.Say(GetContext().clauseSource,
+-          "The %s task-dependence-type is deprecated in %s"_warn_en_US,
+-          parser::ToUpperCaseLetters(
+-              parser::OmpTaskDependenceType::EnumToString(depType)),
+-          ThisVersion(version));
+-      break;
+-    default:
+-      break;
+-    }
+-  }
++  CheckTaskDependenceType(depType);
+ 
+   if (directive == llvm::omp::OMPD_depobj) {
+     // [5.0:255:11], [5.1:288:3]
+@@ -3593,6 +3619,8 @@ void OmpStructureChecker::Enter(const parser::OmpClause::Update &x) {
+   llvm::omp::Directive directive{GetContext().directive};
+   unsigned version{context_.langOptions().OpenMPVersion};
+ 
++  CheckTaskDependenceType(x.v.v.v);
++
+   // [5.1:288:4-5]
+   // An update clause on a depobj construct must not have source, sink or depobj
+   // as dependence-type.
+diff --git a/flang/lib/Semantics/check-omp-structure.h b/flang/lib/Semantics/check-omp-structure.h
+index 5e26827934796..d9236be8bced4 100644
+--- a/flang/lib/Semantics/check-omp-structure.h
++++ b/flang/lib/Semantics/check-omp-structure.h
+@@ -202,6 +202,7 @@ class OmpStructureChecker
+   void CheckSIMDNest(const parser::OpenMPConstruct &x);
+   void CheckTargetNest(const parser::OpenMPConstruct &x);
+   void CheckTargetUpdate();
++  void CheckTaskDependenceType(const parser::OmpTaskDependenceType::Type &x);
+   void CheckCancellationNest(
+       const parser::CharBlock &source, const parser::OmpCancelType::Type &type);
+   std::int64_t GetOrdCollapseLevel(const parser::OpenMPLoopConstruct &x);
+diff --git a/flang/test/Lower/OpenMP/Todo/depend-clause-inoutset.f90 b/flang/test/Lower/OpenMP/Todo/depend-clause-inoutset.f90
+new file mode 100644
+index 0000000000000..017df00630833
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/depend-clause-inoutset.f90
+@@ -0,0 +1,11 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: INOUTSET and MUTEXINOUTSET are not supported yet
++subroutine f00(x)
++  integer :: x
++  !$omp task depend(inoutset: x)
++  x = x + 1
++  !$omp end task
++end
++
+diff --git a/flang/test/Lower/OpenMP/Todo/depend-clause-mutexinoutset.f90 b/flang/test/Lower/OpenMP/Todo/depend-clause-mutexinoutset.f90
+new file mode 100644
+index 0000000000000..2f6ff77b20a88
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/Todo/depend-clause-mutexinoutset.f90
+@@ -0,0 +1,11 @@
++!RUN: %not_todo_cmd bbc -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++!RUN: %not_todo_cmd %flang_fc1 -emit-hlfir -fopenmp -fopenmp-version=52 -o - %s 2>&1 | FileCheck %s
++
++!CHECK: not yet implemented: INOUTSET and MUTEXINOUTSET are not supported yet
++subroutine f00(x)
++  integer :: x
++  !$omp task depend(mutexinoutset: x)
++  x = x + 1
++  !$omp end task
++end
++
+diff --git a/flang/test/Semantics/OpenMP/depend06.f90 b/flang/test/Semantics/OpenMP/depend06.f90
+new file mode 100644
+index 0000000000000..a9668c552f967
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/depend06.f90
+@@ -0,0 +1,17 @@
++!RUN: %python %S/../test_errors.py %s %flang -fopenmp -fopenmp-version=45 -Werror
++
++subroutine f00(x)
++  integer :: x
++!WARNING: INOUTSET task-dependence-type is not supported in OpenMP v4.5, try -fopenmp-version=52
++  !$omp task depend(inoutset: x)
++  x = x + 1
++  !$omp end task
++end
++
++subroutine f01(x)
++  integer :: x
++!WARNING: MUTEXINOUTSET task-dependence-type is not supported in OpenMP v4.5, try -fopenmp-version=50
++  !$omp task depend(mutexinoutset: x)
++  x = x + 1
++  !$omp end task
++end
+diff --git a/flang/test/Semantics/OpenMP/depobj-construct-v52.f90 b/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
+index f2e66485c6c80..3e2345e445c0a 100644
+--- a/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
++++ b/flang/test/Semantics/OpenMP/depobj-construct-v52.f90
+@@ -2,7 +2,7 @@
+ 
+ subroutine f00
+   integer :: obj
+-!WARNING: The SOURCE task-dependence-type is deprecated in OpenMP v5.2
++!WARNING: SOURCE task-dependence-type is deprecated in OpenMP v5.2
+ !ERROR: A DEPEND clause on a DEPOBJ construct must not have SOURCE or SINK as dependence-type
+   !$omp depobj(obj) depend(source)
+ end

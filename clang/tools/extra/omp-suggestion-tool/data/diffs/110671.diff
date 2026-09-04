@@ -1,0 +1,132 @@
+diff --git a/flang/lib/Semantics/check-namelist.cpp b/flang/lib/Semantics/check-namelist.cpp
+index b000e1771755e..c2804c5d874e9 100644
+--- a/flang/lib/Semantics/check-namelist.cpp
++++ b/flang/lib/Semantics/check-namelist.cpp
+@@ -34,4 +34,19 @@ void NamelistChecker::Leave(const parser::NamelistStmt &nmlStmt) {
+   }
+ }
+ 
++void NamelistChecker::Leave(const parser::LocalitySpec::Reduce &x) {
++  for (const parser::Name &name : std::get<std::list<parser::Name>>(x.t)) {
++    Symbol *sym{name.symbol};
++    // This is not disallowed by the standard, but would be difficult to
++    // support. This has to go here not with the other checks for locality specs
++    // in resolve-names.cpp so that it is done after the InNamelist flag is
++    // applied.
++    if (sym && sym->GetUltimate().test(Symbol::Flag::InNamelist)) {
++      context_.Say(name.source,
++          "NAMELIST variable '%s' not allowed in a REDUCE locality-spec"_err_en_US,
++          name.ToString());
++    }
++  }
++}
++
+ } // namespace Fortran::semantics
+diff --git a/flang/lib/Semantics/check-namelist.h b/flang/lib/Semantics/check-namelist.h
+index a23b7d717b022..c51beb2cf25ae 100644
+--- a/flang/lib/Semantics/check-namelist.h
++++ b/flang/lib/Semantics/check-namelist.h
+@@ -17,6 +17,7 @@ class NamelistChecker : public virtual BaseChecker {
+ public:
+   NamelistChecker(SemanticsContext &context) : context_{context} {}
+   void Leave(const parser::NamelistStmt &);
++  void Leave(const parser::LocalitySpec::Reduce &);
+ 
+ private:
+   SemanticsContext &context_;
+diff --git a/flang/lib/Semantics/resolve-directives.cpp b/flang/lib/Semantics/resolve-directives.cpp
+index 45fe17c0122c0..23a1ecbd2842d 100644
+--- a/flang/lib/Semantics/resolve-directives.cpp
++++ b/flang/lib/Semantics/resolve-directives.cpp
+@@ -2384,6 +2384,21 @@ void OmpAttributeVisitor::ResolveOmpObject(
+                               GetContext().directive)
+                               .str()));
+                 }
++                if (ompFlag == Symbol::Flag::OmpReduction) {
++                  const Symbol &ultimateSymbol{symbol->GetUltimate()};
++                  // Using variables inside of a namelist in OpenMP reductions
++                  // is allowed by the standard, but is not allowed for
++                  // privatisation. This looks like an oversight. If the
++                  // namelist is hoisted to a global, we cannot apply the
++                  // mapping for the reduction variable: resulting in incorrect
++                  // results. Disabling this hoisting could make some real
++                  // production code go slower. See discussion in #109303
++                  if (ultimateSymbol.test(Symbol::Flag::InNamelist)) {
++                    context_.Say(name->source,
++                        "Variable '%s' in NAMELIST cannot be in a REDUCTION clause"_err_en_US,
++                        name->ToString());
++                  }
++                }
+                 if (GetContext().directive ==
+                     llvm::omp::Directive::OMPD_target_data) {
+                   checkExclusivelists(symbol, Symbol::Flag::OmpUseDevicePtr,
+diff --git a/flang/test/Semantics/OpenMP/reduction-namelist.f90 b/flang/test/Semantics/OpenMP/reduction-namelist.f90
+new file mode 100644
+index 0000000000000..edae3d7aef2c5
+--- /dev/null
++++ b/flang/test/Semantics/OpenMP/reduction-namelist.f90
+@@ -0,0 +1,46 @@
++! RUN: %python %S/../test_errors.py %s %flang -fopenmp
++! This is not actually disallowed by the OpenMP standard, but it is not allowed
++! for privatisation - this seems like an oversight.
++
++module test
++  integer :: a, b, c
++  namelist /nlist1/ a, b
++end module
++
++program omp_reduction
++  use test
++
++  integer :: p(10) ,q(10)
++  namelist /nlist2/ c, d
++
++  a = 5
++  b = 10
++  c = 100
++
++  !ERROR: Variable 'd' in NAMELIST cannot be in a REDUCTION clause
++  !ERROR: Variable 'a' in NAMELIST cannot be in a REDUCTION clause
++  !$omp parallel reduction(+:d) reduction(+:a)
++  d = a + b
++  a = d
++  !$omp end parallel
++
++  call sb()
++
++  contains
++    subroutine sb()
++      namelist /nlist3/ p, q
++
++      !ERROR: Variable 'p' in NAMELIST cannot be in a REDUCTION clause
++      !ERROR: Variable 'q' in NAMELIST cannot be in a REDUCTION clause
++      !$omp parallel reduction(+:p) reduction(+:q)
++      p = c * b
++      q = p * d
++      !$omp end parallel
++
++      write(*, nlist1)
++      write(*, nlist2)
++      write(*, nlist3)
++
++    end subroutine
++
++end program omp_reduction
+diff --git a/flang/test/Semantics/resolve123.f90 b/flang/test/Semantics/resolve123.f90
+index 1b2c4613f2fef..8f7c3acd44311 100644
+--- a/flang/test/Semantics/resolve123.f90
++++ b/flang/test/Semantics/resolve123.f90
+@@ -77,3 +77,13 @@ subroutine s9()
+   do concurrent(i=1:5) reduce(+:i)
+   end do
+ end subroutine s9
++
++subroutine s10()
++! Cannot have variable inside of a NAMELIST in a REDUCE locality spec
++  integer :: k
++  namelist /nlist1/ k
++!ERROR: NAMELIST variable 'k' not allowed in a REDUCE locality-spec
++  do concurrent(i=1:5) reduce(+:k)
++     k = k + i
++  end do
++end subroutine s10

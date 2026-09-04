@@ -1,0 +1,1849 @@
+diff --git a/flang/docs/OpenMP-descriptor-management.md b/flang/docs/OpenMP-descriptor-management.md
+index 368ff3e911fcb..d0eb01b00f9bb 100644
+--- a/flang/docs/OpenMP-descriptor-management.md
++++ b/flang/docs/OpenMP-descriptor-management.md
+@@ -44,7 +44,7 @@ Currently, Flang will lower these descriptor types in the OpenMP lowering (lower
+ to all other map types, generating an omp.MapInfoOp containing relevant information required for lowering
+ the OpenMP dialect to LLVM-IR during the final stages of the MLIR lowering. However, after 
+ the lowering to FIR/HLFIR has been performed an OpenMP dialect specific pass for Fortran, 
+-`OMPDescriptorMapInfoGenPass` (Optimizer/OMPDescriptorMapInfoGen.cpp) will expand the 
++`OMPMapInfoFinalizationPass` (Optimizer/OMPMapInfoFinalization.cpp) will expand the 
+ `omp.MapInfoOp`'s containing descriptors (which currently will be a `BoxType` or `BoxAddrOp`) into multiple 
+ mappings, with one extra per pointer member in the descriptor that is supported on top of the original
+ descriptor map operation. These pointers members are linked to the parent descriptor by adding them to 
+@@ -53,7 +53,7 @@ owning operation's (`omp.TargetOp`, `omp.TargetDataOp` etc.) map operand list an
+ operation is `IsolatedFromAbove`, it also inserts them as `BlockArgs` to canonicalize the mappings and
+ simplify lowering.
+ 
+-An example transformation by the `OMPDescriptorMapInfoGenPass`:
++An example transformation by the `OMPMapInfoFinalizationPass`:
+ 
+ ```
+ 
+diff --git a/flang/include/flang/Optimizer/Transforms/Passes.h b/flang/include/flang/Optimizer/Transforms/Passes.h
+index 470ed8a125ac4..ae1d72a3526bf 100644
+--- a/flang/include/flang/Optimizer/Transforms/Passes.h
++++ b/flang/include/flang/Optimizer/Transforms/Passes.h
+@@ -68,7 +68,7 @@ std::unique_ptr<mlir::Pass> createAlgebraicSimplificationPass();
+ std::unique_ptr<mlir::Pass>
+ createAlgebraicSimplificationPass(const mlir::GreedyRewriteConfig &config);
+ 
+-std::unique_ptr<mlir::Pass> createOMPDescriptorMapInfoGenPass();
++std::unique_ptr<mlir::Pass> createOMPMapInfoFinalizationPass();
+ std::unique_ptr<mlir::Pass> createOMPFunctionFilteringPass();
+ std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+ createOMPMarkDeclareTargetPass();
+diff --git a/flang/include/flang/Optimizer/Transforms/Passes.td b/flang/include/flang/Optimizer/Transforms/Passes.td
+index 1eaaa32a508a0..e22c1b5f338b7 100644
+--- a/flang/include/flang/Optimizer/Transforms/Passes.td
++++ b/flang/include/flang/Optimizer/Transforms/Passes.td
+@@ -321,15 +321,15 @@ def LoopVersioning : Pass<"loop-versioning", "mlir::func::FuncOp"> {
+   let dependentDialects = [ "fir::FIROpsDialect" ];
+ }
+ 
+-def OMPDescriptorMapInfoGenPass
+-    : Pass<"omp-descriptor-map-info-gen", "mlir::func::FuncOp"> {
++def OMPMapInfoFinalizationPass
++    : Pass<"omp-map-info-finalization", "mlir::func::FuncOp"> {
+   let summary = "expands OpenMP MapInfo operations containing descriptors";
+   let description = [{
+     Expands MapInfo operations containing descriptor types into multiple 
+     MapInfo's for each pointer element in the descriptor that requires 
+     explicit individual mapping by the OpenMP runtime.
+   }];
+-  let constructor = "::fir::createOMPDescriptorMapInfoGenPass()";
++  let constructor = "::fir::createOMPMapInfoFinalizationPass()";
+   let dependentDialects = ["mlir::omp::OpenMPDialect"];
+ }
+ 
+diff --git a/flang/include/flang/Tools/CLOptions.inc b/flang/include/flang/Tools/CLOptions.inc
+index 79a2a4f63cfcf..cc3431d5b71d2 100644
+--- a/flang/include/flang/Tools/CLOptions.inc
++++ b/flang/include/flang/Tools/CLOptions.inc
+@@ -335,7 +335,7 @@ inline void createHLFIRToFIRPassPipeline(
+ /// rather than the host device.
+ inline void createOpenMPFIRPassPipeline(
+     mlir::PassManager &pm, bool isTargetDevice) {
+-  pm.addPass(fir::createOMPDescriptorMapInfoGenPass());
++  pm.addPass(fir::createOMPMapInfoFinalizationPass());
+   pm.addPass(fir::createOMPMarkDeclareTargetPass());
+   if (isTargetDevice)
+     pm.addPass(fir::createOMPFunctionFilteringPass());
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+index b7198c951c8fe..0ea87314d571f 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.cpp
+@@ -814,30 +814,6 @@ bool ClauseProcessor::processLink(
+       });
+ }
+ 
+-mlir::omp::MapInfoOp
+-createMapInfoOp(fir::FirOpBuilder &builder, mlir::Location loc,
+-                mlir::Value baseAddr, mlir::Value varPtrPtr, std::string name,
+-                llvm::ArrayRef<mlir::Value> bounds,
+-                llvm::ArrayRef<mlir::Value> members, uint64_t mapType,
+-                mlir::omp::VariableCaptureKind mapCaptureType, mlir::Type retTy,
+-                bool isVal) {
+-  if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(baseAddr.getType())) {
+-    baseAddr = builder.create<fir::BoxAddrOp>(loc, baseAddr);
+-    retTy = baseAddr.getType();
+-  }
+-
+-  mlir::TypeAttr varType = mlir::TypeAttr::get(
+-      llvm::cast<mlir::omp::PointerLikeType>(retTy).getElementType());
+-
+-  mlir::omp::MapInfoOp op = builder.create<mlir::omp::MapInfoOp>(
+-      loc, retTy, baseAddr, varType, varPtrPtr, members, bounds,
+-      builder.getIntegerAttr(builder.getIntegerType(64, false), mapType),
+-      builder.getAttr<mlir::omp::VariableCaptureKindAttr>(mapCaptureType),
+-      builder.getStringAttr(name));
+-
+-  return op;
+-}
+-
+ bool ClauseProcessor::processMap(
+     mlir::Location currentLocation, Fortran::lower::StatementContext &stmtCtx,
+     mlir::omp::MapClauseOps &result,
+@@ -845,7 +821,17 @@ bool ClauseProcessor::processMap(
+     llvm::SmallVectorImpl<mlir::Location> *mapSymLocs,
+     llvm::SmallVectorImpl<mlir::Type> *mapSymTypes) const {
+   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+-  return findRepeatableClause<omp::clause::Map>(
++  // We always require tracking of symbols, even if the caller does not,
++  // so we create an optionally used local set of symbols when the mapSyms
++  // argument is not present.
++  llvm::SmallVector<const Fortran::semantics::Symbol *> localMapSyms;
++  llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> *ptrMapSyms =
++      mapSyms ? mapSyms : &localMapSyms;
++  std::map<const Fortran::semantics::Symbol *,
++           llvm::SmallVector<OmpMapMemberIndicesData>>
++      parentMemberIndices;
++
++  bool clauseFound = findRepeatableClause<omp::clause::Map>(
+       [&](const omp::clause::Map &clause,
+           const Fortran::parser::CharBlock &source) {
+         using Map = omp::clause::Map;
+@@ -910,24 +896,33 @@ bool ClauseProcessor::processMap(
+           // Explicit map captures are captured ByRef by default,
+           // optimisation passes may alter this to ByCopy or other capture
+           // types to optimise
+-          mlir::Value mapOp = createMapInfoOp(
+-              firOpBuilder, clauseLocation, symAddr, mlir::Value{},
+-              asFortran.str(), bounds, {},
++          mlir::omp::MapInfoOp mapOp = createMapInfoOp(
++              firOpBuilder, clauseLocation, symAddr,
++              /*varPtrPtr=*/mlir::Value{}, asFortran.str(), bounds,
++              /*members=*/{}, /*membersIndex=*/mlir::DenseIntElementsAttr{},
+               static_cast<
+                   std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+                   mapTypeBits),
+               mlir::omp::VariableCaptureKind::ByRef, symAddr.getType());
+ 
+-          result.mapVars.push_back(mapOp);
+-
+-          if (mapSyms)
+-            mapSyms->push_back(object.id());
+-          if (mapSymLocs)
+-            mapSymLocs->push_back(symAddr.getLoc());
+-          if (mapSymTypes)
+-            mapSymTypes->push_back(symAddr.getType());
++          if (object.id()->owner().IsDerivedType()) {
++            addChildIndexAndMapToParent(object, parentMemberIndices, mapOp,
++                                        semaCtx);
++          } else {
++            result.mapVars.push_back(mapOp);
++            ptrMapSyms->push_back(object.id());
++            if (mapSymTypes)
++              mapSymTypes->push_back(symAddr.getType());
++            if (mapSymLocs)
++              mapSymLocs->push_back(symAddr.getLoc());
++          }
+         }
+       });
++
++  insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
++                               *ptrMapSyms, mapSymTypes, mapSymLocs);
++
++  return clauseFound;
+ }
+ 
+ bool ClauseProcessor::processReduction(
+diff --git a/flang/lib/Lower/OpenMP/ClauseProcessor.h b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+index 78c148ab02163..54ffcd0c964bf 100644
+--- a/flang/lib/Lower/OpenMP/ClauseProcessor.h
++++ b/flang/lib/Lower/OpenMP/ClauseProcessor.h
+@@ -185,7 +185,12 @@ template <typename T>
+ bool ClauseProcessor::processMotionClauses(
+     Fortran::lower::StatementContext &stmtCtx,
+     mlir::omp::MapClauseOps &result) {
+-  return findRepeatableClause<T>(
++  std::map<const Fortran::semantics::Symbol *,
++           llvm::SmallVector<OmpMapMemberIndicesData>>
++      parentMemberIndices;
++  llvm::SmallVector<const Fortran::semantics::Symbol *> mapSymbols;
++
++  bool clauseFound = findRepeatableClause<T>(
+       [&](const T &clause, const Fortran::parser::CharBlock &source) {
+         mlir::Location clauseLocation = converter.genLocation(source);
+         fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+@@ -203,6 +208,7 @@ bool ClauseProcessor::processMotionClauses(
+         for (const omp::Object &object : objects) {
+           llvm::SmallVector<mlir::Value> bounds;
+           std::stringstream asFortran;
++
+           Fortran::lower::AddrAndBoundsInfo info =
+               Fortran::lower::gatherDataOperandAddrAndBounds<
+                   mlir::omp::MapBoundsOp, mlir::omp::MapBoundsType>(
+@@ -218,17 +224,29 @@ bool ClauseProcessor::processMotionClauses(
+           // Explicit map captures are captured ByRef by default,
+           // optimisation passes may alter this to ByCopy or other capture
+           // types to optimise
+-          mlir::Value mapOp = createMapInfoOp(
+-              firOpBuilder, clauseLocation, symAddr, mlir::Value{},
+-              asFortran.str(), bounds, {},
++          mlir::omp::MapInfoOp mapOp = createMapInfoOp(
++              firOpBuilder, clauseLocation, symAddr,
++              /*varPtrPtr=*/mlir::Value{}, asFortran.str(), bounds,
++              /*members=*/{}, /*membersIndex=*/mlir::DenseIntElementsAttr{},
+               static_cast<
+                   std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+                   mapTypeBits),
+               mlir::omp::VariableCaptureKind::ByRef, symAddr.getType());
+ 
+-          result.mapVars.push_back(mapOp);
++          if (object.id()->owner().IsDerivedType()) {
++            addChildIndexAndMapToParent(object, parentMemberIndices, mapOp,
++                                        semaCtx);
++          } else {
++            result.mapVars.push_back(mapOp);
++            mapSymbols.push_back(object.id());
++          }
+         }
+       });
++
++  insertChildMapInfoIntoParent(converter, parentMemberIndices, result.mapVars,
++                               mapSymbols,
++                               /*mapSymTypes=*/nullptr, /*mapSymLocs=*/nullptr);
++  return clauseFound;
+ }
+ 
+ template <typename... Ts>
+diff --git a/flang/lib/Lower/OpenMP/OpenMP.cpp b/flang/lib/Lower/OpenMP/OpenMP.cpp
+index 44011ad78f2e2..f23902d6a8239 100644
+--- a/flang/lib/Lower/OpenMP/OpenMP.cpp
++++ b/flang/lib/Lower/OpenMP/OpenMP.cpp
+@@ -939,8 +939,10 @@ genBodyOfTargetOp(Fortran::lower::AbstractConverter &converter,
+         std::stringstream name;
+         firOpBuilder.setInsertionPoint(targetOp);
+         mlir::Value mapOp = createMapInfoOp(
+-            firOpBuilder, copyVal.getLoc(), copyVal, mlir::Value{}, name.str(),
+-            bounds, llvm::SmallVector<mlir::Value>{},
++            firOpBuilder, copyVal.getLoc(), copyVal,
++            /*varPtrPtr=*/mlir::Value{}, name.str(), bounds,
++            /*members=*/llvm::SmallVector<mlir::Value>{},
++            /*membersIndex=*/mlir::DenseIntElementsAttr{},
+             static_cast<
+                 std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+                 llvm::omp::OpenMPOffloadMappingFlags::OMP_MAP_IMPLICIT),
+@@ -1637,8 +1639,9 @@ genTargetOp(Fortran::lower::AbstractConverter &converter,
+         }
+ 
+         mlir::Value mapOp = createMapInfoOp(
+-            firOpBuilder, baseOp.getLoc(), baseOp, mlir::Value{}, name.str(),
+-            bounds, {},
++            firOpBuilder, baseOp.getLoc(), baseOp, /*varPtrPtr=*/mlir::Value{},
++            name.str(), bounds, /*members=*/{},
++            /*membersIndex=*/mlir::DenseIntElementsAttr{},
+             static_cast<
+                 std::underlying_type_t<llvm::omp::OpenMPOffloadMappingFlags>>(
+                 mapFlag),
+diff --git a/flang/lib/Lower/OpenMP/Utils.cpp b/flang/lib/Lower/OpenMP/Utils.cpp
+index c38e0c18cac88..b183705c56776 100644
+--- a/flang/lib/Lower/OpenMP/Utils.cpp
++++ b/flang/lib/Lower/OpenMP/Utils.cpp
+@@ -22,6 +22,9 @@
+ #include <flang/Semantics/tools.h>
+ #include <llvm/Support/CommandLine.h>
+ 
++#include <algorithm>
++#include <numeric>
++
+ llvm::cl::opt<bool> treatIndexAsSection(
+     "openmp-treat-index-as-section",
+     llvm::cl::desc("In the OpenMP data clauses treat `a(N)` as `a(N:N)`."),
+@@ -116,6 +119,216 @@ void gatherFuncAndVarSyms(
+     symbolAndClause.emplace_back(clause, *object.id());
+ }
+ 
++mlir::omp::MapInfoOp
++createMapInfoOp(fir::FirOpBuilder &builder, mlir::Location loc,
++                mlir::Value baseAddr, mlir::Value varPtrPtr, std::string name,
++                llvm::ArrayRef<mlir::Value> bounds,
++                llvm::ArrayRef<mlir::Value> members,
++                mlir::DenseIntElementsAttr membersIndex, uint64_t mapType,
++                mlir::omp::VariableCaptureKind mapCaptureType, mlir::Type retTy,
++                bool partialMap) {
++  if (auto boxTy = baseAddr.getType().dyn_cast<fir::BaseBoxType>()) {
++    baseAddr = builder.create<fir::BoxAddrOp>(loc, baseAddr);
++    retTy = baseAddr.getType();
++  }
++
++  mlir::TypeAttr varType = mlir::TypeAttr::get(
++      llvm::cast<mlir::omp::PointerLikeType>(retTy).getElementType());
++
++  mlir::omp::MapInfoOp op = builder.create<mlir::omp::MapInfoOp>(
++      loc, retTy, baseAddr, varType, varPtrPtr, members, membersIndex, bounds,
++      builder.getIntegerAttr(builder.getIntegerType(64, false), mapType),
++      builder.getAttr<mlir::omp::VariableCaptureKindAttr>(mapCaptureType),
++      builder.getStringAttr(name), builder.getBoolAttr(partialMap));
++
++  return op;
++}
++
++static int
++getComponentPlacementInParent(const Fortran::semantics::Symbol *componentSym) {
++  const auto *derived =
++      componentSym->owner()
++          .derivedTypeSpec()
++          ->typeSymbol()
++          .detailsIf<Fortran::semantics::DerivedTypeDetails>();
++  assert(derived &&
++         "expected derived type details when processing component symbol");
++  for (auto [placement, name] : llvm::enumerate(derived->componentNames()))
++    if (name == componentSym->name())
++      return placement;
++  return -1;
++}
++
++static std::optional<Object>
++getComponentObject(std::optional<Object> object,
++                   Fortran::semantics::SemanticsContext &semaCtx) {
++  if (!object)
++    return std::nullopt;
++
++  auto ref = evaluate::ExtractDataRef(*object.value().ref());
++  if (!ref)
++    return std::nullopt;
++
++  if (std::holds_alternative<evaluate::Component>(ref->u))
++    return object;
++
++  auto baseObj = getBaseObject(object.value(), semaCtx);
++  if (!baseObj)
++    return std::nullopt;
++
++  return getComponentObject(baseObj.value(), semaCtx);
++}
++
++static void
++generateMemberPlacementIndices(const Object &object,
++                               llvm::SmallVectorImpl<int> &indices,
++                               Fortran::semantics::SemanticsContext &semaCtx) {
++  auto compObj = getComponentObject(object, semaCtx);
++  while (compObj) {
++    indices.push_back(getComponentPlacementInParent(compObj->id()));
++    compObj =
++        getComponentObject(getBaseObject(compObj.value(), semaCtx), semaCtx);
++  }
++
++  indices = llvm::SmallVector<int>{llvm::reverse(indices)};
++}
++
++void addChildIndexAndMapToParent(
++    const omp::Object &object,
++    std::map<const Fortran::semantics::Symbol *,
++             llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++    mlir::omp::MapInfoOp &mapOp,
++    Fortran::semantics::SemanticsContext &semaCtx) {
++  std::optional<Fortran::evaluate::DataRef> dataRef =
++      ExtractDataRef(object.designator);
++  assert(dataRef.has_value() &&
++         "DataRef could not be extracted during mapping of derived type "
++         "cannot proceed");
++  const Fortran::semantics::Symbol *parentSym = &dataRef->GetFirstSymbol();
++  assert(parentSym && "Could not find parent symbol during lower of "
++                      "a component member in OpenMP map clause");
++  llvm::SmallVector<int> indices;
++  generateMemberPlacementIndices(object, indices, semaCtx);
++  parentMemberIndices[parentSym].push_back({indices, mapOp});
++}
++
++static void calculateShapeAndFillIndices(
++    llvm::SmallVectorImpl<int64_t> &shape,
++    llvm::SmallVectorImpl<OmpMapMemberIndicesData> &memberPlacementData) {
++  shape.push_back(memberPlacementData.size());
++  size_t largestIndicesSize =
++      std::max_element(memberPlacementData.begin(), memberPlacementData.end(),
++                       [](auto a, auto b) {
++                         return a.memberPlacementIndices.size() <
++                                b.memberPlacementIndices.size();
++                       })
++          ->memberPlacementIndices.size();
++  shape.push_back(largestIndicesSize);
++
++  // DenseElementsAttr expects a rectangular shape for the data, so all
++  // index lists have to be of the same length, this emplaces -1 as filler.
++  for (auto &v : memberPlacementData) {
++    if (v.memberPlacementIndices.size() < largestIndicesSize) {
++      auto *prevEnd = v.memberPlacementIndices.end();
++      v.memberPlacementIndices.resize(largestIndicesSize);
++      std::fill(prevEnd, v.memberPlacementIndices.end(), -1);
++    }
++  }
++}
++
++static mlir::DenseIntElementsAttr createDenseElementsAttrFromIndices(
++    llvm::SmallVectorImpl<OmpMapMemberIndicesData> &memberPlacementData,
++    fir::FirOpBuilder &builder) {
++  llvm::SmallVector<int64_t> shape;
++  calculateShapeAndFillIndices(shape, memberPlacementData);
++
++  llvm::SmallVector<int> indicesFlattened = std::accumulate(
++      memberPlacementData.begin(), memberPlacementData.end(),
++      llvm::SmallVector<int>(),
++      [](llvm::SmallVector<int> &x, OmpMapMemberIndicesData y) {
++        x.insert(x.end(), y.memberPlacementIndices.begin(),
++                 y.memberPlacementIndices.end());
++        return x;
++      });
++
++  return mlir::DenseIntElementsAttr::get(
++      mlir::VectorType::get(shape,
++                            mlir::IntegerType::get(builder.getContext(), 32)),
++      indicesFlattened);
++}
++
++void insertChildMapInfoIntoParent(
++    Fortran::lower::AbstractConverter &converter,
++    std::map<const Fortran::semantics::Symbol *,
++             llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++    llvm::SmallVectorImpl<mlir::Value> &mapOperands,
++    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> &mapSyms,
++    llvm::SmallVectorImpl<mlir::Type> *mapSymTypes,
++    llvm::SmallVectorImpl<mlir::Location> *mapSymLocs) {
++  for (auto indices : parentMemberIndices) {
++    bool parentExists = false;
++    size_t parentIdx;
++    for (parentIdx = 0; parentIdx < mapSyms.size(); ++parentIdx) {
++      if (mapSyms[parentIdx] == indices.first) {
++        parentExists = true;
++        break;
++      }
++    }
++
++    if (parentExists) {
++      auto mapOp = llvm::cast<mlir::omp::MapInfoOp>(
++          mapOperands[parentIdx].getDefiningOp());
++
++      // NOTE: To maintain appropriate SSA ordering, we move the parent map
++      // which will now have references to its children after the last
++      // of its members to be generated. This is necessary when a user
++      // has defined a series of parent and children maps where the parent
++      // precedes the children. An alternative, may be to do
++      // delayed generation of map info operations from the clauses and
++      // organize them first before generation.
++      mapOp->moveAfter(indices.second.back().memberMap);
++
++      for (auto memberIndicesData : indices.second)
++        mapOp.getMembersMutable().append(
++            memberIndicesData.memberMap.getResult());
++
++      mapOp.setMembersIndexAttr(createDenseElementsAttrFromIndices(
++          indices.second, converter.getFirOpBuilder()));
++    } else {
++      // NOTE: We take the map type of the first child, this may not
++      // be the correct thing to do, however, we shall see. For the moment
++      // it allows this to work with enter and exit without causing MLIR
++      // verification issues. The more appropriate thing may be to take
++      // the "main" map type clause from the directive being used.
++      uint64_t mapType = indices.second[0].memberMap.getMapType().value_or(0);
++
++      // create parent to emplace and bind members
++      mlir::Value origSymbol = converter.getSymbolAddress(*indices.first);
++
++      llvm::SmallVector<mlir::Value> members;
++      for (OmpMapMemberIndicesData memberIndicesData : indices.second)
++        members.push_back((mlir::Value)memberIndicesData.memberMap);
++
++      mlir::Value mapOp = createMapInfoOp(
++          converter.getFirOpBuilder(), origSymbol.getLoc(), origSymbol,
++          /*varPtrPtr=*/mlir::Value(), indices.first->name().ToString(),
++          /*bounds=*/{}, members,
++          createDenseElementsAttrFromIndices(indices.second,
++                                             converter.getFirOpBuilder()),
++          mapType, mlir::omp::VariableCaptureKind::ByRef, origSymbol.getType(),
++          /*partialMap=*/true);
++
++      mapOperands.push_back(mapOp);
++      mapSyms.push_back(indices.first);
++
++      if (mapSymTypes)
++        mapSymTypes->push_back(mapOp.getType());
++      if (mapSymLocs)
++        mapSymLocs->push_back(mapOp.getLoc());
++    }
++  }
++}
++
+ Fortran::semantics::Symbol *
+ getOmpObjectSymbol(const Fortran::parser::OmpObject &ompObject) {
+   Fortran::semantics::Symbol *sym = nullptr;
+@@ -125,7 +338,11 @@ getOmpObjectSymbol(const Fortran::parser::OmpObject &ompObject) {
+             if (auto *arrayEle =
+                     Fortran::parser::Unwrap<Fortran::parser::ArrayElement>(
+                         designator)) {
+-              sym = GetFirstName(arrayEle->base).symbol;
++              // Use getLastName to retrieve the arrays symbol, this will
++              // provide the farthest right symbol (the last) in a designator,
++              // i.e. providing something like the following:
++              // "dtype1%dtype2%array[2:10]", will result in "array"
++              sym = GetLastName(arrayEle->base).symbol;
+             } else if (auto *structComp = Fortran::parser::Unwrap<
+                            Fortran::parser::StructureComponent>(designator)) {
+               sym = structComp->component.symbol;
+diff --git a/flang/lib/Lower/OpenMP/Utils.h b/flang/lib/Lower/OpenMP/Utils.h
+index 5e0ebba23bf35..8fbb18fa8656f 100644
+--- a/flang/lib/Lower/OpenMP/Utils.h
++++ b/flang/lib/Lower/OpenMP/Utils.h
+@@ -21,7 +21,6 @@ extern llvm::cl::opt<bool> enableDelayedPrivatization;
+ namespace fir {
+ class FirOpBuilder;
+ } // namespace fir
+-
+ namespace Fortran {
+ 
+ namespace semantics {
+@@ -46,13 +45,42 @@ using DeclareTargetCapturePair =
+     std::pair<mlir::omp::DeclareTargetCaptureClause,
+               const Fortran::semantics::Symbol &>;
+ 
++// A small helper structure for keeping track of a component members MapInfoOp
++// and index data when lowering OpenMP map clauses. Keeps track of the
++// placement of the component in the derived type hierarchy it rests within,
++// alongside the generated mlir::omp::MapInfoOp for the mapped component.
++struct OmpMapMemberIndicesData {
++  // The indices representing the component members placement in its derived
++  // type parents hierarchy.
++  llvm::SmallVector<int> memberPlacementIndices;
++
++  // Placement of the member in the member vector.
++  mlir::omp::MapInfoOp memberMap;
++};
++
+ mlir::omp::MapInfoOp
+ createMapInfoOp(fir::FirOpBuilder &builder, mlir::Location loc,
+                 mlir::Value baseAddr, mlir::Value varPtrPtr, std::string name,
+                 mlir::ArrayRef<mlir::Value> bounds,
+-                mlir::ArrayRef<mlir::Value> members, uint64_t mapType,
++                mlir::ArrayRef<mlir::Value> members,
++                mlir::DenseIntElementsAttr membersIndex, uint64_t mapType,
+                 mlir::omp::VariableCaptureKind mapCaptureType, mlir::Type retTy,
+-                bool isVal = false);
++                bool partialMap = false);
++
++void addChildIndexAndMapToParent(
++    const omp::Object &object,
++    std::map<const Fortran::semantics::Symbol *,
++             llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++    mlir::omp::MapInfoOp &mapOp, Fortran::semantics::SemanticsContext &semaCtx);
++
++void insertChildMapInfoIntoParent(
++    Fortran::lower::AbstractConverter &converter,
++    std::map<const Fortran::semantics::Symbol *,
++             llvm::SmallVector<OmpMapMemberIndicesData>> &parentMemberIndices,
++    llvm::SmallVectorImpl<mlir::Value> &mapOperands,
++    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *> &mapSyms,
++    llvm::SmallVectorImpl<mlir::Type> *mapSymTypes,
++    llvm::SmallVectorImpl<mlir::Location> *mapSymLocs);
+ 
+ mlir::Type getLoopVarType(Fortran::lower::AbstractConverter &converter,
+                           std::size_t loopVarTypeSize);
+diff --git a/flang/lib/Optimizer/Transforms/CMakeLists.txt b/flang/lib/Optimizer/Transforms/CMakeLists.txt
+index 5a542f237f8f9..308b5ed06623f 100644
+--- a/flang/lib/Optimizer/Transforms/CMakeLists.txt
++++ b/flang/lib/Optimizer/Transforms/CMakeLists.txt
+@@ -17,8 +17,8 @@ add_flang_library(FIRTransforms
+   AddDebugInfo.cpp
+   PolymorphicOpConversion.cpp
+   LoopVersioning.cpp
+-  OMPDescriptorMapInfoGen.cpp
+   OMPFunctionFiltering.cpp
++  OMPMapInfoFinalization.cpp
+   OMPMarkDeclareTarget.cpp
+   VScaleAttr.cpp
+   FunctionAttr.cpp
+diff --git a/flang/lib/Optimizer/Transforms/OMPDescriptorMapInfoGen.cpp b/flang/lib/Optimizer/Transforms/OMPDescriptorMapInfoGen.cpp
+deleted file mode 100644
+index 6ffcf0746c76f..0000000000000
+--- a/flang/lib/Optimizer/Transforms/OMPDescriptorMapInfoGen.cpp
++++ /dev/null
+@@ -1,168 +0,0 @@
+-//===- OMPDescriptorMapInfoGen.cpp
+-//---------------------------------------------------===//
+-//
+-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-//
+-//===----------------------------------------------------------------------===//
+-
+-//===----------------------------------------------------------------------===//
+-/// \file
+-/// An OpenMP dialect related pass for FIR/HLFIR which expands MapInfoOp's
+-/// containing descriptor related types (fir::BoxType's) into multiple
+-/// MapInfoOp's containing the parent descriptor and pointer member components
+-/// for individual mapping, treating the descriptor type as a record type for
+-/// later lowering in the OpenMP dialect.
+-//===----------------------------------------------------------------------===//
+-
+-#include "flang/Optimizer/Builder/FIRBuilder.h"
+-#include "flang/Optimizer/Dialect/FIRType.h"
+-#include "flang/Optimizer/Dialect/Support/KindMapping.h"
+-#include "flang/Optimizer/Transforms/Passes.h"
+-#include "mlir/Dialect/Func/IR/FuncOps.h"
+-#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+-#include "mlir/IR/BuiltinDialect.h"
+-#include "mlir/IR/BuiltinOps.h"
+-#include "mlir/IR/Operation.h"
+-#include "mlir/IR/SymbolTable.h"
+-#include "mlir/Pass/Pass.h"
+-#include "mlir/Support/LLVM.h"
+-#include "llvm/ADT/SmallPtrSet.h"
+-#include <iterator>
+-
+-namespace fir {
+-#define GEN_PASS_DEF_OMPDESCRIPTORMAPINFOGENPASS
+-#include "flang/Optimizer/Transforms/Passes.h.inc"
+-} // namespace fir
+-
+-namespace {
+-class OMPDescriptorMapInfoGenPass
+-    : public fir::impl::OMPDescriptorMapInfoGenPassBase<
+-          OMPDescriptorMapInfoGenPass> {
+-
+-  void genDescriptorMemberMaps(mlir::omp::MapInfoOp op,
+-                               fir::FirOpBuilder &builder,
+-                               mlir::Operation *target) {
+-    mlir::Location loc = builder.getUnknownLoc();
+-    mlir::Value descriptor = op.getVarPtr();
+-
+-    // If we enter this function, but the mapped type itself is not the
+-    // descriptor, then it's likely the address of the descriptor so we
+-    // must retrieve the descriptor SSA.
+-    if (!fir::isTypeWithDescriptor(op.getVarType())) {
+-      if (auto addrOp = mlir::dyn_cast_if_present<fir::BoxAddrOp>(
+-              op.getVarPtr().getDefiningOp())) {
+-        descriptor = addrOp.getVal();
+-      }
+-    }
+-
+-    // The fir::BoxOffsetOp only works with !fir.ref<!fir.box<...>> types, as
+-    // allowing it to access non-reference box operations can cause some
+-    // problematic SSA IR. However, in the case of assumed shape's the type
+-    // is not a !fir.ref, in these cases to retrieve the appropriate
+-    // !fir.ref<!fir.box<...>> to access the data we need to map we must
+-    // perform an alloca and then store to it and retrieve the data from the new
+-    // alloca.
+-    if (mlir::isa<fir::BaseBoxType>(descriptor.getType())) {
+-      mlir::OpBuilder::InsertPoint insPt = builder.saveInsertionPoint();
+-      builder.setInsertionPointToStart(builder.getAllocaBlock());
+-      auto alloca = builder.create<fir::AllocaOp>(loc, descriptor.getType());
+-      builder.restoreInsertionPoint(insPt);
+-      builder.create<fir::StoreOp>(loc, descriptor, alloca);
+-      descriptor = alloca;
+-    }
+-
+-    mlir::Value baseAddrAddr = builder.create<fir::BoxOffsetOp>(
+-        loc, descriptor, fir::BoxFieldAttr::base_addr);
+-
+-    // Member of the descriptor pointing at the allocated data
+-    mlir::Value baseAddr = builder.create<mlir::omp::MapInfoOp>(
+-        loc, baseAddrAddr.getType(), descriptor,
+-        llvm::cast<mlir::omp::PointerLikeType>(
+-            fir::unwrapRefType(baseAddrAddr.getType()))
+-            .getElementType(),
+-        baseAddrAddr, mlir::SmallVector<mlir::Value>{}, op.getBounds(),
+-        builder.getIntegerAttr(builder.getIntegerType(64, false),
+-                               op.getMapType().value()),
+-        builder.getAttr<mlir::omp::VariableCaptureKindAttr>(
+-            mlir::omp::VariableCaptureKind::ByRef),
+-        builder.getStringAttr("") /*name*/);
+-
+-    // TODO: map the addendum segment of the descriptor, similarly to the
+-    // above base address/data pointer member.
+-
+-    if (auto mapClauseOwner =
+-            llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
+-      llvm::SmallVector<mlir::Value> newMapOps;
+-      mlir::OperandRange mapOperandsArr = mapClauseOwner.getMapOperands();
+-
+-      for (size_t i = 0; i < mapOperandsArr.size(); ++i) {
+-        if (mapOperandsArr[i] == op) {
+-          // Push new implicit maps generated for the descriptor.
+-          newMapOps.push_back(baseAddr);
+-
+-          // for TargetOp's which have IsolatedFromAbove we must align the
+-          // new additional map operand with an appropriate BlockArgument,
+-          // as the printing and later processing currently requires a 1:1
+-          // mapping of BlockArgs to MapInfoOp's at the same placement in
+-          // each array (BlockArgs and MapOperands).
+-          if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target))
+-            targetOp.getRegion().insertArgument(i, baseAddr.getType(), loc);
+-        }
+-        newMapOps.push_back(mapOperandsArr[i]);
+-      }
+-      mapClauseOwner.getMapOperandsMutable().assign(newMapOps);
+-    }
+-
+-    mlir::Value newDescParentMapOp = builder.create<mlir::omp::MapInfoOp>(
+-        op->getLoc(), op.getResult().getType(), descriptor,
+-        fir::unwrapRefType(descriptor.getType()), mlir::Value{},
+-        mlir::SmallVector<mlir::Value>{baseAddr},
+-        mlir::SmallVector<mlir::Value>{},
+-        builder.getIntegerAttr(builder.getIntegerType(64, false),
+-                               op.getMapType().value()),
+-        op.getMapCaptureTypeAttr(), op.getNameAttr());
+-    op.replaceAllUsesWith(newDescParentMapOp);
+-    op->erase();
+-  }
+-
+-  // This pass executes on mlir::ModuleOp's finding omp::MapInfoOp's containing
+-  // descriptor based types (allocatables, pointers, assumed shape etc.) and
+-  // expanding them into multiple omp::MapInfoOp's for each pointer member
+-  // contained within the descriptor.
+-  void runOnOperation() override {
+-    mlir::func::FuncOp func = getOperation();
+-    mlir::ModuleOp module = func->getParentOfType<mlir::ModuleOp>();
+-    fir::KindMapping kindMap = fir::getKindMapping(module);
+-    fir::FirOpBuilder builder{module, std::move(kindMap)};
+-
+-    func->walk([&](mlir::omp::MapInfoOp op) {
+-      if (fir::isTypeWithDescriptor(op.getVarType()) ||
+-          mlir::isa_and_present<fir::BoxAddrOp>(
+-              op.getVarPtr().getDefiningOp())) {
+-        builder.setInsertionPoint(op);
+-        // TODO: Currently only supports a single user for the MapInfoOp, this
+-        // is fine for the moment as the Fortran Frontend will generate a
+-        // new MapInfoOp per Target operation for the moment. However, when/if
+-        // we optimise/cleanup the IR, it likely isn't too difficult to
+-        // extend this function, it would require some modification to create a
+-        // single new MapInfoOp per new MapInfoOp generated and share it across
+-        // all users appropriately, making sure to only add a single member link
+-        // per new generation for the original originating descriptor MapInfoOp.
+-        assert(llvm::hasSingleElement(op->getUsers()) &&
+-               "OMPDescriptorMapInfoGen currently only supports single users "
+-               "of a MapInfoOp");
+-        genDescriptorMemberMaps(op, builder, *op->getUsers().begin());
+-      }
+-    });
+-  }
+-};
+-
+-} // namespace
+-
+-namespace fir {
+-std::unique_ptr<mlir::Pass> createOMPDescriptorMapInfoGenPass() {
+-  return std::make_unique<OMPDescriptorMapInfoGenPass>();
+-}
+-} // namespace fir
+diff --git a/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp b/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
+new file mode 100644
+index 0000000000000..5a5d4b9e0da4e
+--- /dev/null
++++ b/flang/lib/Optimizer/Transforms/OMPMapInfoFinalization.cpp
+@@ -0,0 +1,261 @@
++//===- OMPMapInfoFinalization.cpp
++//---------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++//===----------------------------------------------------------------------===//
++/// \file
++/// An OpenMP dialect related pass for FIR/HLFIR which performs some
++/// pre-processing of MapInfoOp's after the module has been lowered to
++/// finalize them.
++///
++/// For example, it expands MapInfoOp's containing descriptor related
++/// types (fir::BoxType's) into multiple MapInfoOp's containing the parent
++/// descriptor and pointer member components for individual mapping,
++/// treating the descriptor type as a record type for later lowering in the
++/// OpenMP dialect.
++///
++/// The pass also adds MapInfoOp's that are members of a parent object but are
++/// not directly used in the body of a target region to its BlockArgument list
++/// to maintain consistency across all MapInfoOp's tied to a region directly or
++/// indirectly via a parent object.
++//===----------------------------------------------------------------------===//
++
++#include "flang/Optimizer/Builder/FIRBuilder.h"
++#include "flang/Optimizer/Dialect/FIRType.h"
++#include "flang/Optimizer/Dialect/Support/KindMapping.h"
++#include "flang/Optimizer/Transforms/Passes.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
++#include "mlir/IR/BuiltinDialect.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/Operation.h"
++#include "mlir/IR/SymbolTable.h"
++#include "mlir/Pass/Pass.h"
++#include "mlir/Support/LLVM.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/Frontend/OpenMP/OMPConstants.h"
++#include <iterator>
++
++namespace fir {
++#define GEN_PASS_DEF_OMPMAPINFOFINALIZATIONPASS
++#include "flang/Optimizer/Transforms/Passes.h.inc"
++} // namespace fir
++
++namespace {
++class OMPMapInfoFinalizationPass
++    : public fir::impl::OMPMapInfoFinalizationPassBase<
++          OMPMapInfoFinalizationPass> {
++
++  void genDescriptorMemberMaps(mlir::omp::MapInfoOp op,
++                               fir::FirOpBuilder &builder,
++                               mlir::Operation *target) {
++    mlir::Location loc = op.getLoc();
++    mlir::Value descriptor = op.getVarPtr();
++
++    // If we enter this function, but the mapped type itself is not the
++    // descriptor, then it's likely the address of the descriptor so we
++    // must retrieve the descriptor SSA.
++    if (!fir::isTypeWithDescriptor(op.getVarType())) {
++      if (auto addrOp = mlir::dyn_cast_if_present<fir::BoxAddrOp>(
++              op.getVarPtr().getDefiningOp())) {
++        descriptor = addrOp.getVal();
++      }
++    }
++
++    // The fir::BoxOffsetOp only works with !fir.ref<!fir.box<...>> types, as
++    // allowing it to access non-reference box operations can cause some
++    // problematic SSA IR. However, in the case of assumed shape's the type
++    // is not a !fir.ref, in these cases to retrieve the appropriate
++    // !fir.ref<!fir.box<...>> to access the data we need to map we must
++    // perform an alloca and then store to it and retrieve the data from the new
++    // alloca.
++    if (mlir::isa<fir::BaseBoxType>(descriptor.getType())) {
++      mlir::OpBuilder::InsertPoint insPt = builder.saveInsertionPoint();
++      builder.setInsertionPointToStart(builder.getAllocaBlock());
++      auto alloca = builder.create<fir::AllocaOp>(loc, descriptor.getType());
++      builder.restoreInsertionPoint(insPt);
++      builder.create<fir::StoreOp>(loc, descriptor, alloca);
++      descriptor = alloca;
++    }
++
++    mlir::Value baseAddrAddr = builder.create<fir::BoxOffsetOp>(
++        loc, descriptor, fir::BoxFieldAttr::base_addr);
++
++    // Member of the descriptor pointing at the allocated data
++    mlir::Value baseAddr = builder.create<mlir::omp::MapInfoOp>(
++        loc, baseAddrAddr.getType(), descriptor,
++        mlir::TypeAttr::get(llvm::cast<mlir::omp::PointerLikeType>(
++                                fir::unwrapRefType(baseAddrAddr.getType()))
++                                .getElementType()),
++        baseAddrAddr, /*members=*/mlir::SmallVector<mlir::Value>{},
++        /*member_index=*/mlir::DenseIntElementsAttr{}, op.getBounds(),
++        builder.getIntegerAttr(builder.getIntegerType(64, false),
++                               op.getMapType().value()),
++        builder.getAttr<mlir::omp::VariableCaptureKindAttr>(
++            mlir::omp::VariableCaptureKind::ByRef),
++        /*name=*/builder.getStringAttr(""),
++        /*partial_map=*/builder.getBoolAttr(false));
++
++    // TODO: map the addendum segment of the descriptor, similarly to the
++    // above base address/data pointer member.
++
++    if (auto mapClauseOwner =
++            llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target)) {
++      llvm::SmallVector<mlir::Value> newMapOps;
++      mlir::OperandRange mapOperandsArr = mapClauseOwner.getMapOperands();
++
++      for (size_t i = 0; i < mapOperandsArr.size(); ++i) {
++        if (mapOperandsArr[i] == op) {
++          // Push new implicit maps generated for the descriptor.
++          newMapOps.push_back(baseAddr);
++
++          // for TargetOp's which have IsolatedFromAbove we must align the
++          // new additional map operand with an appropriate BlockArgument,
++          // as the printing and later processing currently requires a 1:1
++          // mapping of BlockArgs to MapInfoOp's at the same placement in
++          // each array (BlockArgs and MapOperands).
++          if (auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target))
++            targetOp.getRegion().insertArgument(i, baseAddr.getType(), loc);
++        }
++        newMapOps.push_back(mapOperandsArr[i]);
++      }
++      mapClauseOwner.getMapOperandsMutable().assign(newMapOps);
++    }
++
++    mlir::Value newDescParentMapOp = builder.create<mlir::omp::MapInfoOp>(
++        op->getLoc(), op.getResult().getType(), descriptor,
++        mlir::TypeAttr::get(fir::unwrapRefType(descriptor.getType())),
++        /*varPtrPtr=*/mlir::Value{},
++        /*members=*/mlir::SmallVector<mlir::Value>{baseAddr},
++        /*members_index=*/
++        mlir::DenseIntElementsAttr::get(
++            mlir::VectorType::get(
++                llvm::ArrayRef<int64_t>({1, 1}),
++                mlir::IntegerType::get(builder.getContext(), 32)),
++            llvm::ArrayRef<int32_t>({0})),
++        /*bounds=*/mlir::SmallVector<mlir::Value>{},
++        builder.getIntegerAttr(builder.getIntegerType(64, false),
++                               op.getMapType().value()),
++        op.getMapCaptureTypeAttr(), op.getNameAttr(), op.getPartialMapAttr());
++    op.replaceAllUsesWith(newDescParentMapOp);
++    op->erase();
++  }
++
++  // We add all mapped record members not directly used in the target region
++  // to the block arguments in front of their parent and we place them into
++  // the map operands list for consistency.
++  //
++  // These indirect uses (via accesses to their parent) will still be
++  // mapped individually in most cases, and a parent mapping doesn't
++  // guarantee the parent will be mapped in its totality, partial
++  // mapping is common.
++  //
++  // For example:
++  //    map(tofrom: x%y)
++  //
++  // Will generate a mapping for "x" (the parent) and "y" (the member).
++  // The parent "x" will not be mapped, but the member "y" will.
++  // However, we must have the parent as a BlockArg and MapOperand
++  // in these cases, to maintain the correct uses within the region and
++  // to help tracking that the member is part of a larger object.
++  //
++  // In the case of:
++  //    map(tofrom: x%y, x%z)
++  //
++  // The parent member becomes more critical, as we perform a partial
++  // structure mapping where we link the mapping of the members y
++  // and z together via the parent x. We do this at a kernel argument
++  // level in LLVM IR and not just MLIR, which is important to maintain
++  // similarity to Clang and for the runtime to do the correct thing.
++  // However, we still do not map the structure in its totality but
++  // rather we generate an un-sized "binding" map entry for it.
++  //
++  // In the case of:
++  //    map(tofrom: x, x%y, x%z)
++  //
++  // We do actually map the entirety of "x", so the explicit mapping of
++  // x%y, x%z becomes unnecessary. It is redundant to write this from a
++  // Fortran OpenMP perspective (although it is legal), as even if the
++  // members were allocatables or pointers, we are mandated by the
++  // specification to map these (and any recursive components) in their
++  // entirety, which is different to the C++ equivalent, which requires
++  // explicit mapping of these segments.
++  void addImplicitMembersToTarget(mlir::omp::MapInfoOp op,
++                                  fir::FirOpBuilder &builder,
++                                  mlir::Operation *target) {
++    auto mapClauseOwner =
++        llvm::dyn_cast<mlir::omp::MapClauseOwningOpInterface>(target);
++    if (!mapClauseOwner)
++      return;
++
++    llvm::SmallVector<mlir::Value> newMapOps;
++    mlir::OperandRange mapOperandsArr = mapClauseOwner.getMapOperands();
++    auto targetOp = llvm::dyn_cast<mlir::omp::TargetOp>(target);
++
++    for (size_t i = 0; i < mapOperandsArr.size(); ++i) {
++      if (mapOperandsArr[i] == op) {
++        for (auto [j, mapMember] : llvm::enumerate(op.getMembers())) {
++          newMapOps.push_back(mapMember);
++          // for TargetOp's which have IsolatedFromAbove we must align the
++          // new additional map operand with an appropriate BlockArgument,
++          // as the printing and later processing currently requires a 1:1
++          // mapping of BlockArgs to MapInfoOp's at the same placement in
++          // each array (BlockArgs and MapOperands).
++          if (targetOp) {
++            targetOp.getRegion().insertArgument(i + j, mapMember.getType(),
++                                                targetOp->getLoc());
++          }
++        }
++      }
++      newMapOps.push_back(mapOperandsArr[i]);
++    }
++    mapClauseOwner.getMapOperandsMutable().assign(newMapOps);
++  }
++
++  // This pass executes on mlir::ModuleOp's finding omp::MapInfoOp's containing
++  // descriptor based types (allocatables, pointers, assumed shape etc.) and
++  // expanding them into multiple omp::MapInfoOp's for each pointer member
++  // contained within the descriptor.
++  void runOnOperation() override {
++    mlir::func::FuncOp func = getOperation();
++    mlir::ModuleOp module = func->getParentOfType<mlir::ModuleOp>();
++    fir::KindMapping kindMap = fir::getKindMapping(module);
++    fir::FirOpBuilder builder{module, std::move(kindMap)};
++
++    func->walk([&](mlir::omp::MapInfoOp op) {
++      // TODO: Currently only supports a single user for the MapInfoOp, this
++      // is fine for the moment as the Fortran Frontend will generate a
++      // new MapInfoOp per Target operation for the moment. However, when/if
++      // we optimise/cleanup the IR, it likely isn't too difficult to
++      // extend this function, it would require some modification to create a
++      // single new MapInfoOp per new MapInfoOp generated and share it across
++      // all users appropriately, making sure to only add a single member link
++      // per new generation for the original originating descriptor MapInfoOp.
++      assert(llvm::hasSingleElement(op->getUsers()) &&
++             "OMPMapInfoFinalization currently only supports single users "
++             "of a MapInfoOp");
++
++      if (!op.getMembers().empty()) {
++        addImplicitMembersToTarget(op, builder, *op->getUsers().begin());
++      } else if (fir::isTypeWithDescriptor(op.getVarType()) ||
++                 mlir::isa_and_present<fir::BoxAddrOp>(
++                     op.getVarPtr().getDefiningOp())) {
++        builder.setInsertionPoint(op);
++        genDescriptorMemberMaps(op, builder, *op->getUsers().begin());
++      }
++    });
++  }
++};
++
++} // namespace
++
++namespace fir {
++std::unique_ptr<mlir::Pass> createOMPMapInfoFinalizationPass() {
++  return std::make_unique<OMPMapInfoFinalizationPass>();
++}
++} // namespace fir
+diff --git a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+index 8cf4f566964f9..72cd0a763e71a 100644
+--- a/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
++++ b/flang/test/Fir/convert-to-llvm-openmp-and-fir.fir
+@@ -937,11 +937,68 @@ func.func @omp_map_info_descriptor_type_conversion(%arg0 : !fir.ref<!fir.box<!fi
+   %0 = fir.box_offset %arg0 base_addr : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> !fir.llvm_ptr<!fir.ref<i32>>
+   // CHECK: %[[MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[GEP]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
+   %1 = omp.map.info var_ptr(%0 : !fir.llvm_ptr<!fir.ref<i32>>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+-  // CHECK: %[[DESC_MAP:.*]] = omp.map.info var_ptr(%[[ARG_0]] : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(always, delete) capture(ByRef) members(%[[MEMBER_MAP]] : !llvm.ptr) -> !llvm.ptr {name = ""}
+-  %2 = omp.map.info var_ptr(%arg0 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(always, delete) capture(ByRef) members(%1 : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.heap<i32>>> {name = ""}
++  // CHECK: %[[DESC_MAP:.*]] = omp.map.info var_ptr(%[[ARG_0]] : !llvm.ptr, !llvm.struct<(ptr, i64, i32, i8, i8, i8, i8)>) map_clauses(always, delete) capture(ByRef) members(%[[MEMBER_MAP]] : [0] : !llvm.ptr) -> !llvm.ptr {name = ""}
++  %2 = omp.map.info var_ptr(%arg0 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(always, delete) capture(ByRef) members(%1 : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.heap<i32>>> {name = ""}
+   // CHECK: omp.target_exit_data map_entries(%[[DESC_MAP]] : !llvm.ptr) 
+   omp.target_exit_data   map_entries(%2 : !fir.ref<!fir.box<!fir.heap<i32>>>)
+   return 
+ }
+ 
+ // -----
++
++// CHECK-LABEL:  llvm.func @omp_map_info_derived_type_explicit_member_conversion
++// CHECK-SAME:   %[[ARG_0:.*]]: !llvm.ptr)
++
++func.func @omp_map_info_derived_type_explicit_member_conversion(%arg0 : !fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++  // CHECK: %[[GEP:.*]] = llvm.getelementptr %[[ARG_0]][0, 2] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"_QFderived_type", (f32, array<10 x i32>, i32)>
++  %0 = fir.field_index int, !fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>
++  %1 = fir.coordinate_of %arg0, %0 : (!fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.field) -> !fir.ref<i32>
++  // CHECK: %[[MAP_MEMBER_1:.*]] = omp.map.info var_ptr(%[[GEP]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "dtype%int"}
++  %2 = omp.map.info var_ptr(%1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "dtype%int"}
++  // CHECK: %[[GEP_2:.*]] = llvm.getelementptr %[[ARG_0]][0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"_QFderived_type", (f32, array<10 x i32>, i32)>
++  %3 = fir.field_index real, !fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>
++  %4 = fir.coordinate_of %arg0, %3 : (!fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.field) -> !fir.ref<f32>
++  // CHECK: %[[MAP_MEMBER_2:.*]] = omp.map.info var_ptr(%[[GEP_2]] : !llvm.ptr, f32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "dtype%real"}
++  %5 = omp.map.info var_ptr(%4 : !fir.ref<f32>, f32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f32> {name = "dtype%real"}    
++  // CHECK: %[[MAP_PARENT:.*]] = omp.map.info var_ptr(%[[ARG_0]] : !llvm.ptr, !llvm.struct<"_QFderived_type", (f32, array<10 x i32>, i32)>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBER_1]], %[[MAP_MEMBER_2]] : [2], [0] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {name = "dtype", partial_map = true} 
++  %6 = omp.map.info var_ptr(%arg0 : !fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(tofrom) capture(ByRef) members(%2, %5 : [2], [0] : !fir.ref<i32>, !fir.ref<f32>) -> !fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "dtype", partial_map = true}
++  // CHECK: omp.target map_entries(%[[MAP_MEMBER_1]] -> %[[ARG_1:.*]], %[[MAP_MEMBER_2]] -> %[[ARG_2:.*]], %[[MAP_PARENT]] -> %[[ARG_3:.*]] : !llvm.ptr, !llvm.ptr, !llvm.ptr) {
++  // CHECK: ^bb0(%[[ARG_1]]: !llvm.ptr, %[[ARG_2]]: !llvm.ptr, %[[ARG_3]]: !llvm.ptr):
++  omp.target map_entries(%2 -> %arg1, %5 -> %arg2, %6 -> %arg3 : !fir.ref<i32>, !fir.ref<f32>, !fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++  ^bb0(%arg1: !fir.ref<f32>, %arg2: !fir.ref<i32>, %arg3: !fir.ref<!fir.type<_QFderived_type{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++    omp.terminator
++  }
++  return
++}
++
++// -----
++
++// CHECK-LABEL:  llvm.func @omp_map_info_nested_derived_type_explicit_member_conversion
++// CHECK-SAME:   %[[ARG_0:.*]]: !llvm.ptr)
++
++func.func @omp_map_info_nested_derived_type_explicit_member_conversion(%arg0 : !fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>) {
++    // CHECK: %[[GEP:.*]] = llvm.getelementptr %[[ARG_0]][0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"_QFTtop_layer", (array<10 x i32>, struct<"_QFTbottom_layer", (array<10 x f32>, f64)>, i32)>
++    %0 = fir.field_index nested, !fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>
++    %1 = fir.coordinate_of %arg0, %0 : (!fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>, !fir.field) -> !fir.ref<!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>>
++    // CHECK: %[[GEP_2:.*]] = llvm.getelementptr %[[GEP]][0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"_QFTbottom_layer", (array<10 x f32>, f64)>
++    %2 = fir.field_index i2, !fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>
++    %3 = fir.coordinate_of %1, %2 : (!fir.ref<!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>>, !fir.field) -> !fir.ref<f64>
++    // CHECK: %[[MAP_MEMBER_1:.*]] = omp.map.info var_ptr(%[[GEP_2]] : !llvm.ptr, f64) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %4 = omp.map.info var_ptr(%3 : !fir.ref<f64>, f64) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f64>
++    // CHECK: %[[GEP_3:.*]] = llvm.getelementptr %[[ARG_0]][0, 2] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"_QFTtop_layer", (array<10 x i32>, struct<"_QFTbottom_layer", (array<10 x f32>, f64)>, i32)>
++    %5 = fir.field_index k, !fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>
++    %6 = fir.coordinate_of %arg0, %5 : (!fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>, !fir.field) -> !fir.ref<i32>
++    // CHECK: %[[MAP_MEMBER_2:.*]] = omp.map.info var_ptr(%[[GEP_3]] : !llvm.ptr, i32) map_clauses(tofrom) capture(ByRef) -> !llvm.ptr
++    %7 = omp.map.info var_ptr(%6 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
++    // CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[ARG_0]] : !llvm.ptr, !llvm.struct<"_QFTtop_layer", (array<10 x i32>, struct<"_QFTbottom_layer", (array<10 x f32>, f64)>, i32)>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBER_1]], %[[MAP_MEMBER_2]] : [1,1], [2,-1] : !llvm.ptr, !llvm.ptr) -> !llvm.ptr {partial_map = true}
++    %9 = omp.map.info var_ptr(%arg0 : !fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>, !fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>) map_clauses(tofrom) capture(ByRef) members(%4, %7 : [1,1], [2,-1] : !fir.ref<f64>, !fir.ref<i32>) -> !fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>> {partial_map = true}
++    // CHECK: omp.target map_entries(%[[MAP_MEMBER_1]] -> %{{.*}}, %[[MAP_MEMBER_2]] -> %{{.*}}, %[[PARENT_MAP]] -> %{{.*}} : !llvm.ptr, !llvm.ptr, !llvm.ptr) {
++    // CHECK: ^bb0(%{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr, %{{.*}}: !llvm.ptr):
++    omp.target map_entries(%4 -> %arg1, %7 -> %arg2, %9 -> %arg3 : !fir.ref<f64>, !fir.ref<i32>, !fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>) {
++     ^bb0(%arg1: !fir.ref<i32>, %arg2: !fir.ref<f64>, %arg3: !fir.ref<!fir.type<_QFTtop_layer{array_i:!fir.array<10xi32>,nested:!fir.type<_QFTbottom_layer{array_i2:!fir.array<10xf32>,i2:f64}>,k:i32}>>):
++      omp.terminator
++    }
++  return
++}
++
++// -----
+diff --git a/flang/test/Integration/OpenMP/map-types-and-sizes.f90 b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+index 283ac227f3436..f3a20690f05a9 100644
+--- a/flang/test/Integration/OpenMP/map-types-and-sizes.f90
++++ b/flang/test/Integration/OpenMP/map-types-and-sizes.f90
+@@ -69,6 +69,147 @@ subroutine mapType_allocatable_explicit
+   !$omp end target
+   deallocate(a)
+ end subroutine mapType_allocatable_explicit
++ 
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 48]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 547]
++subroutine mapType_derived_implicit
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target
++     scalar_arr%int = 1
++  !$omp end target
++end subroutine mapType_derived_implicit
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 48]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_derived_explicit
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr)
++     scalar_arr%int = 1
++  !$omp end target
++end subroutine mapType_derived_explicit
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 40]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_derived_explicit_single_member
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr%array)
++     scalar_arr%array(1) = 1
++  !$omp end target
++end subroutine mapType_derived_explicit_single_member
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [3 x i64] [i64 0, i64 4, i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [3 x i64] [i64 32, i64 281474976710659, i64 281474976710659]
++subroutine mapType_derived_explicit_multiple_members
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr%int, scalar_arr%real)
++     scalar_arr%int = 1
++  !$omp end target
++end subroutine mapType_derived_explicit_multiple_members
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 16]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_derived_explicit_member_with_bounds
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr%array(2:5))
++     scalar_arr%array(3) = 3
++  !$omp end target
++end subroutine mapType_derived_explicit_member_with_bounds
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_derived_explicit_nested_single_member
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr%nest%real)
++    scalar_arr%nest%real = 1
++  !$omp end target
++end subroutine mapType_derived_explicit_nested_single_member
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [3 x i64] [i64 0, i64 4, i64 4]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [3 x i64] [i64 32, i64 281474976710659, i64 281474976710659]
++subroutine mapType_derived_explicit_multiple_nested_members
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++!$omp target map(tofrom: scalar_arr%nest%int, scalar_arr%nest%real)
++  scalar_arr%nest%int = 1
++!$omp end target
++end subroutine mapType_derived_explicit_multiple_nested_members
++
++!CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [1 x i64] [i64 16]
++!CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [1 x i64] [i64 35]
++subroutine mapType_derived_explicit_nested_member_with_bounds
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  type(scalar_and_array) :: scalar_arr 
++  
++!$omp target map(tofrom: scalar_arr%nest%array(2:5))
++    scalar_arr%nest%array(3) = 3
++!$omp end target
++end subroutine mapType_derived_explicit_nested_member_with_bounds
+ 
+ !CHECK: @.offload_sizes{{.*}} = private unnamed_addr constant [2 x i64] [i64 8, i64 4]
+ !CHECK: @.offload_maptypes{{.*}} = private unnamed_addr constant [2 x i64] [i64 544, i64 800]
+@@ -100,7 +241,6 @@ end subroutine mapType_char
+ !CHECK: %[[OFFLOAD_SIZE_ARR:.*]] = getelementptr inbounds [3 x i64], ptr %.offload_sizes, i32 0, i32 0
+ !CHECK: store i64 %[[DIV]], ptr %[[OFFLOAD_SIZE_ARR]], align 8
+ 
+-
+ !CHECK-LABEL: define {{.*}} @{{.*}}maptype_allocatable_explicit_{{.*}}
+ !CHECK: %[[ALLOCA:.*]] = alloca { ptr, i64, i32, i8, i8, i8, i8 }, i64 1, align 8
+ !CHECK: %[[ALLOCA_GEP:.*]] = getelementptr { ptr, i64, i32, i8, i8, i8, i8 }, ptr %[[ALLOCA]], i32 1
+@@ -110,3 +250,99 @@ end subroutine mapType_char
+ !CHECK: %[[DIV:.*]] = sdiv exact i64 %[[SIZE_DIFF]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
+ !CHECK: %[[OFFLOAD_SIZE_ARR:.*]] = getelementptr inbounds [3 x i64], ptr %.offload_sizes, i32 0, i32 0
+ !CHECK: store i64 %[[DIV]], ptr %[[OFFLOAD_SIZE_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_implicit_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_implicitTscalar_and_array, i64 1, align 8
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicitTscalar_and_array, i64 1, align 8
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_single_member_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_single_memberTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS:.*]] = getelementptr %_QFmaptype_derived_explicit_single_memberTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 1
++!CHECK: %[[ARR_OFF:.*]] = getelementptr inbounds [10 x i32], ptr %[[MEMBER_ACCESS]], i64 0, i64 0
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[ARR_OFF]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_multiple_members_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_multiple_membersTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS_1:.*]] = getelementptr %_QFmaptype_derived_explicit_multiple_membersTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 2
++!CHECK: %[[MEMBER_ACCESS_2:.*]] = getelementptr %_QFmaptype_derived_explicit_multiple_membersTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 0
++!CHECK: %[[ARR_END_OFF:.*]] = getelementptr i32, ptr %[[MEMBER_ACCESS_1]], i64 1
++!CHECK: %[[ARR_END:.*]] = ptrtoint ptr %[[ARR_END_OFF]] to i64
++!CHECK: %[[FIRST_MEMBER:.*]] = ptrtoint ptr %[[MEMBER_ACCESS_2]] to i64
++!CHECK: %[[SIZE_DIFF:.*]] = sub i64 %[[ARR_END]], %[[FIRST_MEMBER]]
++!CHECK: %[[SIZE:.*]] = sdiv exact i64 %[[SIZE_DIFF]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[MEMBER_ACCESS_2]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_SIZE_ARR:.*]] = getelementptr inbounds [3 x i64], ptr %.offload_sizes, i32 0, i32 0
++!CHECK: store i64 %[[SIZE]], ptr %[[OFFLOAD_SIZE_ARR]], align 8
++!CHECK: %[[BASE_PTR_ARR_2:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR_2]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR_2:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++!CHECK: store ptr %[[MEMBER_ACCESS_1]], ptr %[[OFFLOAD_PTR_ARR_2]], align 8
++!CHECK: %[[BASE_PTR_ARR_3:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 2
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR_3]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR_3:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 2
++!CHECK: store ptr %[[MEMBER_ACCESS_2]], ptr %[[OFFLOAD_PTR_ARR_3]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_member_with_bounds_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS:.*]] = getelementptr %_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 1
++!CHECK: %[[ARR_OFF:.*]] = getelementptr inbounds [10 x i32], ptr %[[MEMBER_ACCESS]], i64 0, i64 1
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[ARR_OFF]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_nested_single_member_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_nested_single_memberTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS:.*]] = getelementptr %_QFmaptype_derived_explicit_nested_single_memberTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 2, i32 1
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[MEMBER_ACCESS]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_multiple_nested_members_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_multiple_nested_membersTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS_1:.*]] = getelementptr %_QFmaptype_derived_explicit_multiple_nested_membersTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 2, i32 0
++!CHECK: %[[MEMBER_ACCESS_2:.*]] = getelementptr %_QFmaptype_derived_explicit_multiple_nested_membersTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 2, i32 1
++!CHECK: %[[ARR_END_OFF:.*]] = getelementptr float, ptr %[[MEMBER_ACCESS_2]], i64 1
++!CHECK: %[[ARR_END:.*]] = ptrtoint ptr %[[ARR_END_OFF]] to i64
++!CHECK: %[[FIRST_MEMBER:.*]] = ptrtoint ptr %[[MEMBER_ACCESS_1]] to i64
++!CHECK: %[[SIZE_DIFF:.*]] = sub i64 %[[ARR_END]], %[[FIRST_MEMBER]]
++!CHECK: %[[SIZE:.*]] = sdiv exact i64 %[[SIZE_DIFF]], ptrtoint (ptr getelementptr (i8, ptr null, i32 1) to i64)
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[MEMBER_ACCESS_1]], ptr %[[OFFLOAD_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_SIZE_ARR:.*]] = getelementptr inbounds [3 x i64], ptr %.offload_sizes, i32 0, i32 0
++!CHECK: store i64 %[[SIZE]], ptr %[[OFFLOAD_SIZE_ARR]], align 8
++!CHECK: %[[BASE_PTR_ARR_2:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 1
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR_2]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR_2:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 1
++!CHECK: store ptr %[[MEMBER_ACCESS_1]], ptr %[[OFFLOAD_PTR_ARR_2]], align 8
++!CHECK: %[[BASE_PTR_ARR_3:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_baseptrs, i32 0, i32 2
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR_3]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR_3:.*]] = getelementptr inbounds [3 x ptr], ptr %.offload_ptrs, i32 0, i32 2
++!CHECK: store ptr %[[MEMBER_ACCESS_2]], ptr %[[OFFLOAD_PTR_ARR_3]], align 8
++
++!CHECK-LABEL: define {{.*}} @{{.*}}maptype_derived_explicit_nested_member_with_bounds_{{.*}}
++!CHECK: %[[ALLOCA:.*]] = alloca %_QFmaptype_derived_explicit_nested_member_with_boundsTscalar_and_array, i64 1, align 8
++!CHECK: %[[MEMBER_ACCESS:.*]] = getelementptr %_QFmaptype_derived_explicit_nested_member_with_boundsTscalar_and_array, ptr %[[ALLOCA]], i32 0, i32 2, i32 2
++!CHECK: %[[ARR_OFF:.*]] = getelementptr inbounds [10 x i32], ptr %[[MEMBER_ACCESS]], i64 0, i64 1
++!CHECK: %[[BASE_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_baseptrs, i32 0, i32 0
++!CHECK: store ptr %[[ALLOCA]], ptr %[[BASE_PTR_ARR]], align 8
++!CHECK: %[[OFFLOAD_PTR_ARR:.*]] = getelementptr inbounds [1 x ptr], ptr %.offload_ptrs, i32 0, i32 0
++!CHECK: store ptr %[[ARR_OFF]], ptr %[[OFFLOAD_PTR_ARR]], align 8
+diff --git a/flang/test/Lower/OpenMP/allocatable-array-bounds.f90 b/flang/test/Lower/OpenMP/allocatable-array-bounds.f90
+index 14a50692bc601..87ca400e82e23 100644
+--- a/flang/test/Lower/OpenMP/allocatable-array-bounds.f90
++++ b/flang/test/Lower/OpenMP/allocatable-array-bounds.f90
+@@ -24,7 +24,7 @@
+ !HOST: %[[BOUNDS_1:.*]] = omp.map.bounds lower_bound(%[[LB_1]] : index) upper_bound(%[[UB_1]] : index) extent(%[[BOX_3]]#1 : index) stride(%[[BOX_2]]#2 : index) start_idx(%[[BOX_1]]#0 : index) {stride_in_bytes = true}
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %[[DECLARE_1]]#1 base_addr : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[DECLARE_1]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS_1]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}    
+-!HOST: %[[MAP_INFO_1:.*]] = omp.map.info var_ptr(%[[DECLARE_1]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "sp_read(2:5)"}
++!HOST: %[[MAP_INFO_1:.*]] = omp.map.info var_ptr(%[[DECLARE_1]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "sp_read(2:5)"}
+ 
+ !HOST: %[[LOAD_3:.*]] = fir.load %[[DECLARE_2]]#0 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+ !HOST: %[[LOAD_4:.*]] = fir.load %[[DECLARE_2]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>
+@@ -42,7 +42,7 @@
+ !HOST: %[[BOUNDS_2:.*]] = omp.map.bounds lower_bound(%[[LB_2]] : index) upper_bound(%[[UB_2]] : index) extent(%[[BOX_5]]#1 : index) stride(%[[BOX_4]]#2 : index) start_idx(%[[BOX_3]]#0 : index) {stride_in_bytes = true}
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %[[DECLARE_2]]#1 base_addr : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[DECLARE_2]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS_2]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}    
+-!HOST: %[[MAP_INFO_2:.*]] = omp.map.info var_ptr(%[[DECLARE_2]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "sp_write(2:5)"}
++!HOST: %[[MAP_INFO_2:.*]] = omp.map.info var_ptr(%[[DECLARE_2]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "sp_write(2:5)"}
+ 
+ subroutine read_write_section()
+     integer, allocatable :: sp_read(:)
+@@ -81,7 +81,7 @@ module assumed_allocatable_array_routines
+ !HOST: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%[[LB]] : index) upper_bound(%[[UB]] : index) extent(%[[BOX_3]]#1 : index) stride(%[[BOX_2]]#2 : index) start_idx(%[[BOX_1]]#0 : index) {stride_in_bytes = true}
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %[[DECLARE]]#1 base_addr : (!fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}    
+-!HOST: %[[MAP_INFO:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "arr_read_write(2:5)"}    
++!HOST: %[[MAP_INFO:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>>, !fir.box<!fir.heap<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.box<!fir.heap<!fir.array<?xi32>>>> {name = "arr_read_write(2:5)"}    
+ subroutine assumed_shape_array(arr_read_write)
+     integer, allocatable, intent(inout) :: arr_read_write(:)
+ 
+diff --git a/flang/test/Lower/OpenMP/allocatable-map.f90 b/flang/test/Lower/OpenMP/allocatable-map.f90
+index 396d45373b848..a9f576a6f0999 100644
+--- a/flang/test/Lower/OpenMP/allocatable-map.f90
++++ b/flang/test/Lower/OpenMP/allocatable-map.f90
+@@ -2,12 +2,12 @@
+ 
+ !HLFIRDIALECT: %[[POINTER:.*]]:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFpointer_routineEpoint"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+ !HLFIRDIALECT: %[[BOX_OFF:.*]] = fir.box_offset %[[POINTER]]#1 base_addr : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> !fir.llvm_ptr<!fir.ref<i32>>
+-!HLFIRDIALECT: %[[POINTER_MAP_MEMBER:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr(%[[BOX_OFF]] : !fir.llvm_ptr<!fir.ref<i32>>)  map_clauses(implicit, tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+-!HLFIRDIALECT: %[[POINTER_MAP:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(implicit, tofrom) capture(ByRef) members(%[[POINTER_MAP_MEMBER]] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "point"}
+-!HLFIRDIALECT: omp.target map_entries({{.*}}, %[[POINTER_MAP_MEMBER]] -> {{.*}}, %[[POINTER_MAP]] -> {{.*}} : {{.*}}, !fir.llvm_ptr<!fir.ref<i32>>, !fir.ref<!fir.box<!fir.ptr<i32>>>) {
++!HLFIRDIALECT: %[[POINTER_MAP_MEMBER:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr(%[[BOX_OFF]] : !fir.llvm_ptr<!fir.ref<i32>>)  map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
++!HLFIRDIALECT: %[[POINTER_MAP:.*]] = omp.map.info var_ptr(%[[POINTER]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[POINTER_MAP_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "point"}
++!HLFIRDIALECT: omp.target map_entries(%[[POINTER_MAP_MEMBER]] -> {{.*}}, %[[POINTER_MAP]] -> {{.*}} : !fir.llvm_ptr<!fir.ref<i32>>, !fir.ref<!fir.box<!fir.ptr<i32>>>) {
+ subroutine pointer_routine()
+     integer, pointer :: point 
+-!$omp target map(tofrom:pointer)
++!$omp target map(tofrom:point)
+     point = 1
+ !$omp end target
+ end subroutine pointer_routine
+diff --git a/flang/test/Lower/OpenMP/array-bounds.f90 b/flang/test/Lower/OpenMP/array-bounds.f90
+index 8c9d8944bf33f..f235d5041ab26 100644
+--- a/flang/test/Lower/OpenMP/array-bounds.f90
++++ b/flang/test/Lower/OpenMP/array-bounds.f90
+@@ -52,7 +52,7 @@ module assumed_array_routines
+ !HOST: %[[BOUNDS:.*]] = omp.map.bounds   lower_bound(%[[C3]] : index) upper_bound(%[[C4]] : index) extent(%[[DIMS1]]#1 : index) stride(%[[DIMS0]]#2 : index) start_idx(%[[C0]] : index) {stride_in_bytes = true}
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %0 base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
+-!HOST: %[[MAP:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>> {name = "arr_read_write(2:5)"}
++!HOST: %[[MAP:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>> {name = "arr_read_write(2:5)"}
+ !HOST: omp.target   map_entries(%[[MAP_INFO_MEMBER]] -> %{{.*}}, %[[MAP]] -> %{{.*}}, {{.*}} -> {{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.array<?xi32>>, !fir.ref<i32>) {
+     subroutine assumed_shape_array(arr_read_write)
+             integer, intent(inout) :: arr_read_write(:)
+@@ -77,7 +77,7 @@ end subroutine assumed_shape_array
+ !HOST: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%c1{{.*}} : index) upper_bound(%c4{{.*}} : index) extent(%[[EXT]] : index) stride(%[[DIMS0]]#2 : index) start_idx(%c1{{.*}} : index) {stride_in_bytes = true}
+ !HOST: %[[VAR_PTR_PTR:.*]] = fir.box_offset %[[INTERMEDIATE_ALLOCA]] base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+ !HOST: %[[MAP_INFO_MEMBER:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[VAR_PTR_PTR]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
+-!HOST: %[[MAP:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>> {name = "arr_read_write(2:5)"}
++!HOST: %[[MAP:.*]] = omp.map.info var_ptr(%[[INTERMEDIATE_ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_INFO_MEMBER]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>> {name = "arr_read_write(2:5)"}
+ !HOST: omp.target map_entries(%[[MAP_INFO_MEMBER]] -> %{{.*}}, %[[MAP]] -> %{{.*}}, {{.*}} -> {{.*}} : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, !fir.ref<!fir.array<?xi32>>, !fir.ref<i32>) {
+     subroutine assumed_size_array(arr_read_write)
+         integer, intent(inout) :: arr_read_write(*)
+diff --git a/flang/test/Lower/OpenMP/derived-type-map.f90 b/flang/test/Lower/OpenMP/derived-type-map.f90
+new file mode 100644
+index 0000000000000..6121b450f0620
+--- /dev/null
++++ b/flang/test/Lower/OpenMP/derived-type-map.f90
+@@ -0,0 +1,238 @@
++!RUN: %flang_fc1 -emit-hlfir -fopenmp %s -o - | FileCheck %s
++
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_implicitEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_implicitEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> (!fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>)
++!CHECK: %[[MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(implicit, tofrom) capture(ByRef) -> !fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "scalar_arr"}
++!CHECK:     omp.target map_entries(%[[MAP]] -> %[[ARG0:.*]] : !fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++!CHECK:         ^bb0(%[[ARG0]]: !fir.ref<!fir.type<_QFmaptype_derived_implicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++subroutine mapType_derived_implicit
++    type :: scalar_and_array
++      real(4) :: real
++      integer(4) :: array(10)
++      integer(4) :: int
++    end type scalar_and_array
++    type(scalar_and_array) :: scalar_arr 
++    
++    !$omp target
++       scalar_arr%int = 1
++    !$omp end target
++end subroutine mapType_derived_implicit
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_explicitEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_explicitEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> (!fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>)
++!CHECK: %[[MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#0 : !fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "scalar_arr"}
++!CHECK:  omp.target map_entries(%[[MAP]] -> %[[ARG0:.*]] : !fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++!CHECK:    ^bb0(%[[ARG0]]: !fir.ref<!fir.type<_QFmaptype_derived_explicitTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++subroutine mapType_derived_explicit
++    type :: scalar_and_array
++      real(4) :: real
++      integer(4) :: array(10)
++      integer(4) :: int
++    end type scalar_and_array
++    type(scalar_and_array) :: scalar_arr 
++    
++    !$omp target map(tofrom: scalar_arr)
++       scalar_arr%int = 1
++    !$omp end target
++end subroutine mapType_derived_explicit
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_explicit_single_memberEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_explicit_single_memberEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> (!fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>)
++!CHECK: %[[MEMBER:.*]] = hlfir.designate %[[DECLARE]]#0{"array"}   shape %{{.*}} : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.shape<1>) -> !fir.ref<!fir.array<10xi32>>
++!CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%{{.*}} : index) upper_bound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) start_idx(%{{.*}} : index)
++!CHECK: %[[MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[MEMBER]] : !fir.ref<!fir.array<10xi32>>, !fir.array<10xi32>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.ref<!fir.array<10xi32>> {name = "scalar_arr%array"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(tofrom) capture(ByRef) members(%[[MEMBER_MAP]] : [1] : !fir.ref<!fir.array<10xi32>>) -> !fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP]] -> %[[ARG0:.*]], %[[PARENT_MAP]] -> %[[ARG1:.*]] : !fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++!CHECK:  ^bb0(%[[ARG0]]: !fir.ref<!fir.array<10xi32>>, %[[ARG1]]: !fir.ref<!fir.type<_QFmaptype_derived_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++subroutine mapType_derived_explicit_single_member
++    type :: scalar_and_array
++      real(4) :: real
++      integer(4) :: array(10)
++      integer(4) :: int
++    end type scalar_and_array
++    type(scalar_and_array) :: scalar_arr 
++    
++    !$omp target map(tofrom: scalar_arr%array)
++       scalar_arr%array(1) = 1
++    !$omp end target
++end subroutine mapType_derived_explicit_single_member
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_explicit_multiple_membersEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_explicit_multiple_membersEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> (!fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>)
++!CHECK: %[[MEMBER1:.*]] = hlfir.designate %[[DECLARE]]#0{"int"}   : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> !fir.ref<i32>
++!CHECK: %[[MEMBER_MAP_1:.*]] = omp.map.info var_ptr(%[[MEMBER1]] : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "scalar_arr%int"}
++!CHECK: %[[MEMBER2:.*]] = hlfir.designate %[[DECLARE]]#0{"real"}   : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> !fir.ref<f32>
++!CHECK: %[[MEMBER_MAP_2:.*]] = omp.map.info var_ptr(%[[MEMBER2]] : !fir.ref<f32>, f32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f32> {name = "scalar_arr%real"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(tofrom) capture(ByRef) members(%[[MEMBER_MAP_1]], %[[MEMBER_MAP_2]] : [2], [0] : !fir.ref<i32>, !fir.ref<f32>) -> !fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP_1]] -> %[[ARG0:.*]], %[[MEMBER_MAP_2]] -> %[[ARG1:.*]], %[[PARENT_MAP]] -> %[[ARG2:.*]] : !fir.ref<i32>, !fir.ref<f32>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++!CHECK:  ^bb0(%[[ARG0]]: !fir.ref<i32>, %[[ARG1]]: !fir.ref<f32>, %[[ARG2]]: !fir.ref<!fir.type<_QFmaptype_derived_explicit_multiple_membersTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++subroutine mapType_derived_explicit_multiple_members
++    type :: scalar_and_array
++      real(4) :: real
++      integer(4) :: array(10)
++      integer(4) :: int
++    end type scalar_and_array
++    type(scalar_and_array) :: scalar_arr 
++    
++    !$omp target map(tofrom: scalar_arr%int, scalar_arr%real)
++       scalar_arr%int = 1
++    !$omp end target
++end subroutine mapType_derived_explicit_multiple_members
++  
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_explicit_member_with_boundsEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_explicit_member_with_boundsEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) -> (!fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>)
++!CHECK: %[[MEMBER:.*]] = hlfir.designate %[[DECLARE]]#0{"array"}   shape %{{.*}} : (!fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.shape<1>) -> !fir.ref<!fir.array<10xi32>>
++!CHECK: %{{.*}} = arith.constant 1 : index
++!CHECK: %[[LB:.*]] = arith.constant 1 : index
++!CHECK: %[[UB:.*]] = arith.constant 4 : index
++!CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%[[LB]] : index) upper_bound(%[[UB]] : index) extent(%{{.*}} : index) stride(%{{.*}} : index) start_idx(%{{.*}} : index)
++!CHECK: %[[MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[MEMBER]] : !fir.ref<!fir.array<10xi32>>, !fir.array<10xi32>) map_clauses(tofrom) capture(ByRef) bounds(%20) -> !fir.ref<!fir.array<10xi32>> {name = "scalar_arr%array(2:5)"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : !fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>, !fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>) map_clauses(tofrom) capture(ByRef) members(%[[MEMBER_MAP]] : [1] : !fir.ref<!fir.array<10xi32>>) -> !fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>> {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP]] -> %[[ARG0:.*]], %[[PARENT_MAP]] -> %[[ARG1:.*]] : !fir.ref<!fir.array<10xi32>>, !fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>) {
++!CHECK: ^bb0(%[[ARG0]]: !fir.ref<!fir.array<10xi32>>, %[[ARG1]]: !fir.ref<!fir.type<_QFmaptype_derived_explicit_member_with_boundsTscalar_and_array{real:f32,array:!fir.array<10xi32>,int:i32}>>):
++subroutine mapType_derived_explicit_member_with_bounds
++    type :: scalar_and_array
++      real(4) :: real
++      integer(4) :: array(10)
++      integer(4) :: int
++    end type scalar_and_array
++    type(scalar_and_array) :: scalar_arr 
++    
++    !$omp target map(tofrom: scalar_arr%array(2:5))
++       scalar_arr%array(3) = 3
++    !$omp end target
++end subroutine mapType_derived_explicit_member_with_bounds
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.type<_QFmaptype_derived_nested_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,nest:!fir.type<_QFmaptype_derived_nested_explicit_single_memberTnested{int:i32,real:f32,array:!fir.array<10xi32>}>,int:i32}> {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_nested_explicit_single_memberEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_nested_explicit_single_memberEscalar_arr"} : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,nest:!fir.type<_QFmaptype_derived_nested_explicit_single_memberTnested{int:i32,real:f32,array:!fir.array<10xi32>}>,int:i32}>>) -> {{.*}}
++!CHECK: %[[NEST:.*]] = hlfir.designate %[[DECLARE]]#0{"nest"}   : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_single_memberTscalar_and_array{real:f32,array:!fir.array<10xi32>,nest:!fir.type<_QFmaptype_derived_nested_explicit_single_memberTnested{int:i32,real:f32,array:!fir.array<10xi32>}>,int:i32}>>) -> {{.*}}
++!CHECK: %[[NEST_MEMBER:.*]] = hlfir.designate %[[NEST]]{"array"}   shape %{{.*}} : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_single_memberTnested{int:i32,real:f32,array:!fir.array<10xi32>}>>, !fir.shape<1>) -> !fir.ref<!fir.array<10xi32>>
++!CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%{{.*}} : index) upper_bound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) start_idx(%{{.*}} : index)
++!CHECK: %[[MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[NEST_MEMBER]] : !fir.ref<!fir.array<10xi32>>, !fir.array<10xi32>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.ref<!fir.array<10xi32>> {name = "scalar_arr%nest%array"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : {{.*}}) map_clauses(tofrom) capture(ByRef) members(%35 : [2,2] : !fir.ref<!fir.array<10xi32>>) -> {{.*}} {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP]] -> %[[ARG0:.*]], %[[PARENT_MAP]] -> %[[ARG1:.*]] : {{.*}}, {{.*}}) {
++!CHECK:  ^bb0(%[[ARG0]]: {{.*}}, %[[ARG1]]: {{.*}}):
++subroutine mapType_derived_nested_explicit_single_member
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  
++  type(scalar_and_array) :: scalar_arr 
++
++  !$omp target map(tofrom: scalar_arr%nest%array)
++    scalar_arr%nest%array(1) = 1
++  !$omp end target
++end subroutine mapType_derived_nested_explicit_single_member
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca {{.*}} {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_nested_explicit_multiple_membersEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_nested_explicit_multiple_membersEscalar_arr"} : ({{.*}}) -> {{.*}}
++!CHECK: %[[NEST:.*]] = hlfir.designate %[[DECLARE]]#0{"nest"}   : ({{.*}}) -> {{.*}}
++!CHECK: %[[NEST_MEMBER1:.*]] = hlfir.designate %[[NEST]]{"int"}   : ({{.*}}) -> !fir.ref<i32>
++!CHECK: %[[MEMBER_MAP_1:.*]] = omp.map.info var_ptr(%[[NEST_MEMBER1]] : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "scalar_arr%nest%int"}
++!CHECK: %[[NEST:.*]] = hlfir.designate %[[DECLARE]]#0{"nest"}   : ({{.*}}) -> {{.*}}
++!CHECK: %[[NEST_MEMBER2:.*]] = hlfir.designate %[[NEST]]{"real"}   : ({{.*}}) -> !fir.ref<f32>
++!CHECK: %[[MEMBER_MAP_2:.*]] = omp.map.info var_ptr(%[[NEST_MEMBER2]] : !fir.ref<f32>, f32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f32> {name = "scalar_arr%nest%real"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : {{.*}}, {{.*}}) map_clauses(tofrom) capture(ByRef) members(%[[MEMBER_MAP_1]], %[[MEMBER_MAP_2]] : [2,0], [2,1] : !fir.ref<i32>, !fir.ref<f32>) -> {{.*}} {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP_1]] -> %[[ARG0:.*]], %[[MEMBER_MAP_2]] -> %[[ARG1:.*]], %[[PARENT_MAP]] -> %[[ARG2:.*]] : !fir.ref<i32>, !fir.ref<f32>, {{.*}}) {
++!CHECK: ^bb0(%[[ARG0]]: !fir.ref<i32>, %[[ARG1]]: !fir.ref<f32>, %[[ARG2]]: {{.*}}):
++subroutine mapType_derived_nested_explicit_multiple_members
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++
++  type(scalar_and_array) :: scalar_arr 
++
++  !$omp target map(tofrom: scalar_arr%nest%int, scalar_arr%nest%real)
++    scalar_arr%nest%int = 1
++  !$omp end target
++end subroutine mapType_derived_nested_explicit_multiple_members
++
++!CHECK: %[[ALLOCA:.*]] = fir.alloca {{.*}} {bindc_name = "scalar_arr", uniq_name = "_QFmaptype_derived_nested_explicit_member_with_boundsEscalar_arr"}
++!CHECK: %[[DECLARE:.*]]:2 = hlfir.declare %[[ALLOCA]] {uniq_name = "_QFmaptype_derived_nested_explicit_member_with_boundsEscalar_arr"} : {{.*}} -> {{.*}}
++!CHECK: %[[NEST:.*]] = hlfir.designate %[[DECLARE]]#0{"nest"}   : {{.*}} -> {{.*}}
++!CHECK: %[[C10:.*]] = arith.constant 10 : index
++!CHECK: %[[NEST_MEMBER:.*]] = hlfir.designate %[[NEST]]{"array"}   {{.*}} : {{.*}} -> !fir.ref<!fir.array<10xi32>>
++!CHECK: %[[C1:.*]] = arith.constant 1 : index
++!CHECK: %[[C1_2:.*]] = arith.constant 1 : index
++!CHECK: %[[C4:.*]] = arith.constant 4 : index
++!CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%[[C1_2]] : index) upper_bound(%[[C4]] : index) extent(%[[C10]] : index) stride(%[[C1]] : index) start_idx(%[[C1]] : index)
++!CHECK: %[[MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[NEST_MEMBER]] : !fir.ref<!fir.array<10xi32>>, !fir.array<10xi32>) map_clauses(tofrom) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.ref<!fir.array<10xi32>> {name = "scalar_arr%nest%array(2:5)"}
++!CHECK: %[[PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE]]#1 : {{.*}}, {{.*}}) map_clauses(tofrom) capture(ByRef) members(%[[MEMBER_MAP]] : [2,2] : !fir.ref<!fir.array<10xi32>>) -> {{.*}} {name = "scalar_arr", partial_map = true}
++!CHECK: omp.target map_entries(%[[MEMBER_MAP]] -> %[[ARG0:.*]], %[[PARENT_MAP]] -> %[[ARG1:.*]] : !fir.ref<!fir.array<10xi32>>, {{.*}}) {
++!CHECK: ^bb0(%[[ARG0]]: !fir.ref<!fir.array<10xi32>>, %[[ARG1]]: {{.*}}):
++subroutine mapType_derived_nested_explicit_member_with_bounds
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  
++  type(scalar_and_array) :: scalar_arr 
++  
++  !$omp target map(tofrom: scalar_arr%nest%array(2:5))
++    scalar_arr%nest%array(3) = 3
++  !$omp end target
++end subroutine mapType_derived_nested_explicit_member_with_bounds
++
++!CHECK: %[[ALLOCA_1:.*]] = fir.alloca {{.*}} {bindc_name = "scalar_arr1", uniq_name = "_QFmaptype_multilpe_derived_nested_explicit_memberEscalar_arr1"}
++!CHECK: %[[DECLARE_1:.*]]:2 = hlfir.declare %[[ALLOCA_1]] {uniq_name = "_QFmaptype_multilpe_derived_nested_explicit_memberEscalar_arr1"} : {{.*}} -> {{.*}}
++!CHECK: %[[ALLOCA_2:.*]] = fir.alloca {{.*}} {bindc_name = "scalar_arr2", uniq_name = "_QFmaptype_multilpe_derived_nested_explicit_memberEscalar_arr2"}
++!CHECK: %[[DECLARE_2:.*]]:2 = hlfir.declare %[[ALLOCA_2]] {uniq_name = "_QFmaptype_multilpe_derived_nested_explicit_memberEscalar_arr2"} : {{.*}} -> {{.*}}
++!CHECK: %[[PARENT_1:.*]] = hlfir.designate %[[DECLARE_1]]#0{"nest"}   : {{.*}} -> {{.*}}
++!CHECK: %[[MEMBER_1:.*]] = hlfir.designate %[[PARENT_1]]{"int"}   : {{.*}} -> !fir.ref<i32>
++!CHECK: %[[MAP_MEMBER_1:.*]] = omp.map.info var_ptr(%[[MEMBER_1]] : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "scalar_arr1%nest%int"}
++!CHECK: %[[PARENT_2:.*]] = hlfir.designate %[[DECLARE_2]]#0{"nest"}   : {{.*}} -> {{.*}}
++!CHECK: %[[MEMBER_2:.*]] = hlfir.designate %[[PARENT_2]]{"int"}   : {{.*}} -> !fir.ref<i32>
++!CHECK: %[[MAP_MEMBER_2:.*]] = omp.map.info var_ptr(%[[MEMBER_2]] : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "scalar_arr2%nest%int"}
++!CHECK: %[[MAP_PARENT_1:.*]] = omp.map.info var_ptr(%[[DECLARE_1]]#1 : {{.*}}) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBER_1]] : [2,0] : !fir.ref<i32>) -> {{.*}} {name = "scalar_arr1", partial_map = true}
++!CHECK: %[[MAP_PARENT_2:.*]] = omp.map.info var_ptr(%[[DECLARE_2]]#1 : {{.*}}) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBER_2]] : [2,0] : !fir.ref<i32>) -> {{.*}} {name = "scalar_arr2", partial_map = true}
++!CHECK: omp.target map_entries(%[[MAP_MEMBER_1]] -> %[[ARG0:.*]], %[[MAP_PARENT_1]] -> %[[ARG1:.*]], %[[MAP_MEMBER_2]] -> %[[ARG2:.*]], %[[MAP_PARENT_2:.*]] -> %[[ARG3:.*]] : !fir.ref<i32>, {{.*}}, !fir.ref<i32>, {{.*}}) {
++!CHECK: ^bb0(%[[ARG0]]: !fir.ref<i32>, %[[ARG1]]: {{.*}}, %[[ARG2]]: !fir.ref<i32>, %[[ARG3]]: {{.*}}):
++subroutine mapType_multilpe_derived_nested_explicit_member
++  type :: nested
++    integer(4) :: int
++    real(4) :: real
++    integer(4) :: array(10)
++  end type nested
++
++  type :: scalar_and_array
++    real(4) :: real
++    integer(4) :: array(10)
++    type(nested) :: nest
++    integer(4) :: int
++  end type scalar_and_array
++  
++  type(scalar_and_array) :: scalar_arr1
++  type(scalar_and_array) :: scalar_arr2
++
++!$omp target map(tofrom:scalar_arr1%nest%int, scalar_arr2%nest%int)
++  scalar_arr1%nest%int = 3
++  scalar_arr2%nest%int = 2
++!$omp end target
++end subroutine mapType_multilpe_derived_nested_explicit_member
+diff --git a/flang/test/Lower/OpenMP/map-component-ref.f90 b/flang/test/Lower/OpenMP/map-component-ref.f90
+index 435bc8e6bd368..2c582667f38d3 100644
+--- a/flang/test/Lower/OpenMP/map-component-ref.f90
++++ b/flang/test/Lower/OpenMP/map-component-ref.f90
+@@ -5,7 +5,7 @@
+ ! CHECK: %[[V1:[0-9]+]]:2 = hlfir.declare %[[V0]] {uniq_name = "_QFfooEa"} : (!fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>) -> (!fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>, !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>)
+ ! CHECK: %[[V2:[0-9]+]] = hlfir.designate %[[V1]]#0{"a1"}   : (!fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>) -> !fir.ref<i32>
+ ! CHECK: %[[V3:[0-9]+]] = omp.map.info var_ptr(%[[V2]] : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "a%a1"}
+-! CHECK: %[[V4:[0-9]+]] = omp.map.info var_ptr(%[[V1]]#1 : !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>, !fir.type<_QFfooTt0{a0:i32,a1:i32}>) map_clauses(implicit, tofrom) capture(ByRef) -> !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>> {name = "a"}
++! CHECK: %[[V4:[0-9]+]] = omp.map.info var_ptr(%[[V1]]#1 : !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>, !fir.type<_QFfooTt0{a0:i32,a1:i32}>) map_clauses(tofrom) capture(ByRef) members(%[[V3]] : [1] : !fir.ref<i32>) -> !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>> {name = "a", partial_map = true}
+ ! CHECK: omp.target map_entries(%[[V3]] -> %arg0, %[[V4]] -> %arg1 : !fir.ref<i32>, !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>) {
+ ! CHECK: ^bb0(%arg0: !fir.ref<i32>, %arg1: !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>):
+ ! CHECK:   %[[V5:[0-9]+]]:2 = hlfir.declare %arg1 {uniq_name = "_QFfooEa"} : (!fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>) -> (!fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>, !fir.ref<!fir.type<_QFfooTt0{a0:i32,a1:i32}>>)
+diff --git a/flang/test/Lower/OpenMP/target.f90 b/flang/test/Lower/OpenMP/target.f90
+index e3b3799e5e7af..9bb855e446941 100644
+--- a/flang/test/Lower/OpenMP/target.f90
++++ b/flang/test/Lower/OpenMP/target.f90
+@@ -532,7 +532,7 @@ subroutine omp_target_device_addr
+    !CHECK: %[[VAL_0:.*]] = fir.alloca !fir.box<!fir.ptr<i32>> {bindc_name = "a", uniq_name = "_QFomp_target_device_addrEa"}
+    !CHECK: %[[VAL_0_DECL:.*]]:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<pointer>, uniq_name = "_QFomp_target_device_addrEa"} : (!fir.ref<!fir.box<!fir.ptr<i32>>>) -> (!fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.ref<!fir.box<!fir.ptr<i32>>>)
+    !CHECK: %[[MAP_MEMBERS:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, i32) var_ptr_ptr({{.*}} : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+-   !CHECK: %[[MAP:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBERS]] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
++   !CHECK: %[[MAP:.*]] = omp.map.info var_ptr({{.*}} : !fir.ref<!fir.box<!fir.ptr<i32>>>, !fir.box<!fir.ptr<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBERS]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.ptr<i32>>> {name = "a"}
+    !CHECK: omp.target_data map_entries(%[[MAP_MEMBERS]], %[[MAP]] : {{.*}}) use_device_addr(%[[VAL_0_DECL]]#1 : !fir.ref<!fir.box<!fir.ptr<i32>>>) {
+    !$omp target data map(tofrom: a) use_device_addr(a)
+    !CHECK: ^bb0(%[[VAL_1:.*]]: !fir.ref<!fir.box<!fir.ptr<i32>>>):
+diff --git a/flang/test/Transforms/omp-descriptor-map-info-gen.fir b/flang/test/Transforms/omp-descriptor-map-info-gen.fir
+deleted file mode 100644
+index 05d05b0ecb597..0000000000000
+--- a/flang/test/Transforms/omp-descriptor-map-info-gen.fir
++++ /dev/null
+@@ -1,44 +0,0 @@
+-// RUN: fir-opt --omp-descriptor-map-info-gen %s | FileCheck %s
+-
+-module attributes {omp.is_target_device = false} {
+-  func.func @test_descriptor_expansion_pass(%arg0: !fir.box<!fir.array<?xi32>>) {
+-    %0 = fir.alloca !fir.box<!fir.heap<i32>>
+-    %1 = fir.zero_bits !fir.heap<i32>
+-    %2:2 = hlfir.declare %arg0 {fortran_attrs = #fir.var_attrs<intent_out>, uniq_name = "test"} : (!fir.box<!fir.array<?xi32>>) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
+-    %3 = fir.embox %1 : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
+-    fir.store %3 to %0 : !fir.ref<!fir.box<!fir.heap<i32>>>
+-    %4:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "test2"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
+-    %5 = fir.allocmem i32 {fir.must_be_heap = true}
+-    %6 = fir.embox %5 : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
+-    fir.store %6 to %4#1 : !fir.ref<!fir.box<!fir.heap<i32>>>
+-    %c0 = arith.constant 1 : index  
+-    %c1 = arith.constant 0 : index
+-    %c2 = arith.constant 10 : index
+-    %dims:3 = fir.box_dims %2#1, %c1 : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
+-    %bounds = omp.map.bounds lower_bound(%c1 : index) upper_bound(%c2 : index) extent(%dims#1 : index) stride(%dims#2 : index) start_idx(%c0 : index) {stride_in_bytes = true}
+-    %7 = fir.box_addr %2#1 : (!fir.box<!fir.array<?xi32>>) -> !fir.ref<!fir.array<?xi32>>
+-    %8 = omp.map.info var_ptr(%4#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.box<!fir.heap<i32>>>
+-    %9 = omp.map.info var_ptr(%7 : !fir.ref<!fir.array<?xi32>>, !fir.array<?xi32>) map_clauses(from) capture(ByRef) bounds(%bounds) -> !fir.ref<!fir.array<?xi32>>
+-    omp.target map_entries(%8 -> %arg1, %9 -> %arg2 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.array<?xi32>>) {
+-    ^bb0(%arg1: !fir.ref<!fir.box<!fir.heap<i32>>>, %arg2: !fir.ref<!fir.array<?xi32>>):
+-      omp.terminator
+-    }
+-    return 
+-  }
+-}
+- 
+-// CHECK: func.func @test_descriptor_expansion_pass(%[[ARG0:.*]]: !fir.box<!fir.array<?xi32>>) {
+-// CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
+-// CHECK: %[[ALLOCA2:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
+-// CHECK: %[[DECLARE1:.*]]:2 = hlfir.declare %[[ARG0]] {fortran_attrs = #fir.var_attrs<intent_out>, uniq_name = "test"} : (!fir.box<!fir.array<?xi32>>) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
+-// CHECK: %[[DECLARE2:.*]]:2 = hlfir.declare %[[ALLOCA2]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "test2"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
+-// CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%{{.*}} : index) upper_bound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) start_idx(%{{.*}} : index) {stride_in_bytes = true}
+-// CHECK: %[[BASE_ADDR_OFF:.*]] = fir.box_offset %[[DECLARE2]]#1 base_addr : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> !fir.llvm_ptr<!fir.ref<i32>>
+-// CHECK: %[[DESC_MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE2]]#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, i32) var_ptr_ptr(%[[BASE_ADDR_OFF]] : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
+-// CHECK: %[[DESC_PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE2]]#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[DESC_MEMBER_MAP]] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.heap<i32>>>
+-// CHECK: fir.store %[[DECLARE1]]#1 to %[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
+-// CHECK: %[[BASE_ADDR_OFF_2:.*]] = fir.box_offset %[[ALLOCA]] base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
+-// CHECK: %[[DESC_MEMBER_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[BASE_ADDR_OFF_2]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(from) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
+-// CHECK: %[[DESC_PARENT_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(from) capture(ByRef) members(%15 : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>>
+-// CHECK: omp.target map_entries(%[[DESC_MEMBER_MAP]] -> %[[ARG1:.*]], %[[DESC_PARENT_MAP]] -> %[[ARG2:.*]], %[[DESC_MEMBER_MAP_2]] -> %[[ARG3:.*]], %[[DESC_PARENT_MAP_2]] -> %[[ARG4:.*]] : {{.*}}) {
+-// CHECK: ^bb0(%[[ARG1]]: !fir.llvm_ptr<!fir.ref<i32>>, %[[ARG2]]: !fir.ref<!fir.box<!fir.heap<i32>>>, %[[ARG3]]: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %[[ARG4]]: !fir.ref<!fir.array<?xi32>>):
+diff --git a/flang/test/Transforms/omp-map-info-finalization.fir b/flang/test/Transforms/omp-map-info-finalization.fir
+new file mode 100644
+index 0000000000000..9d776b674151d
+--- /dev/null
++++ b/flang/test/Transforms/omp-map-info-finalization.fir
+@@ -0,0 +1,99 @@
++// RUN: fir-opt --split-input-file --omp-map-info-finalization %s | FileCheck %s
++
++module attributes {omp.is_target_device = false} {
++  func.func @test_descriptor_expansion_pass(%arg0: !fir.box<!fir.array<?xi32>>) {
++    %0 = fir.alloca !fir.box<!fir.heap<i32>>
++    %1 = fir.zero_bits !fir.heap<i32>
++    %2:2 = hlfir.declare %arg0 {fortran_attrs = #fir.var_attrs<intent_out>, uniq_name = "test"} : (!fir.box<!fir.array<?xi32>>) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
++    %3 = fir.embox %1 : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++    fir.store %3 to %0 : !fir.ref<!fir.box<!fir.heap<i32>>>
++    %4:2 = hlfir.declare %0 {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "test2"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
++    %5 = fir.allocmem i32 {fir.must_be_heap = true}
++    %6 = fir.embox %5 : (!fir.heap<i32>) -> !fir.box<!fir.heap<i32>>
++    fir.store %6 to %4#1 : !fir.ref<!fir.box<!fir.heap<i32>>>
++    %c0 = arith.constant 1 : index  
++    %c1 = arith.constant 0 : index
++    %c2 = arith.constant 10 : index
++    %dims:3 = fir.box_dims %2#1, %c1 : (!fir.box<!fir.array<?xi32>>, index) -> (index, index, index)
++    %bounds = omp.map.bounds lower_bound(%c1 : index) upper_bound(%c2 : index) extent(%dims#1 : index) stride(%dims#2 : index) start_idx(%c0 : index) {stride_in_bytes = true}
++    %7 = fir.box_addr %2#1 : (!fir.box<!fir.array<?xi32>>) -> !fir.ref<!fir.array<?xi32>>
++    %8 = omp.map.info var_ptr(%4#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.ref<!fir.box<!fir.heap<i32>>>
++    %9 = omp.map.info var_ptr(%7 : !fir.ref<!fir.array<?xi32>>, !fir.array<?xi32>) map_clauses(from) capture(ByRef) bounds(%bounds) -> !fir.ref<!fir.array<?xi32>>
++    omp.target map_entries(%8 -> %arg1, %9 -> %arg2 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.array<?xi32>>) {
++    ^bb0(%arg1: !fir.ref<!fir.box<!fir.heap<i32>>>, %arg2: !fir.ref<!fir.array<?xi32>>):
++      omp.terminator
++    }
++    return 
++  }
++}
++ 
++// CHECK: func.func @test_descriptor_expansion_pass(%[[ARG0:.*]]: !fir.box<!fir.array<?xi32>>) {
++// CHECK: %[[ALLOCA:.*]] = fir.alloca !fir.box<!fir.array<?xi32>>
++// CHECK: %[[ALLOCA2:.*]] = fir.alloca !fir.box<!fir.heap<i32>>
++// CHECK: %[[DECLARE1:.*]]:2 = hlfir.declare %[[ARG0]] {fortran_attrs = #fir.var_attrs<intent_out>, uniq_name = "test"} : (!fir.box<!fir.array<?xi32>>) -> (!fir.box<!fir.array<?xi32>>, !fir.box<!fir.array<?xi32>>)
++// CHECK: %[[DECLARE2:.*]]:2 = hlfir.declare %[[ALLOCA2]] {fortran_attrs = #fir.var_attrs<allocatable>, uniq_name = "test2"} : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> (!fir.ref<!fir.box<!fir.heap<i32>>>, !fir.ref<!fir.box<!fir.heap<i32>>>)
++// CHECK: %[[BOUNDS:.*]] = omp.map.bounds lower_bound(%{{.*}} : index) upper_bound(%{{.*}} : index) extent(%{{.*}} : index) stride(%{{.*}} : index) start_idx(%{{.*}} : index) {stride_in_bytes = true}
++// CHECK: %[[BASE_ADDR_OFF:.*]] = fir.box_offset %[[DECLARE2]]#1 base_addr : (!fir.ref<!fir.box<!fir.heap<i32>>>) -> !fir.llvm_ptr<!fir.ref<i32>>
++// CHECK: %[[DESC_MEMBER_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE2]]#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, i32) var_ptr_ptr(%[[BASE_ADDR_OFF]] : !fir.llvm_ptr<!fir.ref<i32>>) map_clauses(tofrom) capture(ByRef) -> !fir.llvm_ptr<!fir.ref<i32>> {name = ""}
++// CHECK: %[[DESC_PARENT_MAP:.*]] = omp.map.info var_ptr(%[[DECLARE2]]#1 : !fir.ref<!fir.box<!fir.heap<i32>>>, !fir.box<!fir.heap<i32>>) map_clauses(tofrom) capture(ByRef) members(%[[DESC_MEMBER_MAP]] : [0] : !fir.llvm_ptr<!fir.ref<i32>>) -> !fir.ref<!fir.box<!fir.heap<i32>>>
++// CHECK: fir.store %[[DECLARE1]]#1 to %[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>
++// CHECK: %[[BASE_ADDR_OFF_2:.*]] = fir.box_offset %[[ALLOCA]] base_addr : (!fir.ref<!fir.box<!fir.array<?xi32>>>) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>
++// CHECK: %[[DESC_MEMBER_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.array<?xi32>) var_ptr_ptr(%[[BASE_ADDR_OFF_2]] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) map_clauses(from) capture(ByRef) bounds(%[[BOUNDS]]) -> !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>> {name = ""}
++// CHECK: %[[DESC_PARENT_MAP_2:.*]] = omp.map.info var_ptr(%[[ALLOCA]] : !fir.ref<!fir.box<!fir.array<?xi32>>>, !fir.box<!fir.array<?xi32>>) map_clauses(from) capture(ByRef) members(%[[DESC_MEMBER_MAP_2]] : [0] : !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>) -> !fir.ref<!fir.array<?xi32>>
++// CHECK: omp.target map_entries(%[[DESC_MEMBER_MAP]] -> %[[ARG1:.*]], %[[DESC_PARENT_MAP]] -> %[[ARG2:.*]], %[[DESC_MEMBER_MAP_2]] -> %[[ARG3:.*]], %[[DESC_PARENT_MAP_2]] -> %[[ARG4:.*]] : {{.*}}) {
++// CHECK: ^bb0(%[[ARG1]]: !fir.llvm_ptr<!fir.ref<i32>>, %[[ARG2]]: !fir.ref<!fir.box<!fir.heap<i32>>>, %[[ARG3]]: !fir.llvm_ptr<!fir.ref<!fir.array<?xi32>>>, %[[ARG4]]: !fir.ref<!fir.array<?xi32>>):
++
++// -----
++
++module attributes {omp.is_target_device = false} {
++  func.func @test_derived_type_map_operand_and_block_addition(%arg0: !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) {
++    %0 = hlfir.designate %arg0{"rx"}   : (!fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) -> !fir.ref<f32>
++    %1 = omp.map.info var_ptr(%0 : !fir.ref<f32>, f32) map_clauses(from) capture(ByRef) -> !fir.ref<f32> {name = "scalar_struct%rx"}
++    %2 = hlfir.designate %arg0{"ry"}   : (!fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) -> !fir.ref<f32>
++    %3 = omp.map.info var_ptr(%2 : !fir.ref<f32>, f32) map_clauses(from) capture(ByRef) -> !fir.ref<f32> {name = "scalar_struct%ry"}
++    %4 = omp.map.info var_ptr(%arg0 : !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>, !fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>) map_clauses(from) capture(ByRef) members(%1, %3 : [1], [4] : !fir.ref<f32>, !fir.ref<f32>) -> !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>> {name = "scalar_struct", partial_map = true}
++    omp.target map_entries(%4 -> %arg1 : !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) {
++    ^bb0(%arg1: !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>):
++      omp.terminator
++    }
++    return
++  }
++}
++
++// CHECK: func.func @test_derived_type_map_operand_and_block_addition(%{{.*}}: !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) { 
++// CHECK:   %[[MAP_MEMBER_1:.*]] = omp.map.info var_ptr(%{{.*}} : !fir.ref<f32>, f32) map_clauses(from) capture(ByRef) -> !fir.ref<f32> {name = "scalar_struct%rx"}
++// CHECK:   %[[MAP_MEMBER_2:.*]] = omp.map.info var_ptr(%{{.*}} : !fir.ref<f32>, f32) map_clauses(from) capture(ByRef) -> !fir.ref<f32> {name = "scalar_struct%ry"}
++// CHECK:   %[[MAP_PARENT:.*]] = omp.map.info var_ptr(%{{.*}} : !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>, !fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>) map_clauses(from) capture(ByRef) members(%[[MAP_MEMBER_1]], %[[MAP_MEMBER_2]] : [1], [4] : !fir.ref<f32>, !fir.ref<f32>) -> !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>> {name = "scalar_struct", partial_map = true}
++// CHECK:   omp.target map_entries(%[[MAP_MEMBER_1]] -> %[[ARG1:.*]], %[[MAP_MEMBER_2]] -> %[[ARG2:.*]], %[[MAP_PARENT]] -> %[[ARG3:.*]] : !fir.ref<f32>, !fir.ref<f32>, !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>) {
++// CHECK:     ^bb0(%[[ARG1]]: !fir.ref<f32>, %[[ARG2]]: !fir.ref<f32>, %[[ARG3]]: !fir.ref<!fir.type<_QFTdtype{ix:i32,rx:f32,zx:!fir.complex<4>,nested:!fir.box<!fir.heap<!fir.type<_QFTdtype>>>,ry:f32}>>):
++
++// -----
++
++module attributes {omp.is_target_device = false} {
++func.func @test_nested_derived_type_map_operand_and_block_addition(%arg0: !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>) {        
++    %0 = fir.declare %arg0 {uniq_name = "_QFmaptype_derived_nested_explicit_multiple_membersEsa"} : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>) -> !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>
++    %1 = fir.field_index n, !fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>
++    %2 = fir.coordinate_of %0, %1 : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>, !fir.field) -> !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>>
++    %3 = fir.field_index i, !fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>
++    %4 = fir.coordinate_of %2, %3 : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>>, !fir.field) -> !fir.ref<i32>
++    %5 = omp.map.info var_ptr(%4 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "sa%n%i"}
++    %6 = fir.field_index n, !fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>
++    %7 = fir.coordinate_of %0, %6 : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>, !fir.field) -> !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>>
++    %8 = fir.field_index r, !fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>
++    %9 = fir.coordinate_of %7, %8 : (!fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>>, !fir.field) -> !fir.ref<f32>
++    %10 = omp.map.info var_ptr(%9 : !fir.ref<f32>, f32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f32> {name = "sa%n%r"}
++    %11 = omp.map.info var_ptr(%0 : !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>, !fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>) map_clauses(tofrom) capture(ByRef) members(%5, %10 : [1,0], [1,1] : !fir.ref<i32>, !fir.ref<f32>) -> !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>> {name = "sa", partial_map = true}
++    omp.target map_entries(%11 -> %arg1 : !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>) {
++    ^bb0(%arg1: !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>):
++      omp.terminator
++    }
++    return
++  }
++}
++
++// CHECK: func.func @test_nested_derived_type_map_operand_and_block_addition(%{{.*}}: !fir.ref<!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTscalar_and_array{r:f32,n:!fir.type<_QFmaptype_derived_nested_explicit_multiple_membersTnested{i:i32,r:f32}>}>>) { 
++// CHECK:   %[[MAP_MEMBER_1:.*]] = omp.map.info var_ptr(%{{.*}} : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32> {name = "sa%n%i"}
++// CHECK:   %[[MAP_MEMBER_2:.*]] = omp.map.info var_ptr(%{{.*}} : !fir.ref<f32>, f32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<f32> {name = "sa%n%r"}
++// CHECK:   %[[MAP_PARENT:.*]] = omp.map.info var_ptr(%{{.*}} : {{.*}}, {{.*}}) map_clauses(tofrom) capture(ByRef) members(%[[MAP_MEMBER_1]], %[[MAP_MEMBER_2]] : [1,0], [1,1] : !fir.ref<i32>, !fir.ref<f32>) -> {{.*}} {name = "sa", partial_map = true}
++// CHECK:   omp.target map_entries(%[[MAP_MEMBER_1]] -> %[[ARG1:.*]], %[[MAP_MEMBER_2]] -> %[[ARG2:.*]], %[[MAP_PARENT]] -> %[[ARG3:.*]] : !fir.ref<i32>, !fir.ref<f32>, {{.*}}) {
++// CHECK:     ^bb0(%[[ARG1]]: !fir.ref<i32>, %[[ARG2]]: !fir.ref<f32>, %[[ARG3]]: {{.*}}):

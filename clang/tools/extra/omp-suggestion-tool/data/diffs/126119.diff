@@ -1,0 +1,232 @@
+diff --git a/offload/DeviceRTL/include/DeviceTypes.h b/offload/DeviceRTL/include/DeviceTypes.h
+index 308109b0749f0..2e5d92380f040 100644
+--- a/offload/DeviceRTL/include/DeviceTypes.h
++++ b/offload/DeviceRTL/include/DeviceTypes.h
+@@ -12,9 +12,15 @@
+ #ifndef OMPTARGET_TYPES_H
+ #define OMPTARGET_TYPES_H
+ 
++#include <gpuintrin.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++template <typename T> using Private = __gpu_private T;
++template <typename T> using Constant = __gpu_constant T;
++template <typename T> using Local = __gpu_local T;
++template <typename T> using Global = __gpu_local T;
++
+ enum omp_proc_bind_t {
+   omp_proc_bind_false = 0,
+   omp_proc_bind_true = 1,
+@@ -155,19 +161,6 @@ typedef enum omp_allocator_handle_t {
+ #define __PRAGMA(STR) _Pragma(#STR)
+ #define OMP_PRAGMA(STR) __PRAGMA(omp STR)
+ 
+-#define SHARED(NAME)                                                           \
+-  [[clang::address_space(3)]] NAME [[clang::loader_uninitialized]];
+-
+-// TODO: clang should use address space 5 for omp_thread_mem_alloc, but right
+-//       now that's not the case.
+-#define THREAD_LOCAL(NAME)                                                     \
+-  [[clang::address_space(5)]] NAME [[clang::loader_uninitialized]]
+-
+-// TODO: clang should use address space 4 for omp_const_mem_alloc, maybe it
+-//       does?
+-#define CONSTANT(NAME)                                                         \
+-  [[clang::address_space(4)]] NAME [[clang::loader_uninitialized]]
+-
+ ///}
+ 
+ #endif
+diff --git a/offload/DeviceRTL/include/State.h b/offload/DeviceRTL/include/State.h
+index 58b619ff1072a..db396dae6e445 100644
+--- a/offload/DeviceRTL/include/State.h
++++ b/offload/DeviceRTL/include/State.h
+@@ -86,7 +86,7 @@ struct TeamStateTy {
+   ParallelRegionFnTy ParallelRegionFnVar;
+ };
+ 
+-extern TeamStateTy [[clang::address_space(3)]] TeamState;
++extern Local<TeamStateTy> TeamState;
+ 
+ struct ThreadStateTy {
+ 
+@@ -112,7 +112,7 @@ struct ThreadStateTy {
+   }
+ };
+ 
+-extern ThreadStateTy **[[clang::address_space(3)]] ThreadStates;
++extern Local<ThreadStateTy **> ThreadStates;
+ 
+ /// Initialize the state machinery. Must be called by all threads.
+ void init(bool IsSPMD, KernelEnvironmentTy &KernelEnvironment,
+diff --git a/offload/DeviceRTL/src/Configuration.cpp b/offload/DeviceRTL/src/Configuration.cpp
+index a2dfa4a02a094..0c31c66ab2deb 100644
+--- a/offload/DeviceRTL/src/Configuration.cpp
++++ b/offload/DeviceRTL/src/Configuration.cpp
+@@ -28,8 +28,8 @@ using namespace ompx;
+ // This variable should be visible to the plugin so we override the default
+ // hidden visibility.
+ [[gnu::used, gnu::retain, gnu::weak,
+-  gnu::visibility("protected")]] DeviceEnvironmentTy
+-    CONSTANT(__omp_rtl_device_environment);
++  gnu::visibility(
++      "protected")]] Constant<DeviceEnvironmentTy> __omp_rtl_device_environment;
+ 
+ uint32_t config::getAssumeTeamsOversubscription() {
+   return __omp_rtl_assume_teams_oversubscription;
+diff --git a/offload/DeviceRTL/src/Mapping.cpp b/offload/DeviceRTL/src/Mapping.cpp
+index a0c0f6721a84c..641be81cca3ed 100644
+--- a/offload/DeviceRTL/src/Mapping.cpp
++++ b/offload/DeviceRTL/src/Mapping.cpp
+@@ -308,7 +308,7 @@ uint32_t mapping::getNumberOfProcessorElements() {
+ 
+ // TODO: This is a workaround for initialization coming from kernels outside of
+ //       the TU. We will need to solve this more correctly in the future.
+-[[gnu::weak]] int SHARED(IsSPMDMode);
++[[gnu::weak, clang::loader_uninitialized]] Local<int> IsSPMDMode;
+ 
+ void mapping::init(bool IsSPMD) {
+   if (mapping::isInitialThreadInLevel0(IsSPMD))
+diff --git a/offload/DeviceRTL/src/Reduction.cpp b/offload/DeviceRTL/src/Reduction.cpp
+index 25f34005532f7..fffd0063940c6 100644
+--- a/offload/DeviceRTL/src/Reduction.cpp
++++ b/offload/DeviceRTL/src/Reduction.cpp
+@@ -71,16 +71,16 @@ static int32_t nvptx_parallel_reduce_nowait(void *reduce_data,
+   if (NumThreads == 1)
+     return 1;
+ 
+-    //
+-    // This reduce function handles reduction within a team. It handles
+-    // parallel regions in both L1 and L2 parallelism levels. It also
+-    // supports Generic, SPMD, and NoOMP modes.
+-    //
+-    // 1. Reduce within a warp.
+-    // 2. Warp master copies value to warp 0 via shared memory.
+-    // 3. Warp 0 reduces to a single value.
+-    // 4. The reduced value is available in the thread that returns 1.
+-    //
++  //
++  // This reduce function handles reduction within a team. It handles
++  // parallel regions in both L1 and L2 parallelism levels. It also
++  // supports Generic, SPMD, and NoOMP modes.
++  //
++  // 1. Reduce within a warp.
++  // 2. Warp master copies value to warp 0 via shared memory.
++  // 3. Warp 0 reduces to a single value.
++  // 4. The reduced value is available in the thread that returns 1.
++  //
+ 
+ #if __has_builtin(__nvvm_reflect)
+   if (__nvvm_reflect("__CUDA_ARCH") >= 700) {
+@@ -196,8 +196,8 @@ int32_t __kmpc_nvptx_teams_reduce_nowait_v2(
+   uint32_t NumThreads = omp_get_num_threads();
+   uint32_t TeamId = omp_get_team_num();
+   uint32_t NumTeams = omp_get_num_teams();
+-  static unsigned SHARED(Bound);
+-  static unsigned SHARED(ChunkTeamCount);
++  [[clang::loader_uninitialized]] static Local<unsigned> Bound;
++  [[clang::loader_uninitialized]] static Local<unsigned> ChunkTeamCount;
+ 
+   // Block progress for teams greater than the current upper
+   // limit. We always only allow a number of teams less or equal
+diff --git a/offload/DeviceRTL/src/State.cpp b/offload/DeviceRTL/src/State.cpp
+index 89edb4802198c..cbe9735145340 100644
+--- a/offload/DeviceRTL/src/State.cpp
++++ b/offload/DeviceRTL/src/State.cpp
+@@ -28,15 +28,17 @@ using namespace ompx;
+ ///{
+ 
+ /// External symbol to access dynamic shared memory.
+-[[gnu::aligned(allocator::ALIGNMENT)]] extern unsigned char
+-    [[clang::address_space(3)]] DynamicSharedBuffer[];
++[[gnu::aligned(
++    allocator::ALIGNMENT)]] extern Local<unsigned char> DynamicSharedBuffer[];
+ 
+ /// The kernel environment passed to the init method by the compiler.
+-static KernelEnvironmentTy *SHARED(KernelEnvironmentPtr);
++[[clang::loader_uninitialized]] static Local<KernelEnvironmentTy *>
++    KernelEnvironmentPtr;
+ 
+ /// The kernel launch environment passed as argument to the kernel by the
+ /// runtime.
+-static KernelLaunchEnvironmentTy *SHARED(KernelLaunchEnvironmentPtr);
++[[clang::loader_uninitialized]] static Local<KernelLaunchEnvironmentTy *>
++    KernelLaunchEnvironmentPtr;
+ 
+ ///}
+ 
+@@ -108,7 +110,8 @@ static_assert(state::SharedScratchpadSize / mapping::MaxThreadsPerTeam <= 256,
+               "Shared scratchpad of this size not supported yet.");
+ 
+ /// The allocation of a single shared memory scratchpad.
+-static SharedMemorySmartStackTy SHARED(SharedMemorySmartStack);
++[[clang::loader_uninitialized]] static Local<SharedMemorySmartStackTy>
++    SharedMemorySmartStack;
+ 
+ void SharedMemorySmartStackTy::init(bool IsSPMD) {
+   Usage[mapping::getThreadIdInBlock()] = 0;
+@@ -220,8 +223,10 @@ void state::TeamStateTy::assertEqual(TeamStateTy &Other) const {
+   ASSERT(HasThreadState == Other.HasThreadState, nullptr);
+ }
+ 
+-state::TeamStateTy SHARED(ompx::state::TeamState);
+-state::ThreadStateTy **SHARED(ompx::state::ThreadStates);
++[[clang::loader_uninitialized]] Local<state::TeamStateTy>
++    ompx::state::TeamState;
++[[clang::loader_uninitialized]] Local<state::ThreadStateTy **>
++    ompx::state::ThreadStates;
+ 
+ namespace {
+ 
+@@ -449,10 +454,10 @@ void *llvm_omp_get_dynamic_shared() { return __kmpc_get_dynamic_shared(); }
+ /// NUM_SHARED_VARIABLES_IN_SHARED_MEM we will malloc space for communication.
+ constexpr uint64_t NUM_SHARED_VARIABLES_IN_SHARED_MEM = 64;
+ 
+-[[clang::loader_uninitialized]] static void *[[clang::address_space(
+-    3)]] SharedMemVariableSharingSpace[NUM_SHARED_VARIABLES_IN_SHARED_MEM];
+-[[clang::loader_uninitialized]] static void **[[clang::address_space(
+-    3)]] SharedMemVariableSharingSpacePtr;
++[[clang::loader_uninitialized]] static Local<void *>
++    SharedMemVariableSharingSpace[NUM_SHARED_VARIABLES_IN_SHARED_MEM];
++[[clang::loader_uninitialized]] static Local<void **>
++    SharedMemVariableSharingSpacePtr;
+ 
+ void __kmpc_begin_sharing_variables(void ***GlobalArgs, uint64_t nArgs) {
+   if (nArgs <= NUM_SHARED_VARIABLES_IN_SHARED_MEM) {
+diff --git a/offload/DeviceRTL/src/Synchronization.cpp b/offload/DeviceRTL/src/Synchronization.cpp
+index a5090b96560c8..0854c21ee152a 100644
+--- a/offload/DeviceRTL/src/Synchronization.cpp
++++ b/offload/DeviceRTL/src/Synchronization.cpp
+@@ -69,7 +69,7 @@ uint32_t atomicInc(uint32_t *A, uint32_t V, atomic::OrderingTy Ordering,
+   }
+ }
+ 
+-uint32_t SHARED(namedBarrierTracker);
++[[clang::loader_uninitialized]] Local<uint32_t> namedBarrierTracker;
+ 
+ void namedBarrierInit() {
+   // Don't have global ctors, and shared memory is not zero init
+diff --git a/offload/DeviceRTL/src/Workshare.cpp b/offload/DeviceRTL/src/Workshare.cpp
+index b1f037a11bddf..de4ed2e2102a6 100644
+--- a/offload/DeviceRTL/src/Workshare.cpp
++++ b/offload/DeviceRTL/src/Workshare.cpp
+@@ -45,7 +45,7 @@ struct DynamicScheduleTracker {
+ #define LAST_CHUNK 2
+ 
+ // TODO: This variable is a hack inherited from the old runtime.
+-static uint64_t SHARED(Cnt);
++[[clang::loader_uninitialized]] static Local<uint64_t> Cnt;
+ 
+ template <typename T, typename ST> struct omptarget_nvptx_LoopSupport {
+   ////////////////////////////////////////////////////////////////////////////////
+@@ -457,7 +457,8 @@ template <typename T, typename ST> struct omptarget_nvptx_LoopSupport {
+ //
+ //  __kmpc_dispatch_deinit
+ //
+-static DynamicScheduleTracker **SHARED(ThreadDST);
++[[clang::loader_uninitialized]] static Local<DynamicScheduleTracker **>
++    ThreadDST;
+ 
+ // Create a new DST, link the current one, and define the new as current.
+ static DynamicScheduleTracker *pushDST() {
