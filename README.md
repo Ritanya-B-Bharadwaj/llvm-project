@@ -1,44 +1,185 @@
-# The LLVM Compiler Infrastructure
+<div align="center">
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)
-[![libc++](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml/badge.svg?branch=main&event=schedule)](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml?query=event%3Aschedule)
+# 🔬 LLVM-PAPI Function-Level Performance Instrumentation Tool
 
-Welcome to the LLVM project!
+[![LLVM](https://img.shields.io/badge/LLVM-Clang-262D3A?style=for-the-badge&logo=llvm&logoColor=white)](https://llvm.org/)
+[![PAPI](https://img.shields.io/badge/PAPI-Performance_API-FF6B6B?style=for-the-badge)](https://icl.utk.edu/papi/)
+[![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-Instrumentation-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)](https://isocpp.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 
-This repository contains the source code for LLVM, a toolkit for the
-construction of highly optimized compilers, optimizers, and run-time
-environments.
+**A powerful compiler-based toolchain for automatically instrumenting C/C++ programs to collect per-function performance metrics**
 
-The LLVM project has multiple components. The core of the project is
-itself called "LLVM". This contains all of the tools, libraries, and header
-files needed to process intermediate representations and convert them into
-object files. Tools include an assembler, disassembler, bitcode analyzer, and
-bitcode optimizer.
+[Features](#-features) • [Quick Start](#-quick-start) • [Usage](#-usage) • [Sample Output](#-sample-output) • [Documentation](#-documentation)
 
-C-like languages use the [Clang](https://clang.llvm.org/) frontend. This
-component compiles C, C++, Objective-C, and Objective-C++ code into LLVM bitcode
--- and from there into object files, using LLVM.
+---
 
-Other components include:
-the [libc++ C++ standard library](https://libcxx.llvm.org),
-the [LLD linker](https://lld.llvm.org), and more.
+</div>
 
-## Getting the Source Code and Building LLVM
+## 📖 Overview
 
-Consult the
-[Getting Started with LLVM](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)
-page for information on building and running LLVM.
+This project leverages **LLVM Clang LibTooling** to automatically inject performance monitoring hooks into your C/C++ source code. It seamlessly integrates with **PAPI (Performance API)** to capture hardware performance counters at the function level, providing deep insights into your application's runtime behavior.
 
-For information on how to contribute to the LLVM project, please take a look at
-the [Contributing to LLVM](https://llvm.org/docs/Contributing.html) guide.
+### 🎯 What It Does
 
-## Getting in touch
+- 🔍 **Automatic Instrumentation**: No manual code changes required
+- ⚡ **Hardware Counter Access**: Track CPU cycles, cache misses, instructions executed, and more
+- 📊 **Per-Function Analytics**: Granular performance data for every function
+- 🚀 **Production Ready**: Fully automated pipeline with minimal overhead
+- 📈 **CSV Export**: Easy-to-analyze performance reports
 
-Join the [LLVM Discourse forums](https://discourse.llvm.org/), [Discord
-chat](https://discord.gg/xS7Z362),
-[LLVM Office Hours](https://llvm.org/docs/GettingInvolved.html#office-hours) or
-[Regular sync-ups](https://llvm.org/docs/GettingInvolved.html#online-sync-ups).
+---
 
-The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
-participants to all modes of communication within the project.
+## ✨ Features
+
+<table>
+<tr>
+<td width="50%">
+
+### 🛠️ **Core Capabilities**
+
+- ✅ Per-function entry/exit instrumentation using Clang AST rewriting
+- ✅ Dynamic runtime integration with **PAPI** event counters
+- ✅ Automated compilation and execution pipeline
+- ✅ CLI-based customization for flexibility
+
+</td>
+<td width="50%">
+
+### 📦 **Metrics Collected**
+
+- 📝 Function name
+- ⏱️ Start & end timestamps (nanosecond precision)
+- 🔢 Configurable PAPI event values
+- 💾 CSV-formatted output for easy analysis
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+```bash
+# Required dependencies
+- LLVM/Clang (with LibTooling)
+- PAPI library
+- GCC/Clang compiler
+```
+
+### 🔧 Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/TarunB1006/PAPI-based-LLVM-Instrumentation-Tool.git
+cd PAPI-based-LLVM-Instrumentation-Tool
+
+# Make the pipeline executable
+chmod +x run_pipeline.sh
+```
+
+---
+
+## 💻 Usage
+
+### Basic Command
+
+```bash
+./run_pipeline.sh \
+  -i <input_file.c> \
+  -e <event1,event2,...> \
+  -o <output_file.csv>
+```
+
+### 📋 Command-Line Options
+
+| Flag | Description | Required |
+|------|-------------|----------|
+| `-i` | Input C/C++ file to instrument | ✅ Yes |
+| `-e` | Comma-separated PAPI events to monitor | ✅ Yes |
+| `-o` | Output CSV file path | ⚠️ Optional |
+
+### 🎯 Example Usage
+
+```bash
+# Monitor total instructions and L1 cache misses
+./run_pipeline.sh \
+  -i test/sample.c \
+  -e "PAPI_TOT_INS,PAPI_L1_DCM" \
+  -o performance_metrics.csv
+```
+
+### 🔄 Pipeline Process
+
+When you run the script, it automatically:
+
+1. 🔨 **Instruments** your source file with PAPI hooks
+2. ⚙️ **Compiles** the instrumented code with PAPI runtime
+3. ▶️ **Executes** the instrumented binary
+4. 📊 **Collects** per-function metrics into CSV
+
+---
+
+## 🎪 Available PAPI Events
+
+### 🔍 Discover Events
+
+```bash
+# List all available preset PAPI events
+papi_avail
+
+# Search for specific native hardware events
+papi_native_avail | grep <keyword>
+```
+
+### 🔥 Popular Events
+
+| Event | Description |
+|-------|-------------|
+| `PAPI_TOT_INS` | Total instructions executed |
+| `PAPI_TOT_CYC` | Total CPU cycles |
+| `PAPI_L1_DCM` | L1 data cache misses |
+| `PAPI_L2_DCM` | L2 data cache misses |
+| `PAPI_BR_MSP` | Branch mispredictions |
+| `PAPI_FP_OPS` | Floating point operations |
+
+---
+
+## 📊 Sample Output
+
+The tool generates a CSV file with detailed per-function metrics:
+
+```csv
+function_name,start_time,end_time,PAPI_TOT_INS,PAPI_L1_DCM
+compute,1623651123.123456789,1623651123.456789123,10231,23
+helper_function,1623651123.234567890,1623651123.345678901,5420,8
+main,1623651123.457123456,1623651123.789321987,132,2
+```
+
+### 📈 Visualization Example
+
+Use your favorite data analysis tools to visualize the results:
+- 📊 Excel/Google Sheets for quick charts
+- 🐍 Python (pandas, matplotlib) for advanced analysis
+- 📉 R for statistical modeling
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph LR
+    A[Source Code] --> B[AST Instrumentation]
+    B --> C[PAPI Runtime Integration]
+    C --> D[Compiled Binary]
+    D --> E[Execution]
+    E --> F[Performance Metrics CSV]
+```
+
+## Acknowledgments
+
+- Built with **LLVM/Clang** LibTooling framework
+- Performance monitoring powered by **PAPI** (Performance API)
+- Inspired by the need for automated, low-overhead performance profiling
